@@ -49,11 +49,21 @@ QUIET :=
 endif
 endif
 
+# Must be defined BEFORE BASE_CFLAGS: that is a `:=` (immediately expanded)
+# assignment, so an empty BUILD_DIR here turns its -I$(BUILD_DIR) into a bare
+# -I that swallows the following -fno-stack-protector as its argument. The
+# build/ directory then is not on the include path at all and every object
+# that includes the generated build_cfg.h fails with "file not found".
+# `make BUILD_DIR=... ` (how tools/build-j414s-windows-unified.py invokes it)
+# masked this, because a command-line assignment is in scope before the
+# makefile is read; a plain `make` from a clean tree did not.
+BUILD_DIR ?= build
+
 BASE_CFLAGS := -O2 -Wall -g -Wundef -Werror=strict-prototypes -fno-common -fno-PIE \
 	-Werror=implicit-function-declaration -Werror=implicit-int \
 	-Wsign-compare -Wunused-parameter -Wno-multichar \
 	-ffreestanding -fpic -ffunction-sections -fdata-sections \
-	-nostdinc -isystem $(shell $(CC) -print-file-name=include) -isystem sysinc \
+	-nostdinc -isystem $(shell $(CC) -print-file-name=include) -isystem sysinc -I$(BUILD_DIR) \
 	-fno-stack-protector -mstrict-align -march=armv8.2-a \
 	$(EXTRA_CFLAGS)
 
@@ -105,6 +115,9 @@ OBJECTS := \
 	afk.o \
 	aic.o \
 	asc.o \
+	acio.o acio_type5.o acio_runtime.o \
+	atcphy.o atcphy_core.o \
+	bcm4388_handoff.o \
 	bootlogo_48.o bootlogo_128.o bootlogo_256.o \
 	chainload.o \
 	chainload_asm.o \
@@ -130,22 +143,28 @@ OBJECTS := \
 	exception.o exception_asm.o \
 	fb.o font.o font_retina.o \
 	firmware.o \
+	gpio.o \
+	gpu_handoff.o gpu_handoff_abi.o \
 	gxf.o gxf_asm.o \
 	heapblock.o \
-	hv.o hv_vm.o hv_exc.o hv_vuart.o hv_wdt.o hv_asm.o hv_aic.o hv_virtio.o \
+	hv.o hv_vm.o hv_exc.o hv_vuart.o hv_wdt.o hv_asm.o hv_aic.o hv_virtio.o hv_tpm.o hv_xfer.o hv_psci.o hv_vgic.o \
 	i2c.o \
 	iodev.o \
 	iova.o \
 	isp.o \
 	kboot.o kboot_atc.o \
 	main.o \
+	media_handoff.o \
 	mitigations.o \
 	mcc.o \
 	memory.o memory_asm.o \
+	mtp_handoff.o \
 	nvme.o \
 	payload.o \
 	pcie.o \
+	wireless_handoff.o wireless_handoff_abi.o \
 	pmgr.o \
+	platform_identity.o \
 	proxy.o \
 	ringbuffer.o \
 	rtkit.o \
@@ -158,7 +177,7 @@ OBJECTS := \
 	startup.o \
 	string.o \
 	tunables.o tunables_static.o \
-	tps6598x.o \
+	tps6598x.o tps6598x_host_policy.o \
 	uart.o \
 	uartproxy.o \
 	usb.o usb_dwc3.o \
@@ -166,7 +185,7 @@ OBJECTS := \
 	vsprintf.o \
 	wdt.o \
 	$(DCP_OBJECTS) \
-	$(MINILZLIB_OBJECTS) $(TINF_OBJECTS) $(DLMALLOC_OBJECTS) $(LIBFDT_OBJECTS) $(RUST_LIB)
+	$(MINILZLIB_OBJECTS) $(TINF_OBJECTS) $(DLMALLOC_OBJECTS) $(LIBFDT_OBJECTS)
 
 FP_OBJECTS := \
 	kboot_gpu.o \
@@ -175,19 +194,20 @@ FP_OBJECTS := \
 	math/powf.o \
 	math/powf_data.o
 
-BUILD_OBJS := $(patsubst %,build/%,$(OBJECTS))
-BUILD_FP_OBJS := $(patsubst %,build/%,$(FP_OBJECTS))
-BUILD_ALL_OBJS := $(BUILD_OBJS) $(BUILD_FP_OBJS)
+BUILD_OBJS := $(patsubst %,$(BUILD_DIR)/%,$(OBJECTS))
+BUILD_FP_OBJS := $(patsubst %,$(BUILD_DIR)/%,$(FP_OBJECTS))
+BUILD_RUST_LIB := $(patsubst %,$(BUILD_DIR)/%,$(RUST_LIB))
+BUILD_ALL_OBJS := $(BUILD_OBJS) $(BUILD_FP_OBJS) $(BUILD_RUST_LIB)
 NAME := m1n1
 TARGET := m1n1.macho
 TARGET_RAW := m1n1.bin
 
-DEPDIR := build/.deps
+DEPDIR := $(BUILD_DIR)/.deps
 
 .PHONY: all clean format invoke_cc always_rebuild
-all: build/$(TARGET) build/$(TARGET_RAW)
+all: $(BUILD_DIR)/$(TARGET) $(BUILD_DIR)/$(TARGET_RAW)
 clean:
-	rm -rf build/* build/.deps
+	rm -rf $(BUILD_DIR)/* $(BUILD_DIR)/.deps
 format:
 	$(CLANG_FORMAT) -i src/*.c src/dcp/*.c src/math/*.c src/*.h src/dcp/*.h src/math/*.h sysinc/*.h
 format-check:
@@ -197,26 +217,26 @@ rustfmt:
 rustfmt-check:
 	cd rust && cargo fmt --check
 
-build/$(RUST_LIB): rust/src/* rust/*
+$(BUILD_DIR)/$(RUST_LIB): rust/src/*.rs rust/src/gpu/*.rs rust/src/gpu/hw/*.rs rust/Cargo.toml rust/Cargo.lock
 	$(QUIET)echo "  RS    $@"
 	$(QUIET)mkdir -p $(DEPDIR)
 	$(QUIET)mkdir -p "$(dir $@)"
-	$(QUIET)cargo build $(CARGO_FLAGS) --target $(RUSTARCH) --lib --release --manifest-path rust/Cargo.toml --target-dir build
-	$(QUIET)cp "build/$(RUSTARCH)/release/${RUST_LIB}" "$@"
+	$(QUIET)cargo build $(CARGO_FLAGS) --target $(RUSTARCH) --lib --release --manifest-path rust/Cargo.toml --target-dir $(BUILD_DIR)
+	$(QUIET)cp "$(BUILD_DIR)/$(RUSTARCH)/release/${RUST_LIB}" "$@"
 
-build/%.o: src/%.S
+$(BUILD_DIR)/%.o: src/%.S
 	$(QUIET)echo "  AS    $@"
 	$(QUIET)mkdir -p $(DEPDIR)
 	$(QUIET)mkdir -p "$(dir $@)"
 	$(QUIET)$(AS) -c $(BASE_CFLAGS) -MMD -MF $(DEPDIR)/$(*F).d -MQ "$@" -MP -o $@ $<
 
-$(BUILD_FP_OBJS): build/%.o: src/%.c
+$(BUILD_FP_OBJS): $(BUILD_DIR)/%.o: src/%.c
 	$(QUIET)echo "  CC FP $@"
 	$(QUIET)mkdir -p $(DEPDIR)
 	$(QUIET)mkdir -p "$(dir $@)"
 	$(QUIET)$(CC) -c $(BASE_CFLAGS) -MMD -MF $(DEPDIR)/$(*F).d -MQ "$@" -MP -o $@ $<
 
-build/%.o: src/%.c build-tag build-cfg
+$(BUILD_DIR)/%.o: src/%.c build-tag build-cfg
 	$(QUIET)echo "  CC    $@"
 	$(QUIET)mkdir -p $(DEPDIR)
 	$(QUIET)mkdir -p "$(dir $@)"
@@ -226,68 +246,73 @@ build/%.o: src/%.c build-tag build-cfg
 invoke_cc:
 	$(QUIET)$(CC) -c $(CFLAGS) -Isrc -o $(OBJFILE) $(CFILE)
 
-build/$(NAME).elf: $(BUILD_ALL_OBJS) m1n1.ld
+$(BUILD_DIR)/$(NAME).elf: $(BUILD_ALL_OBJS) m1n1.ld
 	$(QUIET)echo "  LD    $@"
 	$(QUIET)$(LD) -T m1n1.ld $(LDFLAGS) -o $@ $(BUILD_ALL_OBJS)
 
-build/$(NAME)-raw.elf: $(BUILD_ALL_OBJS) m1n1-raw.ld
+$(BUILD_DIR)/$(NAME)-raw.elf: $(BUILD_ALL_OBJS) m1n1-raw.ld
 	$(QUIET)echo "  LDRAW $@"
 	$(QUIET)$(LD) -T m1n1-raw.ld $(LDFLAGS) -o $@ $(BUILD_ALL_OBJS)
 
-build/$(NAME).macho: build/$(NAME).elf
+$(BUILD_DIR)/$(NAME).macho: $(BUILD_DIR)/$(NAME).elf
 	$(QUIET)echo "  MACHO $@"
 	$(QUIET)$(OBJCOPY) -O binary --strip-debug $< $@
 
 ifeq ($(LOGO),)
-build/$(NAME).bin: build/$(NAME)-raw.elf
+$(BUILD_DIR)/$(NAME).bin: $(BUILD_DIR)/$(NAME)-raw.elf
 	$(QUIET)echo "  RAW   $@"
 	$(QUIET)$(OBJCOPY) -O binary --strip-debug $< $@
 
 else
-build/$(NAME)-asahi.bin: build/$(NAME)-raw.elf
+$(BUILD_DIR)/$(NAME)-asahi.bin: $(BUILD_DIR)/$(NAME)-raw.elf
 	$(QUIET)echo "  RAW   $@"
 	$(QUIET)$(OBJCOPY) -O binary --strip-debug $< $@
 
-build/$(NAME).bin: build/$(NAME)-asahi.bin build/$(LOGO).logo
+$(BUILD_DIR)/$(NAME).bin: $(BUILD_DIR)/$(NAME)-asahi.bin $(BUILD_DIR)/$(LOGO).logo
 	$(QUIET)echo "  RAW   $@"
 	$(QUIET)cat $^ > $@
 endif
 
-.INTERMEDIATE: build-tag build-cfg
-build-tag src/../build/build_tag.h &:
-	$(QUIET)mkdir -p build
-	$(QUIET)./version.sh > build/build_tag.tmp
-	$(QUIET)cmp -s build/build_tag.h build/build_tag.tmp 2>/dev/null || \
-	( mv -f build/build_tag.tmp build/build_tag.h && echo "  TAG   build/build_tag.h" )
+.PHONY: build-tag build-cfg FORCE
+build-tag: $(BUILD_DIR)/build_tag.h
+$(BUILD_DIR)/build_tag.h: FORCE
+	$(QUIET)mkdir -p $(BUILD_DIR)
+	$(QUIET)./version.sh > $(BUILD_DIR)/build_tag.tmp
+	$(QUIET)cmp -s $(BUILD_DIR)/build_tag.h $(BUILD_DIR)/build_tag.tmp 2>/dev/null || \
+	( mv -f $(BUILD_DIR)/build_tag.tmp $(BUILD_DIR)/build_tag.h && echo "  TAG   $(BUILD_DIR)/build_tag.h" )
 
-build-cfg src/../build/build_cfg.h &:
-	$(QUIET)mkdir -p build
-	$(QUIET)for i in $(CFG); do echo "#define $$i"; done > build/build_cfg.tmp
-	$(QUIET)cmp -s build/build_cfg.h build/build_cfg.tmp 2>/dev/null || \
-	( mv -f build/build_cfg.tmp build/build_cfg.h && echo "  CFG   build/build_cfg.h" )
+build-cfg: $(BUILD_DIR)/build_cfg.h
+$(BUILD_DIR)/build_cfg.h: FORCE
+	$(QUIET)mkdir -p $(BUILD_DIR)
+	$(QUIET)for i in $(CFG); do echo "#define $$i"; done > $(BUILD_DIR)/build_cfg.tmp
+	$(QUIET)cmp -s $(BUILD_DIR)/build_cfg.h $(BUILD_DIR)/build_cfg.tmp 2>/dev/null || \
+	( mv -f $(BUILD_DIR)/build_cfg.tmp $(BUILD_DIR)/build_cfg.h && echo "  CFG   $(BUILD_DIR)/build_cfg.h" )
 
-build/%.bin: data/%.bin
+FORCE:
+
+$(BUILD_DIR)/%.bin: data/%.bin
 	$(QUIET)echo "  IMG   $@"
 	$(QUIET)mkdir -p "$(dir $@)"
 	$(QUIET)cp $< $@
 
-build/%.o: build/%.bin
+$(BUILD_DIR)/%.o: $(BUILD_DIR)/%.bin
 	$(QUIET)echo "  BIN   $@"
 	$(QUIET)mkdir -p "$(dir $@)"
-	$(QUIET)$(OBJCOPY) -I binary -B aarch64 -O elf64-littleaarch64 $< $@
+	$(QUIET)cd "$(dir $@)" && $(OBJCOPY) -I binary -B aarch64 -O elf64-littleaarch64 \
+		"$(notdir $<)" "$(notdir $@)"
 
-build/%.bin: font/%.bin
+$(BUILD_DIR)/%.bin: font/%.bin
 	$(QUIET)echo "  CP    $@"
 	$(QUIET)mkdir -p "$(dir $@)"
 	$(QUIET)cp $< $@
 
-build/%.rgba: data/%.png
+$(BUILD_DIR)/%.rgba: data/%.png
 	$(eval SIZE := $(lastword $(subst _, ,$*)))
 	$(QUIET)echo "  MAGIC $@"
 	$(QUIET)mkdir -p "$(dir $@)"
 	$(QUIET)magick $< -background black -flatten -depth 8 -crop $(SIZE)x$(SIZE) -resize $(SIZE)x$(SIZE) rgba:$@
 
-build/%.logo: build/%_256.rgba build/%_128.rgba
+$(BUILD_DIR)/%.logo: $(BUILD_DIR)/%_256.rgba $(BUILD_DIR)/%_128.rgba
 	$(QUIET)echo "  PAYLOAD $@"
 	$(QUIET)mkdir -p "$(dir $@)"
 	$(QUIET)echo -n "m1n1_logo_256128" > $@

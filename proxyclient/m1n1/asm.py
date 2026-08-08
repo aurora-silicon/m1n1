@@ -62,7 +62,7 @@ class BaseAsm(object):
         output = self._get(self.toolchain.OBJDUMP, f"-zd {self.elffile}")
 
         for line in output.split("\n"):
-            if not line or line.startswith("/"):
+            if not line or line.startswith("/") or line[2] == "\\":
                 continue
             sl = line.split()
             if not sl or sl[0][-1] != ":":

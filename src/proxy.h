@@ -97,6 +97,7 @@ typedef enum {
     P_MALLOC,
     P_MEMALIGN,
     P_FREE,
+    P_TOP_OF_MEMORY_ALLOC,
 
     P_KBOOT_BOOT = 0x700, // Kernel boot ops
     P_KBOOT_SET_CHOSEN,
@@ -143,6 +144,14 @@ typedef enum {
     P_VIRTIO_PUT_BUFFER,
     P_HV_EXIT_CPU,
     P_HV_ADD_TIME,
+    P_HV_PSCI_SUSPEND_CPU,
+    P_HV_PSCI_TURN_OFF_CPU,
+    P_HV_PSCI_TURN_ON_CPU,
+    P_HV_PSCI_TURN_OFF_SYSTEM,
+    P_HV_PSCI_RESET_SYSTEM,
+    P_HV_PSCI_FEATURES,
+    P_HV_PSCI_MEM_PROTECT,
+    P_HV_PSCI_MEM_PROTECT_CHECK_RANGE,
 
     P_FB_INIT = 0xd00,
     P_FB_SHUTDOWN,
@@ -156,6 +165,8 @@ typedef enum {
 
     P_PCIE_INIT = 0xe00,
     P_PCIE_SHUTDOWN,
+    P_WIRELESS_HANDOFF_INIT,
+    P_PCIE_WIRELESS_INIT,
 
     P_NVME_INIT = 0xf00,
     P_NVME_SHUTDOWN,
@@ -173,7 +184,140 @@ typedef enum {
     P_DAPF_INIT_ALL = 0x1200,
     P_DAPF_INIT,
 
+    P_HV_MAP_TPM = 0x1400,
+
     P_CPUFREQ_INIT = 0x1300,
+
+    // Apple Type-C PHY (T6020); keep in sync with proxyclient/m1n1/atcphy.py
+    P_ATCPHY_APPLY_MODE = 0x1500,
+    P_ATCPHY_SET_ORIENTATION,
+    P_ATCPHY_POWER_OFF,
+    P_ATCPHY_GET_REG_BASE,
+    P_ATCPHY_ARM_GUEST_MODE,
+    /*
+     * P_ATCPHY_READ_ORIENTATION(port) -> packed u64. Read-only: it issues a
+     * single SMBus read of the port's CD3217 STATUS register and never
+     * writes to the PD controller. ABI (keep in sync with
+     * proxyclient/m1n1/atcphy.py and auroradbg's USB handoff client):
+     *
+     *   0xFFFFFFFFFFFFFFFF  read failed; the caller must NOT infer an
+     *                       orientation from this
+     *   otherwise           bit 32 set (marks a valid reply)
+     *                       bit 33 = plug present
+     *                       bit 34 = plug upside down (flipped)
+     *                       bits 31:0 = raw STATUS dword, for the log
+     *
+     * The all-ones failure code is chosen so that it can never collide with
+     * a valid reply (bit 32 set implies bits 63:35 clear).
+     */
+    P_ATCPHY_READ_ORIENTATION,
+    /*
+     * P_ATCPHY_READ_LINK_STATE(port, selector) -> packed u64. One bounded
+     * read-only STATUS + DATA_STATUS sample and, for USB4, USB4_STATUS; no
+     * HPM command or write is issued.
+     *
+     *   0xFFFFFFFFFFFFFFFF  either register read failed
+     *   selector 0          bit 40 set (valid)
+     *                       bits 39:32 = STATUS byte 0
+     *                       bits 31:0 = raw DATA_STATUS dword
+     *   selector 1          bit 63 set (valid)
+     *                       bits 55:40 = Apple router cable-info word
+     *                       bits 39:32 = USB4 mode/status byte
+     *                       bits 31:0 = raw USB4 EUDO
+     *
+     * STATUS byte 0 contains every role/orientation field used by the boot
+     * gate. DATA_STATUS distinguishes direct USB3 from USB4/TBT/DP. The
+     * selectors deliberately share one operation so clients cannot drift
+     * to a second register-number ABI.
+     */
+    P_ATCPHY_READ_LINK_STATE,
+    /* External Type5 firmware bundle owner. START validates/copies the
+     * bundle and reaches FW_READY only; it never commits the routed PIPE.
+     * args: port, bundle address, bundle size, flipped, thunderbolt-mode,
+     * diagnostic stop (0=full, 1=PHY, 2=state5, 3=state7, 4=copy,
+     * 5=release). */
+    P_ACIO_TYPE5_FW_START,
+    P_ACIO_TYPE5_ABORT,
+    P_ACIO_TYPE5_PHASE,
+    /* Bounded USB4 control-ring access. READ returns bit 32 set plus the
+     * complete 32-bit value, or all-ones on failure. WRITE returns 0/-1.
+     * args: port, route, adapter, config-space, dword-offset[, value]. */
+    P_ACIO_TYPE5_CONFIG_READ32,
+    P_ACIO_TYPE5_CONFIG_WRITE32,
+    /* Execute the root-router configuration handshake against the live
+     * control ring. Requires CONTROL_READY. Creates no tunnel and commits
+     * no PIPE mux. args: port, route, all-parents-support-usb.
+     * Returns 0 or -1; read P_ACIO_TYPE5_STATUS for the failing phase. */
+    P_ACIO_TYPE5_ROUTER_CONFIGURE,
+    /* Bounded telemetry snapshot; never touches hardware. args: port,
+     * selector.
+     *   selector 0  bits 63:32 = phase, bits 31:0 = last error code
+     *   selector 1  bits 63:32 = last error detail word,
+     *               bits 31:0  = total error count
+     *   selector 2  bits 63:32 = config requests, bits 31:0 = failures
+     *   selector 3  bits 31:0  = router state machine index
+     *   selector 4  bits 31:0  = monotonic run id; latch before a run and
+     *                            require a strictly greater value after, so
+     *                            a stale result cannot be read as this
+     *                            run's
+     * Returns all-ones for an invalid port or selector. */
+    P_ACIO_TYPE5_STATUS,
+    /* Bring the bidirectional USB3 tunnel up or down. Requires ROUTER_READY.
+     * Reaches TUNNEL_READY at most -- it does NOT commit the PIPE mux, and
+     * there is deliberately no selector that does.
+     * args: port, up(1)/down(0), down_route, down_adapter, up_route,
+     *       up_adapter. */
+    P_ACIO_TYPE5_USB3_TUNNEL,
+    /* Scan the device router on a host downstream adapter and locate its
+     * USB3 Up adapter. Requires ROUTER_READY and a real link partner.
+     * args: port, host down-adapter.
+     * reply: all-ones on failure, else bit 63 set | route<<16 |
+     *        device-upstream-port<<8 | usb3-up-adapter.
+     * The upstream (lane) port is included because a real tunnel needs it: the
+     * device-side hops run BETWEEN that adapter and the USB3 Up adapter, so a
+     * reply carrying only the Up adapter describes half a path. */
+    P_ACIO_TYPE5_SCAN_DEVICE,
+    /* Commit the routed USB4 PIPE mux (pipehandler -> 0x11) and transition
+     * TUNNEL_READY -> PIPE_COMMITTED. This is the ONLY selector in the whole
+     * Type5 surface that moves the mux off DUMMY. It requires TUNNEL_READY and
+     * is VERIFIED BY READBACK: it returns 0 only when MUX_CTRL reads back
+     * exactly 0x11, else -1 (read P_ACIO_TYPE5_STATUS to tell pipe-commit --
+     * the sequence itself failed -- from pipe-readback -- the mux did not
+     * settle on 0x11). Committing 0x11 points the DWC3 SuperSpeed PIPE at the
+     * ACIO router; it must NOT be issued while a guest xHCI is already bound to
+     * this port. args: port. Returns 0 or -1. */
+    P_ACIO_TYPE5_PIPE_COMMIT,
+    /* Bring up a REAL end-to-end USB3 tunnel: scan through the host lane
+     * adapter for the device router, program four hop descriptors (two per
+     * router) and enable both protocol adapters at their DISCOVERED
+     * capability-0x04 offsets. Requires ROUTER_READY; reaches TUNNEL_READY.
+     * Replaces driving P_ACIO_TYPE5_USB3_TUNNEL with both endpoints on
+     * route 0, which programmed a host-internal loopback.
+     * args: port, host lane adapter, host USB3-Down adapter.
+     * Returns 0 or -1; read P_ACIO_TYPE5_STATUS for the failing condition. */
+    P_ACIO_TYPE5_USB3_TUNNEL_DEVICE,
+
+    // J414s media profile; keep in sync with proxyclient/m1n1/media_handoff.py
+    P_MEDIA_HANDOFF_INIT = 0x1600,
+
+    /*
+     * AGX preboot initdata handoff; keep in sync with
+     * proxyclient/m1n1/gpu_handoff.py and auroradbg's GPU handoff client.
+     *
+     * P_GPU_INITDATA_FILL(reservation_base, reservation_size) -> 0 or a
+     * negative gpu_handoff_error. It generates HwDataA/HwDataB/Globals into
+     * the reservation and stamps each aperture with the identity of the
+     * generator arm that produced it; the caller reads the addresses and sizes
+     * actually produced out of those stamps (see gpu_handoff_abi.h), which is
+     * also exactly what the Windows driver authenticates.
+     *
+     * Read-only with respect to the GPU: it samples the ADT power tables and
+     * two ID registers, writes only DRAM, and never powers the GPU down.
+     */
+    P_GPU_INITDATA_FILL = 0x1800,
+
+    // Bulk host<->guest channel; keep in sync with proxyclient/m1n1/hv/xfer.py
+    P_HV_MAP_XFER = 0x1700,
 } ProxyOp;
 
 #define S_OK     0

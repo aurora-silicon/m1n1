@@ -26,8 +26,20 @@ hv = HV(iface, p, u)
 
 fb = u.ba.video.base
 
-PMU(u).reset_panic_counter()
+try:
+    PMU(u).reset_panic_counter()
+except Exception as e:
+    # Same guard as tools/run_guest.py. On T8142 the SPMI RX FIFO never reports
+    # empty (its STATUS layout differs), so this raises SPMITimeout and would
+    # otherwise make shell.py unusable. The panic counter is a convenience.
+    print(f"WARNING: could not reset the PMU panic counter: {e!r}")
 
 print(f"m1n1 base: 0x{u.base:x}")
 
-PMU(u).reset_panic_counter()
+try:
+    PMU(u).reset_panic_counter()
+except Exception as e:
+    # Same guard as tools/run_guest.py. On T8142 the SPMI RX FIFO never reports
+    # empty (its STATUS layout differs), so this raises SPMITimeout and would
+    # otherwise make shell.py unusable. The panic counter is a convenience.
+    print(f"WARNING: could not reset the PMU panic counter: {e!r}")

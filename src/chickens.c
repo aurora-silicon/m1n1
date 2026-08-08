@@ -134,6 +134,18 @@ const struct midr_part_info midr_parts[] = {
     {MIDR_PART_T6031_SAWTOOTH, "M3 Max Sawtooth", init_t6031_sawtooth, &features_m2},
     {MIDR_PART_T8132_DONAN_ECORE, "M4 Donan (E core)", NULL, &features_m4},
     {MIDR_PART_T8132_DONAN_PCORE, "M4 Donan (P core)", NULL, &features_m4},
+    //
+    // T8142 (M5). No init function yet -- the chicken-bit sequences have not been
+    // reverse engineered, same situation as M4 above.
+    //
+    // Reusing features_m4: T8142 is derived from T8132 (identical AIC, PMGR,
+    // watchdog and GPIO base addresses, same 6E+4P topology, same 1TB DRAM base),
+    // so M4's feature set is the best-supported guess. Unverified -- in
+    // particular sleep_mode is inherited as SLEEP_NONE, which M4 itself marks
+    // "XXX probably new mode required".
+    //
+    {MIDR_PART_T8142_ECORE, "M5 (E core)", NULL, &features_m4},
+    {MIDR_PART_T8142_PCORE, "M5 (P core)", NULL, &features_m4},
 };
 
 const struct midr_part_features features_unknown = {
@@ -212,9 +224,10 @@ void init_cpu(void)
     }
 
     if (cpu_features->cyc_ovrd) {
-        /* Unmask external IRQs, set WFI mode to up (2) */
+        /* Unmask external IRQs, set WFI mode to up (2), enable WFI retention */
         reg_mask(SYS_IMP_APL_CYC_OVRD,
-                 CYC_OVRD_FIQ_MODE_MASK | CYC_OVRD_IRQ_MODE_MASK | CYC_OVRD_WFI_MODE_MASK,
+                 CYC_OVRD_FIQ_MODE_MASK | CYC_OVRD_IRQ_MODE_MASK | CYC_OVRD_WFI_MODE_MASK |
+                     CYC_OVRD_DISABLE_WFI_RET,
                  CYC_OVRD_FIQ_MODE(0) | CYC_OVRD_IRQ_MODE(0) | CYC_OVRD_WFI_MODE(2));
     }
 

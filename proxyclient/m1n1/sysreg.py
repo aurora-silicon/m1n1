@@ -11,7 +11,9 @@ def _load_registers():
     sysreg_fwd = {}
     sysop_fwd = {}
     for fname in ["arm_regs.json", "apple_regs.json"]:
-        data = json.load(open(os.path.join(os.path.dirname(__file__), "..", "..", "tools", fname)))
+        path = os.path.join(os.path.dirname(__file__), "..", "..", "tools", fname)
+        with open(path, encoding="utf-8") as stream:
+            data = json.load(stream)
         for reg in data:
             if "accessors" in reg:
                 for acc in reg["accessors"]:
@@ -287,6 +289,7 @@ class HACR(Register64):
     TRAP_HID = 50
     TRAP_s3_0_c15_c12_1z2 = 51
     TRAP_ACC = 52
+    TRAP_PMUV3 = 56
     TRAP_PM = 57
     TRAP_UPM = 58
     TRAP_s3_1z7_c15_cx_3 = 59

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-import io, sys, traceback, struct, array, bisect, os, plistlib, signal, runpy
+import io, sys, time, traceback, struct, array, bisect, os, plistlib, signal, runpy, platform
 from construct import *
 
 from ..asm import ARMAsm
@@ -15,6 +15,12 @@ from .gdbserver import *
 from .types import *
 from .virtutils import *
 from .virtio import *
+from .tpm import TpmExcInfo, TpmHostDevice, load_tpm_host
+from .tpm import TPM_STATUS_OK, TPM_STATUS_DECLINED
+from .xfer import (XferExcInfo, XferHostDevice, ProxyTransport,
+                   HV_XFER_REGS_SIZE, HV_XFER_PAGE_SIZE, HV_XFER_NAME_SIZE,
+                   ST_OK as XFER_ST_OK, ST_NODEV as XFER_ST_NODEV,
+                   ST_INVAL as XFER_ST_INVAL, CMD_GET as XFER_CMD_GET)
 
 __all__ = ["HV"]
 
@@ -111,9 +117,22 @@ class HV(Reloadable):
         self.started = False
         self.ctx = None
         self.hvcall_handlers = {}
+        # Register-preserving diagnostic calls use the BRK immediate as the
+        # selector.  Unlike the legacy BRK #0x4242 ABI, they do not need to
+        # overwrite guest x0 with a call ID before trapping.
+        self.brkcall_handlers = {}
         self.switching_context = False
         self.show_timestamps = False
         self.virtio_devs = {}
+        self.tpm_dev = None
+        self.tpm_profile = None
+        self.tpm_engine = None
+        self.xfer_dev = None
+        self.xfer_transport = None
+        self.xfer_base = None
+        self.xfer_win = None
+        self.xfer_win_size = 0
+        self.xfer_hvcall_id = None
 
     def _reloadme(self):
         super()._reloadme()
@@ -401,9 +420,15 @@ class HV(Reloadable):
         def handle_sigusr2(signal, stack):
             raise shell.ExitConsole(EXC_RET.EXIT_GUEST)
 
-        default_sigusr1 = signal.signal(signal.SIGUSR1, handle_sigusr1)
+        if(platform.uname().system == "Windows"):
+            default_sigusr1 = signal.signal(signal.SIGBREAK, handle_sigusr1)
+        else:
+            default_sigusr1 = signal.signal(signal.SIGUSR1, handle_sigusr1)
         try:
-            default_sigusr2 = signal.signal(signal.SIGUSR2, handle_sigusr2)
+            if(platform.uname().system == "Windows"):
+                default_sigusr2 = signal.signal(signal.SIGTERM, handle_sigusr2)
+            else:
+                default_sigusr2 = signal.signal(signal.SIGUSR2, handle_sigusr2)
             try:
                 self._in_shell = True
                 try:
@@ -413,9 +438,15 @@ class HV(Reloadable):
                 finally:
                     self._in_shell = False
             finally:
-                signal.signal(signal.SIGUSR2, default_sigusr2)
+                if(platform.uname().system == "Windows"):
+                    signal.signal(signal.SIGTERM, default_sigusr2)
+                else:
+                    signal.signal(signal.SIGUSR2, default_sigusr2)
         finally:
-            signal.signal(signal.SIGUSR1, default_sigusr1)
+            if(platform.uname().system == "Windows"):
+                signal.signal(signal.SIGTERM, default_sigusr1)
+            else:
+                signal.signal(signal.SIGUSR1, default_sigusr1)
 
     @property
     def in_shell(self):
@@ -664,6 +695,27 @@ class HV(Reloadable):
         xlate = {
             DC_CIVAC,
         }
+        pmuv3redirect = {
+            PMCCNTR_EL0,
+            PMMIR_EL1,
+            PMCR_EL0,
+            PMCCFILTR_EL0,
+            PMCEID0_EL0,
+            PMCEID1_EL0,
+            PMCNTENCLR_EL0,
+            PMCNTENSET_EL0,
+            PMEVCNTR0_EL0,
+            PMEVTYPER0_EL0,
+            PMINTENCLR_EL1,
+            PMINTENSET_EL1,
+            PMOVSCLR_EL0,
+            PMOVSSET_EL0,
+            PMSELR_EL0,
+            PMSWINC_EL0,
+            PMUSERENR_EL0,
+            PMXEVCNTR_EL0,
+            PMXEVTYPER_EL0
+        }
         for i in range(len(self._bps)):
             shadow.add(DBGBCRn_EL1(i))
             shadow.add(DBGBVRn_EL1(i))
@@ -700,6 +752,289 @@ class HV(Reloadable):
                 if iss.Rt != 31:
                     value = ctx.regs[iss.Rt]
                 self.log(f"Skip: msr {name}, x{iss.Rt} = {value:x}")
+        elif enc in pmuv3redirect:
+            # Windows (seemingly) only needs access to a cycle counter to work, but Apple chips don't support PMUv3.
+            # Therefore we need to handle PMC setup for the cycle counter here.
+            if iss.DIR == MSR_DIR.READ:
+                if enc == PMCR_EL0:
+                    value = self.u.mrs(PMCR0_EL1)
+                    calculated = 0
+                    pmu_interrupt_mode_mask = ((1 << 10) | (1 << 9) | (1 << 8))
+                    # need to pull multiple different MSRs to give Windows the equivalent PMCR value.
+                    # bits [63:16] are 0
+                    # we have 9 event counters, two of which are static (cycles + instruction count), but indicate that we only have the cycle counter right now
+                    # eventually we *will* need to implement the others.
+                    #
+                    # are PMIs enabled at all?
+                    if ((value & pmu_interrupt_mode_mask) != 0):
+                        calculated = (calculated | (1 << 0))
+                    # bits 1-2 read as 0 per ARM spec
+                    # bit 3 not supported, leave it as 0 since Apple PMUs don't support counting less than every cycle.
+                    # bit 4 is read as 0 per ARM spec
+                    # return bit 5 as 0 for now.
+                    # long cycle/event counters are always enabled on Apple PMUs. 
+                    # (Firestorm/Icestorm trigger overflow on bit 47, Blizzard/Avalanche (and presumably Everest/Sawtooth) it's bit 63)
+                    # on an overflow, we can optionally stop counting on overflow PMI if bit 20 of PMCR0 is set, so query this bit
+                    # to determine status of bit 9 of emulated PMCR.
+                    if((value & (1 << 20)) != 0):
+                        calculated = (calculated | (1 << 9))
+                    calculated = (calculated | (1 << 6) | (1 << 7))
+                    self.log(f"HV PMUv3 Redirect: mrs x{iss.Rt}, {name} = {calculated:x}")
+                    if iss.Rt != 31:
+                        ctx.regs[iss.Rt] = calculated
+
+                elif enc == PMCCNTR_EL0:
+                    # the simplest case. just return what PMC0 would give (since it's the cycle counter)
+                    value = self.u.mrs(PMC0_EL1)
+                    if iss.Rt != 31:
+                        ctx.regs[iss.Rt] = value
+                elif (enc == PMCNTENCLR_EL0) or (enc == PMCNTENSET_EL0):
+                    # these regs can be treated together for the read case but must be handled separately in the write case.
+                    # for now only bit we're concerned about here is bit 31, need to check if PMC0 is enabled, and return that for bit 31
+                    value = self.u.mrs(PMCR0_EL1)
+                    calculated = 0
+                    if((value & (1 << 0)) == 1):
+                        calculated = (calculated | (1 << 31))
+                    self.log(f"HV PMUv3 Redirect: mrs x{iss.Rt}, {name} = {calculated:x}")
+                    if iss.Rt != 31:
+                        ctx.regs[iss.Rt] = calculated
+                elif enc == PMCCFILTR_EL0:
+                    # check what modes we're allowed to count cycles in.
+                    value = self.u.mrs(PMCR1_EL1)
+                    calculated = 0
+                    el0_cycle_counter_mask = (1 << 8)
+                    el1_cycle_counter_mask = (1 << 16)
+                    # bits 63:32 and 23:0 are reserved as 0 per arm spec.
+                    # no secure EL2 (GL2 not in scope right now) so bit 24 is 0
+                    # bit 25 is reserved 0, bit 26/28 is 0 since no EL3
+                    # bit 27 is always 1 to my knowledge since cycles seem to always be counted in EL2
+                    calculated = (calculated | (1 << 27))
+                    # bit 29 is 0 since no EL3
+                    # check the equivalent masks in APL_PMCR1_EL1 to see if EL0 and EL1 counting are enabled for the cycle counter.
+                    if((value & el0_cycle_counter_mask) == 0):
+                        calculated = (calculated | (1 << 30))
+                    if((value & el1_cycle_counter_mask) == 0):
+                        calculated = (calculated | (1 << 31))
+                    self.log(f"HV PMUv3 Redirect: mrs x{iss.Rt}, {name} = {calculated:x}")
+                    if iss.Rt != 31:
+                        ctx.regs[iss.Rt] = calculated
+                
+                elif (enc == PMMIR_EL1) or (enc == PMCEID0_EL0) or (enc == PMCEID1_EL0):
+                    # return 0 for these registers for now.
+                    value = 0
+                    self.log(f"HV PMUv3 Redirect: mrs x{iss.Rt}, {name} = {value:x}")
+                    if iss.Rt != 31:
+                        ctx.regs[iss.Rt] = value
+                elif (enc == PMINTENCLR_EL1) or (enc == PMINTENSET_EL1):
+                    # can be treated together for reads, must be separated for writes.
+                    # overflow interrupts will always happen, so the values of these registers will be determined
+                    # by whether or not PMIs are enabled for a given perf counter. 
+                    # as before, right now only set bit 31 due to only using cycle counter.
+                    value = self.u.mrs(PMCR0_EL1)
+                    calculated = 0
+                    if(value & (1 << 12) != 0):
+                        calculated = (calculated | (1 << 31))
+                    self.log(f"HV PMUv3 Redirect: mrs x{iss.Rt}, {name} = {calculated:x}")
+                    if iss.Rt != 31:
+                        ctx.regs[iss.Rt] = calculated
+                elif (enc == PMOVSCLR_EL0) or (enc == PMOVSSET_EL0):
+                    # state of the overflow bit.
+                    # as before, only cycle counter for now.
+                    value = self.u.mrs(PMSR_EL1)
+                    calculated = 0
+                    if((value & (1 << 0)) != 0):
+                        calculated = (calculated | (1 << 31))
+                    self.log(f"HV PMUv3 Redirect: mrs x{iss.Rt}, {name} = {calculated:x}")
+                    if iss.Rt != 31:
+                        ctx.regs[iss.Rt] = calculated
+                elif enc == PMSELR_EL0:
+                    # always report that the cycle counter is selected for now and discard writes, this will probably need to change later on.
+                    value = 31
+                    self.log(f"HV PMUv3 Redirect: mrs x{iss.Rt}, {name} = {value:x}")
+                    if iss.Rt != 31:
+                        ctx.regs[iss.Rt] = value
+                elif enc == PMUSERENR_EL0:
+                    # controls user mode/EL0 access to the PMC registers.
+                    # on Apple this is controlled by bit 30 of the PMCR0 reg, so if that's enabled, then bit 0
+                    # of this register will also be one, else not.
+                    #
+                    # for now, the overrides are not supported. not sure if it'll be an issue.
+                    value = self.u.mrs(PMCR0_EL1)
+                    calculated = 0
+                    user_mode_pmc_reg_access_enable_mask = (1 << 30)
+                    if((value & user_mode_pmc_reg_access_enable_mask) != 0):
+                        calculated = (calculated | (1 << 0))
+                    self.log(f"HV PMUv3 Redirect: mrs x{iss.Rt}, {name} = {calculated:x}")
+                    if iss.Rt != 31:
+                        ctx.regs[iss.Rt] = calculated
+                
+                else:
+                    # the register is unimplemented for now, just return 0
+                    value = 0
+                    self.log(f"Unimplemented register - HV PMUv3 Redirect: mrs x{iss.Rt}, {name} = {value:x}")
+                    if iss.Rt != 31:
+                        ctx.regs[iss.Rt] = value
+
+            else:
+                # writing to a PMUv3 MSR.
+                if iss.Rt != 31:
+                    desired_value_to_write = ctx.regs[iss.Rt]
+                if enc == PMCR_EL0:
+                    # bits 63:33 cannot be written, reserved as 0
+                    # bit 32 is not supported and any write of it will be discarded for now.
+                    # all bits up to bit 10 will have writes discarded per ARM spec.
+                    # if requesting to write bit 9, write bit 20 to APL_PMCR0.
+                    pmcr_current_value = self.u.mrs(PMCR0_EL1)
+                    stop_evt_count_on_overflow_mask = (1 << 9)
+                    reset_cycle_counter_mask = (1 << 2)
+                    enable_pmus_mask = (1 << 0)
+                    interrupt_mode_fiq_enabled = (4 << 8)
+                    if((desired_value_to_write & stop_evt_count_on_overflow_mask) != 0):
+                        pmcr_current_value = (pmcr_current_value | (1 << 20))
+                    else:
+                        pmcr_current_value = (pmcr_current_value & (~(1 << 20)))
+                    # Apple PMUs always have long event counting enabled, so a write of bits 6 and 7 does nothing.
+                    # bits 5, 4, 3 have writes discarded (no way of supporting it using Apple PMUs)
+                    # if writing bit 2 to reset the cycle counter, write 0 to PMC0 
+                    if((desired_value_to_write & reset_cycle_counter_mask) != 0):
+                        pmcr_current_value = (pmcr_current_value | (~(1 << 12)))
+                        pmcr_current_value = (pmcr_current_value | (~(1 << 0)))
+                        self.u.inst(0xd5033fdf) # isb
+                        self.u.msr(PMCR0_EL1, pmcr_current_value)
+                        self.u.inst(0xd5033fdf) # isb
+                        self.u.msr(PMC0_EL1, 0)
+                        self.u.inst(0xd5033fdf) # isb
+                        pmcr_current_value = (pmcr_current_value | (1 << 12))
+                        pmcr_current_value = (pmcr_current_value | (1 << 0))
+                        self.u.inst(0xd5033fdf) # isb
+                        self.u.msr(PMCR0_EL1, pmcr_current_value)
+                        self.u.inst(0xd5033fdf) # isb
+
+                    # bit 1 unimplemented for now, but would be a similar thing but for an event counter
+                    # bit 0 is to enable event counters globally, the closest equivalent on Apple is setting the
+                    # "interrupt mode", so if this is set to 1, set it to FIQ mode (other modes unsupported)
+                    if((desired_value_to_write & enable_pmus_mask) != 0):
+                        pmcr_current_value = (pmcr_current_value | (4 << 8))
+                    else:
+                        pmcr_current_value = (pmcr_current_value & (~(7 << 8)))
+                    self.u.inst(0xd5033fdf) # isb
+                    self.u.msr(PMCR0_EL1, pmcr_current_value)
+                    self.u.inst(0xd5033fdf) # isb
+                    self.log(f"HV PMUv3 Redirect: msr {name}, x{iss.Rt} = {desired_value_to_write:x} (OK) ({sysreg_name(enc)})")
+                elif enc == PMCCNTR_EL0:
+                    # normally resets of the cycle counter are handled by bit 2 of PMCR_EL0,
+                    # and this is normally read only by itself (despite the Apple equivalent being fully writable)
+                    # therefore discard writes here.
+                    self.log(f"HV PMUv3 Redirect: msr {name}, x{iss.Rt} = {desired_value_to_write:x} (skipped write) ({sysreg_name(enc)})")
+                elif enc == PMCNTENCLR_EL0:
+                    # one of the perf counters is being requested to be disabled, write 0 to the equivalent bit in PMCR0_EL1 (aka [7:0])
+                    pmcr_current_value = self.u.mrs(PMCR0_EL1)
+                    counters_to_be_disabled_mask = 0xffffffff
+                    cycle_counter_bit_apple = (1 << 0)
+
+                    # if no counters are being asked to be disabled, fast track.
+                    if((desired_value_to_write & counters_to_be_disabled_mask) != 0):
+                        # cannot disable any counters above PMC9 as those don't exist so far.
+                        # for now we only care about the cycle counter, so check if that's asking to be disabled specifically
+                        # and then honor that request.
+                        if((desired_value_to_write & (1 << 31)) != 0):
+                            pmcr_current_value = (pmcr_current_value & (~(cycle_counter_bit_apple)))
+                        # TODO: support a mechanism of disabling other event counters when we properly introduce them.
+                        self.u.inst(0xd5033fdf) # isb
+                        self.u.msr(PMCR0_EL1, pmcr_current_value)
+                        self.u.inst(0xd5033fdf) # isb
+                    self.log(f"HV PMUv3 Redirect: msr {name}, x{iss.Rt} = {desired_value_to_write:x} (OK) ({sysreg_name(enc)})")
+                elif enc == PMCNTENSET_EL0:
+                    # perf counter requested to be enabled, write 1 to the equivalent bit in PMCR0_EL1
+                    pmcr_current_value = self.u.mrs(PMCR0_EL1)
+                    counters_to_be_enabled_mask = 0xffffffff
+                    cycle_counter_bit_apple = (1 << 0)
+                    # fast track if nothing is being asked to be enabled
+                    if((desired_value_to_write & counters_to_be_enabled_mask) != 0):
+                        # as with disabling, cycle counter only for now.
+                        if((desired_value_to_write & (1 << 31)) != 0):
+                            pmcr_current_value = (pmcr_current_value | (1 << 0))
+                        self.u.inst(0xd5033fdf) # isb
+                        self.u.msr(PMCR0_EL1, pmcr_current_value)
+                        self.u.inst(0xd5033fdf) # isb
+                    self.log(f"HV PMUv3 Redirect: msr {name}, x{iss.Rt} = {desired_value_to_write:x} (OK) ({sysreg_name(enc)})")
+                elif enc == PMCCFILTR_EL0:
+                    # filtering certain ELs from counting cycles.
+                    # for the EL2 bit, there's no known mechanism in Apple PMUs to stop EL2 from counting cycles, so
+                    # discard any attempt to set bit 27 (EL2 counting) to 0
+                    # for EL0/EL1, enable filtering of cycle counter (other counters to be implemented later) if those bits (31:30)
+                    # are being set to 1 (why bits 31:30 behave oppositely to 27 I will never know...)
+                    pmcr1_current_value = self.u.mrs(PMCR1_EL1)
+                    if((desired_value_to_write & (1 << 30)) == 0):
+                        pmcr1_current_value = (pmcr1_current_value | (1 << 8))
+                    else:
+                        pmcr1_current_value = (pmcr1_current_value & (~(1 << 8)))
+                    if((desired_value_to_write & (1 << 31)) == 0):
+                        pmcr1_current_value = (pmcr1_current_value | (1 << 16))
+                    else:
+                        pmcr1_current_value = (pmcr1_current_value & (~(1 << 16)))
+                    self.u.inst(0xd5033fdf) # isb
+                    self.u.msr(PMCR1_EL1, pmcr1_current_value)
+                    self.u.inst(0xd5033fdf) # isb
+                    self.log(f"HV PMUv3 Redirect: msr {name}, x{iss.Rt} = {desired_value_to_write:x} (OK) ({sysreg_name(enc)})")
+                elif (enc == PMMIR_EL1) or (enc == PMCEID0_EL0) or (enc == PMCEID1_EL0):
+                    # ignore writes to any of these registers for now.
+                    self.log(f"HV PMUv3 Redirect: msr {name}, x{iss.Rt} = {desired_value_to_write:x} (skipped write) ({sysreg_name(enc)})")
+                elif enc == PMINTENCLR_EL1:
+                    # disables the PMI for a given perf counter (basically controls bits 19:12 in PMCR0)
+                    pmcr_current_value = self.u.mrs(PMCR0_EL1)
+                    interrupts_to_be_disabled_mask = 0xffffffff
+                    cycle_counter_interrupt_bit_apple = (1 << 12)
+                    if((desired_value_to_write & interrupts_to_be_disabled_mask) != 0):
+                        #cycle counter only for now.
+                        if((desired_value_to_write & (1 << 31)) != 0):
+                            pmcr_current_value = (pmcr_current_value & (~(cycle_counter_interrupt_bit_apple)))
+                        self.u.inst(0xd5033fdf) # isb
+                        self.u.msr(PMCR0_EL1, pmcr_current_value)
+                        self.u.inst(0xd5033fdf) # isb
+                    self.log(f"HV PMUv3 Redirect: msr {name}, x{iss.Rt} = {desired_value_to_write:x} (OK) ({sysreg_name(enc)})")
+                elif enc == PMINTENSET_EL1:
+                    # enables the PMI for a given perf counter
+                    pmcr_current_value = self.u.mrs(PMCR0_EL1)
+                    interrupts_to_be_enabled_mask = 0xffffffff
+                    cycle_counter_interrupt_bit_apple = (1 << 12)
+                    if((desired_value_to_write & interrupts_to_be_enabled_mask) != 0):
+                        # cycle counter only for now
+                        if((desired_value_to_write & (1 << 31)) != 0):
+                            pmcr_current_value = (pmcr_current_value | (cycle_counter_interrupt_bit_apple))
+                        self.u.inst(0xd5033fdf) # isb
+                        self.u.msr(PMCR0_EL1, pmcr_current_value)
+                        self.u.inst(0xd5033fdf) # isb
+                    self.log(f"HV PMUv3 Redirect: msr {name}, x{iss.Rt} = {desired_value_to_write:x} (OK) ({sysreg_name(enc)})")
+                elif enc == PMOVSCLR_EL0:
+                    # clearing the overflow bit (aka MSB of the PMC0 counter)
+                    pmsr_current_value = self.u.mrs(PMSR_EL1)
+                    pmcr0_current_value = self.u.mrs(PMCR0_EL1)
+                    # cycle counter only for now
+                    if((desired_value_to_write & (1 << 31)) != 0):
+                        pmcr0_current_value = (pmcr0_current_value & (~(1 << 12)))
+                        pmcr0_current_value = (pmcr0_current_value & (~(1 << 0)))
+                        self.u.inst(0xd5033fdf) # isb
+                        self.u.msr(PMCR0_EL1, pmcr0_current_value)
+                        self.u.inst(0xd5033fdf) # isb
+                        self.u.inst(0xd5033fdf) # isb
+                        self.u.msr(PMC0_EL1, 0)
+                        self.u.inst(0xd5033fdf) # isb
+                        pmcr0_current_value = (pmcr0_current_value | (1 << 12))
+                        pmcr0_current_value = (pmcr0_current_value | (1 << 0))
+                        self.u.inst(0xd5033fdf) # isb
+                        self.u.msr(PMCR0_EL1, pmcr0_current_value)
+                        self.u.inst(0xd5033fdf) # isb
+
+                    self.log(f"HV PMUv3 Redirect: msr {name}, x{iss.Rt} = {desired_value_to_write:x} (OK) ({sysreg_name(enc)})")
+                elif enc == PMUSERENR_EL0:
+                    
+                    self.log(f"HV PMUv3 Redirect: msr {name}, x{iss.Rt} = {desired_value_to_write:x} (OK) ({sysreg_name(enc)})")
+                else:
+                    # discard any writes to other registers.
+                    # if we need to change this for another register, remember to add it above this else statement.
+                    self.log(f"Unimplemented register - HV PMUv3 Redirect: msr {name}, x{iss.Rt} = {desired_value_to_write:x}")
+
         else:
             if iss.DIR == MSR_DIR.READ:
                 enc2 = self.MSR_REDIRECTS.get(enc, enc)
@@ -714,7 +1049,7 @@ class HV(Reloadable):
                 sys.stdout.flush()
                 if enc in xlate:
                     value = self.p.hv_translate(value, True, False)
-                self.u.msr(enc2, value, call=self.p.gl2_call)
+                self.u.msr(enc2, value)
                 self.log(f"Pass: msr {name}, x{iss.Rt} = {value:x} (OK) ({sysreg_name(enc2)})")
 
         ctx.elr += 4
@@ -723,9 +1058,49 @@ class HV(Reloadable):
             self.patch_exception_handling()
 
         return True
+    
+    def handle_smc(self, ctx):
+        #can't call C exception handler from python directly for now, so need to pass args from here to the C functions.
+        retval = 0 # corresponds to PSCI_STATUS_SUCCESS
+        psci_function_id = ctx.regs[0]
+        self.log(f"Python HV PSCI: function call {psci_function_id:x}")
+        if(psci_function_id == 0x84000000):
+            ctx.regs[0] = ((1 << 16) | (1))
+        elif((psci_function_id == 0x84000001) or (psci_function_id == 0xC4000001)):
+            retval = self.p.hv_psci_suspend_cpu(ctx.regs[1], ctx.regs[2], ctx.regs[3])
+            ctx.regs[0] = retval
+        elif((psci_function_id == 0x84000002)):
+            retval = self.p.hv_psci_turn_off_cpu()
+        elif((psci_function_id == 0x84000003) or (psci_function_id == 0xc4000003)):
+            retval = self.p.hv_psci_turn_on_cpu(ctx.regs[1], ctx.regs[2], ctx.regs[3])
+        elif((psci_function_id == 0x84000008)):
+            self.p.hv_psci_turn_off_system()
+        elif((psci_function_id == 0x84000009)):
+            self.p.hv_psci_reset_system()
+        elif((psci_function_id == 0x8400000A)):
+            retval = self.p.hv_psci_features(ctx.regs[1])
+            ctx.regs[0] = retval
+        elif((psci_function_id == 0x84000013)):
+            retval = self.p.hv_psci_mem_protect(ctx.regs[1])
+            ctx.regs[0] = retval
+        elif((psci_function_id == 0x84000014) or (psci_function_id == 0xc4000014)):
+            retval = self.p.hv_psci_mem_protect_check_range(ctx.regs[1], ctx.regs[2])
+            ctx.regs[0] = retval
+        else:
+            self.log("Python HV PSCI: Function call not supported")
+            ctx.regs[0] = -1
+
+        ctx.elr += 4
+        self.log(f"Python HV PSCI: SMC successful (returned value {ctx.regs[0]:x})")
+        return True
 
     def handle_impdef(self, ctx):
+        if ctx.afsr1 == 0x1c00000:
+            # SMC trap
+            return self.handle_smc(ctx)
         if ctx.esr.ISS == 0x20:
+            #self.log("Python HV: MSR IMPDEF hook being handled")
+            #self.log(f"Python HV: ESR_EL1:{ctx.esr.value:x}")
             return self.handle_msr(ctx, ctx.afsr1)
 
         code = struct.unpack("<I", self.iface.readmem(ctx.elr_phys, 4))
@@ -846,8 +1221,19 @@ class HV(Reloadable):
     def add_hvcall(self, callid, handler):
         self.hvcall_handlers[callid] = handler
 
+    def add_brkcall(self, callid, handler):
+        if not 0 <= callid <= 0xffff:
+            raise ValueError(f"BRK call ID is not 16-bit: {callid:#x}")
+        self.brkcall_handlers[callid] = handler
+
     def handle_brk(self, ctx):
         iss = ctx.esr.ISS
+        handler = self.brkcall_handlers.get(iss, None)
+        if handler is not None:
+            ok = handler(ctx)
+            if ok:
+                ctx.elr += 4
+            return ok
         if iss != 0x4242:
             return self._lower()
 
@@ -1064,6 +1450,384 @@ class HV(Reloadable):
         dev.hv = self
         self.virtio_devs[base] = dev
 
+    def attach_tpm(self, base=None, profile=None, create=False, engine=None,
+                   verbose=True):
+        """Map an emulated TPM 2.0 CRB and reserve its window.
+
+        No ADT node is created, deliberately. Unlike virtio -- which Linux
+        must discover through the device tree -- the TPM is found by Windows
+        purely through ACPI: the TPM2 table's AddressOfControlArea and the
+        MSFT0101 device's _CRS. Mu is told the base out of band, so inventing
+        an ADT node here would describe the device to an OS that never looks.
+
+        Engine selection, fail-closed at every step:
+
+          attach_tpm()                     no engine. The CRB enumerates and
+                                           every command answers TPM_RC_FAILURE
+                                           -- interface bring-up only.
+          attach_tpm(profile="~/…/p0")     swtpm on the Mac, NV persisted in
+                                           the profile directory. The profile
+                                           must already exist (create=True to
+                                           make a fresh one -- explicitly,
+                                           never as a fallback).
+          attach_tpm(engine=obj)           a caller-managed engine object
+                                           (e.g. tpm_host.MssimEngine),
+                                           already started.
+
+        With an engine, the store is validated and the engine is probed
+        BEFORE the CRB is mapped: if either refuses, this raises and the
+        guest boots with no TPM at all -- byte-identical to today. That is
+        the loud path; a TPM that silently forgot its state would cost a
+        BitLocker recovery prompt with no diagnostic pointing here.
+
+        Returns the base so the caller can hand it to the firmware builder;
+        the control area Mu must publish is base + 0x40, NOT base.
+        """
+        if base is None:
+            base = self.alloc_mmio_base(self.adt, 0x1000)
+
+        if base & 0xfff:
+            raise ValueError(f"TPM base 0x{base:x} is not locality-aligned")
+
+        tpm_dev = None
+        if profile is not None or engine is not None:
+            tpm_host = load_tpm_host()
+            if engine is None:
+                self.tpm_profile = tpm_host.TpmProfile(profile) \
+                    .open(create=create)  # loud on corruption/mismatch
+                engine = tpm_host.SwtpmEngine(self.tpm_profile.dir)
+                engine.start()
+            # Liveness probe (GetCapability): proves a TPM 2.0 engine parses
+            # commands without consuming the guest's own Startup transition.
+            tpm_host.probe(engine)
+            self.tpm_engine = engine
+            tpm_dev = TpmHostDevice(engine, tpm_host, verbose=verbose)
+
+        mode = 1 if tpm_dev is not None else 0
+        print(f"Adding TPM CRB @ 0x{base:x} (control area 0x{base + 0x40:x}, "
+              f"engine={'host' if mode else 'none/RC_FAILURE'})")
+        if self.p.hv_map_tpm(base, mode) < 0:
+            raise Exception("hv_map_tpm failed")
+
+        # Registered only after the map succeeded, so a failed map cannot
+        # leave a handler answering for a device that does not exist.
+        self.tpm_dev = tpm_dev
+
+        # RESERVED, not a tracer: the EL2 hook owns every access in this page,
+        # and a tracer would fight it for the same faults.
+        self.add_tracer(irange(base, 0x1000), "TPM", TraceMode.RESERVED)
+        self.tpm_base = base
+        return base
+
+    def detach_tpm_engine(self):
+        """Stop the host engine and mark the NV store cleanly closed."""
+        if self.tpm_engine is not None:
+            try:
+                self.tpm_engine.stop()
+            finally:
+                self.tpm_engine = None
+        if self.tpm_profile is not None:
+            self.tpm_profile.close()
+            self.tpm_profile = None
+        self.tpm_dev = None
+
+    def handle_tpm(self, reason, code, info):
+        """One HV_TPM event per guest TPM command (mirrors handle_virtio).
+
+        The guest's vCPU is parked inside hv_exc_proxy() until this returns,
+        so the reply is synchronous from its point of view. Every outcome
+        writes an explicit status back into hv_tpm_exc_info: the EL2 device
+        initialises it to a poison value, and anything but 0 makes the guest
+        see TPM_RC_FAILURE rather than stale buffer bytes or a hang.
+        """
+        ctx = self.iface.readstruct(info, ExcInfo)
+        tinfo = self.iface.readstruct(ctx.data, TpmExcInfo)
+
+        rsp = None
+        try:
+            if self.tpm_dev is None:
+                self.log("TPM event with no host device attached")
+            elif tinfo.cmd_len == 0 or tinfo.cmd_len > tinfo.rsp_max:
+                self.log(f"TPM event with bad cmd_len {tinfo.cmd_len}")
+            else:
+                cmd = self.iface.readmem(tinfo.buf, tinfo.cmd_len)
+                rsp = self.tpm_dev.execute(cmd)
+                if rsp is not None and len(rsp) > tinfo.rsp_max:
+                    self.log(f"TPM response too large: {len(rsp)}")
+                    rsp = None
+        except Exception:
+            self.log("Python exception from within TPM handler")
+            traceback.print_exc()
+            rsp = None
+
+        if rsp is not None:
+            self.iface.writemem(tinfo.buf, rsp)
+            tinfo.rsp_len = len(rsp)
+            tinfo.status = TPM_STATUS_OK
+        else:
+            tinfo.rsp_len = 0
+            tinfo.status = TPM_STATUS_DECLINED
+
+        self.iface.writemem(ctx.data, TpmExcInfo.build(tinfo))
+        self.p.exit(EXC_RET.HANDLED)
+
+    # ------------------------------------------------------------------
+    # Bulk host<->guest channel (src/hv_xfer.c, .xfer)
+    # ------------------------------------------------------------------
+
+    def _xfer_dram_range(self):
+        """The physical DRAM window a bulk transfer may legally touch.
+
+        Matches wlan/hv_xfer's C-side derivation: ram_base is boot_args
+        phys_base rounded down to 4 GiB, and mem_size_actual is the whole of
+        physical memory, not the reduced size handed to the guest.
+        """
+        ram_base = self.u.ba.phys_base & ~0xffffffff
+        return ram_base, ram_base + self.u.ba.mem_size_actual
+
+    def xfer_translate(self, ipa, size):
+        """Translate a guest window to a physical range, or return None.
+
+        Mirrors xfer_validate_window() in src/hv_xfer.c exactly: 16 KiB
+        aligned, stage-2 mapped as plain HW pages, physically contiguous, and
+        entirely inside DRAM. The DRAM check is the one that matters -- /arm-io
+        is mapped HW too, so contiguity alone would happily let a guest aim a
+        bulk write at an MMIO aperture.
+        """
+        if size <= 0 or size % HV_XFER_PAGE_SIZE or ipa % HV_XFER_PAGE_SIZE:
+            return None
+
+        first = None
+        for off in range(0, size, HV_XFER_PAGE_SIZE):
+            pte = self.p.hv_pt_walk(ipa + off)
+            if not pte or not (pte & self.PTE_VALID):
+                return None
+            pa = pte & 0x3ffffffffc000  # GENMASK(49, 14)
+            if first is None:
+                first = pa
+            elif pa != first + off:
+                return None
+
+        lo, hi = self._xfer_dram_range()
+        if first < lo or first + size > hi:
+            return None
+        return first
+
+    def attach_xfer(self, base=None, size=1 << 20, engine=None, inbox=None,
+                    publish=None, compress=True, verbose=True):
+        """Map the bulk channel: a hooked doorbell page plus a shared window.
+
+        The window is allocated out of the proxy heap, which lives below the
+        guest's boot_args phys_base and is therefore absent from the guest's
+        memory map -- Windows will never allocate it, so nothing can clobber
+        it. It is then mapped into the guest identity (IPA == PA) as a plain
+        HW stage-2 mapping, so guest accesses to it never trap.
+
+        Returns the doorbell base. Raises on refusal; the caller is expected to
+        treat "no bulk channel" as non-fatal, because the vUART is untouched
+        either way.
+        """
+        if size <= 0 or size % HV_XFER_PAGE_SIZE:
+            raise ValueError(f"xfer window size {size:#x} is not a multiple of "
+                             f"{HV_XFER_PAGE_SIZE:#x}")
+
+        if base is None:
+            env = os.environ.get("M1N1_HV_XFER_BASE")
+            base = int(env, 0) if env else alloc_mmio_base(self.adt, HV_XFER_REGS_SIZE)
+        if base is None:
+            raise Exception("no free MMIO window for the xfer doorbell")
+        if base % HV_XFER_REGS_SIZE:
+            raise ValueError(f"xfer doorbell base {base:#x} is not 16 KiB aligned")
+
+        win = self.u.heap.memalign(HV_XFER_PAGE_SIZE, size)
+
+        if self.p.hv_map_xfer(base, win, size) < 0:
+            raise Exception(f"hv_map_xfer({base:#x}, {win:#x}, {size:#x}) failed")
+
+        # RESERVED, not a tracer: the EL2 hook owns every access to the
+        # doorbell, and the window must keep the HW mapping hv_map_xfer() just
+        # made. RESERVED is the highest TraceMode, so it wins over the "HW"
+        # tracer that already covers /arm-io and pt_update() leaves both alone.
+        self.add_tracer(irange(base, HV_XFER_REGS_SIZE), "HVXFER", TraceMode.RESERVED)
+        self.add_tracer(irange(win, size), "HVXFER-WIN", TraceMode.RESERVED)
+
+        if engine is None:
+            engine = XferHostDevice(inbox=inbox, compress=compress, verbose=verbose)
+        elif inbox is not None:
+            engine.set_inbox(inbox)
+
+        if publish:
+            for item in publish:
+                engine.publish_file(item)
+
+        self.xfer_dev = engine
+        self.xfer_transport = ProxyTransport(self.iface, self.p, self.u,
+                                             compress=compress)
+        self.xfer_base = base
+        self.xfer_win = win
+        self.xfer_win_size = size
+
+        print(f"Adding bulk xfer channel @ {base:#x} "
+              f"(window {win:#x}+{size:#x}, {size >> 10} KiB)")
+        return base
+
+    def handle_xfer(self, reason, code, info):
+        """One HV_XFER event per doorbell command (mirrors handle_tpm).
+
+        The guest's vCPU is parked inside hv_exc_proxy() until this returns, so
+        the answer is synchronous from its point of view. Every path writes an
+        explicit status back: EL2 poisons the field with -ENODEV, and anything
+        but 0 makes the guest see a failed command rather than stale window
+        bytes or a hang.
+        """
+        ctx = self.iface.readstruct(info, ExcInfo)
+        xinfo = self.iface.readstruct(ctx.data, XferExcInfo)
+
+        if self.xfer_dev is None:
+            status, result = XFER_ST_NODEV, 0
+        else:
+            status, result = self.xfer_dev.dispatch(
+                self.xfer_transport, xinfo.cmd, xinfo.tag, xinfo.off,
+                xinfo.length, xinfo.win_phys, xinfo.win_size, xinfo.name_phys)
+
+        xinfo.status = status
+        xinfo.result = result
+        self.iface.writemem(ctx.data, XferExcInfo.build(xinfo))
+        self.p.exit(EXC_RET.HANDLED)
+
+    def enable_xfer_hvcall(self, callid=0x58464552, engine=None, inbox=None,
+                           publish=None, compress=True, verbose=True):
+        """Expose the same engine through the existing BRK #0x4242 hypercall.
+
+        This front end needs NO m1n1 firmware change at all -- BRK from EL1
+        already traps to EL2 (MDCR_EL2.TDE) and lands in handle_brk(). It
+        exists so the whole data path can be proven on the next boot, before
+        anyone rebuilds and repins m1n1 for the MMIO device, and so a guest
+        that cannot conveniently map MMIO still has a way in.
+
+        Guest ABI (AArch64, EL1):
+
+            x0 = 0x58464552 ('XFER')      call id, required by the BRK ABI
+            x1 = command                  CMD_PING/OPEN/GET/PUT/CLOSE
+            x2 = window guest-physical base   (16 KiB aligned)
+            x3 = window size                  (16 KiB multiple)
+            x4 = offset into the window
+            x5 = length
+            x6 = tag (bit 31 set = guest->host stream)
+            x7 = guest-physical address of a 64-byte NUL-padded name, or 0
+            brk #0x4242
+          returns
+            x0 = status (0 = ok, negative = failure)
+            x1 = bytes actually moved
+
+        Unlike the MMIO device there is no discovery register here: if this is
+        not enabled on the host side, the BRK falls through to EL1 and Windows
+        sees a debug break. The guest must therefore only issue it when the
+        operator has explicitly turned the channel on for that boot.
+        """
+        if engine is None:
+            engine = self.xfer_dev
+        if engine is None:
+            engine = XferHostDevice(inbox=inbox, compress=compress, verbose=verbose)
+        elif inbox is not None:
+            engine.set_inbox(inbox)
+
+        if publish:
+            for item in publish:
+                engine.publish_file(item)
+
+        self.xfer_dev = engine
+        if self.xfer_transport is None:
+            self.xfer_transport = ProxyTransport(self.iface, self.p, self.u,
+                                                 compress=compress)
+
+        def handler(ctx):
+            cmd = ctx.regs[1] & 0xffffffff
+            win_ipa = ctx.regs[2]
+            win_size = ctx.regs[3]
+            off = ctx.regs[4] & 0xffffffff
+            length = ctx.regs[5] & 0xffffffff
+            tag = ctx.regs[6] & 0xffffffff
+            name_ipa = ctx.regs[7]
+
+            win_pa = self.xfer_translate(win_ipa, win_size)
+            if win_pa is None:
+                ctx.regs[0] = XFER_ST_INVAL & 0xffffffffffffffff
+                ctx.regs[1] = 0
+                return True
+
+            name_pa = 0
+            if name_ipa:
+                page = name_ipa & ~(HV_XFER_PAGE_SIZE - 1)
+                page_pa = self.xfer_translate(page, HV_XFER_PAGE_SIZE)
+                if page_pa is None or \
+                        (name_ipa & (HV_XFER_PAGE_SIZE - 1)) + HV_XFER_NAME_SIZE > HV_XFER_PAGE_SIZE:
+                    ctx.regs[0] = XFER_ST_INVAL & 0xffffffffffffffff
+                    ctx.regs[1] = 0
+                    return True
+                name_pa = page_pa + (name_ipa & (HV_XFER_PAGE_SIZE - 1))
+
+            status, result = self.xfer_dev.dispatch(
+                self.xfer_transport, cmd, tag, off, length, win_pa, win_size,
+                name_pa)
+
+            # Same invariant as xfer_window_sync() in src/hv_xfer.c: after any
+            # command that touched the window, EL2 holds no cache lines for
+            # the touched range. Always AFTER the access, never before.
+            touched = result if cmd == XFER_CMD_GET else length
+            if status == XFER_ST_OK and touched and off < win_size:
+                self.p.dc_civac(win_pa + off, min(touched, win_size - off))
+
+            ctx.regs[0] = status & 0xffffffffffffffff
+            ctx.regs[1] = result
+            return True
+
+        self.add_hvcall(callid, handler)
+        self.xfer_hvcall_id = callid
+        print(f"Bulk xfer hypercall enabled: BRK #0x4242 with x0={callid:#x}")
+        return callid
+
+    def xfer_selftest(self, size=None, rounds=3, pattern=None):
+        """Measure the bulk path end to end with no guest involvement.
+
+        This is the smallest possible first hardware test: it exercises exactly
+        the transport a GET/PUT uses (REQ_MEMWRITE and REQ_MEMREAD into the
+        shared window) and verifies the bytes, but touches no guest state and
+        needs no guest driver. Run it from the hypervisor shell.
+        """
+        if self.xfer_win is None:
+            raise Exception("no xfer channel attached; call attach_xfer() first")
+        if size is None:
+            size = self.xfer_win_size
+        if size > self.xfer_win_size:
+            raise ValueError(f"size {size:#x} exceeds the window "
+                             f"({self.xfer_win_size:#x})")
+
+        if pattern is None:
+            pattern = bytes((i * 7 + 13) & 0xff for i in range(size))
+
+        # Uncompressible, so this measures the wire and not gzip.
+        raw = ProxyTransport(self.iface, self.p, self.u, compress=False)
+
+        for i in range(rounds):
+            t0 = time.time()
+            raw.writemem(self.xfer_win, pattern)
+            t1 = time.time()
+            self.p.dc_civac(self.xfer_win, size)
+            got = raw.readmem(self.xfer_win, size)
+            t2 = time.time()
+
+            if got != pattern:
+                bad = next(j for j in range(size) if got[j] != pattern[j])
+                raise Exception(f"xfer selftest MISMATCH at offset {bad:#x}: "
+                                f"got {got[bad]:#04x}, want {pattern[bad]:#04x}")
+
+            print(f"xfer selftest {i + 1}/{rounds}: "
+                  f"write {size / (t1 - t0) / 1024:.1f} KiB/s, "
+                  f"read {size / (t2 - t1) / 1024:.1f} KiB/s, verified")
+
+        return True
+
     def handle_virtio(self, reason, code, info):
         ctx = self.iface.readstruct(info, ExcInfo)
         self.virtio_ctx = info = self.iface.readstruct(ctx.data, VirtioExcInfo)
@@ -1087,7 +1851,11 @@ class HV(Reloadable):
         self.cont()
 
     def cont(self):
-        os.kill(os.getpid(), signal.SIGUSR1)
+        if(platform.uname().system == "Windows"):
+            int_signal = signal.CTRL_BREAK_EVENT
+        else:
+            int_signal = signal.SIGUSR1
+        os.kill(os.getpid(), int_signal)
 
     def _lower(self):
         if not self.is_fault:
@@ -1239,7 +2007,11 @@ class HV(Reloadable):
             self.cpu(cpu_id)
 
     def exit(self):
-        os.kill(os.getpid(), signal.SIGUSR2)
+        if(platform.uname().system == "Windows"):
+            int_signal = signal.SIGTERM
+        else:
+            int_signal = signal.SIGUSR2
+        os.kill(os.getpid(), int_signal)
 
     def reboot(self):
         print("Hard rebooting the system")
@@ -1370,7 +2142,11 @@ class HV(Reloadable):
                 self.p.iodev_set_usage(iodev, 0)
 
         print("Initializing hypervisor over iodev %s" % self.iodev)
-        self.p.hv_init()
+        if self.p.hv_init() != 0:
+            raise RuntimeError(
+                "m1n1 refused hypervisor initialization: USB guest handoff "
+                "did not reach a safe, unambiguous state"
+            )
 
         self.iface.set_handler(START.EXCEPTION_LOWER, EXC.SYNC, self.handle_exception)
         self.iface.set_handler(START.EXCEPTION_LOWER, EXC.IRQ, self.handle_exception)
@@ -1383,6 +2159,13 @@ class HV(Reloadable):
         self.iface.set_handler(START.HV, HV_EVENT.WDT_BARK, self.handle_bark)
         self.iface.set_handler(START.HV, HV_EVENT.CPU_SWITCH, self.handle_exception)
         self.iface.set_handler(START.HV, HV_EVENT.VIRTIO, self.handle_virtio)
+        self.iface.set_handler(START.HV, HV_EVENT.TPM, self.handle_tpm)
+        # Registered unconditionally, even with no channel attached. An
+        # HV_XFER event with no handler would leave the target sitting in
+        # uartproxy_run() forever with the guest parked; answering -ENODEV
+        # costs nothing and can only ever be reached by a guest that went
+        # looking for a device that is not there.
+        self.iface.set_handler(START.HV, HV_EVENT.XFER, self.handle_xfer)
         self.iface.set_handler(START.HV, HV_EVENT.PANIC, self.handle_bark)
         self.iface.set_event_handler(EVENT.MMIOTRACE, self.handle_mmiotrace)
         self.iface.set_event_handler(EVENT.IRQTRACE, self.handle_irqtrace)
@@ -1402,8 +2185,14 @@ class HV(Reloadable):
         hcr.TVM = 0
         hcr.FMO = 1
         hcr.IMO = 0
+        #
+        # trap SMCs (this bit is only applicable for Blizzard/Avalanche and later cores since earlier generations used a chicken bit and these
+        # cores implement nested virtualization.
+        #
+        hcr.TSC = 1
         hcr.TTLBOS = 1
-        self.u.msr(HCR_EL2, hcr.value)
+        #m1n1_windows change: only set HCR from hv_init()
+        #self.u.msr(HCR_EL2, hcr.value)
 
         # Trap dangerous things
         hacr = HACR(0)
@@ -1416,6 +2205,7 @@ class HV(Reloadable):
             hacr.TRAP_HID = 1
             hacr.TRAP_ACC = 1
             hacr.TRAP_IPI = 1
+            hacr.TRAP_PMUV3 = 1
             hacr.TRAP_SERROR_INFO = 1 # M1RACLES mitigation
             hacr.TRAP_PM = 1
         self.u.msr(HACR_EL2, hacr.value)
@@ -1429,25 +2219,33 @@ class HV(Reloadable):
         self.u.msr(MDCR_EL2, mdcr.value)
         self.u.msr(MDSCR_EL1, MDSCR(MDE=1).value)
 
-        # Enable AMX
-        amx_ctl = AMX_CONFIG(self.u.mrs(AMX_CONFIG_EL1))
-        amx_ctl.EN_EL1 = 1
-        self.u.msr(AMX_CONFIG_EL1, amx_ctl.value)
+        # T8132/T8142 expose Apple IMPDEF registers as read-only.  EDK2 does
+        # not need AMX, Apple AP keys, ACTLR tuning, SPRR, or GXF.
+        chip_id = self.adt["/chosen"].chip_id
+        apple_sysregs_locked = chip_id in (0x8132, 0x8142)
+        self.apple_sysregs_locked = apple_sysregs_locked
+        if not apple_sysregs_locked:
+            amx_ctl = AMX_CONFIG(self.u.mrs(AMX_CONFIG_EL1))
+            amx_ctl.EN_EL1 = 1
+            self.u.msr(AMX_CONFIG_EL1, amx_ctl.value)
 
-        # Set guest AP keys
-        self.u.msr(VMKEYLO_EL2, 0x4E7672476F6E6147)
-        self.u.msr(VMKEYHI_EL2, 0x697665596F755570)
-        self.u.msr(APSTS_EL12, 1)
+            # Set guest AP keys on generations with unlocked Apple sysregs.
+            self.u.msr(VMKEYLO_EL2, 0x4E7672476F6E6147)
+            self.u.msr(VMKEYHI_EL2, 0x697665596F755570)
+            self.u.msr(APSTS_EL12, 1)
+        else:
+            print(f"HV: chip 0x{chip_id:x}: skipping write-locked Apple IMPDEF sysregs")
 
         self.map_vuart()
 
-        # ACTLR depends on the CPU part
-        part = MIDR(self.u.mrs(MIDR_EL1)).PART
-        actlr_el12 = ACTLR_EL12 if part >= MIDR_PART.T8110_BLIZZARD else ACTLR_EL12_PRE
+        # ACTLR is also Apple IMPDEF and write-locked on T8132/T8142.
+        if not apple_sysregs_locked:
+            part = MIDR(self.u.mrs(MIDR_EL1)).PART
+            actlr_el12 = ACTLR_EL12 if part >= MIDR_PART.T8110_BLIZZARD else ACTLR_EL12_PRE
 
-        actlr = ACTLR(self.u.mrs(actlr_el12))
-        actlr.EnMDSB = 1
-        self.u.msr(actlr_el12, actlr.value)
+            actlr = ACTLR(self.u.mrs(actlr_el12))
+            actlr.EnMDSB = 1
+            self.u.msr(actlr_el12, actlr.value)
 
         self.setup_adt()
 
@@ -1487,13 +2285,11 @@ class HV(Reloadable):
         pmgr_hooks = []
 
         def hook_pmgr_dev(dev):
-            ps = pmgr.ps_regs[dev.psreg]
-            if dev.psidx or dev.psreg:
-                addr = pmgr.get_reg(ps.reg)[0] + ps.offset + dev.psidx * 8
-                pmgr_hooks.append(addr)
-                for idx in self.adt.pmgr_dev_get_parents(dev):
-                    if idx in dev_by_id:
-                        hook_pmgr_dev(dev_by_id[idx])
+            addr = self.adt.pmgr_dev_get_addr(dev)
+            pmgr_hooks.append(addr)
+            for idx in self.adt.pmgr_dev_get_parents(dev):
+                if idx in dev_by_id:
+                    hook_pmgr_dev(dev_by_id[idx])
 
         for name in hook_devs:
             dev = dev_by_name[name]
@@ -1562,7 +2358,7 @@ class HV(Reloadable):
             chip_id = self.u.adt["/chosen"].chip_id
             if chip_id in (0x8103, 0x6000, 0x6001, 0x6002):
                 cpu_start = 0x54000 + die * 0x20_0000_0000
-            elif chip_id in (0x8112, 0x8122, 0x6030):
+            elif chip_id in (0x8112, 0x8122, 0x8132, 0x8140, 0x8142, 0x6030):
                 cpu_start = 0x34000 + die * 0x20_0000_0000
             elif chip_id in (0x6020, 0x6021, 0x6022):
                 cpu_start = 0x28000 + die * 0x20_0000_0000
@@ -1700,6 +2496,10 @@ class HV(Reloadable):
         guest_base += align(self.u.ba.devtree_size)
         tc_base = guest_base
         guest_base += align(tc_size)
+        # AArch64 UEFI runtime memory must be 64 KiB aligned.  Raw Mu images
+        # describe the loaded firmware region as EfiRuntimeServicesData, so a
+        # 16 KiB-aligned payload address makes DxeCore reject ExitBootServices.
+        guest_base = align_up(guest_base, 0x10000)
         self.guest_base = guest_base
         mem_top = self.u.ba.phys_base + self.u.ba.mem_size
         mem_size = mem_top - phys_base
@@ -1775,14 +2575,17 @@ class HV(Reloadable):
         elif self.tba.revision == 3:
             self.iface.writemem(guest_base + self.bootargs_off, BootArgs_r3.build(self.tba))
 
-        print("Setting secondary CPU RVBARs...")
-        rvbar = self.entry & ~0xfff
-        for cpu in self.adt["cpus"]:
-            if cpu.state == "running":
-                continue
-            addr, size = cpu.cpu_impl_reg
-            print(f"  {cpu.name}: [0x{addr:x}] = 0x{rvbar:x}")
-            self.p.write64(addr, rvbar)
+        if self.adt["/chosen"].chip_id != 0x8142:
+            print("Setting secondary CPU RVBARs...")
+            rvbar = self.entry & ~0xfff
+            for cpu in self.adt["cpus"]:
+                if cpu.state == "running":
+                    continue
+                addr, size = cpu.cpu_impl_reg
+                print(f"  {cpu.name}: [0x{addr:x}] = 0x{rvbar:x}")
+                self.p.write64(addr, rvbar)
+        else:
+            print("Skipping legacy secondary CPU RVBAR writes on T8142")
 
     def _load_macho_symbols(self):
         self.symbol_dict = self.macho.symbols
@@ -1911,18 +2714,19 @@ class HV(Reloadable):
 
         print("Shutting down framebuffer...")
         self.p.fb_shutdown(True)
+        if getattr(self, "apple_sysregs_locked", False):
+            print("Skipping write-locked SPRR/GXF enable")
+        else:
+            print("Enabling SPRR...")
+            self.u.msr(SPRR_CONFIG_EL1, 1)
 
-        print("Enabling SPRR...")
-        self.u.msr(SPRR_CONFIG_EL1, 1)
-
-        print("Enabling GXF...")
-        self.u.msr(GXF_CONFIG_EL1, 1)
+            print("Enabling GXF...")
+            self.u.msr(GXF_CONFIG_EL1, 1)
 
         print(f"Jumping to entrypoint at 0x{self.entry:x}")
 
         self.iface.dev.timeout = None
         self.default_sigint = signal.signal(signal.SIGINT, self._handle_sigint)
-
         set_sigquit_stackdump_handler()
 
         if self.wdt_cpu is not None:

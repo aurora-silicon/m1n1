@@ -4,6 +4,7 @@
 #define UCON     0x004
 #define UFCON    0x008
 #define UTRSTAT  0x010
+#define UERSTAT  0x014
 #define UFSTAT   0x018
 #define UTXH     0x020
 #define URXH     0x024

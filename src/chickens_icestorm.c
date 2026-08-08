@@ -14,8 +14,11 @@ static void init_common_icestorm(void)
     // violation"
     reg_set(SYS_IMP_APL_EHID10, HID10_FORCE_WAIT_STATE_DRAIN_UC | HID10_DISABLE_ZVA_TEMPORAL_TSO);
 
-    // Disable SMC trapping to EL2
-    reg_clr(SYS_IMP_APL_EHID20, EHID20_TRAP_SMC);
+    //
+    // m1n1_windows change: to facilitate PSCI support for OSes that require it, allow SMCs to be trapped to EL2 on Firestorm/Icestorm cores.
+    // (standard HCR bit is used on Blizzard/Avalanche and later cores.)
+    //
+    reg_set(SYS_IMP_APL_EHID20, EHID20_TRAP_SMC);
 }
 
 void init_m1_icestorm(int rev)

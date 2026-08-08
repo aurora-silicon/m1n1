@@ -7,7 +7,7 @@
  * - https://www.beyondlogic.org/usbnutshell/usb1.shtml
  */
 
-#include "../build/build_tag.h"
+#include "build_tag.h"
 
 #include "usb_dwc3.h"
 #include "adt.h"
@@ -97,6 +97,7 @@ typedef struct dwc3_dev {
     dart_dev_t *dart;
 
     enum ep0_state ep0_state;
+    u8 configuration;
     const void *ep0_buffer;
     u32 ep0_buffer_len;
     void *ep0_read_buffer;
@@ -637,6 +638,7 @@ static void usb_dwc3_ep0_handle_standard_device(dwc3_dev_t *dev,
                     dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
                     for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
                         dev->pipe[i].ready = false;
+                    dev->configuration = 0;
                     break;
                 case 1:
                     /* we've already configured these endpoints so that we just need to enable them
@@ -648,6 +650,7 @@ static void usb_dwc3_ep0_handle_standard_device(dwc3_dev_t *dev,
                     set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_IN_2));
                     set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_INTR_IN_2));
                     dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
+                    dev->configuration = 1;
                     break;
                 default:
                     usb_dwc3_ep_set_stall(dev, 0, 1);
@@ -663,6 +666,12 @@ static void usb_dwc3_ep0_handle_standard_device(dwc3_dev_t *dev,
             } else {
                 dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
             }
+            break;
+
+        case USB_REQUEST_GET_CONFIGURATION:
+            dev->ep0_buffer = &dev->configuration;
+            dev->ep0_buffer_len = 1;
+            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
             break;
 
         case USB_REQUEST_GET_STATUS: {
@@ -691,6 +700,22 @@ static void usb_dwc3_ep0_handle_standard_interface(dwc3_dev_t *dev,
             dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
             break;
         }
+        case USB_REQUEST_GET_INTERFACE: {
+            static const u8 alternate_setting = 0;
+            dev->ep0_buffer = &alternate_setting;
+            dev->ep0_buffer_len = 1;
+            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
+            break;
+        }
+        case USB_REQUEST_SET_INTERFACE:
+            if (setup->raw.wValue == 0) {
+                usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN);
+                dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE;
+            } else {
+                usb_dwc3_ep_set_stall(dev, 0, 1);
+                dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
+            }
+            break;
         default:
             usb_dwc3_ep_set_stall(dev, 0, 1);
             dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
@@ -755,6 +780,8 @@ static void usb_dwc3_ep0_handle_standard(dwc3_dev_t *dev, const union usb_setup_
     }
 }
 
+static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number);
+
 static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_packet *setup)
 {
     int pipe = setup->raw.wIndex / 2;
@@ -771,6 +798,13 @@ static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_pac
                 dev->pipe[pipe].ready = false;
                 usb_debug_printf("ACM device opened\n");
                 dev->pipe[pipe].ready = true;
+                /*
+                 * Prime the first host-to-device transfer immediately. Newer
+                 * DWC3 revisions do not reliably emit the initial
+                 * XFERNOTREADY event, which otherwise deadlocks uartproxy's
+                 * first request after a reconnect.
+                 */
+                usb_dwc3_cdc_start_bulk_out_xfer(dev, dev->pipe[pipe].ep_out);
             } else {
                 dev->pipe[pipe].ready = false;
                 usb_debug_printf("ACM device closed\n");
@@ -920,8 +954,8 @@ static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number
     trb->ctrl |= DWC3_TRBCTL_NORMAL;
     trb->size = DWC3_TRB_SIZE_LENGTH(XFER_SIZE);
 
-    usb_dwc3_ep_start_transfer(dev, endpoint_number, trb_iova);
-    dev->endpoints[endpoint_number].xfer_in_progress = true;
+    if (usb_dwc3_ep_start_transfer(dev, endpoint_number, trb_iova))
+        return;
 }
 
 static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
@@ -1013,6 +1047,10 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
 
 static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev)
 {
+    dev->configuration = 0;
+    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
+        dev->pipe[i].ready = false;
+
     /* clear STALL mode for all endpoints */
     dev->endpoints[0].xfer_in_progress = false;
     for (int i = 1; i < MAX_ENDPOINTS; ++i) {
@@ -1407,12 +1445,21 @@ size_t usb_dwc3_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, void *buf, size_t 
 
 ssize_t usb_dwc3_can_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
 {
-    if (!dev || !dev->pipe[pipe].ready)
+    if (!dev)
+        return 0;
+
+    /* The host may have opened the pipe since the previous poll. */
+    usb_dwc3_handle_events(dev);
+
+    if (!dev->pipe[pipe].ready)
         return 0;
 
     ringbuffer_t *host2device = dev->pipe[pipe].host2device;
     if (!host2device)
         return 0;
+
+    /* Keep one receive TRB armed before uartproxy waits for input. */
+    usb_dwc3_cdc_start_bulk_out_xfer(dev, dev->pipe[pipe].ep_out);
 
     return ringbuffer_get_used(host2device);
 }
@@ -1424,6 +1471,41 @@ bool usb_dwc3_can_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
         return false;
 
     return dev->pipe[pipe].ready;
+}
+
+/*
+ * Number of bytes that can be handed to usb_dwc3_queue()/usb_dwc3_write() right
+ * now WITHOUT that call spinning.
+ *
+ * usb_dwc3_queue() loops until every byte has been accepted by the TX
+ * ringbuffer, pumping the event loop in between. That is fine for m1n1's own
+ * console, which is always eventually drained by the host proxy. It is NOT fine
+ * for a caller that runs inside an EL2 exception handler (the guest-UART MMIO
+ * hook): if the host end of the CDC pipe is not draining -- nobody has the TTY
+ * open, the terminal was SIGKILLed, socat died -- the ring fills, the loop never
+ * terminates, and the HV watchdog (1 s, src/hv_wdt.c) barks and takes the
+ * machine down. That strands the one physical serial link and costs a physical
+ * reboot.
+ *
+ * usb_dwc3_can_write() cannot be used to avoid this: it only reports whether the
+ * pipe has been configured by the host, not whether there is buffer space.
+ *
+ * ringbuffer_write() treats "write + 1 == read" as full, so the usable capacity
+ * is one byte less than ringbuffer_get_free() reports. Subtract that byte here
+ * so the value returned is a hard, directly usable bound.
+ */
+size_t usb_dwc3_write_space(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
+{
+    if (!dev || !dev->pipe[pipe].ready)
+        return 0;
+
+    ringbuffer_t *device2host = dev->pipe[pipe].device2host;
+    if (!device2host)
+        return 0;
+
+    size_t free = ringbuffer_get_free(device2host);
+
+    return free > 1 ? free - 1 : 0;
 }
 
 void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)

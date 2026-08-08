@@ -78,6 +78,12 @@ void get_notchless_fb(u64 *fb_base, u64 *fb_height)
 
     u32 val;
 
+    //
+    // m1n1_windows HACK: skip the notchless framebuffer check for laptops for now.
+    //
+
+    return;
+
     if ((ADT_GETPROP(adt, node, "partially-occluded-display", &val) < 0 || !val) &&
         (chip_id != T8015 || (board_id != 0x6 && board_id != 0xe))) {
         printf("FDT: No notch detected\n");
@@ -192,6 +198,10 @@ static int dt_set_fb(void)
     u64 fb_base, fb_height;
     get_notchless_fb(&fb_base, &fb_height);
     u64 fb_size = cur_boot_args.video.stride * fb_height;
+    //
+    // m1n1_windows change: align the FB size to the nearest page boundary.
+    //
+    fb_size = ((fb_size + 0x4000) & ~(0x3FFF));
     u64 fbreg[2] = {cpu_to_fdt64(fb_base), cpu_to_fdt64(fb_size)};
     char fbname[32];
 
@@ -564,7 +574,7 @@ static int dt_set_cpus(void)
         if (dt_mpidr != mpidr)
             bail_cleanup("FDT: DT CPU %d MPIDR mismatch: 0x%lx != 0x%lx\n", cpu, dt_mpidr, mpidr);
 
-        u64 release_addr = smp_get_release_addr(cpu);
+        u64 release_addr = smp_get_release_addr(cpu, false);
         if (fdt_setprop_inplace_u64(dt, node, "cpu-release-addr", release_addr))
             bail_cleanup("FDT: couldn't set cpu-release-addr property\n");
 
@@ -1218,7 +1228,9 @@ static int dt_set_acio_tunables(void)
         snprintf(adt_path, sizeof(adt_path), "/arm-io/acio%d", i);
 
         memset(fdt_alias, 0, sizeof(fdt_alias));
-        snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_rc", i);
+        /* Asahi m1n1 tbt@3e781e2d: this node owns the whole ACIO
+         * co-processor, not just the root-complex register window. */
+        snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_acio", i);
         dt_copy_acio_tunables(adt_path, fdt_alias, usb4_rc_tunables,
                               sizeof(usb4_rc_tunables) / sizeof(*usb4_rc_tunables));
 
@@ -2627,6 +2639,70 @@ static int dt_setup_mtd_phram(void)
     return 0;
 }
 
+
+int kboot_prepare_adt(void) {
+
+    int node = adt_path_offset(adt, "/cpus");
+    if (node < 0) {
+        printf("Error getting ADT /cpus node\n");
+        return -1;
+    }
+
+    u64 aligned_size = ALIGN_UP(cur_boot_args.devtree_size, SZ_16K);
+    void *adt_el2 = memalign(SZ_16K, aligned_size);
+
+    u64 adt_base;
+    if(chip_id == T8103 || chip_id == T8112)
+        adt_base = ADT_EL2_36_BIT;
+    else
+        adt_base = ADT_EL2_42_BIT;
+
+    mmu_add_mapping((u64)adt_el2, adt_base, aligned_size, MAIR_IDX_NORMAL_NC, PERM_RW);
+    mmu_add_mapping(adt_base, (u64)adt_el2, aligned_size, MAIR_IDX_NORMAL_NC, PERM_RW);
+
+    void *original_adt = adt;
+
+    ADT_FOREACH_CHILD(adt, node) {
+        u32 cpu_id = 0;
+        if (ADT_GETPROP(adt, node, "cpu-id", &cpu_id) < 0)
+            if (ADT_GETPROP(adt, node, "reg", &cpu_id) < 0)
+                continue;
+
+        if (cpu_id >= MAX_CPUS) {
+            printf("cpu-id %d exceeds max CPU count %d: increase MAX_CPUS\n", cpu_id, MAX_CPUS);
+            continue;
+        }
+
+        u64 stack_carveout[2] = {};
+        u64 release_addr[1] = {};
+
+        if(cpu_id == 0){//boot cpu can have m1n1 carveout
+            stack_carveout[0] = (u64)_base;
+            stack_carveout[1] = ((u64)_end) - ((u64)_base);
+        }
+        else{//secondaries get the secondary stacks
+            stack_carveout[0] = (u64)secondary_stacks[cpu_id];
+            stack_carveout[1] = (u64)SECONDARY_STACK_SIZE;
+        }
+        release_addr[0] = smp_get_release_addr(cpu_id, false);
+
+        int ret = 0;
+        //To avoid adding extra ADT nodes we can save carveouts to something unused like cpm-impl-reg
+        ret = adt_setprop(adt, node, "cpm-impl-reg", &stack_carveout, sizeof(stack_carveout));
+        if (ret < 0)
+            printf("kboot_prepare_adt: failed to add cpu %d carveout\n", cpu_id);
+
+        adt = adt_el2;//switch global adt address to el2 one because adt_setprop ignores the parameter.
+        ret = adt_setprop(adt, node, "reg-private", &release_addr, sizeof(release_addr));
+        if (ret < 0)
+            printf("kboot_prepare_adt: failed to add cpu %d release address\n", cpu_id);
+        adt = original_adt;//restore to our own adt
+    }
+
+    return 0;
+}
+
+
 int kboot_prepare_dt(void *fdt)
 {
     if (dt) {
@@ -2723,6 +2799,8 @@ int kboot_prepare_dt(void *fdt)
 
     printf("FDT prepared at %p\n", dt);
 
+    kboot_prepare_adt();
+
     return 0;
 }
 
@@ -2745,7 +2823,7 @@ int kboot_boot(void *kernel)
     next_stage.args[1] = 0;
     next_stage.args[2] = 0;
     next_stage.args[3] = 0;
-    next_stage.args[4] = 0;
+    next_stage.args[4] = (u64)&cur_boot_args;//boot_args_addr;
     next_stage.restore_logo = false;
 
     return 0;

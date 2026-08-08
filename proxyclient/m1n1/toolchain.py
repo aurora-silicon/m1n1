@@ -6,10 +6,11 @@ m1n1: toolchain abstraction for compiling code on proxyclient host
 import os
 import shutil
 import subprocess
+import platform
 
 from dataclasses import dataclass
 
-from posix import uname_result
+from os import uname_result
 
 
 __all__ = ["Toolchain"]
@@ -94,18 +95,17 @@ class Toolchain:
     ARCH: str
     # pylint: enable=invalid-name
 
-    def __init__(self, u: uname_result = os.uname(), r: LLVMResolver = _llvm_resolver):
+    def __init__(self, u: uname_result = platform.uname(), r: LLVMResolver = _llvm_resolver):
 
         self.uname = u
-
-        if u.sysname == "OpenBSD":
+        if u.system == "OpenBSD":
             default_arch = "aarch64-none-elf-"
-        elif u.sysname in ["Darwin", "Linux"] and u.machine != "aarch64":
+        elif u.system in ["Darwin", "Linux", "Windows"] and u.machine != "aarch64":
             default_arch = "aarch64-linux-gnu-"
         else:
             default_arch = ""
 
-        if u.sysname in ["OpenBSD", "Darwin"]:
+        if u.system in ["OpenBSD", "Darwin", "Windows"]:
             default_use_clang = "1"
         else:
             default_use_clang = "0"
@@ -121,9 +121,9 @@ class Toolchain:
 
         toolchain_paths = ()
 
-        if u.sysname == "Darwin":
+        if u.system == "Darwin":
             toolchain_paths = r.get_paths()
-        elif u.sysname == "OpenBSD":
+        elif u.system == "OpenBSD":
             toolchain_paths = (DEFAULT_TOOLCHAIN_PREFIX_OPENBSD, None)
         else:
             toolchain_paths = (DEFAULT_TOOLCHAIN_PREFIX_OTHER, None)

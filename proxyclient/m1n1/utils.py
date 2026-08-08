@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 from enum import Enum
-import threading, traceback, bisect, copy, heapq, importlib, sys, itertools, time, os, functools, struct, re, signal
+import threading, traceback, bisect, copy, heapq, importlib, sys, itertools, time, os, functools, struct, re, signal, platform
 from construct import Adapter, Int64ul, Int32ul, Int16ul, Int8ul, ExprAdapter, GreedyRange, ListContainer, StopFieldError, ExplicitError, StreamError
 
 __all__ = ["FourCC"]
@@ -222,7 +222,10 @@ def dumpstacks(signal, frame):
     sys.exit(1)
 
 def set_sigquit_stackdump_handler():
-    signal.signal(signal.SIGQUIT, dumpstacks)
+    if(platform.uname().system == "Windows"):
+        signal.signal(signal.SIGTERM, dumpstacks)
+    else:
+        signal.signal(signal.SIGQUIT, dumpstacks)
 
 def parse_indexlist(s):
     items = set()

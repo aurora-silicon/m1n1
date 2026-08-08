@@ -24,13 +24,19 @@ void smp_stop_secondaries(bool deep_sleep);
 #define smp_call2(i, f, a, b)    smp_call4(i, f, a, b, 0, 0)
 #define smp_call3(i, f, a, b, c) smp_call4(i, f, a, b, c, 0)
 
+
+#define ADT_EL2_36_BIT 0xF30000000
+#define ADT_EL2_42_BIT 0x5300000000
+
 void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3);
 
 u64 smp_wait(int cpu);
 
 bool smp_is_alive(int cpu);
 uint64_t smp_get_mpidr(int cpu);
-u64 smp_get_release_addr(int cpu);
+int smp_get_id(uint64_t mpidr);
+int smp_cpu_count(void);
+u64 smp_get_release_addr(int cpu, bool from_adt);
 void smp_set_wfe_mode(bool new_mode);
 void smp_send_ipi(int cpu);
 

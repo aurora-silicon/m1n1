@@ -3,7 +3,17 @@ import struct
 
 from ..utils import *
 
-__all__ = ["SPMI"]
+__all__ = ["SPMI", "SPMITimeout"]
+
+# The STATUS poll loops below used to be unbounded. On T8142 under the
+# hypervisor the RX FIFO can read as permanently non-empty, which wedged the
+# host in an infinite read32 loop with no way out but ^C.
+# Each poll is a USB round-trip, so this is already several seconds of patience;
+# a healthy transaction settles in one or two iterations.
+SPMI_POLL_LIMIT = 1000
+
+class SPMITimeout(Exception):
+    pass
 
 CMD_EXT_WRITE   = 0x00
 CMD_EXT_READ    = 0x20
@@ -39,9 +49,25 @@ class SPMI:
         self.base = u.adt[adt_path].get_reg(0)[0]
         self.regs = SPMIRegs(u, self.base)
 
+    def _drain(self, verbose=False):
+        for _ in range(SPMI_POLL_LIMIT):
+            if self.regs.STATUS.reg.RX_EMPTY:
+                return
+            v = self.regs.REPLY.val
+            if verbose:
+                print(">", v)
+        raise SPMITimeout(f"SPMI @ {self.base:#x}: RX FIFO never drained "
+                          f"(STATUS = {self.regs.STATUS.val:#x})")
+
+    def _await_reply(self):
+        for _ in range(SPMI_POLL_LIMIT):
+            if not self.regs.STATUS.reg.RX_EMPTY:
+                return
+        raise SPMITimeout(f"SPMI @ {self.base:#x}: no reply "
+                          f"(STATUS = {self.regs.STATUS.val:#x})")
+
     def read(self, slave, reg, size):
-        while not self.regs.STATUS.reg.RX_EMPTY:
-            print(">", self.regs.REPLY.val)
+        self._drain(verbose=True)
 
         self.regs.CMD.reg = R_CMD(REG = reg, ACTIVE=1, SLAVE_ID = slave, CMD = CMD_EXT_READL | (size - 1))
 
@@ -49,8 +75,7 @@ class SPMI:
 
         left = size + 4
         while left > 0:
-            while self.regs.STATUS.reg.RX_EMPTY:
-                pass
+            self._await_reply()
             v = self.regs.REPLY.val
             buf += struct.pack("<I", v)
             left -= 4
@@ -58,8 +83,7 @@ class SPMI:
         return buf[4:4+size]
 
     def write(self, slave, reg, data):
-        while not self.regs.STATUS.reg.RX_EMPTY:
-            self.regs.REPLY.val
+        self._drain()
 
         size = len(data)
         self.regs.CMD.reg = R_CMD(REG = reg, ACTIVE=1, SLAVE_ID = slave, CMD = CMD_EXT_WRITEL | (size - 1))
@@ -69,8 +93,7 @@ class SPMI:
             self.regs.CMD.val = struct.unpack("<I", blk)[0]
             data = data[4:]
 
-        while self.regs.STATUS.reg.RX_EMPTY:
-            pass
+        self._await_reply()
         return self.regs.REPLY.val
 
     def read8(self, slave, reg):

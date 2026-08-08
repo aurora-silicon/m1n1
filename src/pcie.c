@@ -1,11 +1,879 @@
 /* SPDX-License-Identifier: MIT */
 
-#include "adt.h"
 #include "pcie.h"
+
+#ifndef PCIE_T602X_WIRELESS_HOST_TEST
+#include "adt.h"
+#include "gpio.h"
+#include "platform_identity.h"
 #include "pmgr.h"
+#include "smc.h"
 #include "string.h"
 #include "tunables.h"
 #include "utils.h"
+#endif
+
+/*
+ * PCI-to-PCI bridge (type 1) header, bus number register at 0x18:
+ * primary | secondary << 8 | subordinate << 16 | secondary latency << 24.
+ */
+#define PCI_BRIDGE_BUS_NUMBER      0x18
+#define PCI_BRIDGE_PRIMARY_BUS     GENMASK(7, 0)
+#define PCI_BRIDGE_SECONDARY_BUS   GENMASK(15, 8)
+#define PCI_BRIDGE_SUBORDINATE_BUS GENMASK(23, 16)
+#define PCI_BRIDGE_BUS_RANGE       GENMASK(23, 0)
+
+static int pcie_t602x_bcm4388_restore_rid(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                          u64 address, u32 prior)
+{
+    u32 value;
+
+    if (ops->write32(context, address, prior))
+        return -1;
+    if (ops->read32(context, address, &value))
+        return -1;
+
+    return value == prior ? 0 : -1;
+}
+
+static int pcie_t602x_bcm4388_rollback_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                            bool restore_rid0, u32 prior_rid0, bool restore_rid1,
+                                            u32 prior_rid1)
+{
+    const u64 base = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_RID2SID_OFFSET;
+    bool rid0_failed = false;
+    bool rid1_failed = false;
+
+    /* Restore slot 1 first, but always attempt slot 0 as required by the contract. */
+    if (restore_rid1)
+        rid1_failed = pcie_t602x_bcm4388_restore_rid(ops, context, base + 4, prior_rid1) != 0;
+    if (restore_rid0)
+        rid0_failed = pcie_t602x_bcm4388_restore_rid(ops, context, base, prior_rid0) != 0;
+
+    if (rid0_failed)
+        return PCIE_T602X_BCM4388_ERR_RID0_ROLLBACK;
+    if (rid1_failed)
+        return PCIE_T602X_BCM4388_ERR_RID1_ROLLBACK;
+
+    return PCIE_T602X_BCM4388_OK;
+}
+
+static int pcie_t602x_bcm4388_preflight_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                             struct pcie_t602x_bcm4388_rid_transaction *state)
+{
+    const u64 rid0_address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_RID2SID_OFFSET;
+    const u64 rid1_address = rid0_address + 4;
+
+    /* Read both slots before writing anything so occupied-slot rejection is atomic. */
+    if (ops->read32(context, rid0_address, &state->prior_rid0))
+        return PCIE_T602X_BCM4388_ERR_RID0_READ;
+    if (ops->read32(context, rid1_address, &state->prior_rid1))
+        return PCIE_T602X_BCM4388_ERR_RID1_READ;
+
+    if (state->prior_rid0 != 0 && state->prior_rid0 != PCIE_T602X_BCM4388_WIFI_RID2SID)
+        return PCIE_T602X_BCM4388_ERR_RID0_OCCUPIED;
+    if (state->prior_rid1 != 0 && state->prior_rid1 != PCIE_T602X_BCM4388_BLUETOOTH_RID2SID)
+        return PCIE_T602X_BCM4388_ERR_RID1_OCCUPIED;
+
+    return PCIE_T602X_BCM4388_OK;
+}
+
+static int pcie_t602x_bcm4388_install_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                           struct pcie_t602x_bcm4388_rid_transaction *state)
+{
+    const u64 rid0_address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_RID2SID_OFFSET;
+    const u64 rid1_address = rid0_address + 4;
+    u32 value;
+    bool changed_rid0 = false;
+    bool attempted_rid1 = false;
+    int error;
+
+    if (state->prior_rid0 != PCIE_T602X_BCM4388_WIFI_RID2SID) {
+        changed_rid0 = true;
+        state->changed_mask |= UINT32_C(1) << 0;
+        if (ops->write32(context, rid0_address, PCIE_T602X_BCM4388_WIFI_RID2SID)) {
+            error = PCIE_T602X_BCM4388_ERR_RID0_WRITE;
+            goto rollback_rid0;
+        }
+        if (ops->read32(context, rid0_address, &value)) {
+            error = PCIE_T602X_BCM4388_ERR_RID0_READBACK_READ;
+            goto rollback_rid0;
+        }
+        if (value != PCIE_T602X_BCM4388_WIFI_RID2SID) {
+            error = PCIE_T602X_BCM4388_ERR_RID0_READBACK_MISMATCH;
+            goto rollback_rid0;
+        }
+    }
+
+    if (state->prior_rid1 != PCIE_T602X_BCM4388_BLUETOOTH_RID2SID) {
+        attempted_rid1 = true;
+        state->changed_mask |= UINT32_C(1) << 1;
+        if (ops->write32(context, rid1_address, PCIE_T602X_BCM4388_BLUETOOTH_RID2SID)) {
+            error = PCIE_T602X_BCM4388_ERR_RID1_WRITE;
+            goto rollback_both;
+        }
+        if (ops->read32(context, rid1_address, &value)) {
+            error = PCIE_T602X_BCM4388_ERR_RID1_READBACK_READ;
+            goto rollback_both;
+        }
+        if (value != PCIE_T602X_BCM4388_BLUETOOTH_RID2SID) {
+            error = PCIE_T602X_BCM4388_ERR_RID1_READBACK_MISMATCH;
+            goto rollback_both;
+        }
+    }
+
+    state->active = true;
+    return PCIE_T602X_BCM4388_OK;
+
+rollback_both: {
+    int rollback_error = pcie_t602x_bcm4388_rollback_rids(
+        ops, context, changed_rid0, state->prior_rid0, attempted_rid1, state->prior_rid1);
+    return rollback_error ? rollback_error : error;
+}
+
+rollback_rid0: {
+    int rollback_error =
+        pcie_t602x_bcm4388_rollback_rids(ops, context, changed_rid0, state->prior_rid0, false, 0);
+    return rollback_error ? rollback_error : error;
+}
+}
+
+static int pcie_t602x_bcm4388_force_msi_disabled(const struct pcie_t602x_mmio_ops *ops,
+                                                 void *context, u32 prior_config)
+{
+    const u64 address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    const u32 disabled_config = prior_config & ~PCIE_T602X_PORT_MSI_ENABLE;
+    u32 value;
+
+    if (ops->write32(context, address, disabled_config))
+        return -1;
+    if (ops->read32(context, address, &value))
+        return -1;
+
+    return value == disabled_config ? 0 : -1;
+}
+
+/*
+ * Is the port-0 MSI decoder in exactly the state m1n1 itself programs?
+ *
+ * pcie_init_controller() now activates every T602x port's decoder during
+ * bring-up (doorbell, identity PORT_MSIMAP, PORT_MSICFG_EN), mirroring Linux's
+ * apple_pcie_port_setup_irq().  A transaction that runs afterwards therefore
+ * legitimately finds MSI already enabled -- by us, on the same boot, a few
+ * milliseconds earlier.
+ *
+ * Sets *is_ours only when the doorbell and all 32 map entries read back
+ * byte-for-byte as pcie_port_program_msi() writes them.  Any other
+ * enabled configuration still belongs to some other owner, so the fail-closed
+ * guard below keeps rejecting it.
+ */
+static int pcie_t602x_bcm4388_msi_is_ours(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                          bool *is_ours)
+{
+    const u64 base = PCIE_T602X_BCM4388_PORT0_BASE;
+    u32 value;
+
+    *is_ours = false;
+
+    if (ops->read32(context, base + PCIE_T602X_PORT_MSI_ADDRESS_LO, &value))
+        return PCIE_T602X_BCM4388_ERR_MSI_PREFLIGHT_READ;
+    if (value != PCIE_T602X_MSI_DOORBELL_ADDRESS)
+        return PCIE_T602X_BCM4388_OK;
+    if (ops->read32(context, base + PCIE_T602X_PORT_MSI_ADDRESS_HI, &value))
+        return PCIE_T602X_BCM4388_ERR_MSI_PREFLIGHT_READ;
+    if (value != 0)
+        return PCIE_T602X_BCM4388_OK;
+
+    for (u32 vector = 0; vector < PCIE_T602X_PORT_MSI_VECTOR_COUNT; vector++) {
+        if (ops->read32(context, base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * vector, &value))
+            return PCIE_T602X_BCM4388_ERR_MSI_PREFLIGHT_READ;
+        if (value != (PCIE_T602X_MSIMAP_VALID | vector))
+            return PCIE_T602X_BCM4388_OK;
+    }
+
+    *is_ours = true;
+    return PCIE_T602X_BCM4388_OK;
+}
+
+static int pcie_t602x_bcm4388_require_msi_quiesced(const struct pcie_t602x_mmio_ops *ops,
+                                                   void *context, u32 *prior_config)
+{
+    const u64 address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+
+    if (ops->read32(context, address, prior_config))
+        return PCIE_T602X_BCM4388_ERR_MSI_PREFLIGHT_READ;
+    if ((*prior_config & PCIE_T602X_PORT_MSI_ENABLE) != 0) {
+        bool is_ours;
+        int ret = pcie_t602x_bcm4388_msi_is_ours(ops, context, &is_ours);
+
+        if (ret)
+            return ret;
+        if (!is_ours)
+            return PCIE_T602X_BCM4388_ERR_MSI_NOT_QUIESCED;
+    }
+
+    return PCIE_T602X_BCM4388_OK;
+}
+
+static int pcie_t602x_bcm4388_disable_msi(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                         u32 prior_config)
+{
+    const u64 address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    const u32 disabled_config = prior_config & ~PCIE_T602X_PORT_MSI_ENABLE;
+    u32 value;
+
+    if (ops->write32(context, address, disabled_config))
+        return PCIE_T602X_BCM4388_ERR_MSI_DISABLE_WRITE;
+    if (ops->read32(context, address, &value))
+        return PCIE_T602X_BCM4388_ERR_MSI_DISABLE_READ;
+    if (value != disabled_config)
+        return PCIE_T602X_BCM4388_ERR_MSI_DISABLE_MISMATCH;
+
+    return PCIE_T602X_BCM4388_OK;
+}
+
+int pcie_t602x_bcm4388_require_port0_msi_disabled(const struct pcie_t602x_mmio_ops *ops,
+                                                  void *context)
+{
+    const u64 address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    u32 value;
+
+    if (!ops || !ops->read32)
+        return PCIE_T602X_BCM4388_ERR_INVALID_ARGUMENT;
+    if (ops->read32(context, address, &value))
+        return PCIE_T602X_BCM4388_ERR_MSI_PREFLIGHT_READ;
+    return value == 0 ? PCIE_T602X_BCM4388_OK : PCIE_T602X_BCM4388_ERR_MSI_NOT_QUIESCED;
+}
+
+int pcie_t602x_bcm4388_disable_port0_msi(const struct pcie_t602x_mmio_ops *ops, void *context)
+{
+    const u64 address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    u32 value;
+
+    if (!ops || !ops->read32 || !ops->write32)
+        return PCIE_T602X_BCM4388_ERR_INVALID_ARGUMENT;
+    if (ops->write32(context, address, 0))
+        return PCIE_T602X_BCM4388_ERR_MSI_DISABLE_WRITE;
+    if (ops->read32(context, address, &value))
+        return PCIE_T602X_BCM4388_ERR_MSI_DISABLE_READ;
+    return value == 0 ? PCIE_T602X_BCM4388_OK : PCIE_T602X_BCM4388_ERR_MSI_DISABLE_MISMATCH;
+}
+
+static int pcie_t602x_bcm4388_fail_msi(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                       u32 prior_config, int primary_error)
+{
+    if (pcie_t602x_bcm4388_force_msi_disabled(ops, context, prior_config))
+        return PCIE_T602X_BCM4388_ERR_MSI_DISABLE_RECOVERY;
+
+    return primary_error;
+}
+
+static int pcie_t602x_bcm4388_program_msi(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                         u32 prior_config)
+{
+    const u64 base = PCIE_T602X_BCM4388_PORT0_BASE;
+    const u64 config_address = base + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    const u64 address_lo = base + PCIE_T602X_PORT_MSI_ADDRESS_LO;
+    const u64 address_hi = base + PCIE_T602X_PORT_MSI_ADDRESS_HI;
+    u32 value;
+
+    if (ops->write32(context, address_lo, PCIE_T602X_BCM4388_MSI_ADDRESS))
+        return pcie_t602x_bcm4388_fail_msi(ops, context, prior_config,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ADDRESS_LO_WRITE);
+    if (ops->write32(context, address_hi, 0))
+        return pcie_t602x_bcm4388_fail_msi(ops, context, prior_config,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ADDRESS_HI_WRITE);
+
+    for (u32 vector = 0; vector < PCIE_T602X_PORT_MSI_VECTOR_COUNT; vector++) {
+        u64 map_address = base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * vector;
+
+        if (ops->write32(context, map_address, PCIE_T602X_MSIMAP_VALID | vector))
+            return pcie_t602x_bcm4388_fail_msi(ops, context, prior_config,
+                                               PCIE_T602X_BCM4388_ERR_MSI_MAP_WRITE(vector));
+    }
+
+    if (ops->read32(context, address_lo, &value))
+        return pcie_t602x_bcm4388_fail_msi(ops, context, prior_config,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ADDRESS_LO_READ);
+    if (value != PCIE_T602X_BCM4388_MSI_ADDRESS)
+        return pcie_t602x_bcm4388_fail_msi(ops, context, prior_config,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ADDRESS_LO_MISMATCH);
+    if (ops->read32(context, address_hi, &value))
+        return pcie_t602x_bcm4388_fail_msi(ops, context, prior_config,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ADDRESS_HI_READ);
+    if (value != 0)
+        return pcie_t602x_bcm4388_fail_msi(ops, context, prior_config,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ADDRESS_HI_MISMATCH);
+
+    for (u32 vector = 0; vector < PCIE_T602X_PORT_MSI_VECTOR_COUNT; vector++) {
+        u64 map_address = base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * vector;
+
+        if (ops->read32(context, map_address, &value))
+            return pcie_t602x_bcm4388_fail_msi(ops, context, prior_config,
+                                               PCIE_T602X_BCM4388_ERR_MSI_MAP_READ(vector));
+        if (value != (PCIE_T602X_MSIMAP_VALID | vector))
+            return pcie_t602x_bcm4388_fail_msi(ops, context, prior_config,
+                                               PCIE_T602X_BCM4388_ERR_MSI_MAP_MISMATCH(vector));
+    }
+
+    value = prior_config | PCIE_T602X_PORT_MSI_ENABLE;
+    if (ops->write32(context, config_address, value))
+        return pcie_t602x_bcm4388_fail_msi(ops, context, prior_config,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ENABLE_WRITE);
+    if (ops->read32(context, config_address, &value))
+        return pcie_t602x_bcm4388_fail_msi(ops, context, prior_config,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ENABLE_READ);
+    if (value != (prior_config | PCIE_T602X_PORT_MSI_ENABLE))
+        return pcie_t602x_bcm4388_fail_msi(ops, context, prior_config,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ENABLE_MISMATCH);
+
+    return PCIE_T602X_BCM4388_OK;
+}
+
+int pcie_t602x_bcm4388_route_port0_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                        struct pcie_t602x_bcm4388_rid_transaction *transaction)
+{
+    int ret;
+
+    if (!ops || !ops->read32 || !ops->write32 || !transaction)
+        return PCIE_T602X_BCM4388_ERR_INVALID_ARGUMENT;
+
+    *transaction = (struct pcie_t602x_bcm4388_rid_transaction){0};
+    ret = pcie_t602x_bcm4388_preflight_rids(ops, context, transaction);
+    if (ret)
+        return ret;
+
+    /*
+     * Retain the token even when the first rollback attempt reports failure.
+     * A larger fail-closed transaction may then retry restoration while also
+     * disabling its DART stream.
+     */
+    transaction->active = true;
+    ret = pcie_t602x_bcm4388_install_rids(ops, context, transaction);
+    return ret;
+}
+
+int pcie_t602x_bcm4388_rollback_port0_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                           struct pcie_t602x_bcm4388_rid_transaction *transaction)
+{
+    int ret;
+
+    if (!ops || !ops->read32 || !ops->write32 || !transaction)
+        return PCIE_T602X_BCM4388_ERR_INVALID_ARGUMENT;
+    if (!transaction->active)
+        return PCIE_T602X_BCM4388_OK;
+
+    ret = pcie_t602x_bcm4388_rollback_rids(
+        ops, context, (transaction->changed_mask & (UINT32_C(1) << 0)) != 0,
+        transaction->prior_rid0, (transaction->changed_mask & (UINT32_C(1) << 1)) != 0,
+        transaction->prior_rid1);
+    if (!ret)
+        *transaction = (struct pcie_t602x_bcm4388_rid_transaction){0};
+    return ret;
+}
+
+int pcie_t602x_bcm4388_enable_port0_msi(const struct pcie_t602x_mmio_ops *ops, void *context)
+{
+    int ret;
+
+    if (!ops || !ops->read32 || !ops->write32)
+        return PCIE_T602X_BCM4388_ERR_INVALID_ARGUMENT;
+    ret = pcie_t602x_bcm4388_require_port0_msi_disabled(ops, context);
+    if (ret)
+        return ret;
+    return pcie_t602x_bcm4388_program_msi(ops, context, 0);
+}
+
+int pcie_t602x_bcm4388_setup_port0(const struct pcie_t602x_mmio_ops *ops, void *context)
+{
+    struct pcie_t602x_bcm4388_rid_transaction rid_state;
+    u32 prior_msi_config;
+    int rollback_error;
+    int ret;
+
+    if (!ops || !ops->read32 || !ops->write32)
+        return PCIE_T602X_BCM4388_ERR_INVALID_ARGUMENT;
+
+    /* Never destroy a decoder that another owner may already be using. */
+    ret = pcie_t602x_bcm4388_require_msi_quiesced(ops, context, &prior_msi_config);
+    if (ret)
+        return ret;
+
+    rid_state = (struct pcie_t602x_bcm4388_rid_transaction){0};
+    ret = pcie_t602x_bcm4388_preflight_rids(ops, context, &rid_state);
+    if (ret)
+        return ret;
+
+    /* No RID or MSI state is changed before this fail-closed disable succeeds. */
+    ret = pcie_t602x_bcm4388_disable_msi(ops, context, prior_msi_config);
+    if (ret)
+        return pcie_t602x_bcm4388_fail_msi(ops, context, prior_msi_config, ret);
+
+    ret = pcie_t602x_bcm4388_install_rids(ops, context, &rid_state);
+    if (ret)
+        return pcie_t602x_bcm4388_fail_msi(ops, context, prior_msi_config, ret);
+
+    ret = pcie_t602x_bcm4388_program_msi(ops, context, prior_msi_config);
+    if (!ret)
+        return PCIE_T602X_BCM4388_OK;
+
+    /* RID2SID controls DMA independently of MSI; unwind newly acquired slots. */
+    rollback_error = pcie_t602x_bcm4388_rollback_port0_rids(ops, context, &rid_state);
+    return rollback_error ? rollback_error : ret;
+}
+
+static u32 pcie_clamp_u32(u32 value, u32 min, u32 max)
+{
+    if (value < min)
+        return min;
+    if (value > max)
+        return max;
+    return value;
+}
+
+void pcie_perst_delays_from_adt(struct pcie_perst_delays *out, bool have_refclk_to_perst,
+                                u32 refclk_to_perst, bool have_perst_to_config, u32 perst_to_config)
+{
+    u32 refclk_us = PCIE_PERST_REFCLK_TO_PERST_MIN_US;
+    u32 config_us = PCIE_PERST_TO_CONFIG_MIN_US;
+
+    if (!out)
+        return;
+
+    /* t-refclk-to-perst is microseconds; see the unit derivation in pcie.h. */
+    if (have_refclk_to_perst)
+        refclk_us = refclk_to_perst;
+
+    /* perst-to-config is milliseconds; guard the scale against overflow. */
+    if (have_perst_to_config) {
+        if (perst_to_config > PCIE_PERST_TO_CONFIG_MAX_US / 1000)
+            config_us = PCIE_PERST_TO_CONFIG_MAX_US;
+        else
+            config_us = perst_to_config * 1000;
+    }
+
+    out->refclk_to_perst_us = pcie_clamp_u32(refclk_us, PCIE_PERST_REFCLK_TO_PERST_MIN_US,
+                                             PCIE_PERST_REFCLK_TO_PERST_MAX_US);
+    out->perst_to_config_us =
+        pcie_clamp_u32(config_us, PCIE_PERST_TO_CONFIG_MIN_US, PCIE_PERST_TO_CONFIG_MAX_US);
+}
+
+/*
+ * Power-rail ownership.
+ *
+ * A port's rail is never declared on the bridge itself.  It lives on whatever
+ * node claims that bridge via a `function-pcie_port_control*` property whose
+ * first argument is the bridge's own AAPL,phandle.  On J414s:
+ *
+ *   /arm-io/apcie/pci-bridge1/pcie-sdreader
+ *       function-pcie_port_control_sd -> args[0] = 101 = pci-bridge1
+ *       function-sd_pwr_en            -> SMC key "gP16", mode word 0
+ *   /amfm                                (top level, NOT under apcie)
+ *       function-pcie_port_control    -> args[0] = 98  = pci-bridge0
+ *       function-reg_on               -> SMC key "gP0d", mode word 0x800000
+ *
+ * Both verified live against the J414s ADT.  Note the WiFi/BT owner is not a
+ * descendant of the bridge at all, which is why a child-only search finds the
+ * SD rail and silently misses the wireless one.
+ */
+/*
+ * Everything from here to the matching #endif reads the ADT and talks to the
+ * SMC directly, and is reachable only from pcie_init_controller(), which is
+ * itself hardware-only.  It has to stay inside this guard: tests/pcie builds
+ * src/pcie.c with PCIE_T602X_WIRELESS_HOST_TEST to cover the callback-driven
+ * BCM4388 RID/MSI and port bring-up helpers, and an unguarded adt/smc
+ * reference here breaks that whole suite -- which is exactly what happened
+ * between 3b24e2cb and this commit.
+ */
+#ifndef PCIE_T602X_WIRELESS_HOST_TEST
+static const char *const pcie_port_control_props[] = {
+    "function-pcie_port_control",
+    "function-pcie_port_control_sd",
+};
+
+/* Rail property names, tried in order on a resolved owner node. */
+static const char *const pcie_port_rail_names[] = {
+    "reg_on",
+    "sd_pwr_en",
+    "pwr_en",
+};
+
+static bool pcie_node_controls_bridge(int node, u32 bridge_phandle)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(pcie_port_control_props); i++) {
+        struct apple_gpio_function fn;
+        const void *value;
+        u32 len = 0;
+
+        value = adt_getprop(adt, node, pcie_port_control_props[i], &len);
+        if (!value || !len)
+            continue;
+        if (apple_gpio_parse_function(value, len, &fn) < 0)
+            continue;
+        /* args[0] lands in fn.pin for this record shape. */
+        if (fn.pin == bridge_phandle)
+            return true;
+    }
+
+    return false;
+}
+
+/*
+ * Deliberately NOT a recursive whole-ADT search.  An earlier version walked
+ * the entire tree from the root looking for the owning node; on hardware that
+ * hard-reset the machine mid-`pcie_init` (serial dropped outright), and this
+ * codebase already has a documented history of unreliable generic tree
+ * traversal.  There are only two places an owner is ever found, so look in
+ * exactly those two and keep the traversal bounded and deterministic:
+ *
+ *   1. the bridge's own children  -- /arm-io/apcie/pci-bridgeN/<endpoint>
+ *   2. the fixed top-level node   -- /amfm
+ *
+ * Both are confirmed against the live J414s ADT, and each candidate still has
+ * to prove ownership via function-pcie_port_control* naming this bridge, so a
+ * machine that wires them differently gets nothing rather than the wrong rail.
+ */
+static int pcie_find_rail_owner(int bridge_offset, u32 bridge_phandle)
+{
+    static const char *const owner_paths[] = {"/amfm"};
+    int child_count, child;
+
+    if (bridge_phandle == 0)
+        return -1;
+
+    child_count = adt_get_child_count(adt, bridge_offset);
+    child = adt_first_child_offset(adt, bridge_offset);
+    while (child_count-- > 0 && child > 0) {
+        if (pcie_node_controls_bridge(child, bridge_phandle))
+            return child;
+        child = adt_next_sibling_offset(adt, child);
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(owner_paths); i++) {
+        int node = adt_path_offset(adt, owner_paths[i]);
+
+        if (node < 0)
+            continue;
+        if (pcie_node_controls_bridge(node, bridge_phandle))
+            return node;
+    }
+
+    return -1;
+}
+
+/*
+ * Raise a port's power rail, if it has one.  Returns true when a rail was
+ * actually driven, so the caller knows whether Tpvperl applies.
+ *
+ * Best-effort throughout: no owner, no rail, an unresolvable key or a dead SMC
+ * all log and continue.  A wrong or missing rail must degrade a device, never
+ * refuse the boot.
+ */
+/*
+ * Two things are OPT-IN and deliberately off for the generic pcie_init() path:
+ * the port power rails, and the root ports' bridge bus numbers.  They are
+ * co-requisite -- routing without power reaches a dead link, power without
+ * routing reaches a device nothing can address -- so one flag gates both and
+ * the invariant cannot be half-applied.
+ *
+ * Doing either is correct firmware behaviour, but it is premature for a
+ * Windows boot: it hands Windows three PCIe devices (BCM4388 Wi-Fi, its
+ * Bluetooth function, and the GL9755 SD reader) whose MSI delivery is not yet
+ * activated on this platform.  Measured consequence -- with rails on, Windows
+ * bugchecked BUGCODE_USB3_DRIVER (0x144) on a gpu-only profile, and
+ * INACCESSIBLE_BOOT_DEVICE (0x7B) on ans-gpu; xHCI shares the interrupt setup
+ * these undeliverable devices disturb.  Both boots showed "rail" asserted
+ * twice with no link failures, so the rails were the common factor.
+ *
+ * pcie_init_wireless() opts in, because wireless/SD bring-up cannot proceed
+ * without power and the SID-1 handoff cannot read endpoint config space
+ * without routing.  Flip the default only once MSI delivery works.
+ *
+ * Status of that precondition: pcie_t602x_enable_port_msi() now activates the
+ * root ports' MSI decoders on every T602x port this file brings up, which is
+ * the firmware half of "MSI delivery works" and was previously missing
+ * outright.  The Windows half is still unproven on hardware -- the endpoint
+ * INFs opt in via MSISupported and the HAL publishes AIC lines 1672..1703 as
+ * an InterruptLineMsi/V2m bank, but no interrupt has ever been observed
+ * arriving.  Do NOT flip this default on that basis alone; re-measure the
+ * 0x144/0x7b bugchecks first, now that both this and the bus-number routing
+ * fix are in.
+ */
+static bool pcie_wireless_profile = false;
+
+/*
+ * Give a root port a bus number range so config space behind it is routable.
+ *
+ * m1n1 has never done this: it trains the links and stops.  Both J414s root
+ * ports therefore come out of bring-up with primary = secondary = subordinate
+ * = 0, and a bridge whose secondary bus is 0 forwards no configuration request
+ * at all -- every config read of the endpoint returns 0xffffffff even though
+ * LINKSTS reports the link up.  Measured on hardware: after this controller
+ * reported "Port 0 link up (status 0xd9000001)", config 0x18 on both root
+ * ports read zero and neither endpoint was visible; writing the bus numbers by
+ * hand made 14e4:4434 (Wi-Fi, bus 1 dev 0 fn 0), 14e4:5f72 (Bluetooth, fn 1)
+ * and 17a0:9755 (GL9755 SD reader, bus 2 dev 0 fn 0) appear immediately.
+ *
+ * Numbering: each Apple root port owns exactly one downstream bus, and the
+ * root ports themselves are bus 0 devices 0..N-1 (which is precisely why
+ * config_base is controller_config_base + (port << 15) -- ECAM device number
+ * == port index).  So port N gets secondary = subordinate = N + 1, which is
+ * also what a normal OS enumerator ends up assigning.  Primary stays 0.
+ *
+ * This is not a takeover: any OS PCI enumerator reprograms these registers
+ * from scratch during its own scan, and on profiles where the rails stay down
+ * there is no powered device behind the bridge for the routing to expose.
+ * Best-effort -- a read-back mismatch logs and continues, because a bridge
+ * that will not accept a bus number is a diagnosis for the caller to fail on,
+ * not a reason to abort the whole controller.
+ */
+static bool pcie_program_bridge_bus_numbers(u64 config_base, u32 port)
+{
+    u32 secondary = port + 1;
+    u32 want = FIELD_PREP(PCI_BRIDGE_PRIMARY_BUS, 0) |
+               FIELD_PREP(PCI_BRIDGE_SECONDARY_BUS, secondary) |
+               FIELD_PREP(PCI_BRIDGE_SUBORDINATE_BUS, secondary);
+    u32 got;
+
+    if (!pcie_wireless_profile)
+        return false;
+
+    /* Preserve the secondary latency timer in the top byte. */
+    mask32(config_base + PCI_BRIDGE_BUS_NUMBER, PCI_BRIDGE_BUS_RANGE, want);
+    got = read32(config_base + PCI_BRIDGE_BUS_NUMBER) & PCI_BRIDGE_BUS_RANGE;
+    if (got != want) {
+        printf("pcie: Port %d bus-number write did not stick (%#x, wanted %#x)\n", port, got,
+               want);
+        return false;
+    }
+
+    printf("pcie: Port %d routed as primary 0, secondary %u, subordinate %u\n", port, secondary,
+           secondary);
+    return true;
+}
+
+static bool pcie_enable_port_rail(int bridge_offset, int port)
+{
+    u32 bridge_phandle = 0;
+    int owner;
+
+    if (!pcie_wireless_profile)
+        return false;
+
+    if (ADT_GETPROP(adt, bridge_offset, "AAPL,phandle", &bridge_phandle) < 0)
+        return false;
+
+    owner = pcie_find_rail_owner(bridge_offset, bridge_phandle);
+    if (owner < 0)
+        return false;
+
+    for (size_t i = 0; i < ARRAY_SIZE(pcie_port_rail_names); i++) {
+        struct apple_smc_rail rail = {0};
+        smc_dev_t *smc;
+        u32 value;
+
+        if (apple_smc_resolve_function(owner, pcie_port_rail_names[i], &rail) != 0 || !rail.valid)
+            continue;
+
+        smc = smc_init();
+        if (!smc) {
+            printf("pcie: Port %d rail %s: SMC unavailable\n", port, pcie_port_rail_names[i]);
+            return false;
+        }
+
+        /*
+         * CMD_OUTPUT | level, never the ADT's own mode word ORed with the
+         * level.  src/dcp.c does the latter and it happens to work for the
+         * HDMI rails because their mode word is 0x800000, but the SD rail's is
+         * 0 -- `mode | 1` would write a bare 0x1 (CMD_ACTION) and drive
+         * nothing.  CMD_OUTPUT is verified against SMCG.asl's published
+         * ntasp,smc-gpio-cmd-output and proven on hardware for "gP16".
+         */
+        value = APPLE_SMC_GPIO_CMD_OUTPUT | 1;
+        if (smc_write_u32(smc, rail.key, value) < 0) {
+            printf("pcie: Port %d rail %s write failed (key %#x)\n", port, pcie_port_rail_names[i],
+                   rail.key);
+            smc_shutdown(smc);
+            return false;
+        }
+
+        printf("pcie: Port %d rail %s enabled (SMC key %#x <- %#x)\n", port,
+               pcie_port_rail_names[i], rail.key, value);
+        smc_shutdown(smc);
+        return true;
+    }
+
+    return false;
+}
+#endif /* !PCIE_T602X_WIRELESS_HOST_TEST */
+
+static bool pcie_bringup_ops_valid(const struct pcie_port_bringup_ops *ops,
+                                   const struct pcie_port_bringup *cfg)
+{
+    if (!ops || !cfg)
+        return false;
+    if (!ops->read32 || !ops->write32 || !ops->set32 || !ops->clear32 || !ops->poll32 ||
+        !ops->delay_us)
+        return false;
+    if (cfg->have_perst_gpio && !ops->perst_set)
+        return false;
+    return true;
+}
+
+int pcie_port_release_perst(const struct pcie_port_bringup_ops *ops, void *context,
+                            const struct pcie_port_bringup *cfg)
+{
+    bool drive_perst;
+
+    if (!pcie_bringup_ops_valid(ops, cfg))
+        return PCIE_PORT_BRINGUP_ERR_INVALID_ARGUMENT;
+
+    /*
+     * Never reset a port whose link someone else already brought up, and never
+     * touch a pad we could not resolve.
+     */
+    drive_perst = cfg->have_perst_gpio && !cfg->link_was_up;
+
+    if (ops->set32(context, cfg->port_base + PCIE_PORT_APPCLK, PCIE_PORT_APPCLK_EN))
+        return PCIE_PORT_BRINGUP_ERR_APPCLK;
+
+    /*
+     * Assert PERST# before the clocks come up.  apple_pcie_setup_link() takes
+     * the pad as GPIOD_OUT_HIGH (logical asserted) for exactly this reason:
+     * "The Aquantia AQC113 10GB nic used desktop macs is sensitive to
+     * deasserting it without prior clock setup."
+     */
+    if (drive_perst && ops->perst_set(context, true))
+        return PCIE_PORT_BRINGUP_ERR_PERST_ASSERT;
+
+    if (cfg->port_phy_base) {
+        u64 lane_cfg = cfg->port_phy_base + PCIE_PHY_LANE_CFG;
+
+        if (ops->clear32(context, lane_cfg,
+                         PCIE_PHY_LANE_CFG_REFCLK0REQ | PCIE_PHY_LANE_CFG_REFCLK1REQ))
+            return PCIE_PORT_BRINGUP_ERR_PHY_REQ;
+
+        if (ops->set32(context, lane_cfg, PCIE_PHY_LANE_CFG_REFCLK0REQ))
+            return PCIE_PORT_BRINGUP_ERR_PHY_REQ;
+        if (ops->poll32(context, lane_cfg, PCIE_PHY_LANE_CFG_REFCLK0ACK,
+                        PCIE_PHY_LANE_CFG_REFCLK0ACK, cfg->phy_ack_timeout_us))
+            return PCIE_PORT_BRINGUP_ERR_PHY_CLK0_ACK;
+
+        if (ops->set32(context, lane_cfg, PCIE_PHY_LANE_CFG_REFCLK1REQ))
+            return PCIE_PORT_BRINGUP_ERR_PHY_REQ;
+        if (ops->poll32(context, lane_cfg, PCIE_PHY_LANE_CFG_REFCLK1ACK,
+                        PCIE_PHY_LANE_CFG_REFCLK1ACK, cfg->phy_ack_timeout_us))
+            return PCIE_PORT_BRINGUP_ERR_PHY_CLK1_ACK;
+
+        if (ops->clear32(context, lane_cfg, PCIE_PHY_LANE_CFG_UNK14))
+            return PCIE_PORT_BRINGUP_ERR_REFCLK_EN;
+        if (ops->set32(context, lane_cfg, PCIE_PHY_LANE_CFG_REFCLKEN0))
+            return PCIE_PORT_BRINGUP_ERR_REFCLK_EN;
+        if (ops->set32(context, lane_cfg, PCIE_PHY_LANE_CFG_REFCLKEN1))
+            return PCIE_PORT_BRINGUP_ERR_REFCLK_EN;
+    }
+
+    /* Tperst-clk: stable reference clock -> PERST# deassertion. */
+    ops->delay_us(context, cfg->delays.refclk_to_perst_us);
+
+    if (ops->set32(context, cfg->port_base + cfg->perst_reg, PCIE_PORT_PERST_OFF))
+        return PCIE_PORT_BRINGUP_ERR_PERST_RELEASE_REG;
+
+    if (drive_perst && ops->perst_set(context, false))
+        return PCIE_PORT_BRINGUP_ERR_PERST_RELEASE_GPIO;
+
+    return PCIE_PORT_BRINGUP_OK;
+}
+
+int pcie_port_start_link(const struct pcie_port_bringup_ops *ops, void *context,
+                         const struct pcie_port_bringup *cfg)
+{
+    u32 link_status = 0;
+
+    if (!pcie_bringup_ops_valid(ops, cfg))
+        return PCIE_PORT_BRINGUP_ERR_INVALID_ARGUMENT;
+
+    if (cfg->port_phy_base &&
+        ops->set32(context, cfg->port_phy_base + PCIE_PHY_LANE_CFG, PCIE_PHY_LANE_CFG_REFCLKCGEN))
+        return PCIE_PORT_BRINGUP_ERR_REFCLK_CGEN;
+
+    if (ops->read32(context, cfg->port_base + PCIE_PORT_LINKSTS, &link_status))
+        return PCIE_PORT_BRINGUP_ERR_LINK_DOWN;
+
+    /* Already trained: leave LTSSM alone, exactly as apple_pcie_setup_port() does. */
+    if (link_status & PCIE_PORT_LINKSTS_UP)
+        return PCIE_PORT_BRINGUP_OK;
+
+    if (ops->write32(context, cfg->port_base + PCIE_PORT_LTSSMCTL, PCIE_PORT_LTSSMCTL_START))
+        return PCIE_PORT_BRINGUP_ERR_LTSSM_START;
+
+    if (ops->poll32(context, cfg->port_base + PCIE_PORT_LINKSTS, PCIE_PORT_LINKSTS_UP,
+                    PCIE_PORT_LINKSTS_UP, cfg->link_up_timeout_us))
+        return PCIE_PORT_BRINGUP_ERR_LINK_DOWN;
+
+    return PCIE_PORT_BRINGUP_OK;
+}
+
+int pcie_port_program_msi(const struct pcie_port_bringup_ops *ops, void *context, u64 port_base)
+{
+    u32 value;
+
+    if (!ops || !ops->read32 || !ops->write32 || !ops->set32)
+        return PCIE_PORT_MSI_ERR_INVALID_ARGUMENT;
+
+    if (ops->write32(context, port_base + PCIE_T602X_PORT_MSI_ADDRESS_LO,
+                     PCIE_T602X_MSI_DOORBELL_ADDRESS) ||
+        ops->write32(context, port_base + PCIE_T602X_PORT_MSI_ADDRESS_HI, 0))
+        return PCIE_PORT_MSI_ERR_ADDRESS_WRITE;
+
+    for (u32 vector = 0; vector < PCIE_T602X_PORT_MSI_VECTOR_COUNT; vector++) {
+        if (ops->write32(context, port_base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * vector,
+                         PCIE_T602X_MSIMAP_VALID | vector))
+            return PCIE_PORT_MSI_ERR_MAP_WRITE;
+    }
+
+    if (ops->read32(context, port_base + PCIE_T602X_PORT_MSI_ADDRESS_LO, &value))
+        return PCIE_PORT_MSI_ERR_ADDRESS_READBACK;
+    if (value != PCIE_T602X_MSI_DOORBELL_ADDRESS)
+        return PCIE_PORT_MSI_ERR_ADDRESS_READBACK;
+    if (ops->read32(context, port_base + PCIE_T602X_PORT_MSI_ADDRESS_HI, &value))
+        return PCIE_PORT_MSI_ERR_ADDRESS_READBACK;
+    if (value != 0)
+        return PCIE_PORT_MSI_ERR_ADDRESS_READBACK;
+
+    for (u32 vector = 0; vector < PCIE_T602X_PORT_MSI_VECTOR_COUNT; vector++) {
+        if (ops->read32(context, port_base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * vector, &value))
+            return PCIE_PORT_MSI_ERR_MAP_READBACK;
+        if (value != (PCIE_T602X_MSIMAP_VALID | vector))
+            return PCIE_PORT_MSI_ERR_MAP_READBACK;
+    }
+
+    /*
+     * The decoder is enabled last, after the doorbell and the whole map read
+     * back correct: an enabled decoder pointed at a half-written map would
+     * deliver MSIs to the wrong AIC line rather than to none at all.
+     */
+    if (ops->set32(context, port_base + PCIE_T602X_PORT_MSI_CONFIG_OFFSET,
+                   PCIE_T602X_PORT_MSI_ENABLE))
+        return PCIE_PORT_MSI_ERR_ENABLE_WRITE;
+    if (ops->read32(context, port_base + PCIE_T602X_PORT_MSI_CONFIG_OFFSET, &value))
+        return PCIE_PORT_MSI_ERR_ENABLE_READBACK;
+    if ((value & PCIE_T602X_PORT_MSI_ENABLE) == 0)
+        return PCIE_PORT_MSI_ERR_ENABLE_READBACK;
+
+    /*
+     * Arm the free diagnostic: PORT_INTSTAT is write-1-to-clear, so clearing
+     * MSI_ERR/MSI_BAD_DATA here means any later read attributes them to the
+     * operating system's own MSI traffic rather than to bring-up.  A failure
+     * to clear them is not worth failing the port over.
+     */
+    (void)ops->write32(context, port_base + PCIE_T602X_PORT_INTSTAT,
+                       PCIE_T602X_PORT_INT_MSI_ERR | PCIE_T602X_PORT_INT_MSI_BAD_DATA);
+
+    return PCIE_PORT_MSI_OK;
+}
+
+#ifndef PCIE_T602X_WIRELESS_HOST_TEST
 
 /*
  * The ADT uses 17 register sets:
@@ -67,8 +935,7 @@
 #define APCIE_PORT_RESET     0x814
 #define APCIE_PORT_RESET_DIS BIT(0)
 
-#define APCIE_T602X_PORT_RESET  0x82c
-#define APCIE_T602X_PORT_MSIMAP 0x3800
+#define APCIE_T602X_PORT_RESET 0x82c
 
 /* PCIe capability registers */
 #define PCIE_CAP_BASE    0x70
@@ -200,13 +1067,131 @@ struct state {
     u64 port_ltssm_base[8];
     u64 port_phy_base[8];
     u64 port_intr2axi_base[8];
+    struct apple_gpio_pin port_perst_gpio[8];
     const struct reg_info *pcie_regs;
+    u32 initialized_port_mask;
     bool initialized;
 };
 
 static struct state controllers[NUM_CONTROLLERS];
 
-static int pcie_init_controller(int controller, const char *path)
+/*
+ * Hardware backing for the bring-up sequence.  `context` is the resolved
+ * PERST# pad; it is only dereferenced when the sequence was told the pad
+ * resolved (have_perst_gpio), and apple_gpio_set_output() rejects an
+ * unresolved pin anyway.
+ */
+static int pcie_hw_read32(void *context, u64 address, u32 *value)
+{
+    UNUSED(context);
+    *value = read32(address);
+    return 0;
+}
+
+static int pcie_hw_write32(void *context, u64 address, u32 value)
+{
+    UNUSED(context);
+    write32(address, value);
+    return 0;
+}
+
+static int pcie_hw_set32(void *context, u64 address, u32 set)
+{
+    UNUSED(context);
+    set32(address, set);
+    return 0;
+}
+
+static int pcie_hw_clear32(void *context, u64 address, u32 clear)
+{
+    UNUSED(context);
+    clear32(address, clear);
+    return 0;
+}
+
+static int pcie_hw_poll32(void *context, u64 address, u32 mask, u32 target, u32 timeout_us)
+{
+    UNUSED(context);
+    return poll32(address, mask, target, timeout_us);
+}
+
+static void pcie_hw_delay_us(void *context, u32 us)
+{
+    UNUSED(context);
+    udelay(us);
+}
+
+static int pcie_hw_perst_set(void *context, bool asserted)
+{
+    /*
+     * PERST# is active low (reset-gpios = <&pinctrl_ap N GPIO_ACTIVE_LOW>), so
+     * asserting reset drives the pad to 0 and releasing drives it to 1.
+     */
+    return apple_gpio_set_output((const struct apple_gpio_pin *)context, !asserted);
+}
+
+static const struct pcie_port_bringup_ops pcie_hw_bringup_ops = {
+    .read32 = pcie_hw_read32,
+    .write32 = pcie_hw_write32,
+    .set32 = pcie_hw_set32,
+    .clear32 = pcie_hw_clear32,
+    .poll32 = pcie_hw_poll32,
+    .delay_us = pcie_hw_delay_us,
+    .perst_set = pcie_hw_perst_set,
+};
+
+/*
+ * Activate a T602x root port's MSI decoder.
+ *
+ * This is the tail of Linux's apple_pcie_port_setup_irq() for the t602x
+ * variant (drivers/pci/controller/pcie-apple.c), which is the only published
+ * description of the sequence:
+ *
+ *     writel(lower_32_bits(DOORBELL_ADDR), base + PORT_T602X_MSIADDR);
+ *     writel(upper_32_bits(DOORBELL_ADDR), base + PORT_T602X_MSIADDR_HI);
+ *     for (i = 0; i < nvecs; i++)
+ *         writel(FIELD_PREP(PORT_MSIMAP_TARGET, i) | PORT_MSIMAP_ENABLE,
+ *                base + PORT_T602X_MSIMAP + 4 * i);
+ *     writel(PORT_MSICFG_EN, base + PORT_MSICFG);
+ *
+ * m1n1 previously wrote only the map.  The upstream T602x bring-up block
+ * earlier in this function writes PORT_MSICFG = 0x100 and PORT_MSIADDR = 0, so
+ * without this the port ends bring-up with the decoder pointed at address 0
+ * and PORT_MSICFG_EN clear: every inbound MSI is dropped.  Under Linux that is
+ * invisible because pcie-apple.c programs it; Windows has no equivalent, since
+ * the doorbell lives in the root complex rather than in anything ACPI
+ * describes, so m1n1 is the only layer that can do it.  Mu is not an option --
+ * AppleSiliconPciPlatformDxe is deliberately out of its firmware volume and it
+ * performs no PCIe port bring-up at all.
+ *
+ * PORT_MSICFG is left read-modify-write rather than assigned, so whatever the
+ * upstream sequence put in the L2MSINUM field survives; the field is unused on
+ * the msimap-style decoder and the existing BCM4388 transaction has always
+ * written `prior | EN`.
+ *
+ * Best-effort: a port whose decoder does not read back is logged and left
+ * alone.  MSI that does not work must degrade a device, never refuse the boot.
+ * The write/read-back sequence itself lives in pcie_port_program_msi() so the
+ * host tests can pin it; this wrapper only reports.
+ */
+static void pcie_t602x_enable_port_msi(u64 port_base, u32 port)
+{
+    int ret = pcie_port_program_msi(&pcie_hw_bringup_ops, NULL, port_base);
+
+    if (ret) {
+        printf("pcie: Port %d MSI decoder did not take (%d); MSI will not be delivered\n", port,
+               ret);
+        return;
+    }
+
+    printf("pcie: Port %d MSI enabled (doorbell %#x, %d vectors, cfg %#x, intstat %#x)\n", port,
+           PCIE_T602X_MSI_DOORBELL_ADDRESS, PCIE_T602X_PORT_MSI_VECTOR_COUNT,
+           read32(port_base + PCIE_T602X_PORT_MSI_CONFIG_OFFSET),
+           read32(port_base + PCIE_T602X_PORT_INTSTAT));
+}
+
+static int pcie_init_controller(int controller, const char *path, u32 allowed_port_mask,
+                                bool require_link_up)
 {
     struct state *state = &controllers[controller];
     int adt_path[8];
@@ -216,7 +1201,9 @@ static int pcie_init_controller(int controller, const char *path)
     const struct fuse_bits *fuse_bits;
 
     state->initialized = false;
+    state->initialized_port_mask = 0;
     state->num_phys = 1;
+    memset(state->port_perst_gpio, 0, sizeof(state->port_perst_gpio));
 
     adt_offset = adt_path_offset_trace(adt, path, adt_path);
     if (adt_offset < 0) {
@@ -275,8 +1262,9 @@ static int pcie_init_controller(int controller, const char *path)
         return -1;
     }
 
-    u64 config_base;
-    if (adt_get_reg(adt, adt_path, "reg", state->pcie_regs->config_idx, &config_base, NULL)) {
+    u64 controller_config_base;
+    if (adt_get_reg(adt, adt_path, "reg", state->pcie_regs->config_idx,
+                    &controller_config_base, NULL)) {
         printf("pcie: Error getting reg with index %d for %s\n", state->pcie_regs->config_idx,
                path);
         return -1;
@@ -465,6 +1453,7 @@ static int pcie_init_controller(int controller, const char *path)
     for (u32 port = 0; port < state->port_count; port++) {
         char bridge[64];
         int bridge_offset;
+        u64 config_base;
 
         /*
          * Initialize RC port.
@@ -484,6 +1473,12 @@ static int pcie_init_controller(int controller, const char *path)
 
         if ((bridge_offset = adt_path_offset(adt, bridge)) < 0)
             continue;
+        if ((allowed_port_mask & BIT(port)) == 0) {
+            printf("pcie: Leaving port %d disabled by profile\n", port);
+            continue;
+        }
+
+        config_base = controller_config_base + ((u64)port << 15);
 
         printf("pcie: Initializing port %d\n", port);
 
@@ -523,6 +1518,86 @@ static int pcie_init_controller(int controller, const char *path)
             state->port_intr2axi_base[port] = 0;
         }
 
+        /*
+         * Everything below reprograms the port, so sample the link state first.
+         * A port that is already trained must not be reset out from under
+         * whoever owns it (apple_pcie_setup_port() guards its bring-up the same
+         * way), so this decides whether PERST# may be toggled at all.
+         */
+        struct pcie_port_bringup bringup = {
+            .port_base = state->port_base[port],
+            .port_phy_base = state->pcie_regs->type == APCIE_T602X ? state->port_phy_base[port] : 0,
+            .perst_reg =
+                state->pcie_regs->type == APCIE_T602X ? APCIE_T602X_PORT_RESET : APCIE_PORT_RESET,
+            .phy_ack_timeout_us = 50000,
+            .link_up_timeout_us = PCIE_PERST_LINK_UP_TIMEOUT_US,
+            .link_was_up =
+                (read32(state->port_base[port] + APCIE_PORT_LINKSTS) & APCIE_PORT_LINKSTS_UP) != 0,
+        };
+        struct apple_gpio_pin perst_gpio = {0};
+
+        /*
+         * PERST# is a GPIO on every Apple platform that declares it, and m1n1
+         * historically never drove it -- only the internal PERST register.  On
+         * J414s both ports leave the pad asserted (DATA=0, active low) out of
+         * iBoot, so the endpoint is held in reset and the link can never train.
+         *
+         * Resolution is entirely ADT-driven (function-perst -> phandle + pin),
+         * so nothing here is machine specific.  A port with no function-perst,
+         * an SMC-backed rail, or an unresolvable phandle simply keeps the old
+         * behaviour: the pad is left exactly as firmware set it.
+         */
+        if (apple_gpio_resolve_function(bridge_offset, "perst", &perst_gpio) == 0) {
+            bringup.have_perst_gpio = true;
+            state->port_perst_gpio[port] = perst_gpio;
+            printf("pcie: Port %d PERST# is GPIO pin %u at %#lx\n", port, perst_gpio.pin,
+                   perst_gpio.base);
+        } else {
+            printf("pcie: Port %d has no resolvable PERST# GPIO; leaving the pad alone\n", port);
+        }
+
+        u32 t_refclk_to_perst = 0, perst_to_config = 0;
+        bool have_refclk_to_perst =
+            ADT_GETPROP(adt, bridge_offset, "t-refclk-to-perst", &t_refclk_to_perst) >= 0;
+        bool have_perst_to_config =
+            ADT_GETPROP(adt, bridge_offset, "perst-to-config", &perst_to_config) >= 0;
+
+        pcie_perst_delays_from_adt(&bringup.delays, have_refclk_to_perst, t_refclk_to_perst,
+                                   have_perst_to_config, perst_to_config);
+
+        /*
+         * `manual-enable` marks a port that is under explicit software
+         * enable/disable control rather than being treated as always-on.  It
+         * is NOT a "skip this port" marker and it says nothing about whether
+         * firmware already brought the port up.
+         *
+         * Determined from AppleEmbeddedPCIE.kext: AppleEmbeddedPCIEPort::
+         * autoEnable() enables the port either way.  Without manual-enable it
+         * enables with flags 0x8 and returns true, so AppleEmbeddedPCIE::
+         * configure() adds the port to its wait-for-link-up mask; with
+         * manual-enable it enables with flags 0x8|0x2 and returns false, so
+         * macOS scans the port but does not block on its link.  The only
+         * property that actually defers a scan is the separate
+         * `manual-enable-defer-scan`, which no published Apple Silicon ADT
+         * carries.  Both J414s ports declare manual-enable, and both must be
+         * brought up -- skipping either is what would leave WiFi/BT and the SD
+         * card reader dead.
+         *
+         * m1n1's job is to bring hardware up, so the property changes no
+         * behaviour here; it is logged so the ownership is explicit, and
+         * `manual-enable-s2r` is noted only because it means PERST# for this
+         * port is re-driven across suspend/resume (IOPCIFamily
+         * IOPCIBridge.cpp), which is not something m1n1 participates in.
+         */
+        if (adt_getprop(adt, bridge_offset, "manual-enable", NULL))
+            printf("pcie: Port %d is manual-enable; m1n1 owns its bring-up\n", port);
+
+        if (bringup.link_was_up)
+            printf("pcie: Port %d link is already up; not resetting it\n", port);
+
+        printf("pcie: Port %d PERST# timing: refclk->perst %uus, perst->config %uus\n", port,
+               bringup.delays.refclk_to_perst_us, bringup.delays.perst_to_config_us);
+
         if (state->pcie_regs->type == APCIE_T602X) {
             set32(state->rc_base + 0x3c, 0x1);
 
@@ -543,7 +1618,7 @@ static int pcie_init_controller(int controller, const char *path)
             write32(state->port_base[port] + 0x808, 0x1000ff);
             write32(state->port_base[port] + 0x82c, 0x0);
             for (int i = 0; i < 512; i++)
-                write32(state->port_base[port] + APCIE_T602X_PORT_MSIMAP + 4 * i, 0);
+                write32(state->port_base[port] + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * i, 0);
             write32(state->port_base[port] + 0x397c, 0x0);
             if (controller == APCIE)
                 write32(state->port_base[port] + 0x130, 0x3000000);
@@ -562,34 +1637,45 @@ static int pcie_init_controller(int controller, const char *path)
             return -1;
         }
 
-        set32(state->port_base[port] + APCIE_PORT_APPCLK, APCIE_PORT_APPCLK_EN);
+        /*
+         * Power-enable rails.  PERST# alone is not enough: on J414s both ports
+         * drove PERST# correctly and still reported LINKSTS 0xab000208 forever,
+         * because a device with no power rail is not a link partner at all.
+         *
+         * The rail is declared on the ENDPOINT child, not on the bridge -- on
+         * J414s /arm-io/apcie/pci-bridge1/pcie-sdreader carries
+         * function-sd_pwr_en (SMC key "gP16" == 0x67503136, verified live
+         * against the ADT), while pci-bridge0's wlan/bluetooth-pcie children
+         * carry no such property and need nothing here.  So walk the children
+         * rather than looking at the bridge.
+         *
+         * Ordering follows pcie-apple.c: the rail goes high while PERST# is
+         * still asserted, then Tpvperl settles before PERST# is released.  We
+         * assert here, ahead of pcie_port_release_perst(), so the device is
+         * powered and stable for the whole reset window.
+         *
+         * Best-effort by design: a missing property, an unresolvable key, or a
+         * dead SMC logs and continues.  A port whose link is already up is left
+         * alone entirely -- never power-cycle a working device.
+         */
+        /*
+         * Raise this port's power rail while PERST# is still asserted, then let
+         * Tpvperl settle before it is released.  A port whose link is already
+         * up is left alone -- never power-cycle a working device.
+         */
+        if (!bringup.link_was_up && pcie_enable_port_rail(bridge_offset, port))
+            udelay(PCIE_PWREN_TO_PERST_US);
 
-        if (state->pcie_regs->type == APCIE_T602X) {
-            clear32(state->port_phy_base[port] + APCIE_PHY_CTRL,
-                    APCIE_PHY_CTRL_CLK0REQ | APCIE_PHY_CTRL_CLK1REQ);
-
-            set32(state->port_phy_base[port] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK0REQ);
-            if (poll32(state->port_phy_base[port] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK0ACK,
-                       APCIE_PHY_CTRL_CLK0ACK, 50000)) {
-                printf("pcie: Timeout enabling PHY CLK0\n");
-                return -1;
-            }
-
-            set32(state->port_phy_base[port] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK1REQ);
-            if (poll32(state->port_phy_base[port] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK1ACK,
-                       APCIE_PHY_CTRL_CLK1ACK, 50000)) {
-                printf("pcie: Timeout enabling PHY CLK1\n");
-                return -1;
-            }
-
-            clear32(state->port_phy_base[port] + APCIE_PHY_CTRL, 0x4000);
-            set32(state->port_phy_base[port] + APCIE_PHY_CTRL, 0x200);
-            set32(state->port_phy_base[port] + APCIE_PHY_CTRL, 0x400);
-
-            set32(state->port_base[port] + APCIE_T602X_PORT_RESET, APCIE_PORT_RESET_DIS);
-        } else {
-            /* PERSTN */
-            set32(state->port_base[port] + APCIE_PORT_RESET, APCIE_PORT_RESET_DIS);
+        /*
+         * APPCLK on, PERST# asserted before the clocks, refclk request/ack,
+         * Tperst-clk, then PERST# released -- apple_pcie_setup_link() order.
+         * The register pokes are byte-for-byte the ones m1n1 already issued
+         * here; the PERST# pad handling and the ADT-derived delay are new.
+         */
+        int bringup_ret = pcie_port_release_perst(&pcie_hw_bringup_ops, &perst_gpio, &bringup);
+        if (bringup_ret) {
+            printf("pcie: Port %d PERST# release failed (%d) on %s\n", port, bringup_ret, bridge);
+            return -1;
         }
 
         if (poll32(state->port_base[port] + APCIE_PORT_STATUS, APCIE_PORT_STATUS_RUN,
@@ -631,6 +1717,17 @@ static int pcie_init_controller(int controller, const char *path)
             set32(state->port_ltssm_base[port] + 0x20, 0x2);
             write32(state->port_ltssm_base[port] + 0x14, 0x1);
         }
+
+        /*
+         * perst-to-config: PCIe Base r5.0 6.6.1 requires 100ms between the last
+         * PERST# deassertion and the first configuration request.  The block
+         * above re-cycles the internal PERST register (m1n1 has always done
+         * that, Asahi does not), so the wait is taken here, after the final
+         * PERST transition and before the first config-space access below.  The
+         * endpoint's own PERST# pad was released earlier, so it gets at least
+         * this much settling time too.
+         */
+        udelay(bringup.delays.perst_to_config_us);
 
         /* Make Designware PCIe Core registers writable. */
         set32(config_base + DWC_DBI_RO_WR, DWC_DBI_RO_WR_EN);
@@ -706,14 +1803,33 @@ static int pcie_init_controller(int controller, const char *path)
                 write32(state->port_intr2axi_base[port] + 0x80, 0x1);
 
             clear32(state->rc_base + 0x3c, 0x1);
-            for (int i = 0; i < 32; i++)
-                write32(state->port_base[port] + APCIE_T602X_PORT_MSIMAP + 4 * i, 0x80000000 | i);
+            pcie_t602x_enable_port_msi(state->port_base[port], port);
         }
 
-        read32(state->port_base[port] + APCIE_PORT_LINKSTS);
+        /*
+         * Enable refclk clock gating, start LTSSM and poll for the link with a
+         * bounded timeout -- the tail of apple_pcie_setup_port().  m1n1 used to
+         * read LINKSTS exactly once here, which can only ever observe a link
+         * that some earlier stage had already trained.
+         */
+        int link_ret = pcie_port_start_link(&pcie_hw_bringup_ops, &perst_gpio, &bringup);
+        u32 link_status = read32(state->port_base[port] + APCIE_PORT_LINKSTS);
 
-        /* Move to the next PCIe device on this bus. */
-        config_base += (1 << 15);
+        if (link_ret) {
+            printf("pcie: Port %d link did not come up within %uus (status %#x)\n", port,
+                   bringup.link_up_timeout_us, link_status);
+            if (require_link_up)
+                return -1;
+        } else {
+            printf("pcie: Port %d link up (status %#x)\n", port, link_status);
+            /*
+             * Only once the link is actually up: a bus number range on a port
+             * with no link partner advertises a hierarchy that does not exist.
+             */
+            pcie_program_bridge_bus_numbers(config_base, port);
+        }
+
+        state->initialized_port_mask |= BIT(port);
     }
 
     printf("pcie: Initialized controller %d\n", controller);
@@ -729,14 +1845,45 @@ int pcie_init(void)
     if (pcie_initialized)
         return 0;
 
-    success |= pcie_init_controller(APCIE, "/arm-io/apcie") == 0;
-    success |= pcie_init_controller(APCIE_GE0, "/arm-io/apcie-ge0") == 0;
-    success |= pcie_init_controller(APCIE_GE1, "/arm-io/apcie-ge1") == 0;
+    success |= pcie_init_controller(APCIE, "/arm-io/apcie", UINT32_MAX, false) == 0;
+    success |= pcie_init_controller(APCIE_GE0, "/arm-io/apcie-ge0", UINT32_MAX, false) == 0;
+    success |= pcie_init_controller(APCIE_GE1, "/arm-io/apcie-ge1", UINT32_MAX, false) == 0;
 
     if (success)
         pcie_initialized = true;
 
     return success ? 0 : -1;
+}
+
+int pcie_init_wireless(void)
+{
+    if (!platform_is_j414s()) {
+        printf("pcie: wireless profile rejected non-J414s identity\n");
+        return -1;
+    }
+    if (pcie_initialized)
+        return -1;
+
+    /*
+     * The wireless/SD bring-up path is the one caller that needs the port
+     * power rails AND routable bus numbers behind the root ports.  See
+     * pcie_wireless_profile: the generic pcie_init() path used by non-wireless
+     * Windows boots leaves both alone, because these devices' MSI delivery is
+     * not activated yet and powering them destabilises xHCI.
+     *
+     * Both ports: WiFi/BT is on pci-bridge0 and the SD reader on pci-bridge1,
+     * so BIT(0) alone would leave SD dark.  require_link_up stays false --
+     * port 1 having no link must not fail the wireless profile, and vice
+     * versa.
+     */
+    pcie_wireless_profile = true;
+
+    if (pcie_init_controller(APCIE, "/arm-io/apcie", BIT(0) | BIT(1), false)) {
+        pcie_wireless_profile = false;
+        return -1;
+    }
+    pcie_initialized = true;
+    return 0;
 }
 
 int pcie_shutdown(void)
@@ -751,6 +1898,16 @@ int pcie_shutdown(void)
             continue;
 
         for (u32 port = 0; port < state->port_count; port++) {
+            if ((state->initialized_port_mask & BIT(port)) == 0)
+                continue;
+            /*
+             * Put the endpoint back in reset before its clocks go away, so it
+             * is never left running unclocked.  Only pads m1n1 itself resolved
+             * and drove are touched.  The argument is the pad level, and the
+             * pad is active low, so driving it low asserts PERST#.
+             */
+            if (state->port_perst_gpio[port].valid)
+                apple_gpio_set_output(&state->port_perst_gpio[port], false);
             if (state->pcie_regs->type == APCIE_T602X)
                 clear32(state->port_base[port] + APCIE_T602X_PORT_RESET, APCIE_PORT_RESET_DIS);
             else
@@ -765,6 +1922,7 @@ int pcie_shutdown(void)
         }
 
         state->initialized = false;
+        state->initialized_port_mask = 0;
     }
 
     pcie_initialized = false;
@@ -772,3 +1930,5 @@ int pcie_shutdown(void)
 
     return 0;
 }
+
+#endif /* !PCIE_T602X_WIRELESS_HOST_TEST */

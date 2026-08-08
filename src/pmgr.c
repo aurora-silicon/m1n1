@@ -16,7 +16,23 @@
 #define PMGR_PS_ACTUAL    GENMASK(7, 4)
 #define PMGR_PS_TARGET    GENMASK(3, 0)
 
-#define PMGR_POLL_TIMEOUT 10000
+/* 192000 us.  NOTE: this was previously justified as "Apple's TARGET/ACTUAL
+ * wait = 0x2ee00 us".  That justification is wrong twice over and is
+ * corrected here rather than propagated:
+ *
+ *  - Apple's 0x2ee00 is a raw mach-tick delta, not microseconds.
+ *    ApplePMGR::waitReg32 does `deadline = mach_absolute_time() + timeout`
+ *    with no unit conversion, so at the 24 MHz timebase 0x2ee00 ticks is
+ *    ~8 ms, not 192 ms.
+ *  - 0x2ee00 is ApplePMGR's house-standard constant seen in
+ *    enableCioReconfig's pre-wait (and configISPRefClock / enableTVM), not
+ *    in the PS TARGET/ACTUAL convergence poll, which uses its own
+ *    mach_absolute_time loop.
+ *
+ * The numeric value is deliberately kept: 192 ms is ~24x Apple's bound, so
+ * it is strictly more permissive and cannot cause a spurious timeout.  It
+ * is a safety margin, not a decoded Apple constant. */
+#define PMGR_POLL_TIMEOUT 192000
 
 #define PMGR_FLAG_VIRTUAL 0x10
 
@@ -50,6 +66,40 @@ static int pmgr_dies;
 
 static const u32 *pmgr_ps_regs = NULL;
 static u32 pmgr_ps_regs_len = 0;
+
+//
+// T8142 (Apple M5) replaced `ps-regs` with `ps-groups`.
+//
+// Up to and including T8132 (M4), a device's power-state register was found with
+// a two-level lookup:
+//
+//     addr = pmgr_reg[ps_regs[psreg_idx].reg_idx]
+//          + ps_regs[psreg_idx].offset
+//          + (addr_offset << 3)
+//
+// T8142 flattens that. `ps-regs` is gone; `ps-groups` is a much smaller table
+// (3 entries on J704) whose first word is just a reg index, and the device record
+// carries a single u32 at offset 0x10 holding both the group and the complete
+// byte offset:
+//
+//     v    = u32 at device record + 0x10
+//     addr = pmgr_reg[ps_groups[v >> 24].reg_idx] + (v & 0xffffff)
+//
+// The old addr_offset/psreg_idx bytes (record +0x0a/+0x0b) are zero on T8142.
+//
+// Derived by diffing the J704 and J713 ADTs. Corroborated three ways: the top
+// byte takes exactly three distinct values across all 386 T8142 devices, matching
+// the three ps-groups entries; the resulting offsets stay inside their respective
+// pmgr reg windows; and the addresses land next to M4's for the same devices
+// (ATC0_USB is reg[1]+0xc0 on M4 and reg[1]+0xd0 on M5).
+//
+#define PMGR_DEV_PS_GROUP_OFFSET 0x10
+#define PMGR_PS_GROUP_INDEX(v)   ((v) >> 24)
+#define PMGR_PS_GROUP_OFFSET(v)  ((v) & 0xffffff)
+
+static const u32 *pmgr_ps_groups = NULL;
+static u32 pmgr_ps_groups_len = 0;
+static bool pmgr_use_ps_groups = false;
 
 static const struct pmgr_device *pmgr_devices = NULL;
 static u32 pmgr_devices_len = 0;
@@ -110,9 +160,51 @@ static int pmgr_find_device(u16 id, const struct pmgr_device **device)
     return -1;
 }
 
+//
+// T8142 path: resolve a device's power-state register from ps-groups.
+// See the commentary next to pmgr_ps_groups above for the format.
+//
+static uintptr_t pmgr_get_psgroup_addr(const struct pmgr_device *device)
+{
+    u32 v;
+    memcpy(&v, (const u8 *)device + PMGR_DEV_PS_GROUP_OFFSET, sizeof(v));
+
+    u32 group = PMGR_PS_GROUP_INDEX(v);
+    u32 offset = PMGR_PS_GROUP_OFFSET(v);
+
+    if (group * 3 >= pmgr_ps_groups_len / sizeof(u32)) {
+        printf("pmgr: ps-group %u out of bounds (%u entries)\n", group,
+               pmgr_ps_groups_len / (3 * (u32)sizeof(u32)));
+        return 0;
+    }
+
+    u32 reg_idx = pmgr_ps_groups[3 * group];
+
+    u64 pmgr_reg;
+    if (adt_get_reg(adt, pmgr_path, "reg", reg_idx, &pmgr_reg, NULL) < 0) {
+        printf("pmgr: Error getting /arm-io/pmgr reg %u for ps-group %u\n", reg_idx, group);
+        return 0;
+    }
+
+    return pmgr_reg + offset;
+}
+
 static uintptr_t pmgr_device_get_addr(u8 die, const struct pmgr_device *device)
 {
-    uintptr_t addr = pmgr_get_psreg(device->psreg_idx);
+    uintptr_t addr;
+
+    if (pmgr_use_ps_groups) {
+        //
+        // The complete byte offset is already folded into the ps-group word, so
+        // unlike the ps-regs path there is no addr_offset to add afterwards.
+        //
+        addr = pmgr_get_psgroup_addr(device);
+        if (addr == 0)
+            return 0;
+        return addr + PMGR_DIE_OFFSET * die;
+    }
+
+    addr = pmgr_get_psreg(device->psreg_idx);
     if (addr == 0)
         return 0;
 
@@ -324,6 +416,20 @@ int pmgr_adt_reset(const char *path)
     return ret;
 }
 
+int pmgr_device_name_by_id(u16 id, char *out, size_t len)
+{
+    const struct pmgr_device *device;
+
+    if (!pmgr_initialized || !out || !len || pmgr_find_device(id, &device) < 0)
+        return -1;
+
+    size_t i = 0;
+    while (i < len - 1 && i < sizeof(device->name) && device->name[i])
+        out[i] = device->name[i], i++;
+    out[i] = 0;
+    return 0;
+}
+
 int pmgr_reset(int die, const char *name)
 {
     const struct pmgr_device *dev = NULL;
@@ -381,8 +487,20 @@ int pmgr_init(void)
 
     pmgr_ps_regs = adt_getprop(adt, pmgr_offset, "ps-regs", &pmgr_ps_regs_len);
     if (pmgr_ps_regs == NULL || pmgr_ps_regs_len == 0) {
-        printf("pmgr: Error getting /arm-io/pmgr ps-regs\n.");
-        return -1;
+        //
+        // T8142 (M5) and later drop ps-regs in favour of ps-groups. Fall back
+        // rather than failing: bailing here leaves every power domain unmanaged,
+        // which shows up much later as an unpowered device faulting on its first
+        // MMIO access (on T8142 that was the USB DART).
+        //
+        pmgr_ps_groups = adt_getprop(adt, pmgr_offset, "ps-groups", &pmgr_ps_groups_len);
+        if (pmgr_ps_groups == NULL || pmgr_ps_groups_len == 0) {
+            printf("pmgr: Error getting /arm-io/pmgr ps-regs or ps-groups\n");
+            return -1;
+        }
+        pmgr_use_ps_groups = true;
+        printf("pmgr: using ps-groups (%u entries)\n",
+               pmgr_ps_groups_len / (3 * (u32)sizeof(u32)));
     }
 
     pmgr_devices = adt_getprop(adt, pmgr_offset, "devices", &pmgr_devices_len);

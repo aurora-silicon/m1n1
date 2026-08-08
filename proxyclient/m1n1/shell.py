@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-import atexit, serial, os, struct, code, traceback, readline, rlcompleter, sys
+import atexit, serial, os, struct, code, traceback, rlcompleter, sys, platform
 import __main__
 import builtins
 import re
@@ -9,6 +9,14 @@ from .proxyutils import *
 from .utils import *
 from . import sysreg
 from inspect import isfunction, signature
+
+
+if(platform.uname().system == "Windows"):
+    from pyreadline3 import Readline
+    readline = Readline()
+else:
+    import readline
+
 
 __all__ = ["ExitConsole", "run_shell"]
 
@@ -25,8 +33,13 @@ class HistoryConsole(code.InteractiveConsole):
         if hasattr(readline, "read_history_file"):
             try:
                 readline.read_history_file(histfile)
-            except FileNotFoundError:
-                pass
+            except OSError as e:
+                # Command history is a convenience; a missing, root-owned or
+                # flag-locked history file must not stop the shell from opening.
+                # save_history() below already tolerates the same failures.
+                if not isinstance(e, FileNotFoundError):
+                    print(f"Failed reading history from {histfile}: {e}",
+                          file=sys.stderr)
 
     def save_history(self):
         readline.set_history_length(10000)

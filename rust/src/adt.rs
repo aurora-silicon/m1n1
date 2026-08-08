@@ -37,6 +37,38 @@ pub struct ADTProperty {
     value: [u8],
 }
 
+/// ADTPropertyStringIterator
+#[derive(Debug)]
+pub struct ADTPropertyStringIterator<'a> {
+    value: &'a [u8],
+}
+
+impl<'a> Iterator for ADTPropertyStringIterator<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        match CStr::from_bytes_until_nul(self.value) {
+            Ok(cs) => match cs.to_str() {
+                Ok(s) => {
+                    match self.value.iter().position(|&x| x == 0) {
+                        Some(nul) => self.value = &self.value[(nul + 1)..],
+                        None => self.value = &[],
+                    }
+                    Some(s)
+                }
+                Err(_) => {
+                    self.value = &[];
+                    None
+                }
+            },
+            Err(_) => {
+                self.value = &[];
+                None
+            }
+        }
+    }
+}
+
 #[repr(C, packed(1))]
 pub struct ADTSegmentRanges {
     phys: u64,
@@ -245,17 +277,22 @@ impl ADTNode {
         }
     }
 
+    /// Get a reference to the root node
+    pub fn root() -> Result<&'static ADTNode, AdtError> {
+        let ptr: *const ADTNode = unsafe { adt as *const ADTNode };
+        ADTNode::from_ptr(ptr)
+    }
+
     /// Get a reference to a node at a specified path, tracing the path to the
     /// desired node
     pub fn from_path_trace(
         path: &str,
         mut breadcrumbs: Option<&mut [Option<&'static ADTNode>]>,
     ) -> Result<&'static ADTNode, AdtError> {
-        let ptr: *const ADTNode = unsafe { adt as *const ADTNode };
         let mut p = path;
         let mut bc_idx: usize = 0;
 
-        let head = ADTNode::from_ptr(ptr)?;
+        let head = ADTNode::root()?;
         let mut n = head;
 
         while !p.is_empty() {
@@ -296,10 +333,6 @@ impl ADTNode {
             }
 
             p = rest;
-        }
-
-        if let Some(b) = breadcrumbs.as_mut() {
-            b[bc_idx] = Some(head)
         }
 
         Ok(n)
@@ -421,7 +454,13 @@ impl ADTNode {
     }
 
     pub fn is_compatible(&self, compatible: &str) -> Result<bool, AdtError> {
-        Ok(self.named_prop("compatible")?.str()?.contains(compatible))
+        let prop = self.named_prop("compatible")?;
+        Ok(prop.str_iter().any(|c| c == compatible))
+    }
+
+    pub fn compatible(&self, index: usize) -> Option<&str> {
+        let prop = self.named_prop("compatible").ok()?;
+        prop.str_iter().nth(index)
     }
 }
 
@@ -534,6 +573,12 @@ impl ADTProperty {
         }
     }
 
+    pub fn str_iter<'a>(&'a self) -> ADTPropertyStringIterator<'a> {
+        ADTPropertyStringIterator {
+            value: unsafe { core::slice::from_raw_parts(self.value.as_ptr(), self.size as usize) },
+        }
+    }
+
     pub fn set(&mut self, val: &[u8]) -> Result<usize, AdtError> {
         if val.len() != self.size as usize {
             return Err(AdtError::BadLength);
@@ -568,6 +613,14 @@ impl ADTProperty {
         }
 
         Ok(u32::from_ne_bytes(self.value[..4].try_into().unwrap()))
+    }
+
+    pub fn u64(&self) -> Result<u64, AdtError> {
+        if self.size != 8 {
+            return Err(AdtError::BadLength);
+        }
+
+        Ok(u64::from_ne_bytes(self.value[..8].try_into().unwrap()))
     }
 }
 
@@ -763,16 +816,62 @@ pub unsafe extern "C" fn adt_is_compatible(
 ) -> bool {
     let strcompat: &str = unsafe { CStr::from_ptr(compat).to_str().unwrap() };
     let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr)
-        .unwrap()
-        .is_compatible(strcompat)
-        .unwrap()
+
+    //
+    // Both of these used to be .unwrap(), which panics the whole of m1n1.
+    //
+    // is_compatible() returns Err(NotFound) when the node simply has no
+    // "compatible" property, which is perfectly normal -- plenty of ADT nodes
+    // have none. The C API this replaced returned false in that case, and every
+    // caller here treats the result as a plain boolean predicate, so a missing
+    // property must mean "not compatible", not "abort".
+    //
+    // Hit on T8142 after chainload.py pushes its re-serialised ADT and m1n1
+    // reloads: startup calls adt_is_compatible() on a node without the property
+    // and panics at this line, taking the machine down before the chainloaded
+    // payload ever runs.
+    //
+    let node = match ADTNode::from_ptr(ptr) {
+        Ok(node) => node,
+        Err(_) => return false,
+    };
+
+    node.is_compatible(strcompat).unwrap_or(false)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn adt_is_compatible_at(
+    _dt: *const c_void,
+    offset: c_int,
+    compat: *const c_char,
+    index: usize,
+) -> bool {
+    let strcompat: &str = unsafe { CStr::from_ptr(compat).to_str().unwrap() };
+    let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
+    ADTNode::from_ptr(ptr).unwrap().compatible(index).unwrap() == strcompat
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn adt_get_name(_dt: *const c_void, offset: c_int) -> *const c_char {
     let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr).unwrap().name().unwrap().as_ptr() as *const c_char
+
+    //
+    // Same panic hazard as adt_is_compatible() above: two .unwrap()s on a path
+    // that C callers expect to fail softly. Return an empty string rather than a
+    // null pointer -- callers like usb.c do check for NULL, but others pass the
+    // result straight to strcmp(), and an empty string is safe for both.
+    //
+    static EMPTY: &[u8] = b"\0";
+
+    let node = match ADTNode::from_ptr(ptr) {
+        Ok(node) => node,
+        Err(_) => return EMPTY.as_ptr() as *const c_char,
+    };
+
+    match node.name() {
+        Ok(name) => name.as_ptr() as *const c_char,
+        Err(_) => EMPTY.as_ptr() as *const c_char,
+    }
 }
 
 #[no_mangle]
@@ -824,10 +923,13 @@ pub unsafe extern "C" fn adt_path_offset_trace(
         Ok(n) => {
             if !offsets.is_null() {
                 for (i, &r) in refs.iter().enumerate() {
-                    if r.is_some() {
-                        unsafe {
-                            *offsets.add(i) =
-                                (r.unwrap().as_ptr() as *const u8).sub(adt as usize) as i32;
+                    unsafe {
+                        let val = r
+                            .map(|r| r.as_ptr().sub(adt as usize) as i32)
+                            .unwrap_or_default();
+                        *offsets.add(i) = val;
+                        if val == 0 {
+                            break;
                         }
                     }
                 }
