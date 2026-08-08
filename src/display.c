@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 
-#include "build_cfg.h"
+#include "../build/build_cfg.h"
 
 #include "display.h"
 #include "adt.h"
@@ -88,16 +88,6 @@ static const display_config_t display_config_m2_pro_max = {
 #endif
     .dp2hdmi_gpio = "/arm-io/dp2hdmi-gpio0",
     .dptx_phy = "/arm-io/lpdptx-phy0",
-};
-
-/* J414s MacBook Pro uses the internal T6020 display pipeline. */
-static const display_config_t display_config_m2_pro_internal = {
-    .dcp = "/arm-io/dcp0",
-    .dcp_dart = "/arm-io/dart-dcp0",
-    .disp_dart = "/arm-io/dart-disp0",
-    .pmgr_dev = "DISP0_CPU0",
-    .dcp_alias = "dcp",
-    .dcp_index = 0,
 };
 
 static const display_config_t display_config_m2_ultra = {
@@ -257,9 +247,7 @@ const display_config_t *display_get_config(void)
 {
     const display_config_t *conf = NULL;
 
-    if (adt_is_compatible(adt, 0, "J414sAP"))
-        conf = &display_config_m2_pro_internal;
-    else if (adt_is_compatible(adt, 0, "J473AP"))
+    if (adt_is_compatible(adt, 0, "J473AP"))
         conf = &display_config_m2;
     else if (adt_is_compatible(adt, 0, "J474sAP") || adt_is_compatible(adt, 0, "J475cAP"))
         conf = &display_config_m2_pro_max;
@@ -390,7 +378,7 @@ static int display_swap(u64 iova, u32 stride, u32 width, u32 height)
         .plane_cnt = 1,
         .width = width,
         .height = height,
-        .surface_fmt = FMT_BGRA,
+        .surface_fmt = FMT_w30r,
         .colorspace = 2,
         .eotf = EOTF_GAMMA_SDR,
         .transform = XFRM_NONE,
@@ -586,17 +574,12 @@ int display_configure(const char *config)
     bool reinit = false;
     if (fb_pa != cur_boot_args.video.base || cur_boot_args.video.stride != stride ||
         cur_boot_args.video.width != tbest.width || cur_boot_args.video.height != tbest.height ||
-        (cur_boot_args.video.depth & FB_DEPTH_MASK) != 32) {
+        cur_boot_args.video.depth != 30) {
         cur_boot_args.video.base = fb_pa;
         cur_boot_args.video.stride = stride;
         cur_boot_args.video.width = tbest.width;
         cur_boot_args.video.height = tbest.height;
-        /*
-         * FMT_BGRA is the Windows/UEFI-compatible 8:8:8:8 surface selected by
-         * display_swap().  Keep the boot-args depth in sync with that DCP
-         * surface so the next stage does not reinterpret it as w30r.
-         */
-        cur_boot_args.video.depth = 32 | (opts.retina ? FB_DEPTH_FLAG_RETINA : 0);
+        cur_boot_args.video.depth = 30 | (opts.retina ? FB_DEPTH_FLAG_RETINA : 0);
         reinit = true;
     }
 
@@ -659,14 +642,6 @@ int display_init(void)
     if ((cur_boot_args.video.width == 640 && cur_boot_args.video.height == 1136) &&
         chip_id != S5L8960X) {
         printf("display: Dummy framebuffer found, initializing display\n");
-        return display_configure(NULL);
-    } else if (adt_is_compatible(adt, 0, "J414sAP")) {
-        /*
-         * iBoot leaves the internal panel on a w30r framebuffer.  Convert it
-         * to the BGRA surface required by the UEFI/Windows handoff before the
-         * proxy host snapshots boot_args for the guest.
-         */
-        printf("display: J414s internal panel, configuring Windows BGRA handoff\n");
         return display_configure(NULL);
     } else if (display_is_external && is_mac) {
         printf("display: External display found, reconfiguring\n");

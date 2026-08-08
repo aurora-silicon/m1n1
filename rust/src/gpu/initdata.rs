@@ -729,70 +729,6 @@ fn chip_hwcfg() -> Option<&'static HwConfig> {
     })
 }
 
-/// Which arm of the (gpu_gen, gpu_variant, compat_maj, compat_min) match in
-/// [`fill_gpu_initdata_inner`] actually produced the bytes.
-///
-/// This is the ONLY field that says what the generated data *is*. Everything
-/// else -- chip id, variant, firmware version -- says what the machine was, and
-/// a consumer that checks only those is correlating, not identifying. Kept in
-/// sync with `GPU_HANDOFF_V1_BUILDER_*` in `src/gpu_handoff_abi.h`.
-pub const GPU_BUILDER_ARM_NONE: u32 = 0;
-pub const GPU_BUILDER_ARM_G13_V12_3: u32 = 1;
-pub const GPU_BUILDER_ARM_G14_V12_4: u32 = 2;
-pub const GPU_BUILDER_ARM_G13_V13_5: u32 = 3;
-pub const GPU_BUILDER_ARM_G14_V13_5: u32 = 4;
-pub const GPU_BUILDER_ARM_G14X_V13_5: u32 = 5;
-
-/// Everything the Windows side needs to *identify* a generated initdata triple,
-/// emitted by the same call that produced the bytes.
-///
-/// Deliberately NOT re-derivable after the fact: a second pass over the ADT and
-/// the GPU registers would agree with the first on a healthy boot and would
-/// therefore only ever confirm itself.
-#[repr(C)]
-pub struct GpuInitdataIdent {
-    pub chip_id: u32,
-    pub gpu_gen: u32,
-    pub gpu_variant: u32,
-    pub gpu_core: u32,
-    pub gpu_rev_id: u32,
-    pub num_cores: u32,
-    pub compat_maj: u32,
-    pub compat_min: u32,
-    pub data_a_size: u32,
-    pub data_b_size: u32,
-    pub globals_size: u32,
-    pub builder_arm: u32,
-}
-
-/*
- * The AppleAgxGpu Windows KMD hardcodes these three lengths as
- * NTASI_AGX_INITDATA_G14X_V13_5_{HWDATA_A,HWDATA_B,GLOBALS}_SIZE
- * (AuroraSilicon/drivers/AppleAgxGpu/cores/agx-initdata-core/agx_initdata.h)
- * and validates the payloads it is handed against them exactly.
- *
- * If this generator's G14X/13.5 layout ever stops matching, the two trees have
- * silently diverged and the driver would be handed a differently-shaped graph
- * of the right length class. Fail the m1n1 BUILD instead: this costs nothing at
- * run time and it is checkable offline, without hardware.
- */
-const _: () = assert!(
-    mem::size_of::<raw::HwDataAG14XV13_5>() == 0x6c34,
-    "HwDataA G14X V13.5 must match NTASI_AGX_INITDATA_G14X_V13_5_HWDATA_A_SIZE"
-);
-const _: () = assert!(
-    mem::size_of::<raw::HwDataBG14XV13_5>() == 0x1884,
-    "HwDataB G14X V13.5 must match NTASI_AGX_INITDATA_G14X_V13_5_HWDATA_B_SIZE"
-);
-const _: () = assert!(
-    mem::size_of::<raw::GlobalsG14XV13_5>() == 0x1715c,
-    "Globals G14X V13.5 must match NTASI_AGX_INITDATA_G14X_V13_5_GLOBALS_SIZE"
-);
-const _: () = assert!(
-    mem::offset_of!(raw::GlobalsG14XV13_5, pending_submissions) == 0xd1c0,
-    "Globals G14X V13.5 pending_submissions must match the AppleAgxGpu runtime ABI"
-);
-
 #[no_mangle]
 pub unsafe extern "C" fn rust_gpu_initdata_size(
     compat_maj: u32,
@@ -885,32 +821,6 @@ pub unsafe extern "C" fn rust_fill_gpu_initdata(
     data_a: *mut c_void,
     data_b: *mut c_void,
     globals: *mut c_void,
-) -> i32 {
-    unsafe { fill_gpu_initdata_inner(ins, data_a, data_b, globals, core::ptr::null_mut()) }
-}
-
-/// As [`rust_fill_gpu_initdata`], but also reports which generator arm ran and
-/// on what silicon, from inside the same call that wrote the bytes.
-///
-/// `ident` may be null. On failure it is left untouched, so a caller that
-/// zeroed it sees `builder_arm == GPU_BUILDER_ARM_NONE`.
-#[no_mangle]
-pub unsafe extern "C" fn rust_fill_gpu_initdata_stamped(
-    ins: *const InitdataInputs,
-    data_a: *mut c_void,
-    data_b: *mut c_void,
-    globals: *mut c_void,
-    ident: *mut GpuInitdataIdent,
-) -> i32 {
-    unsafe { fill_gpu_initdata_inner(ins, data_a, data_b, globals, ident) }
-}
-
-unsafe fn fill_gpu_initdata_inner(
-    ins: *const InitdataInputs,
-    data_a: *mut c_void,
-    data_b: *mut c_void,
-    globals: *mut c_void,
-    ident: *mut GpuInitdataIdent,
 ) -> i32 {
     let ins = unsafe { &*ins };
     let hwcfg = if let Some(h) = chip_hwcfg() {
@@ -1067,7 +977,7 @@ unsafe fn fill_gpu_initdata_inner(
             num_frags: num_cores,
         },
     };
-    let (builder_arm, data_a_size, data_b_size, globals_size) = unsafe {
+    unsafe {
         match (
             hwcfg.gpu_gen,
             hwcfg.gpu_variant,
@@ -1081,12 +991,6 @@ unsafe fn fill_gpu_initdata_inner(
                 InitDataBuilderG13V12_3::hwdata_b(hwcfg, &dyncfg, data_b);
                 let globals = &mut *(globals as *mut raw::GlobalsG13V12_3);
                 InitDataBuilderG13V12_3::globals(hwcfg, &dyncfg.pwr, globals);
-                (
-                    GPU_BUILDER_ARM_G13_V12_3,
-                    mem::size_of::<raw::HwDataAG13V12_3>(),
-                    mem::size_of::<raw::HwDataBG13V12_3>(),
-                    mem::size_of::<raw::GlobalsG13V12_3>(),
-                )
             }
             (hw::GpuGen::G14, hw::GpuVariant::G, 12, 4) => {
                 let data_a = &mut *(data_a as *mut raw::HwDataAG14V12_4);
@@ -1095,12 +999,6 @@ unsafe fn fill_gpu_initdata_inner(
                 InitDataBuilderG14V12_4::hwdata_b(hwcfg, &dyncfg, data_b);
                 let globals = &mut *(globals as *mut raw::GlobalsG14V12_4);
                 InitDataBuilderG14V12_4::globals(hwcfg, &dyncfg.pwr, globals);
-                (
-                    GPU_BUILDER_ARM_G14_V12_4,
-                    mem::size_of::<raw::HwDataAG14V12_4>(),
-                    mem::size_of::<raw::HwDataBG14V12_4>(),
-                    mem::size_of::<raw::GlobalsG14V12_4>(),
-                )
             }
             (hw::GpuGen::G13, _, 13, 5) => {
                 let data_a = &mut *(data_a as *mut raw::HwDataAG13V13_5);
@@ -1109,12 +1007,6 @@ unsafe fn fill_gpu_initdata_inner(
                 InitDataBuilderG13V13_5::hwdata_b(hwcfg, &dyncfg, data_b);
                 let globals = &mut *(globals as *mut raw::GlobalsG13V13_5);
                 InitDataBuilderG13V13_5::globals(hwcfg, &dyncfg.pwr, globals);
-                (
-                    GPU_BUILDER_ARM_G13_V13_5,
-                    mem::size_of::<raw::HwDataAG13V13_5>(),
-                    mem::size_of::<raw::HwDataBG13V13_5>(),
-                    mem::size_of::<raw::GlobalsG13V13_5>(),
-                )
             }
             (hw::GpuGen::G14, hw::GpuVariant::G, 13, 5) => {
                 let data_a = &mut *(data_a as *mut raw::HwDataAG14V13_5);
@@ -1123,12 +1015,6 @@ unsafe fn fill_gpu_initdata_inner(
                 InitDataBuilderG14V13_5::hwdata_b(hwcfg, &dyncfg, data_b);
                 let globals = &mut *(globals as *mut raw::GlobalsG14V13_5);
                 InitDataBuilderG14V13_5::globals(hwcfg, &dyncfg.pwr, globals);
-                (
-                    GPU_BUILDER_ARM_G14_V13_5,
-                    mem::size_of::<raw::HwDataAG14V13_5>(),
-                    mem::size_of::<raw::HwDataBG14V13_5>(),
-                    mem::size_of::<raw::GlobalsG14V13_5>(),
-                )
             }
             (hw::GpuGen::G14, _, 13, 5) => {
                 let data_a = &mut *(data_a as *mut raw::HwDataAG14XV13_5);
@@ -1137,12 +1023,6 @@ unsafe fn fill_gpu_initdata_inner(
                 InitDataBuilderG14XV13_5::hwdata_b(hwcfg, &dyncfg, data_b);
                 let globals = &mut *(globals as *mut raw::GlobalsG14XV13_5);
                 InitDataBuilderG14XV13_5::globals(hwcfg, &dyncfg.pwr, globals);
-                (
-                    GPU_BUILDER_ARM_G14X_V13_5,
-                    mem::size_of::<raw::HwDataAG14XV13_5>(),
-                    mem::size_of::<raw::HwDataBG14XV13_5>(),
-                    mem::size_of::<raw::GlobalsG14XV13_5>(),
-                )
             }
             _ => {
                 println!(
@@ -1151,25 +1031,6 @@ unsafe fn fill_gpu_initdata_inner(
                 );
                 return -1;
             }
-        }
-    };
-
-    if !ident.is_null() {
-        unsafe {
-            (*ident) = GpuInitdataIdent {
-                chip_id: hwcfg.chip_id,
-                gpu_gen: hwcfg.gpu_gen as u32,
-                gpu_variant: hwcfg.gpu_variant as u32,
-                gpu_core: hwcfg.gpu_core as u32,
-                gpu_rev_id: gpu_rev_id as u32,
-                num_cores,
-                compat_maj: ins.compat_maj,
-                compat_min: ins.compat_min,
-                data_a_size: data_a_size as u32,
-                data_b_size: data_b_size as u32,
-                globals_size: globals_size as u32,
-                builder_arm,
-            };
         }
     }
     0

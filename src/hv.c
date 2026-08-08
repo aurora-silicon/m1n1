@@ -1,23 +1,18 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "hv.h"
-#include "hv_tpm.h"
 #include "assert.h"
 #include "cpu_regs.h"
 #include "display.h"
 #include "gxf.h"
 #include "memory.h"
-#include "mtp_handoff.h"
 #include "pcie.h"
-#include "platform_identity.h"
 #include "smp.h"
 #include "string.h"
 #include "usb.h"
 #include "utils.h"
-#include "adt.h"
-#include "xnuboot.h"
 
-#define HV_TICK_RATE      5000
+#define HV_TICK_RATE      1000
 #define HV_SLOW_TICK_RATE 1
 
 DECLARE_SPINLOCK(bhl);
@@ -37,19 +32,6 @@ static bool hv_has_ecv;
 static bool hv_should_exit[MAX_CPUS];
 bool hv_started_cpus[MAX_CPUS];
 u64 hv_cpus_in_guest;
-/*
- * Set for the duration of hv_rendezvous().  hv_cpus_in_guest is cleared ONLY by
- * hv_exc_entry(), and hv_exc_sync()'s fast path -- the one that handles an
- * Apple IMPDEF MSR trap and returns straight to the guest -- deliberately skips
- * it.  A CPU taking those traps back to back therefore stays marked "in guest"
- * no matter how many it services, and a rendezvous requested by any other core
- * can never complete.  Measured on the J414s: CPU 0 runs the pure-AIC software
- * timer reflection, its breadcrumbs read `Sa#sSa#s` (two full fast-path turns,
- * no slow-path entry) while every other CPU ends in `F`, and the HV panics with
- * "Failed to rendezvous, missing CPUs: 0x1".  The fast path consults this flag
- * so it can take the slow round trip exactly when one is outstanding.
- */
-u64 hv_rendezvous_pending;
 u64 hv_saved_sp[MAX_CPUS];
 
 struct hv_secondary_info_t {
@@ -65,63 +47,15 @@ struct hv_secondary_info_t {
     uint64_t cnthctl;
     uint64_t sprr_config;
     uint64_t gxf_config;
+    uint64_t agt_cnt_rdir_el1;
+    uint64_t agt_cnt_rdir_el12;
 };
 
 static struct hv_secondary_info_t hv_secondary_info;
-static u64 hv_secondary_regs[MAX_CPUS][4];
 
-/*
- * Windows ARM64 owns x18 as its KPCR alias while Apple's host ABI reserves x18.
- * m1n1's exception assembly therefore preserves the guest register verbatim.
- * The remaining Apple-specific requirement is the CPU retention policy: mode 2
- * is the clock-gate-only WFI mode, and CYC_OVRD_DISABLE_WFI_RET must be clear.
- * That bit survives some secondary stop/start chains and, when set, hardware can
- * return from WFI with most of the guest register file lost. Enforce both parts
- * of the policy on every CPU before Windows runs.
- */
-static void hv_configure_guest_wfi_mode(void)
+void hv_init(void)
 {
-    if (!cpu_features->cyc_ovrd)
-        return;
-
-#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
-    const u64 mode = 2;
-#else
-    const u64 mode = 0;
-#endif
-    reg_mask(SYS_IMP_APL_CYC_OVRD,
-             CYC_OVRD_WFI_MODE_MASK | CYC_OVRD_DISABLE_WFI_RET,
-             CYC_OVRD_WFI_MODE(mode));
-    sysop("isb");
-
-    u64 value = mrs(SYS_IMP_APL_CYC_OVRD);
-    printf("HV: guest WFI mode %lu retention %s on CPU %d (CYC_OVRD=0x%lx)\n",
-           FIELD_GET(CYC_OVRD_WFI_MODE_MASK, value),
-           value & CYC_OVRD_DISABLE_WFI_RET ? "disabled" : "enabled",
-           smp_id(), value);
-}
-
-int hv_init(void)
-{
-    // Relinquish every USB controller except the one carrying this proxy.
-    // The guest can then reset those DWC3 blocks into host mode and own their
-    // DARTs without stale m1n1 device-mode endpoints or DMA mappings. A failed
-    // armed ATCPHY re-apply can leave an undefined PIPE topology, so stop the
-    // initialization and report failure to the proxy caller.
-    if (usb_iodev_shutdown_except(uartproxy_iodev) < 0)
-        return -1;
-
     pcie_shutdown();
-#if defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && defined(ENABLE_J414S_WINDOWS_USB_HOST_HANDOFF)
-    /*
-     * The internal PHY host signal does not control connector VBUS.  Put each
-     * unused J414s CD3217/TPS6598x policy controller into its source-preferred
-     * dual-role configuration while its IRQs are still masked.  The exact
-     * proxy-selected controller remains untouched.
-     */
-    if (platform_is_j414s())
-        usb_hpm_handoff_host(uartproxy_iodev);
-#endif
     // Make sure we wake up DCP if we put it to sleep, just quiesce it to match ADT
     if (display_is_external && display_start_dcp() >= 0)
         display_shutdown(DCP_QUIESCED);
@@ -133,121 +67,30 @@ int hv_init(void)
 
     hv_pt_init();
 
-#if defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && defined(ENABLE_J414S_WINDOWS_MTP_HANDOFF)
-    /*
-     * J414s-only Windows preboot handoff.  It boots the MTP IOP and prepares
-     * DAPF/DART, but leaves DockChannel INIT/ring ownership to AppleMtpHid.
-     * The helper has a second runtime chip/board guard; other m1n1 guests are
-     * therefore unaffected even when this Windows build option is compiled.
-     */
-    mtp_handoff_init();
-#endif
-
     // Configure hypervisor defaults
-
-    //
-    // UNKNOWN: do we need to bring TGE back? might have misunderstood why it was there at the start.
-    // leaving it off for now.
-    //
-#ifndef ENABLE_VGIC_MODULE
     hv_write_hcr(HCR_API | // Allow PAuth instructions
                  HCR_APK | // Allow PAuth key registers
                  HCR_TEA | // Trap external aborts
+                 HCR_E2H | // VHE mode (forced)
                  HCR_RW |  // AArch64 guest
-                 HCR_TSC | // Trap SMC exceptions (only writable on Blizzard/Avalanche cores as the previous generations used a chicken bit for this.)
                  HCR_AMO | // Trap SError exceptions
-                 HCR_IMO | // Trap IRQ exceptions (for now)
-                 HCR_FMO | // Trap FIQ exceptions (effectively required for now)
                  HCR_VM);  // Enable stage 2 translation
-#elif defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
-    //
-    // windows-native-aic transform -- primary HCR_EL2 site (secondary cores inherit
-    // this exact value verbatim, see hv_secondary_info.hcr below and
-    // hv_init_secondary()). See docs/windows-native-aic.md for the full design.
-    //
-    // Mu and Windows both drive the physical AIC directly, so ordinary IRQs never
-    // route through EL2 and no virtual GIC is exposed.  FMO starts set while Mu's
-    // VBAR is still zero.  FMO remains set throughout: before ExitBootServices,
-    // Mu receives timer ticks through reserved native-AIC software lines; after
-    // ExitBootServices, Windows receives a per-CPU HCR.VI doorbell and AIC
-    // EVENT(2/3).  No vGIC state is exposed for the Windows-ready timer path.
-    //
-    // HCR_EL2.FMO stays set: the Apple timer is FIQ-only (there is no IRQ-mode timer
-    // delivery on this hardware) and physical FIQs must keep trapping to EL2, because
-    // Windows bugchecks (0x2B/0x3D) if a raw FIQ is ever delivered to EL1. m1n1
-    // intercepts the timer FIQ, masks the physical source, and reflects it through
-    // the Windows-ready synthetic AIC EVENT(2/3) bridge.  A guest timer write is the
-    // completion/re-arm edge; the Mu-only reserved software lines are not used for
-    // steady-state Windows delivery.
-    //
-    // HCR_EL2.TID3 is kept: it is unrelated to IRQ/FIQ routing. It still lets m1n1 OR
-    // in the "GICv3 CPU interface present" bit on a trapped ID_AA64PFR0_EL1 read
-    // (hv_exc.c, SYSREG_ISS(ID_AA64PFR0_EL1) case) for whatever UEFI/HAL GIC probing
-    // logic may still run before/alongside the native AIC HAL extension; the vGIC
-    // virtual CPU interface itself (ICH_*) is left enabled per-core (see
-    // hv_vgicv3_enable_virtual_interrupts() calls below and in hv_init_secondary())
-    // but is no longer used for timer delivery, only for the pre-existing, vestigial
-    // ICC_SGI1R_EL1 SGI-emulation path -- see docs/windows-native-aic.md.
-    //
-    hv_write_hcr(HCR_API | // Allow PAuth instructions
-                 HCR_APK | // Allow PAuth key registers
-                 HCR_TEA | // Trap external aborts
-                 HCR_RW |  // AArch64 guest
-                 HCR_TSC | // Trap SMC exceptions (only writable on Blizzard/Avalanche cores as the previous generations used a chicken bit for this.)
-                 HCR_TID3 | // Trap ID group 3 registers (AA64 PFR, MMFR, ISAR, AFR ID registers) - required to support the vanilla ArmGicDxe UEFI driver.
-                 HCR_AMO | // Trap SError exceptions
-                 HCR_FMO | // Hold timer FIQ until Mu's AIC and timer handlers are ready.
-                 HCR_VM);  // Enable stage 2 translation
-#else
-    hv_write_hcr(HCR_API | // Allow PAuth instructions
-                 HCR_APK | // Allow PAuth key registers
-                 HCR_TEA | // Trap external aborts
-                 HCR_RW |  // AArch64 guest
-                 HCR_TSC | // Trap SMC exceptions (only writable on Blizzard/Avalanche cores as the previous generations used a chicken bit for this.)
-                 HCR_TID3 | // Trap ID group 3 registers (AA64 PFR, MMFR, ISAR, AFR ID registers) - required to support the vanilla ArmGicDxe UEFI driver.
-                 HCR_AMO | // Trap SError exceptions
-                 HCR_IMO | // Trap IRQ exceptions (for now)
-                 HCR_FMO | // Trap FIQ exceptions (effectively required for now)
-                 HCR_VM);  // Enable stage 2 translation
-#endif
 
     // No guest vectors initially
     msr(VBAR_EL12, 0);
 
-    //set up a HACR bit (56)
-    printf("DEBUG: setting up HACR\n");
-    uint64_t hacr_val = mrs(HACR_EL2);
-    hacr_val |= BIT(56);
-    msr(HACR_EL2, hacr_val);
-
-    //
-    // m1n1_windows change: initialize PSCI.
-    //
-    printf("DEBUG: setting up PSCI\n");
-    hv_psci_init();
-#ifdef ENABLE_VGIC_MODULE
-#ifndef ENABLE_NATIVE_AIC_PASSTHROUGH
-    //
-    // m1n1_windows change: set up the vGIC
-    //
-
-    //
-    hv_vgicv3_init();
-    init_vgic_irq_queues();
-#endif
-#endif
-
     // Compute tick interval
     hv_tick_interval = mrs(CNTFRQ_EL0) / HV_TICK_RATE;
-
-    printf("HV: Host tick timer: %s\n", chip_id == T8142 ? "CNTHP_EL2" : "CNTP_EL0");
 
     hv_has_ecv = mrs(ID_AA64MMFR0_EL1) & (0xfULL << 60);
 
     if (hv_has_ecv) {
         printf("HV: ECV enabled\n");
+        // VHE uses the EL1 physical-timer view for the host tick.  Do not
+        // depend on EL1PTEN being inherited from iBoot across a soft reboot.
         reg_set(CNTHCTL_EL2,
-                CNTHCTL_EL1NVVCT | CNTHCTL_EL1NVPCT | CNTHCTL_EL1TVT | CNTHCTL_EL1PCTEN);
+                CNTHCTL_EL1NVVCT | CNTHCTL_EL1NVPCT | CNTHCTL_EL1TVT | CNTHCTL_EL1PTEN |
+                    CNTHCTL_EL1PCTEN);
         hv_secondary_tick_interval = mrs(CNTFRQ_EL0) / HV_SLOW_TICK_RATE;
     } else {
         printf("HV: No ECV supported\n");
@@ -257,13 +100,14 @@ int hv_init(void)
         hv_secondary_tick_interval = hv_tick_interval;
     }
 
-    hv_configure_guest_wfi_mode();
+    // Set deep WFI back to defaults
+    if (cpu_features->apple_sysregs_unlocked)
+        reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK, CYC_OVRD_WFI_MODE(0));
 
     sysop("dsb ishst");
     sysop("tlbi alle1is");
     sysop("dsb ish");
     sysop("isb");
-    return 0;
 }
 
 static void hv_set_gxf_vbar(void)
@@ -288,89 +132,37 @@ void hv_start(void *entry, u64 regs[4])
     if (gxf_enabled())
         gl2_call(hv_set_gxf_vbar, 0, 0, 0, 0);
 
-#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
-    /*
-     * Windows needs the GICD/GICR MMIO records advertised by Mu only while it
-     * classifies the startup controller.  Initialize those register hooks after
-     * the host's broad mappings are complete, but leave HCR.IMO clear and never
-     * enable ICH/LRs: this is a topology carrier, not an interrupt-delivery path.
-     */
-#ifdef ENABLE_VGIC_MODULE
-    hv_vgicv3_init();
-    init_vgic_irq_queues();
-#endif
-
-    /* Host MMIO mappings are complete before hv_start(), so these hooks persist. */
-    hv_native_aic_transition_init();
-#endif
-
-    //
-    // windows-native-aic: this is the "secondary CPU path" half of the HCR_EL2 update
-    // in hv_init() above.  APs started by Windows apply the current pure-AIC phase
-    // policy in hv_init_secondary() rather than inheriting a stale Mu-era FIQ state.
-    //
     hv_secondary_info.hcr = mrs(HCR_EL2);
     hv_secondary_info.hacr = mrs(HACR_EL2);
     hv_secondary_info.vtcr = mrs(VTCR_EL2);
     hv_secondary_info.vttbr = mrs(VTTBR_EL2);
     hv_secondary_info.mdcr = mrs(MDCR_EL2);
     hv_secondary_info.mdscr = mrs(MDSCR_EL1);
-    if (chip_id == T8142) {
-        printf("HV: Skipping removed AMX/AP-key state capture on T8142\n");
-        hv_secondary_info.amx_ctl = 0;
-        hv_secondary_info.apvmkeylo = 0;
-        hv_secondary_info.apvmkeyhi = 0;
-        hv_secondary_info.apsts = 0;
-    } else {
-        hv_secondary_info.amx_ctl = mrs(SYS_IMP_APL_AMX_CTL_EL2);
-        hv_secondary_info.apvmkeylo = mrs(SYS_IMP_APL_APVMKEYLO_EL2);
-        hv_secondary_info.apvmkeyhi = mrs(SYS_IMP_APL_APVMKEYHI_EL2);
-        hv_secondary_info.apsts = mrs(SYS_IMP_APL_APSTS_EL12);
-    }
+    hv_secondary_info.amx_ctl = mrs(SYS_IMP_APL_AMX_CTL_EL2);
+    hv_secondary_info.apvmkeylo = mrs(SYS_IMP_APL_APVMKEYLO_EL2);
+    hv_secondary_info.apvmkeyhi = mrs(SYS_IMP_APL_APVMKEYHI_EL2);
+    hv_secondary_info.apsts = mrs(SYS_IMP_APL_APSTS_EL12);
     hv_secondary_info.actlr_el2 = mrs(ACTLR_EL2);
     if (cpu_features->actlr_el2)
         hv_secondary_info.actlr_el1 = mrs(SYS_ACTLR_EL12);
     else
         hv_secondary_info.actlr_el1 = mrs(SYS_IMP_APL_ACTLR_EL12);
     hv_secondary_info.cnthctl = mrs(CNTHCTL_EL2);
-    if (chip_id == T8142) {
-        printf("HV: Skipping removed SPRR/GXF state capture on T8142\n");
-        hv_secondary_info.sprr_config = 0;
-        hv_secondary_info.gxf_config = 0;
-    } else {
-        hv_secondary_info.sprr_config = mrs(SYS_IMP_APL_SPRR_CONFIG_EL1);
-        hv_secondary_info.gxf_config = mrs(SYS_IMP_APL_GXF_CONFIG_EL1);
+    hv_secondary_info.sprr_config = mrs(SYS_IMP_APL_SPRR_CONFIG_EL1);
+    hv_secondary_info.gxf_config = mrs(SYS_IMP_APL_GXF_CONFIG_EL1);
+    if (cpu_features->counter_redirect) {
+        hv_secondary_info.agt_cnt_rdir_el1 = mrs(SYS_IMP_APL_AGTCNTRDIR_EL1);
+        hv_secondary_info.agt_cnt_rdir_el12 = mrs(SYS_IMP_APL_AGTCNTRDIR_EL12);
     }
 
-#if defined(ENABLE_VGIC_MODULE) && !defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
-    hv_vgicv3_enable_virtual_interrupts();
-    hv_vgicv3_init_list_registers();
-#endif
-
-    printf("HV: Arming host tick\n");
+    printf("HV: Aurora timer probe CNTHCTL_EL2=0x%lx HCR_EL2=0x%lx\n", mrs(CNTHCTL_EL2),
+           mrs(HCR_EL2));
+    sysop("isb");
     hv_arm_tick(false);
     hv_pinned_cpu = -1;
     hv_want_cpu = -1;
     hv_cpus_in_guest = BIT(smp_id());
 
-    u64 adt_base;
-    if(chip_id == T8103 || chip_id == T8112)
-        adt_base = ADT_EL2_36_BIT;
-    else
-        adt_base = ADT_EL2_42_BIT;
-
-    //map the address of the (EL2) ADT to a fixed location so EL1 can patch it
-    hv_map_hw(adt_base, (u64)adt, ALIGN_UP(cur_boot_args.devtree_size, SZ_16K));
-
-    /*
-     * TEE ACPI Profile 4.6.3 requires a TPM's Error, Cancel and Start bits to
-     * be clear when firmware hands control to the OS. No-op unless a CRB was
-     * mapped, so this is unconditional rather than gated on a flag nobody
-     * would remember to set.
-     */
-    hv_tpm_prepare_for_guest();
-
-    printf("HV: Entering guest at %p (x0=0x%lx)\n", entry, regs[0]);
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
 
     __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
@@ -407,24 +199,19 @@ void hv_start(void *entry, u64 regs[4])
 
 static void hv_init_secondary(struct hv_secondary_info_t *info)
 {
-    gxf_init();
+    if (cpu_features->apple_sysregs_unlocked)
+        gxf_init();
 
     msr(VBAR_EL1, _hv_vectors_start);
 
-    //
-    // windows-native-aic: secondary-CPU HCR_EL2 site. info->hcr is the value hv_init()
-    // computed on the boot CPU (see the primary HCR_EL2 comment there) captured by
-    // hv_start() above; this core gets the identical IMO-clear/FMO-set configuration,
-    // not a re-derived one, so there is nothing native-AIC-specific to add here beyond
-    // this note.
-    //
     msr(HCR_EL2, info->hcr);
     msr(HACR_EL2, info->hacr);
     msr(VTCR_EL2, info->vtcr);
     msr(VTTBR_EL2, info->vttbr);
     msr(MDCR_EL2, info->mdcr);
     msr(MDSCR_EL1, info->mdscr);
-    if (chip_id != T8142) {
+
+    if (cpu_features->apple_sysregs_unlocked) {
         msr(SYS_IMP_APL_AMX_CTL_EL2, info->amx_ctl);
         msr(SYS_IMP_APL_APVMKEYLO_EL2, info->apvmkeylo);
         msr(SYS_IMP_APL_APVMKEYHI_EL2, info->apvmkeyhi);
@@ -435,21 +222,23 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
         msr(SYS_ACTLR_EL12, info->actlr_el1);
     else
         msr(SYS_IMP_APL_ACTLR_EL12, info->actlr_el1);
-    msr(CNTHCTL_EL2, info->cnthctl);
-    if (chip_id != T8142) {
+    if (cpu_features->apple_sysregs_unlocked) {
         msr(SYS_IMP_APL_SPRR_CONFIG_EL1, info->sprr_config);
-        msr(SYS_IMP_APL_GXF_CONFIG_EL1, info->gxf_config);
+        /* GXF_CONFIG is UNDEF unless SPRR is enabled */
+        if (info->sprr_config & SPRR_CONFIG_EN)
+            msr(SYS_IMP_APL_GXF_CONFIG_EL1, info->gxf_config);
+    }
+    if (cpu_features->counter_redirect) {
+        msr(SYS_IMP_APL_AGTCNTRDIR_EL1, info->agt_cnt_rdir_el1);
+        msr(SYS_IMP_APL_AGTCNTRDIR_EL12, info->agt_cnt_rdir_el12);
     }
 
-#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
-    /* APs started by Windows inherit the post-EBS FIQ bridge policy. */
-    hv_native_aic_enter_cpu();
-#elif defined(ENABLE_VGIC_MODULE)
-    hv_vgicv3_enable_virtual_interrupts();
-    hv_vgicv3_init_list_registers();
-#endif
+    if (cpu_features->apple_sysregs_unlocked)
+        reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK, CYC_OVRD_WFI_MODE(0));
 
-    hv_configure_guest_wfi_mode();
+    // For M3 and up, CNTHCTL_EL2 must be written after the counter redirection
+    sysop("isb");
+    msr(CNTHCTL_EL2, info->cnthctl);
 
     if (gxf_enabled())
         gl2_call(hv_set_gxf_vbar, 0, 0, 0, 0);
@@ -486,20 +275,8 @@ void hv_start_secondary(int cpu, void *entry, u64 regs[4])
     hv_started_cpus[cpu] = true;
     __atomic_or_fetch(&hv_cpus_in_guest, BIT(cpu), __ATOMIC_ACQUIRE);
 
-    /*
-     * smp_call4() returns to the caller as soon as the target increments its
-     * acknowledgement flag, before the target necessarily dereferences the
-     * argument pointer.  PSCI's CPU_ON caller supplies a stack-local regs[];
-     * retaining that pointer races the next CPU_ON and can give an AP another
-     * processor's context ID.  Keep the guest entry registers in stable
-     * per-CPU storage for the lifetime of the asynchronous guest call.
-     */
-    memcpy(hv_secondary_regs[cpu], regs, sizeof(hv_secondary_regs[cpu]));
-    sysop("dmb sy");
-
     iodev_console_flush();
-    smp_call4(cpu, hv_enter_secondary, (u64)entry,
-              (u64)hv_secondary_regs[cpu], 0, 0);
+    smp_call4(cpu, hv_enter_secondary, (u64)entry, (u64)regs, 0, 0);
 }
 
 void hv_exit_cpu(int cpu)
@@ -511,134 +288,27 @@ void hv_exit_cpu(int cpu)
     hv_should_exit[cpu] = true;
 }
 
-/*
- * Rendezvous budget.
- *
- * The old budget was 1,000,000 iterations of a bare acquire load.  That is not
- * a duration: once every other CPU is parked on bhl the line stays clean in
- * this CPU's cache and the loop retires in a couple of cycles per iteration,
- * so the real budget was somewhere around 0.3-1 ms.  Nothing about the system
- * guarantees a collection inside that window:
- *
- *  - The only lever on a CPU that is running guest code is the IPI, and on
- *    this SoC that is an Apple Fast IPI delivered as an FIQ.  It is latched in
- *    IPI_SR_EL1 so it cannot be lost, but it is not taken while the target is
- *    already at EL2 (exception entry masks DAIF and hv_exc_entry() only clears
- *    the SError bit).  Every microsecond the target spends inside EL2 is a
- *    microsecond the requester spends spinning.
- *  - Several EL2 entries return to the guest without ever calling
- *    hv_exc_entry(), so they hold the CPU's hv_cpus_in_guest bit for their
- *    whole duration -- and some of them printf() to the console, which at UART
- *    speeds is milliseconds per line.  See the enumeration above
- *    hv_rendezvous_quiesce() in hv_exc.c.
- *  - The self-collection fallback cannot help: hv_exc_fiq()'s fast path re-arms
- *    a non-interruptible CPU with hv_secondary_tick_interval, which is one full
- *    second when ECV is available (HV_SLOW_TICK_RATE in this file).  That is
- *    three orders of magnitude past the old budget.
- *
- * So make the budget an actual duration, re-arm the IPI at a fixed cadence
- * inside it rather than exactly once, and -- most importantly -- do not kill
- * the machine when it expires.
- *
- * Measured on the J414s: roughly half of all Windows boots were lost to "HV:
- * Failed to rendezvous".  Before 575ca6c9 it always named CPU 0; afterwards it
- * named a different CPU each time (0x40/CPU 6 in one capture, whose breadcrumb
- * trail `57*89+xs` shows it had *completed* a slow-path MMIO emulation and
- * returned to the guest).  The rendezvous is a time-coherence measure for the
- * proxy -- it exists so every CPU re-enters the guest with the same
- * CNTVOFF_EL2/stolen_time -- not a safety property.  A CPU that misses one
- * picks up the current stolen_time at its next real hv_exc_exit() anyway.
- * Trading a transient timebase skew on one core against destroying the boot is
- * not a close call.
- *
- * Escalate only on evidence of a genuine hang: a CPU that is wedged (a stalled
- * MMIO access, a core that never took the FIQ) will miss every rendezvous, so
- * count consecutive misses and panic once the count is unambiguous.  That is
- * ~1.3s of accumulated stall, which no transient can produce.
- */
-#define HV_RENDEZVOUS_TIMEOUT_US    20000
-#define HV_RENDEZVOUS_IPI_PERIOD_US   250
-#define HV_RENDEZVOUS_MAX_MISSES       64
-
-/*
- * Every hv_rendezvous() caller holds bhl (_hv_exc_proxy(), and hv_switch_cpu()
- * from the proxy request handler, which runs inside uartproxy_run()), so this
- * needs no atomics.
- */
-static u32 hv_rendezvous_misses;
-
-static u64 hv_usecs_to_ticks(u32 usecs)
-{
-    return (mrs(CNTFRQ_EL0) * (u64)usecs) / 1000000;
-}
-
 void hv_rendezvous(void)
 {
+    int timeout = 1000000;
+
     if (!__atomic_load_n(&hv_cpus_in_guest, __ATOMIC_ACQUIRE))
         return;
 
-    /*
-     * Publish BEFORE the IPIs.  A CPU already inside one of the fast paths will
-     * not take the IPI until it next opens an FIQ window, and if it is
-     * servicing a dense stream of IMPDEF MSR traps that window may never come.
-     * The flag lets that CPU notice the rendezvous from inside the fast path
-     * itself rather than depending on interrupt delivery.
-     */
-    __atomic_store_n(&hv_rendezvous_pending, 1, __ATOMIC_RELEASE);
-
-    u64 ipi_period = hv_usecs_to_ticks(HV_RENDEZVOUS_IPI_PERIOD_US);
-    u64 now = mrs(CNTPCT_EL0);
-    u64 deadline = now + hv_usecs_to_ticks(HV_RENDEZVOUS_TIMEOUT_US);
-    u64 next_ipi = now; /* fire the first round immediately */
-    u64 missing;
-
-    for (;;) {
-        missing = __atomic_load_n(&hv_cpus_in_guest, __ATOMIC_ACQUIRE);
-        if (!missing) {
-            __atomic_store_n(&hv_rendezvous_pending, 0, __ATOMIC_RELEASE);
-            hv_rendezvous_misses = 0;
-            return;
+    /* IPI all CPUs. This might result in spurious IPIs to the guest... */
+    for (int i = 0; i < MAX_CPUS; i++) {
+        if (i != smp_id() && hv_started_cpus[i]) {
+            smp_send_ipi(i);
         }
-
-        now = mrs(CNTPCT_EL0);
-
-        if ((s64)(now - next_ipi) >= 0) {
-            /*
-             * Re-IPI on a cadence, not just once.  A CPU that was at EL2 with
-             * FIQs masked when the first IPI landed does take it on its next
-             * eret, so the retry is usually redundant -- but it costs nothing
-             * here and it is the only recovery if an edge is ever dropped.
-             * Poke only the CPUs still marked in-guest: one that has already
-             * left is parked on bhl or legitimately back in the guest, and a
-             * spurious IPI there is a cost paid by the guest.
-             */
-            for (int i = 0; i < MAX_CPUS; i++) {
-                if (i != smp_id() && hv_started_cpus[i] && (missing & BIT(i))) {
-                    smp_send_ipi(i);
-                }
-            }
-            next_ipi = now + ipi_period;
-        }
-
-        if ((s64)(now - deadline) >= 0)
-            break;
     }
 
-    __atomic_store_n(&hv_rendezvous_pending, 0, __ATOMIC_RELEASE);
+    while (timeout--) {
+        if (!__atomic_load_n(&hv_cpus_in_guest, __ATOMIC_ACQUIRE))
+            return;
+    }
 
-    if (++hv_rendezvous_misses >= HV_RENDEZVOUS_MAX_MISSES)
-        hv_panic("HV: %u consecutive failed rendezvous, missing CPUs: 0x%lx (current: %d)\n",
-                 hv_rendezvous_misses, missing, smp_id());
-
-    /*
-     * Loud, but not fatal.  The missing CPU keeps running the guest with a
-     * stale CNTVOFF_EL2 until its next hv_exc_exit(); the proxy transaction we
-     * are about to run proceeds without it.
-     */
-    printf("HV: rendezvous incomplete after %d us (miss %u of %d), missing CPUs: 0x%lx "
-           "(current: %d); continuing\n",
-           HV_RENDEZVOUS_TIMEOUT_US, hv_rendezvous_misses, HV_RENDEZVOUS_MAX_MISSES, missing,
-           smp_id());
+    hv_panic("HV: Failed to rendezvous, missing CPUs: 0x%lx (current: %d)\n",
+             __atomic_load_n(&hv_cpus_in_guest, __ATOMIC_ACQUIRE), smp_id());
 }
 
 bool hv_switch_cpu(int cpu)
@@ -724,36 +394,11 @@ void hv_set_elr(u64 val)
 
 void hv_arm_tick(bool secondary)
 {
-    u64 interval = secondary ? hv_secondary_tick_interval : hv_tick_interval;
-
-    /*
-     * T8142 faults on direct CNTP_*_EL0 accesses from the VHE host context.
-     * Keep CNTP_*_EL02 exclusively for the guest and use the EL2 physical
-     * timer for m1n1's own periodic tick on this generation.
-     */
-    if (chip_id == T8142) {
-        msr(SYS_CNTHP_TVAL_EL2, interval);
-        msr(SYS_CNTHP_CTL_EL2, CNTx_CTL_ENABLE);
-    } else {
-        msr(CNTP_TVAL_EL0, interval);
-        msr(CNTP_CTL_EL0, CNTx_CTL_ENABLE);
-    }
-}
-
-bool hv_mask_pending_tick(void)
-{
-    u64 ctl = chip_id == T8142 ? mrs(SYS_CNTHP_CTL_EL2) : mrs(CNTP_CTL_EL0);
-
-    if (ctl != (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE))
-        return false;
-
-    ctl = CNTx_CTL_ISTATUS | CNTx_CTL_IMASK | CNTx_CTL_ENABLE;
-    if (chip_id == T8142)
-        msr(SYS_CNTHP_CTL_EL2, ctl);
+    if (secondary)
+        msr(CNTP_TVAL_EL0, hv_secondary_tick_interval);
     else
-        msr(CNTP_CTL_EL0, ctl);
-
-    return true;
+        msr(CNTP_TVAL_EL0, hv_tick_interval);
+    msr(CNTP_CTL_EL0, CNTx_CTL_ENABLE);
 }
 
 void hv_maybe_exit(void)

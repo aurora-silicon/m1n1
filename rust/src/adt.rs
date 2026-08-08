@@ -69,6 +69,76 @@ impl<'a> Iterator for ADTPropertyStringIterator<'a> {
     }
 }
 
+/// ADTPropertiesIterator
+#[derive(Debug)]
+pub struct ADTPropertiesIterator {
+    next_property_res: Option<Result<&'static ADTProperty, AdtError>>,
+    remaining: usize,
+}
+
+impl Iterator for ADTPropertiesIterator {
+    type Item = Result<&'static ADTProperty, AdtError>;
+
+    fn next(&mut self) -> Option<Result<&'static ADTProperty, AdtError>> {
+        let Some(property_res) = self.next_property_res.take() else {
+            return None;
+        };
+        let remaining = core::mem::take(&mut self.remaining);
+        let property = match property_res {
+            Err(e) => return Some(Err(e)),
+            Ok(v) => v,
+        };
+
+        if remaining > 1 {
+            self.next_property_res = Some(property.next_property());
+            self.remaining = remaining - 1;
+        }
+
+        Some(Ok(property))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for ADTPropertiesIterator {}
+
+/// ADTPropertiesIteratorMut
+#[derive(Debug)]
+pub struct ADTPropertiesIteratorMut {
+    next_property_res: Option<Result<&'static mut ADTProperty, AdtError>>,
+    remaining: usize,
+}
+
+impl Iterator for ADTPropertiesIteratorMut {
+    type Item = Result<&'static mut ADTProperty, AdtError>;
+
+    fn next(&mut self) -> Option<Result<&'static mut ADTProperty, AdtError>> {
+        let Some(property_res) = self.next_property_res.take() else {
+            return None;
+        };
+        let remaining = core::mem::take(&mut self.remaining);
+        let property = match property_res {
+            Err(e) => return Some(Err(e)),
+            Ok(v) => v,
+        };
+
+        if remaining > 1 {
+            self.next_property_res = Some(property.next_property_mut());
+            self.remaining = remaining - 1;
+        }
+
+        Some(Ok(property))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for ADTPropertiesIteratorMut {}
+
 #[repr(C, packed(1))]
 pub struct ADTSegmentRanges {
     phys: u64,
@@ -211,7 +281,11 @@ pub fn get_reg_container(
             }
         };
 
-        let ranges = node.named_prop("ranges")?;
+        let ranges = match node.named_prop("ranges") {
+            Ok(r) => r,
+            Err(AdtError::NotFound) => break,
+            Err(e) => return Err(e),
+        };
 
         let paddr_cells = parent.named_prop("#address-cells")?.u32()?;
 
@@ -358,16 +432,28 @@ impl ADTNode {
         unsafe { ADTProperty::from_ptr_mut(self.as_ptr().add(size_of::<ADTNode>()) as usize) }
     }
 
+    pub fn properties(&self) -> ADTPropertiesIterator {
+        ADTPropertiesIterator {
+            next_property_res: Some(self.first_property()),
+            remaining: self.property_count as usize,
+        }
+    }
+
+    pub fn properties_mut(&self) -> ADTPropertiesIteratorMut {
+        ADTPropertiesIteratorMut {
+            next_property_res: Some(self.first_property_mut()),
+            remaining: self.property_count as usize,
+        }
+    }
+
     /// Walk the properties at the top of the curret node's memory to arrive at
     /// the node immediately following it. This could be a child node or a sibling.
     /// Use the relevant wrappers for additional safety.
     fn next_node(&self) -> Result<&'static ADTNode, AdtError> {
-        let mut p = self.first_property()?;
-
-        // We already have the first property
-        for _ in 0..self.property_count - 1 {
-            p = p.next_property()?;
-        }
+        let p = self.properties()
+            .last()
+            .unwrap() // There is always at least the first property, or an error
+            ?;
 
         // SAFETY: We will only ever reach this code when we can guarantee that
         // p is a reference to the very last property of the node, meaning that
@@ -396,13 +482,11 @@ impl ADTNode {
     /// Searches the node for a property with the given name, and returns it if
     /// found.
     pub fn named_prop(&self, name: &str) -> Result<&'static ADTProperty, AdtError> {
-        let mut p = self.first_property()?;
-
-        for _ in 0..self.property_count {
+        for p in self.properties() {
+            let p = p?;
             if p.name() == name {
                 return Ok(p);
             }
-            p = p.next_property()?;
         }
         Err(AdtError::NotFound)
     }
@@ -414,13 +498,11 @@ impl ADTNode {
     /// Searches the node for a property with the given name, and returns a mutable
     /// reference to it if found.
     pub fn named_prop_mut(&self, name: &str) -> Result<&'static mut ADTProperty, AdtError> {
-        let mut p = self.first_property_mut()?;
-
-        for _ in 0..self.property_count {
+        for p in self.properties_mut() {
+            let p = p?;
             if p.name() == name {
                 return Ok(p);
             }
-            p = p.next_property_mut()?;
         }
         Err(AdtError::NotFound)
     }
@@ -454,8 +536,11 @@ impl ADTNode {
     }
 
     pub fn is_compatible(&self, compatible: &str) -> Result<bool, AdtError> {
-        let prop = self.named_prop("compatible")?;
-        Ok(prop.str_iter().any(|c| c == compatible))
+        match self.named_prop("compatible") {
+            Ok(prop) => Ok(prop.str_iter().any(|c| c == compatible)),
+            Err(AdtError::NotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn compatible(&self, index: usize) -> Option<&str> {
@@ -655,6 +740,21 @@ pub unsafe extern "C" fn adt_first_property_offset(_dt: *const c_void, offset: c
     unsafe { p.sub(adt as usize) as c_int }
 }
 
+// This function has load-bearing UB on the C side... The sound Rust equivalent
+// breaks this. Recreate the UB here rather than call the new Rust function.
+#[no_mangle]
+pub unsafe extern "C" fn adt_next_property_offset(_dt: *const c_void, offset: c_int) -> c_int {
+    let ptr: usize = unsafe { adt.add(offset as usize) as usize };
+    let p = ADTProperty::from_ptr(ptr).unwrap();
+    unsafe {
+        p.as_ptr()
+            .add(size_of::<[c_char; 32]>())
+            .add(size_of::<u32>())
+            .add((p.size as usize + (ADT_ALIGN - 1)) & !(ADT_ALIGN - 1))
+            .sub(adt as usize) as c_int
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn adt_first_child_offset(_dt: *const c_void, offset: c_int) -> c_int {
     let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
@@ -816,27 +916,10 @@ pub unsafe extern "C" fn adt_is_compatible(
 ) -> bool {
     let strcompat: &str = unsafe { CStr::from_ptr(compat).to_str().unwrap() };
     let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-
-    //
-    // Both of these used to be .unwrap(), which panics the whole of m1n1.
-    //
-    // is_compatible() returns Err(NotFound) when the node simply has no
-    // "compatible" property, which is perfectly normal -- plenty of ADT nodes
-    // have none. The C API this replaced returned false in that case, and every
-    // caller here treats the result as a plain boolean predicate, so a missing
-    // property must mean "not compatible", not "abort".
-    //
-    // Hit on T8142 after chainload.py pushes its re-serialised ADT and m1n1
-    // reloads: startup calls adt_is_compatible() on a node without the property
-    // and panics at this line, taking the machine down before the chainloaded
-    // payload ever runs.
-    //
-    let node = match ADTNode::from_ptr(ptr) {
-        Ok(node) => node,
-        Err(_) => return false,
-    };
-
-    node.is_compatible(strcompat).unwrap_or(false)
+    ADTNode::from_ptr(ptr)
+        .unwrap()
+        .is_compatible(strcompat)
+        .unwrap()
 }
 
 #[no_mangle]
@@ -854,24 +937,7 @@ pub unsafe extern "C" fn adt_is_compatible_at(
 #[no_mangle]
 pub unsafe extern "C" fn adt_get_name(_dt: *const c_void, offset: c_int) -> *const c_char {
     let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-
-    //
-    // Same panic hazard as adt_is_compatible() above: two .unwrap()s on a path
-    // that C callers expect to fail softly. Return an empty string rather than a
-    // null pointer -- callers like usb.c do check for NULL, but others pass the
-    // result straight to strcmp(), and an empty string is safe for both.
-    //
-    static EMPTY: &[u8] = b"\0";
-
-    let node = match ADTNode::from_ptr(ptr) {
-        Ok(node) => node,
-        Err(_) => return EMPTY.as_ptr() as *const c_char,
-    };
-
-    match node.name() {
-        Ok(name) => name.as_ptr() as *const c_char,
-        Err(_) => EMPTY.as_ptr() as *const c_char,
-    }
+    ADTNode::from_ptr(ptr).unwrap().name().unwrap().as_ptr() as *const c_char
 }
 
 #[no_mangle]

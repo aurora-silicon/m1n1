@@ -42,9 +42,6 @@
 #define NVME_LINEAR_SQ_CTRL    0x24908
 #define NVME_LINEAR_SQ_CTRL_EN BIT(0)
 
-#define NVME_UNKNOWN_CTRL                0x24008
-#define NVME_UNKNOWN_CTRL_PRP_NULL_CHECK BIT(11)
-
 #define NVME_MAX_PEND_CMDS_CTRL 0x1210
 #define NVME_DB_LINEAR_ASQ      0x2490c
 #define NVME_DB_LINEAR_IOSQ     0x24910
@@ -64,6 +61,9 @@
 #define NVME_CMD_FLUSH 0x00
 #define NVME_CMD_WRITE 0x01
 #define NVME_CMD_READ  0x02
+
+#define NVMMU_TCB_DMA_FROM_DEVICE BIT(0)
+#define NVMMU_TCB_DMA_TO_DEVICE   BIT(1)
 
 struct nvme_command {
     u8 opcode;
@@ -220,8 +220,13 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
     queue_cmd->tag = tag;
 
     memset(tcb, 0, sizeof(*tcb));
-    tcb->opcode = queue_cmd->opcode;
-    tcb->dma_flags = 3; // always allow read+write to the PRP pages
+    tcb->opcode = 0;
+    if (!queue_cmd->prp1)
+        tcb->dma_flags = 0;
+    else if (queue_cmd->opcode & 1)
+        tcb->dma_flags = NVMMU_TCB_DMA_TO_DEVICE;
+    else
+        tcb->dma_flags = NVMMU_TCB_DMA_FROM_DEVICE;
     tcb->slot_id = tag;
     tcb->len = queue_cmd->cdw12;
     tcb->prp1 = queue_cmd->prp1;
@@ -349,7 +354,6 @@ bool nvme_init(void)
 
     /* setup controller and NVMMU for linear submission queue */
     set32(nvme_base + NVME_LINEAR_SQ_CTRL, NVME_LINEAR_SQ_CTRL_EN);
-    clear32(nvme_base + NVME_UNKNOWN_CTRL, NVME_UNKNOWN_CTRL_PRP_NULL_CHECK);
     write32(nvme_base + NVME_MAX_PEND_CMDS_CTRL,
             ((NVME_QUEUE_SIZE - 1) << 16) | (NVME_QUEUE_SIZE - 1));
     write32(nvme_base + NVMMU_NUM, NVME_QUEUE_SIZE - 1);
@@ -544,7 +548,7 @@ bool nvme_read(u32 nsid, u64 lba, void *buffer)
     cmd.prp1 = (u64)buffer_addr;
     cmd.cdw10 = lba;
     cmd.cdw11 = lba >> 32;
-    cmd.cdw12 = 1; // 4096 bytes
+    cmd.cdw12 = 0; // #blocks, 0-based -> 1 block a 4096 bytes
 
     return nvme_exec_command(&ioq, &cmd, NULL);
 }

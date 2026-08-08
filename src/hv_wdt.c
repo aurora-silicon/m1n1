@@ -37,10 +37,6 @@ void hv_do_panic(void)
         printf("\n");
     }
 
-#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
-    hv_native_aic_trace_dump();
-#endif
-
     printf("Attempting to enter proxy\n");
     iodev_console_flush();
 
@@ -71,10 +67,6 @@ void hv_wdt_bark(void)
         }
         uart_putchar('\n');
     }
-
-#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
-    hv_native_aic_trace_dump();
-#endif
 
     uart_puts("Attempting to enter proxy");
 

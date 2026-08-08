@@ -26,10 +26,6 @@ int pmgr_adt_power_disable_index(const char *path, u32 index);
 int pmgr_adt_reset(const char *path);
 
 int pmgr_reset(int die, const char *name);
-/* Copy the ADT name of the PMGR device with this id into `out`. Returns 0 on
- * success. Used to derive meaning from a device id without hardcoding the
- * id itself, e.g. mapping CIO<N>_RECONFIG-V to reconfiguration slot N. */
-int pmgr_device_name_by_id(u16 id, char *out, size_t len);
 int pmgr_power_on(int die, const char *name);
 
 int pmgr_set_mode(uintptr_t addr, u8 target_mode);

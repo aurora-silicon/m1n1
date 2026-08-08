@@ -2,6 +2,7 @@
 
 #include "adt.h"
 #include "chickens.h"
+#include "dockchannel_uart.h"
 #include "exception.h"
 #include "firmware.h"
 #include "smp.h"
@@ -195,6 +196,9 @@ void _start_c(void *boot_args, void *base)
         debug_putc('!');
     }
 
+    /* Use Dockchannel as a secondary UART for now and ignore failure */
+    dockchannel_uart_init();
+
     uart_puts("Initializing");
     get_device_info();
 
@@ -214,26 +218,15 @@ void _start_c(void *boot_args, void *base)
 /* Secondary SMP core boot */
 void _cpu_reset_c(void *stack)
 {
-    //
-    // Secondaries stay off the console on T8142 -- see T8142_QUIET_SECONDARY in
-    // src/smp.c for why. The boot CPU still prints normally.
-    //
-    bool quiet = (chip_id == T8142) && !is_boot_cpu();
+    if (!is_boot_cpu())
+        uart_puts("RVBAR entry on secondary CPU");
+    else
+        uart_puts("RVBAR entry on primary CPU");
 
-    if (!quiet) {
-        if (!is_boot_cpu())
-            uart_puts("RVBAR entry on secondary CPU");
-        else
-            uart_puts("RVBAR entry on primary CPU");
-
-        printf("\n  Stack base: %p\n", stack);
-        printf("  MPIDR: 0x%lx\n", mrs(MPIDR_EL1));
-    }
-
+    printf("\n  Stack base: %p\n", stack);
+    printf("  MPIDR: 0x%lx\n", mrs(MPIDR_EL1));
     init_cpu();
-
-    if (!quiet)
-        printf("  Running in EL%lu\n\n", mrs(CurrentEL) >> 2);
+    printf("  Running in EL%lu\n\n", mrs(CurrentEL) >> 2);
 
     exception_initialize();
 

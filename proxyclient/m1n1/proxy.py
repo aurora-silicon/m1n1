@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
-import platform, os, sys, struct, serial, time, signal
+import platform, os, sys, struct, serial, time
 from construct import *
 from enum import IntEnum, IntFlag
 from serial.tools.miniterm import Miniterm
 
 from .utils import *
+from .constructutils import bool_
 from .sysreg import *
 
 __all__ = ["REGION_RWX_EL0", "REGION_RW_EL0", "REGION_RX_EL1"]
@@ -31,66 +32,6 @@ class UartChecksumError(UartError):
 
 class UartRemoteError(UartError):
     pass
-
-
-class _DeferredTerminationSignals:
-    """Keep an in-flight unframed data transfer protocol-synchronized.
-
-    REQ_MEMWRITE has a framed command header followed by an exact-size raw
-    byte stream.  If Python accepts an ordinary termination signal between
-    those two boundaries, the target remains blocked in iodev_read() and
-    consumes every later command as payload until it receives the missing
-    bytes.  Defer Ctrl-C, SIGTERM, and terminal-loss SIGHUP until the reply
-    closes the request.  Signal handlers can only be changed from the main
-    thread; worker-thread users retain the historical behavior.
-    """
-
-    def __init__(self):
-        self._previous = {}
-        self._pending = None
-        self._armed = []
-
-    def _handle(self, signum, frame):
-        if self._pending is None:
-            self._pending = (signum, frame)
-
-    def __enter__(self):
-        try:
-            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-                previous = signal.getsignal(signum)
-                if previous == signal.SIG_IGN:
-                    continue
-                signal.signal(signum, self._handle)
-                self._previous[signum] = previous
-                self._armed.append(signum)
-        except ValueError:
-            for signum in reversed(self._armed):
-                signal.signal(signum, self._previous[signum])
-            self._previous.clear()
-            self._armed.clear()
-            return self
-
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        if not self._armed:
-            return False
-
-        for signum in reversed(self._armed):
-            signal.signal(signum, self._previous[signum])
-        if self._pending is None or exc_type is not None:
-            return False
-
-        signum, frame = self._pending
-        previous = self._previous[signum]
-        if callable(previous):
-            previous(signum, frame)
-        elif signum == signal.SIGINT:
-            raise KeyboardInterrupt
-        else:
-            raise SystemExit(128 + signum)
-        return False
-
 
 class Feature(IntFlag):
     DISABLE_DATA_CSUMS = 0x01  # Data transfers don't use checksums
@@ -191,21 +132,10 @@ class UartInterface(Reloadable):
     REPLY_LEN = 36
     EVENT_HDR_LEN = 8
 
-    # USB CDC accepts a continuous byte stream; the old 8 KiB write size made
-    # an 800 MiB WinPE upload cross Python/pyserial roughly 100,000 times.  It
-    # also flushed one progress character per write, which made AuroraDbg
-    # persist roughly 100,000 individual output events.  Keep small writes for
-    # a real UART, but amortize both costs on the checksum-free USB transport.
-    UART_MEMWRITE_CHUNK_SIZE = 8 * 1024
-    USB_MEMWRITE_CHUNK_SIZE = 1024 * 1024
-    MEMWRITE_PROGRESS_INTERVAL = 16 * 1024 * 1024
-
     DEFAULT_UART_DEV="/dev/m1n1"
     DEFAULT_BAUD_RATE=115200
     if platform.system() == 'Darwin':
         DEFAULT_UART_DEV="/dev/cu.usbmodemP_01"
-    if platform.system() == 'Windows':
-        DEFAULT_UART_DEV="COM4"
 
     def __init__(self, device=None, debug=False):
         self.debug = debug
@@ -220,6 +150,15 @@ class UartInterface(Reloadable):
             self.devpath = device
             self.baudrate = baud
 
+            # wait for it to come back
+            if os.environ.get("M1N1WAIT", 0) and not os.path.exists(self.devpath):
+                print("Waiting for %s to appear.." % self.devpath)
+                for n in range(100): # 10s
+                    time.sleep(0.1)
+                    if os.path.exists(self.devpath):
+                        break
+                time.sleep(0.1) # wait for udev to settle (avoid permissions issues)
+
             device = Serial(self.devpath, baud)
 
         self.dev = device
@@ -227,6 +166,7 @@ class UartInterface(Reloadable):
         self.dev.flushOutput()
         self.dev.flushInput()
         self.pted = False
+        self.tty_log = None
         #d = self.dev.read(1)
         #while d != "":
             #d = self.dev.read(1)
@@ -277,11 +217,16 @@ class UartInterface(Reloadable):
         for c in s:
             if not self.pted:
                 sys.stdout.write("TTY> ")
+                if self.tty_log:
+                    self.tty_log.write("TTY> ")
                 self.pted = True
             if c == 10:
                 self.pted = False
             sys.stdout.write(chr(c))
             sys.stdout.flush()
+            if self.tty_log:
+                self.tty_log.write(chr(c))
+                self.tty_log.flush()
 
     def ttymode(self, dev=None):
         if dev is None:
@@ -401,64 +346,21 @@ class UartInterface(Reloadable):
             return self.reply(self.REQ_BOOT)
         except:
             # Over USB, reboots cause a reconnect
-            port = self.dev.port or ""
-            require_disconnect = "usbmodem" in port
-            saw_disconnect = not require_disconnect
             self.dev.close()
             print("Waiting for reconnection... ", end="")
             sys.stdout.flush()
-            reconnect_timeout = float(os.environ.get("M1N1RECONNECTTIMEOUT", "30"))
-            reconnect_deadline = time.monotonic() + reconnect_timeout
-            original_timeout = self.dev.timeout
-            probe_timeout = min(float(original_timeout or 1), 1.0)
-            last_error = None
             for i in range(200):
-                if time.monotonic() >= reconnect_deadline:
-                    break
                 print(".", end="")
                 sys.stdout.flush()
                 try:
                     self.dev.open()
-                except (serial.serialutil.SerialException, OSError) as exc:
-                    last_error = exc
-                    saw_disconnect = True
+                except serial.serialutil.SerialException:
                     time.sleep(0.1)
                 else:
-                    # macOS can leave the old cu.usbmodem node openable for a
-                    # short window after the target has reset. Accepting that
-                    # stale node makes chainload report "Connected" and then
-                    # time out before the replacement CDC device enumerates.
-                    # Require one observable disconnect for USB CDC ports;
-                    # UART transports keep their historical immediate-reopen
-                    # behavior.
-                    if not saw_disconnect:
-                        self.dev.close()
-                        time.sleep(0.1)
-                        continue
-
-                    # An open CDC device node is not proof that the replacement
-                    # proxy is ready.  macOS can publish the node while m1n1 is
-                    # still entering the proxy loop; accepting it here makes
-                    # chainload.py fail one command later in iface.nop().
-                    # Require an actual framed protocol round-trip and retry the
-                    # whole close/open handshake while the transition settles.
-                    try:
-                        self.dev.timeout = probe_timeout
-                        self.nop()
-                    except (UartError, serial.serialutil.SerialException,
-                            OSError) as exc:
-                        last_error = exc
-                        self.dev.close()
-                        time.sleep(0.1)
-                        continue
-
-                    self.dev.timeout = original_timeout
-                    print(" Connected and protocol ready")
-                    return
-
-            self.dev.timeout = original_timeout
-            detail = f": {last_error}" if last_error is not None else ""
-            raise UartTimeout(f"Reconnection/protocol readiness timed out{detail}")
+                    break
+            else:
+                raise UartTimeout("Reconnection timed out")
+            print(" Connected")
 
     def wait_and_handle_boot(self):
         self.handle_boot(self.wait_boot())
@@ -495,32 +397,23 @@ class UartInterface(Reloadable):
         checksum = self.data_checksum(data)
         size = len(data)
         req = struct.pack("<QQI", addr, size, checksum)
-        with _DeferredTerminationSignals():
-            self.cmd(self.REQ_MEMWRITE, req)
-            if self.debug:
-                print("<< DATA:")
-                chexdump(data)
-            if self.enabled_features & Feature.DISABLE_DATA_CSUMS:
-                chunk_size = self.USB_MEMWRITE_CHUNK_SIZE
-            else:
-                chunk_size = self.UART_MEMWRITE_CHUNK_SIZE
-            progress_at = self.MEMWRITE_PROGRESS_INTERVAL
-            for i in range(0, len(data), chunk_size):
-                end = min(i + chunk_size, len(data))
-                self.dev.write(data[i:end])
-                if progress and (end >= progress_at or end == len(data)):
-                    sys.stdout.write(".")
-                    sys.stdout.flush()
-                    while progress_at <= end:
-                        progress_at += self.MEMWRITE_PROGRESS_INTERVAL
+        self.cmd(self.REQ_MEMWRITE, req)
+        if self.debug:
+            print("<< DATA:")
+            chexdump(data)
+        for i in range(0, len(data), 8192):
+            self.dev.write(data[i:i + 8192])
             if progress:
-                print()
-            if self.enabled_features & Feature.DISABLE_DATA_CSUMS:
-                # Extra sentinel after the data to make sure no data is lost
-                self.dev.write(struct.pack("<I", self.DATA_END_SENTINEL))
+                sys.stdout.write(".")
+                sys.stdout.flush()
+        if progress:
+            print()
+        if self.enabled_features & Feature.DISABLE_DATA_CSUMS:
+            # Extra sentinel after the data to make sure no data is lost
+            self.dev.write(struct.pack("<I", self.DATA_END_SENTINEL))
 
-            # should automatically report a CRC failure
-            self.reply(self.REQ_MEMWRITE)
+        # should automatically report a CRC failure
+        self.reply(self.REQ_MEMWRITE)
 
     def readmem(self, addr, size):
         if size == 0:
@@ -567,16 +460,17 @@ class AlignmentError(Exception):
 
 class IODEV(IntEnum):
     UART = 0
-    FB = 1
-    USB_VUART = 2
-    USB0 = 3
-    USB1 = 4
-    USB2 = 5
-    USB3 = 6
-    USB4 = 7
-    USB5 = 8
-    USB6 = 9
-    USB7 = 10
+    DOCKCHANNEL_UART = 1
+    FB = 2
+    USB_VUART = 3
+    USB0 = 4
+    USB1 = 5
+    USB2 = 6
+    USB3 = 7
+    USB4 = 8
+    USB5 = 9
+    USB6 = 10
+    USB7 = 11
 
 class USAGE(IntFlag):
     CONSOLE = (1 << 0)
@@ -592,6 +486,35 @@ class GUARD(IntFlag):
 REGION_RWX_EL0 = 0x80000000000
 REGION_RW_EL0 = 0xa0000000000
 REGION_RX_EL1 = 0xc0000000000
+
+SleepMode = "SleepMode" / Enum(Int32ul,
+    SLEEP_NONE = 0,
+    SLEEP_LEGACY = 1,
+    SLEEP_GLOBAL = 2,
+)
+
+UncoreVersion = "UncoreVersion" / Enum(Int32ul,
+    UNCORE_NONE = 0,
+    UNCORE_V1 = 1,
+    UNCORE_V2 = 2,
+)
+
+CPUFeatures = Struct(
+    "sleep_mode" / SleepMode,
+    "uncore_version" / UncoreVersion,
+    "disable_dc_mva" / bool_,
+    "acc_cfg" / bool_,
+    "apple_sysregs_unlocked" / bool_,
+    "workaround_cyclone_cache" / bool_,
+    "nex_powergating" / bool_,
+    "fast_ipi" / bool_,
+    "mmu_sprr" / bool_,
+    "siq_cfg" / bool_,
+    "amx" / bool_,
+    "actlr_el2" / bool_,
+    "counter_redirect" / bool_,
+    "padding" / Bytes(1),
+)
 
 # Uses UartInterface.proxyreq() to send requests to M1N1 and process
 # responses sent back.
@@ -619,6 +542,7 @@ class M1N1Proxy(Reloadable):
     P_SLEEP = 0x011
     P_EL3_CALL = 0x012
     P_GET_CHIPID = 0x013
+    P_GET_CPU_FEATURES = 0x014
 
     P_WRITE64 = 0x100
     P_WRITE32 = 0x101
@@ -690,17 +614,18 @@ class M1N1Proxy(Reloadable):
     P_MALLOC = 0x601
     P_MEMALIGN = 0x602
     P_FREE = 0x603
-    P_TOP_OF_MEMORY_ALLOC = 0x604
+    P_HEAPBLOCK_SET_LIMIT = 0x604
 
     P_KBOOT_BOOT = 0x700
     P_KBOOT_SET_CHOSEN = 0x701
     P_KBOOT_SET_INITRD = 0x702
     P_KBOOT_PREPARE_DT = 0x703
+    P_KBOOT_SET_UBOOT = 0x704
 
-    P_PMGR_CLOCK_ENABLE = 0x800
-    P_PMGR_CLOCK_DISABLE = 0x801
-    P_PMGR_ADT_CLOCKS_ENABLE = 0x802
-    P_PMGR_ADT_CLOCKS_DISABLE = 0x803
+    P_PMGR_POWER_ENABLE = 0x800
+    P_PMGR_POWER_DISABLE = 0x801
+    P_PMGR_ADT_POWER_ENABLE = 0x802
+    P_PMGR_ADT_POWER_DISABLE = 0x803
     P_PMGR_RESET = 0x804
 
     P_IODEV_SET_USAGE = 0x900
@@ -736,15 +661,6 @@ class M1N1Proxy(Reloadable):
     P_VIRTIO_PUT_BUFFER = 0xc0e
     P_HV_EXIT_CPU = 0xc0f
     P_HV_ADD_TIME = 0xc10
-    P_HV_HANDLE_PSCI_SMC = 0xc11
-    P_HV_PSCI_SUSPEND_CPU = 0xc12
-    P_HV_PSCI_TURN_OFF_CPU = 0xc13
-    P_HV_PSCI_TURN_ON_CPU = 0xc14
-    P_HV_PSCI_TURN_OFF_SYSTEM = 0xc15
-    P_HV_PSCI_RESET_SYSTEM = 0xc16
-    P_HV_PSCI_FEATURES = 0xc17
-    P_HV_PSCI_MEM_PROTECT = 0xc18
-    P_HV_PSCI_MEM_PROTECT_CHECK_RANGE = 0xc19
 
     P_FB_INIT = 0xd00
     P_FB_SHUTDOWN = 0xd01
@@ -758,8 +674,6 @@ class M1N1Proxy(Reloadable):
 
     P_PCIE_INIT = 0xe00
     P_PCIE_SHUTDOWN = 0xe01
-    P_WIRELESS_HANDOFF_INIT = 0xe02
-    P_PCIE_WIRELESS_INIT = 0xe03
 
     P_NVME_INIT = 0xf00
     P_NVME_SHUTDOWN = 0xf01
@@ -777,18 +691,10 @@ class M1N1Proxy(Reloadable):
     P_DAPF_INIT_ALL = 0x1200
     P_DAPF_INIT = 0x1201
 
-    P_HV_MAP_TPM = 0x1400
-
     P_CPUFREQ_INIT = 0x1300
 
-    # J414s media profile; keep in sync with src/proxy.h
-    P_MEDIA_HANDOFF_INIT = 0x1600
-
-    # Bulk host<->guest channel; keep in sync with src/proxy.h
-    P_HV_MAP_XFER = 0x1700
-
-    # AGX preboot initdata handoff; keep in sync with src/proxy.h
-    P_GPU_INITDATA_FILL = 0x1800
+    P_READ_GIGALOCKER = 0x1400
+    P_FREE_GIGALOCKER = 0x1401
 
     def __init__(self, iface, debug=False):
         self.debug = debug
@@ -870,10 +776,16 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_GET_BOOTARGS)
     def get_bootargs_rev(self):
         ba_addr = self.request(self.P_GET_BOOTARGS)
-        rev = self.read16(ba_addr)
+        # can be misaligned..
+        rev = self.read8(ba_addr) | (self.read8(ba_addr+1) << 8)
         return (ba_addr, rev)
     def get_base(self):
         return self.request(self.P_GET_BASE)
+    def get_cpu_features(self):
+        addr = self.request(self.P_GET_CPU_FEATURES, CPUFeatures.sizeof())
+        if not addr:
+            raise ValueError("Size mismatch (Outdated CPUFeatures struct definition?)")
+        return self.iface.readstruct(addr, CPUFeatures)
     def set_baud(self, baudrate):
         self.iface.tty_enable = False
         def change():
@@ -1141,15 +1053,14 @@ class M1N1Proxy(Reloadable):
 
     def heapblock_alloc(self, size):
         return self.request(self.P_HEAPBLOCK_ALLOC, size)
+    def heapblock_set_limit(self, limit):
+        return self.request(self.P_HEAPBLOCK_SET_LIMIT, limit)
     def malloc(self, size):
         return self.request(self.P_MALLOC, size)
     def memalign(self, align, size):
         return self.request(self.P_MEMALIGN, align, size)
     def free(self, ptr):
         self.request(self.P_FREE, ptr)
-    def top_of_memory_alloc(self, size):
-        """Reserve RAM above the guest-visible top and persist boot_args."""
-        return self.request(self.P_TOP_OF_MEMORY_ALLOC, size)
 
     def kboot_boot(self, kernel):
         self.request(self.P_KBOOT_BOOT, kernel)
@@ -1159,15 +1070,17 @@ class M1N1Proxy(Reloadable):
         self.request(self.P_KBOOT_SET_INITRD, base, size)
     def kboot_prepare_dt(self, dt_addr):
         return self.request(self.P_KBOOT_PREPARE_DT, dt_addr)
+    def kboot_set_uboot(self, name, value):
+        self.request(self.P_KBOOT_SET_UBOOT, name, value)
 
-    def pmgr_clock_enable(self, clkid):
-        return self.request(self.P_PMGR_CLOCK_ENABLE, clkid)
-    def pmgr_clock_disable(self, clkid):
-        return self.request(self.P_PMGR_CLOCK_DISABLE, clkid)
-    def pmgr_adt_clocks_enable(self, path):
-        return self.request(self.P_PMGR_ADT_CLOCKS_ENABLE, path)
-    def pmgr_adt_clocks_disable(self, path):
-        return self.request(self.P_PMGR_ADT_CLOCKS_DISABLE, path)
+    def pmgr_power_enable(self, clkid):
+        return self.request(self.P_PMGR_POWER_ENABLE, clkid)
+    def pmgr_power_disable(self, clkid):
+        return self.request(self.P_PMGR_POWER_DISABLE, clkid)
+    def pmgr_adt_power_enable(self, path):
+        return self.request(self.P_PMGR_ADT_POWER_ENABLE, path)
+    def pmgr_adt_power_disable(self, path):
+        return self.request(self.P_PMGR_ADT_POWER_DISABLE, path)
     def pmgr_reset(self, die, name):
         return self.request(self.P_PMGR_RESET, die, name)
 
@@ -1203,7 +1116,7 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_DART_UNMAP, dart, iova, len)
 
     def hv_init(self):
-        return self.request(self.P_HV_INIT, signed=True)
+        return self.request(self.P_HV_INIT)
     def hv_map(self, from_, to, size, incr):
         return self.request(self.P_HV_MAP, from_, to, size, incr)
     def hv_start(self, entry, *args):
@@ -1230,17 +1143,6 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_HV_PIN_CPU, cpu)
     def hv_write_hcr(self, hcr):
         return self.request(self.P_HV_WRITE_HCR, hcr)
-    def hv_map_tpm(self, base, engine=0):
-        # engine: 0 = no backend (TPM_RC_FAILURE device), 1 = host engine
-        # over the proxy (one HV_TPM event per command).
-        return self.request(self.P_HV_MAP_TPM, base, engine)
-    def hv_map_xfer(self, base, win, win_size):
-        # base: doorbell page (16 KiB, hooked). win/win_size: the shared
-        # window, allocated out of the proxy heap so the guest's memory map
-        # never covers it. Returns 0, or negative if EL2 refused.
-        # signed=True: the C side answers -1 on refusal, and the default
-        # unsigned unpack would turn that into a very large positive number.
-        return self.request(self.P_HV_MAP_XFER, base, win, win_size, signed=True)
     def hv_map_virtio(self, base, config):
         return self.request(self.P_HV_MAP_VIRTIO, base, config)
     def virtio_put_buffer(self, base, qu, idx, length):
@@ -1249,22 +1151,6 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_HV_EXIT_CPU, cpu)
     def hv_add_time(self, time):
         return self.request(self.P_HV_ADD_TIME, time)
-    def hv_psci_suspend_cpu(self, power_state, cpu_reentry_addr, context):
-        return self.request(self.P_HV_PSCI_SUSPEND_CPU, power_state, cpu_reentry_addr, context)
-    def hv_psci_turn_off_cpu(self):
-        return self.request(self.P_HV_PSCI_TURN_OFF_CPU)
-    def hv_psci_turn_on_cpu(self, target_cpu, entry_point, context):
-        return self.request(self.P_HV_PSCI_TURN_ON_CPU)
-    def hv_psci_turn_off_system(self):
-        return self.request(self.P_HV_PSCI_TURN_OFF_SYSTEM)
-    def hv_psci_reset_system(self):
-        return self.request(self.P_HV_PSCI_RESET_SYSTEM)
-    def hv_psci_features(self, psci_func_id):
-        return self.request(self.P_HV_PSCI_FEATURES, psci_func_id)
-    def hv_psci_mem_protect(self, enable_mem_protect):
-        return self.request(self.P_HV_PSCI_MEM_PROTECT, enable_mem_protect)
-    def hv_psci_mem_protect_check_range(self, base, length):
-        return self.request(self.P_HV_PSCI_MEM_PROTECT_CHECK_RANGE, base, length)
 
     def fb_init(self):
         return self.request(self.P_FB_INIT)
@@ -1286,43 +1172,9 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_FB_IMPROVE_LOGO)
 
     def pcie_init(self):
-        return self.request(self.P_PCIE_INIT, signed=True)
+        return self.request(self.P_PCIE_INIT)
     def pcie_shutdown(self):
         return self.request(self.P_PCIE_SHUTDOWN)
-    def wireless_handoff_init(self, reservation_base=None, reservation_size=None):
-        if reservation_base is None or reservation_size is None:
-            raise ValueError(
-                "wireless handoff requires an explicit top-of-memory "
-                "reservation base and size"
-            )
-        return self.request(
-            self.P_WIRELESS_HANDOFF_INIT,
-            reservation_base,
-            reservation_size,
-            signed=True,
-        )
-    def pcie_wireless_init(self):
-        return self.request(self.P_PCIE_WIRELESS_INIT, signed=True)
-
-    def gpu_initdata_fill(self, reservation_base=None, reservation_size=None):
-        """Generate and stamp the AGX preboot initdata triple.
-
-        Deliberately has no default reservation: the address must be the one
-        the caller is also going to publish in the guest ADT, and m1n1 refuses
-        anything that is not its own canonical derivation, so guessing here
-        could only ever turn a loud refusal into a quiet one.
-        """
-        if reservation_base is None or reservation_size is None:
-            raise ValueError(
-                "GPU initdata handoff requires an explicit top-of-memory "
-                "reservation base and size"
-            )
-        return self.request(
-            self.P_GPU_INITDATA_FILL,
-            reservation_base,
-            reservation_size,
-            signed=True,
-        )
 
     def nvme_init(self):
         return self.request(self.P_NVME_INIT)
@@ -1354,15 +1206,10 @@ class M1N1Proxy(Reloadable):
 
     def cpufreq_init(self):
         return self.request(self.P_CPUFREQ_INIT)
-
-    def media_handoff_init(self, flags=0):
-        """J414s media profile census; see m1n1.media_handoff for the flags.
-
-        flags=0 (the default) performs no register write of any kind.  There is
-        no automatic call site for this operation anywhere in m1n1: a boot that
-        never calls it is unchanged.
-        """
-        return self.request(self.P_MEDIA_HANDOFF_INIT, flags, signed=True)
+    def read_gigalocker(self, buf):
+        return self.request(self.P_READ_GIGALOCKER, buf)
+    def free_gigalocker(self, buf):
+        return self.request(self.P_FREE_GIGALOCKER, buf)
 
 __all__.extend(k for k, v in globals().items()
                if (callable(v) or isinstance(v, type)) and v.__module__ == __name__)

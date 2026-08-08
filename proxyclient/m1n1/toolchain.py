@@ -6,11 +6,10 @@ m1n1: toolchain abstraction for compiling code on proxyclient host
 import os
 import shutil
 import subprocess
-import platform
 
 from dataclasses import dataclass
 
-from os import uname_result
+from posix import uname_result
 
 
 __all__ = ["Toolchain"]
@@ -35,6 +34,26 @@ class LLVMResolver:
         """Return LLVM paths tuple"""
         _t = (self.clangdir, self.llddir)
         return _t
+
+
+class LLVMConfigLLVMResolver(LLVMResolver):
+    """
+    Class to resolve toolchain prefixes on systems with `llvm-config`
+    """
+
+    # pylint: disable=too-few-public-methods
+
+    def __init__(self):
+        super().__init__()
+        result = subprocess.run(
+            "llvm-config --bindir".split(),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=2,
+        )
+        llvm_prefix = result.stdout.strip()
+        self.clangdir = self.ldddir = llvm_prefix + "/"
 
 
 class BrewLLVMResolver(LLVMResolver):
@@ -68,9 +87,12 @@ class BrewLLVMResolver(LLVMResolver):
 
 
 _brew_path = shutil.which("brew")
+_llvm_config_path = shutil.which("llvm-config")
 
 _llvm_resolver = LLVMResolver()
-if bool(_brew_path):
+if bool(_llvm_config_path):
+    _llvm_resolver = LLVMConfigLLVMResolver()
+elif bool(_brew_path):
     _llvm_resolver = BrewLLVMResolver()
 
 
@@ -95,17 +117,18 @@ class Toolchain:
     ARCH: str
     # pylint: enable=invalid-name
 
-    def __init__(self, u: uname_result = platform.uname(), r: LLVMResolver = _llvm_resolver):
+    def __init__(self, u: uname_result = os.uname(), r: LLVMResolver = _llvm_resolver):
 
         self.uname = u
-        if u.system == "OpenBSD":
+
+        if u.sysname == "OpenBSD":
             default_arch = "aarch64-none-elf-"
-        elif u.system in ["Darwin", "Linux", "Windows"] and u.machine != "aarch64":
+        elif u.sysname in ["Darwin", "Linux"] and u.machine != "aarch64":
             default_arch = "aarch64-linux-gnu-"
         else:
             default_arch = ""
 
-        if u.system in ["OpenBSD", "Darwin", "Windows"]:
+        if u.sysname in ["OpenBSD", "Darwin"]:
             default_use_clang = "1"
         else:
             default_use_clang = "0"
@@ -121,9 +144,9 @@ class Toolchain:
 
         toolchain_paths = ()
 
-        if u.system == "Darwin":
+        if u.sysname == "Darwin":
             toolchain_paths = r.get_paths()
-        elif u.system == "OpenBSD":
+        elif u.sysname == "OpenBSD":
             toolchain_paths = (DEFAULT_TOOLCHAIN_PREFIX_OPENBSD, None)
         else:
             toolchain_paths = (DEFAULT_TOOLCHAIN_PREFIX_OTHER, None)
@@ -145,7 +168,7 @@ class Toolchain:
 
         # pylint: disable=invalid-name
         self.CC = clangdir + "clang --target=" + self.ARCH + " " + self.CFLAGS
-        self.LD = llddir + "ld.lld -maarch64elf"
+        self.LD = llddir + "ld.lld -maarch64elf --pie"
         self.OBJCOPY = clangdir + "llvm-objcopy"
         self.OBJDUMP = clangdir + "llvm-objdump"
         self.NM = clangdir + "llvm-nm"

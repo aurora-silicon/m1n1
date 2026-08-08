@@ -7,7 +7,7 @@
  * - https://www.beyondlogic.org/usbnutshell/usb1.shtml
  */
 
-#include "build_tag.h"
+#include "../build/build_tag.h"
 
 #include "usb_dwc3.h"
 #include "adt.h"
@@ -26,10 +26,15 @@
 
 #define usb_debug_printf(fmt, ...) debug_printf("usb-dwc3@%lx: " fmt, dev->regs, ##__VA_ARGS__)
 
+static bool usb_rxdiag_out_armed[MAX_ENDPOINTS];
+static u32 usb_rxdiag_event_prints;
+
 #define STRING_DESCRIPTOR_LANGUAGES    0
 #define STRING_DESCRIPTOR_MANUFACTURER 1
 #define STRING_DESCRIPTOR_PRODUCT      2
 #define STRING_DESCRIPTOR_SERIAL       3
+
+#define DWC3_EP0_MAX_DESC_LEN 62
 
 #define CDC_DEVICE_CLASS 0x02
 
@@ -577,6 +582,10 @@ static void usb_cdc_get_string_descriptor(u32 index, const void **descriptor, u1
             *descriptor = NULL;
             *descriptor_len = 0;
     }
+
+    // FIXME: handle descriptors larger than maxPacketSize for EP 0
+    // limit the descriptor length to stay below EP 0's maxPacketSize of 64
+    *descriptor_len = min(*descriptor_len, DWC3_EP0_MAX_DESC_LEN);
 }
 
 static int
@@ -627,6 +636,7 @@ static void usb_dwc3_ep0_handle_standard_device(dwc3_dev_t *dev,
             break;
 
         case USB_REQUEST_SET_CONFIGURATION:
+            printf("USB RXDIAG: configuration=%u\n", setup->set_configuration.configuration);
             switch (setup->set_configuration.configuration) {
                 case 0:
                     clear32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_OUT));
@@ -659,6 +669,13 @@ static void usb_dwc3_ep0_handle_standard_device(dwc3_dev_t *dev,
             }
             break;
 
+        case USB_REQUEST_GET_CONFIGURATION:
+            printf("USB RXDIAG: get-configuration=%u\n", dev->configuration);
+            dev->ep0_buffer = &dev->configuration;
+            dev->ep0_buffer_len = 1;
+            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
+            break;
+
         case USB_REQUEST_GET_DESCRIPTOR:
             if (usb_dwc3_handle_ep0_get_descriptor(dev, &setup->get_descriptor) < 0) {
                 usb_dwc3_ep_set_stall(dev, 0, 1);
@@ -666,12 +683,6 @@ static void usb_dwc3_ep0_handle_standard_device(dwc3_dev_t *dev,
             } else {
                 dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
             }
-            break;
-
-        case USB_REQUEST_GET_CONFIGURATION:
-            dev->ep0_buffer = &dev->configuration;
-            dev->ep0_buffer_len = 1;
-            dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND;
             break;
 
         case USB_REQUEST_GET_STATUS: {
@@ -685,7 +696,10 @@ static void usb_dwc3_ep0_handle_standard_device(dwc3_dev_t *dev,
         default:
             usb_dwc3_ep_set_stall(dev, 0, 1);
             dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
-            usb_debug_printf("unsupported SETUP packet\n");
+            printf("USB RXDIAG: unsupported device SETUP type=%02x req=%02x value=%04x "
+                   "index=%04x length=%04x\n",
+                   setup->raw.bmRequestType, setup->raw.bRequest, setup->raw.wValue,
+                   setup->raw.wIndex, setup->raw.wLength);
     }
 }
 
@@ -719,7 +733,10 @@ static void usb_dwc3_ep0_handle_standard_interface(dwc3_dev_t *dev,
         default:
             usb_dwc3_ep_set_stall(dev, 0, 1);
             dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
-            usb_debug_printf("unsupported SETUP packet\n");
+            printf("USB RXDIAG: unsupported interface SETUP type=%02x req=%02x value=%04x "
+                   "index=%04x length=%04x\n",
+                   setup->raw.bmRequestType, setup->raw.bRequest, setup->raw.wValue,
+                   setup->raw.wIndex, setup->raw.wLength);
     }
 }
 
@@ -754,7 +771,10 @@ static void usb_dwc3_ep0_handle_standard_endpoint(dwc3_dev_t *dev,
         default:
             usb_dwc3_ep_set_stall(dev, 0, 1);
             dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
-            usb_debug_printf("unsupported SETUP packet\n");
+            printf("USB RXDIAG: unsupported endpoint SETUP type=%02x req=%02x value=%04x "
+                   "index=%04x length=%04x\n",
+                   setup->raw.bmRequestType, setup->raw.bRequest, setup->raw.wValue,
+                   setup->raw.wIndex, setup->raw.wLength);
     }
 }
 
@@ -794,15 +814,18 @@ static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_pac
             break;
 
         case USB_REQUEST_CDC_SET_CTRL_LINE_STATE:
+            printf("USB RXDIAG: ctrl-line pipe=%d value=%04x ep-out=%u\n", pipe,
+                   setup->raw.wValue, dev->pipe[pipe].ep_out);
             if (setup->raw.wValue & 1) { // DTR
                 dev->pipe[pipe].ready = false;
                 usb_debug_printf("ACM device opened\n");
                 dev->pipe[pipe].ready = true;
                 /*
-                 * Prime the first host-to-device transfer immediately. Newer
-                 * DWC3 revisions do not reliably emit the initial
-                 * XFERNOTREADY event, which otherwise deadlocks uartproxy's
-                 * first request after a reconnect.
+                 * Prime the first host-to-device transfer immediately. Older
+                 * DWC3 revisions emit XFERNOTREADY for an unprimed bulk OUT
+                 * endpoint, but newer revisions are not guaranteed to do so.
+                 * Waiting for that event can leave CDC permanently unable to
+                 * receive its first packet even though enumeration succeeded.
                  */
                 usb_dwc3_cdc_start_bulk_out_xfer(dev, dev->pipe[pipe].ep_out);
             } else {
@@ -954,8 +977,16 @@ static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number
     trb->ctrl |= DWC3_TRBCTL_NORMAL;
     trb->size = DWC3_TRB_SIZE_LENGTH(XFER_SIZE);
 
-    if (usb_dwc3_ep_start_transfer(dev, endpoint_number, trb_iova))
+    int ret = usb_dwc3_ep_start_transfer(dev, endpoint_number, trb_iova);
+    if (ret) {
+        printf("USB RXDIAG: arm OUT ep=%u failed=%d\n", endpoint_number, ret);
         return;
+    }
+
+    if (!usb_rxdiag_out_armed[endpoint_number]) {
+        printf("USB RXDIAG: armed OUT ep=%u size=%u\n", endpoint_number, XFER_SIZE);
+        usb_rxdiag_out_armed[endpoint_number] = true;
+    }
 }
 
 static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
@@ -992,12 +1023,23 @@ static void usb_dwc3_cdc_handle_bulk_out_xfer_done(dwc3_dev_t *dev,
     if (!host2device)
         return;
     size_t len = min(XFER_SIZE, ringbuffer_get_free(host2device));
+    size_t received = len - dev->endpoints[event.endpoint_number].trb->size;
+    printf("USB RXDIAG: OUT complete ep=%u bytes=%lu residual=%u\n", event.endpoint_number,
+           (unsigned long)received, dev->endpoints[event.endpoint_number].trb->size);
     ringbuffer_write(dev->endpoints[event.endpoint_number].xfer_buffer,
-                     len - dev->endpoints[event.endpoint_number].trb->size, host2device);
+                     received, host2device);
 }
 
 static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_depevt event)
 {
+    if ((event.endpoint_number == USB_LEP_CDC_BULK_OUT ||
+         event.endpoint_number == USB_LEP_CDC_BULK_OUT_2) &&
+        usb_rxdiag_event_prints < 24) {
+        printf("USB RXDIAG: event ep=%u type=%u status=%u params=%u\n", event.endpoint_number,
+               event.endpoint_event, event.status, event.parameters);
+        usb_rxdiag_event_prints++;
+    }
+
     if (event.endpoint_event == DWC3_DEPEVT_XFERCOMPLETE) {
         dev->endpoints[event.endpoint_number].xfer_in_progress = false;
 
@@ -1048,6 +1090,8 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
 static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev)
 {
     dev->configuration = 0;
+    memset(usb_rxdiag_out_armed, 0, sizeof(usb_rxdiag_out_armed));
+    usb_rxdiag_event_prints = 0;
     for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
         dev->pipe[i].ready = false;
 
@@ -1448,7 +1492,8 @@ ssize_t usb_dwc3_can_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
     if (!dev)
         return 0;
 
-    /* The host may have opened the pipe since the previous poll. */
+    /* DTR-open itself arrives through this event queue. Keep servicing it
+     * while the pipe is marked closed or a closed pipe can never reopen. */
     usb_dwc3_handle_events(dev);
 
     if (!dev->pipe[pipe].ready)
@@ -1458,7 +1503,12 @@ ssize_t usb_dwc3_can_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
     if (!host2device)
         return 0;
 
-    /* Keep one receive TRB armed before uartproxy waits for input. */
+    /*
+     * uartproxy polls can_read() before it calls read(). Service the event
+     * queue and keep a receive TRB armed here so a host packet can be the
+     * event that makes can_read() become true. Without this, a controller
+     * that does not emit the initial XFERNOTREADY event deadlocks forever.
+     */
     usb_dwc3_cdc_start_bulk_out_xfer(dev, dev->pipe[pipe].ep_out);
 
     return ringbuffer_get_used(host2device);
@@ -1471,41 +1521,6 @@ bool usb_dwc3_can_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
         return false;
 
     return dev->pipe[pipe].ready;
-}
-
-/*
- * Number of bytes that can be handed to usb_dwc3_queue()/usb_dwc3_write() right
- * now WITHOUT that call spinning.
- *
- * usb_dwc3_queue() loops until every byte has been accepted by the TX
- * ringbuffer, pumping the event loop in between. That is fine for m1n1's own
- * console, which is always eventually drained by the host proxy. It is NOT fine
- * for a caller that runs inside an EL2 exception handler (the guest-UART MMIO
- * hook): if the host end of the CDC pipe is not draining -- nobody has the TTY
- * open, the terminal was SIGKILLed, socat died -- the ring fills, the loop never
- * terminates, and the HV watchdog (1 s, src/hv_wdt.c) barks and takes the
- * machine down. That strands the one physical serial link and costs a physical
- * reboot.
- *
- * usb_dwc3_can_write() cannot be used to avoid this: it only reports whether the
- * pipe has been configured by the host, not whether there is buffer space.
- *
- * ringbuffer_write() treats "write + 1 == read" as full, so the usable capacity
- * is one byte less than ringbuffer_get_free() reports. Subtract that byte here
- * so the value returned is a hard, directly usable bound.
- */
-size_t usb_dwc3_write_space(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
-{
-    if (!dev || !dev->pipe[pipe].ready)
-        return 0;
-
-    ringbuffer_t *device2host = dev->pipe[pipe].device2host;
-    if (!device2host)
-        return 0;
-
-    size_t free = ringbuffer_get_free(device2host);
-
-    return free > 1 ? free - 1 : 0;
 }
 
 void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)

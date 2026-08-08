@@ -16,11 +16,6 @@ void _gxf_init(void *gl2_stack, void *gl1_stack);
 u8 *gl1_stack[MAX_CPUS];
 u8 *gl2_stack[MAX_CPUS];
 
-//
-// m1n1_windows TODO: load ARM Trusted Firmware-A in GXF mode and run it from there.
-// Required for bare metal PSCI support. (in particular if Hyper-V is to be a supported thing.)
-//
-
 void gxf_init(void)
 {
     int cpu = smp_id();
@@ -30,7 +25,8 @@ void gxf_init(void)
     if (in_el2() && !gl1_stack[cpu])
         gl1_stack[cpu] = memalign(0x4000, GL_STACK_SIZE);
 
-    _gxf_init(gl2_stack[cpu], gl1_stack[cpu]);
+    _gxf_init(gl2_stack[cpu] + GL_STACK_SIZE,
+              gl1_stack[cpu] ? gl1_stack[cpu] + GL_STACK_SIZE : NULL);
 }
 
 bool gxf_enabled(void)

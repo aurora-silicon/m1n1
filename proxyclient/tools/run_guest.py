@@ -3,7 +3,7 @@
 import sys, pathlib, traceback
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
-import argparse, pathlib, os
+import argparse, pathlib
 from io import BytesIO
 
 def volumespec(s):
@@ -13,19 +13,16 @@ parser = argparse.ArgumentParser(description='Run a Mach-O payload under the hyp
 parser.add_argument('-s', '--symbols', type=pathlib.Path)
 parser.add_argument('-m', '--script', type=pathlib.Path, action='append', default=[])
 parser.add_argument('-c', '--command', action="append", default=[])
-parser.add_argument('--abort-on-script-error', action="store_true",
-                    help="exit instead of entering the guest shell when a preload script/command fails")
 parser.add_argument('-S', '--shell', action="store_true")
 parser.add_argument('-e', '--hook-exceptions', action="store_true")
 parser.add_argument('-d', '--debug-xnu', action="store_true")
 parser.add_argument('-l', '--logfile', type=pathlib.Path)
 parser.add_argument('-C', '--cpus', default=None)
+parser.add_argument('--strip-node', action="append", default=[], metavar='SUBSTR',
+                    help='Remove every ADT node whose name contains SUBSTR.')
 parser.add_argument('-r', '--raw', action="store_true")
 parser.add_argument('-E', '--entry-point', action="store", type=int, help="Entry point for the raw image", default=0x800)
 parser.add_argument('-a', '--append-payload', type=pathlib.Path, action="append", default=[])
-parser.add_argument('--proxy-heap-size', type=lambda value: int(value, 0),
-                    default=int(os.environ.get("M1N1_PROXY_HEAP_SIZE", 768 * 1024 * 1024)),
-                    help="proxy scratch heap size in bytes (accepts 0x-prefixed values)")
 parser.add_argument('-v', '--volume', type=volumespec, action='append',
                     help='Attach a 9P virtio device for file export to the guest. The argument is a host path to the '
                          'exported tree, joined by colon (\':\') with a tag under which the tree will be advertised '
@@ -38,6 +35,7 @@ from m1n1.proxy import *
 from m1n1.proxyutils import *
 from m1n1.utils import *
 from m1n1.shell import run_shell
+from m1n1.sysreg import *
 from m1n1.hv import HV
 from m1n1.hv.virtio import Virtio9PTransport
 from m1n1.hw.pmu import PMU
@@ -45,9 +43,14 @@ from m1n1.hw.pmu import PMU
 iface = UartInterface()
 p = M1N1Proxy(iface, debug=False)
 bootstrap_port(iface, p)
-if args.proxy_heap_size < 256 * 1024 * 1024:
-    parser.error("--proxy-heap-size must be at least 256 MiB")
-u = ProxyUtils(p, heap_size=args.proxy_heap_size)
+u = ProxyUtils(p, heap_size = 128 * 1024 * 1024)
+
+# Setup counter redirect / AHCR_EL2 as expected by macOS for macho payloads
+if not args.raw:
+    chip_id = u.adt["/chosen"].chip_id
+    if chip_id in (0x6030, 0x6031, 0x6032, 0x6034, 0x8122):
+        u.msr(AGTCNTRDIR_EL1, 3)
+        u.msr(AGTCNTRDIR_EL12, 3)
 
 hv = HV(iface, p, u)
 
@@ -66,6 +69,18 @@ if args.cpus:
             print(f"Disabled {cpu}")
         except KeyError:
             continue
+
+if args.strip_node:
+    def strip_nodes(node, path=""):
+        for child in list(node):
+            child_path = f"{path}/{child.name}"
+            if any(pat.lower() in child.name.lower() for pat in args.strip_node):
+                print(f"Removing ADT node {child_path}")
+                del node[child.name]
+            else:
+                strip_nodes(child, child_path)
+
+    strip_nodes(hv.adt)
 
 if args.debug_xnu:
     hv.adt["chosen"].debug_enabled = 1
@@ -100,18 +115,13 @@ if args.raw:
 else:
     hv.load_macho(payload, symfile=symfile)
 
-if hv.adt["/chosen"].chip_id == 0x8142:
-    print("Skipping unsupported PMU panic-counter reset on T8142")
-else:
-    PMU(u).reset_panic_counter()
+PMU(u).reset_panic_counter()
 
 for i in args.script:
     try:
         hv.run_script(i)
     except:
         traceback.print_exc()
-        if args.abort_on_script_error:
-            raise
         args.shell = True
 
 for i in args.command:
@@ -119,8 +129,6 @@ for i in args.command:
         hv.run_code(i)
     except:
         traceback.print_exc()
-        if args.abort_on_script_error:
-            raise
         args.shell = True
 
 if args.shell:

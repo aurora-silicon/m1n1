@@ -303,6 +303,13 @@ DEV_PROPERTIES = {
             "info-*": SafeGreedyRange(Hex(Int32ul)),
         },
     },
+    # PMU nodes on M3 Ultra/M4 Max / macOS 15.6.1 are named "spmi-*"
+    "spmi-*": {
+        "pmu,spmi": {
+            "info-*name*": CString("ascii"),
+            "info-*": SafeGreedyRange(Hex(Int32ul)),
+        },
+    },
     "stockholm-spmi": {
         "*": {
             "required-functions": ADTStringList,
@@ -440,9 +447,11 @@ def parse_prop(node, path, node_name, name, v, is_template=False):
         t = SafeGreedyRange(Struct("bus_addr" / at, "parent_addr" / pat, "size" / st))
 
     elif name.startswith("dapf-instance-"):
-        # Newer Apple device trees no longer use dart-options bit 0x40 to
-        # identify the DAPF record layout. Select a known layout by size and
-        # leave unknown M5-era layouts opaque instead of aborting run_guest.
+        # Using the length to identify the DAPF T8110 variant is not safe as
+        # the least common multiple of 52 and 56 is 728. While this is just
+        # used for parsing and printing this length based selection is good
+        # enough. 0x40 from "dart-options" used previously does not identify
+        # the layout.
         if len(v) % DAPFT8110.sizeof() == 0:
             t = GreedyRange(DAPFT8110)
         elif len(v) % DAPFT8110B.sizeof() == 0:
@@ -779,13 +788,7 @@ class ADTNode:
     def walk_tree(self):
         yield self
         for child in self:
-            # `yield from child` iterates the child, which yields ITS children
-            # and stops -- so a root walk returned only the root plus its
-            # grandchildren, silently skipping every other level. On a J414s
-            # capture that is 174 of 347 nodes, including /arm-io/spi2/mesa
-            # (which trace_mesa.py looks for by walking the tree) and all of
-            # /device-tree/chosen. Recurse properly.
-            yield from child.walk_tree()
+            yield from child
 
     def build_addr_lookup(self):
         lookup = AddrLookup()
@@ -819,17 +822,17 @@ class ADTNode:
         return node
 
     def pmgr_init(self):
-        self.pmgr_u8id = (self["/arm-io/pmgr"].devices[0].id1 != self["/arm-io/pmgr"].devices[1].id1)
+        self._pmgr_u8id = (self["/arm-io/pmgr"].devices[0].id1 != self["/arm-io/pmgr"].devices[1].id1)
         self._pmgr_use_group_and_offset = not "ps-regs" in self["/arm-io/pmgr"]._properties
 
     def pmgr_dev_get_id(self, dev):
-        if self.pmgr_u8id:
+        if self._pmgr_u8id:
             return dev.id1
         else:
             return dev.id2
 
     def pmgr_dev_get_parents(self, dev):
-        if self.pmgr_u8id:
+        if self._pmgr_u8id:
             return dev.parents_un.u8id.parents 
         else:
             return dev.parents_un.u16id.parents 

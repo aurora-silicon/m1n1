@@ -27,7 +27,7 @@ struct i2c_dev {
     uintptr_t base;
 };
 
-static i2c_dev_t *i2c_init_internal(const char *adt_node, bool allow_powered)
+i2c_dev_t *i2c_init(const char *adt_node)
 {
     int adt_path[8];
     int adt_offset;
@@ -44,18 +44,8 @@ static i2c_dev_t *i2c_init_internal(const char *adt_node, bool allow_powered)
     }
 
     if (pmgr_adt_power_enable(adt_node)) {
-        if (!allow_powered) {
-            printf("i2c: Error enabling power for %s\n", adt_node);
-            return NULL;
-        }
-
-        /*
-         * A RAM-chainloaded m1n1 can inherit an already-live I2C block from
-         * the resident stub even when its reconstructed PMGR dependency state
-         * cannot be enabled recursively.  USB HPM access is still valid in
-         * that state, so permit the caller to use the mapped controller.
-         */
-        printf("i2c: power enable failed for %s; trying inherited controller\n", adt_node);
+        printf("i2c: Error enabling power for %s\n", adt_node);
+        return NULL;
     }
 
     i2c_dev_t *dev = calloc(1, sizeof(*dev));
@@ -64,16 +54,6 @@ static i2c_dev_t *i2c_init_internal(const char *adt_node, bool allow_powered)
 
     dev->base = base;
     return dev;
-}
-
-i2c_dev_t *i2c_init(const char *adt_node)
-{
-    return i2c_init_internal(adt_node, false);
-}
-
-i2c_dev_t *i2c_init_allow_powered(const char *adt_node)
-{
-    return i2c_init_internal(adt_node, true);
 }
 
 void i2c_shutdown(i2c_dev_t *dev)
@@ -137,9 +117,10 @@ static int i2c_xfer_write(i2c_dev_t *dev, u8 addr, u32 start, u32 stop, const u8
     if (!stop)
         return 0;
 
-    if (poll32(dev->base + PASEMI_STATUS, PASEMI_STATUS_XFER_BUSY, 0, 50000)) {
+    if (poll32(dev->base + PASEMI_STATUS, PASEMI_STATUS_XFER_ENDED, PASEMI_STATUS_XFER_ENDED,
+               50000)) {
         printf(
-            "i2c: timeout while waiting for PASEMI_STATUS_XFER_BUSY to clear after write xfer\n");
+            "i2c: timeout while waiting for PASEMI_STATUS_XFER_ENDED to be set after write xfer\n");
         return -1;
     }
 
@@ -171,8 +152,10 @@ int i2c_smbus_read(i2c_dev_t *dev, u8 addr, u8 reg, u8 *bfr, size_t len)
     ret = i2c_xfer_read(dev, bfr, min(len, len_reply));
 
 err:
-    if (poll32(dev->base + PASEMI_STATUS, PASEMI_STATUS_XFER_BUSY, 0, 50000)) {
-        printf("i2c: timeout while waiting for PASEMI_STATUS_XFER_BUSY to clear after read xfer\n");
+    if (poll32(dev->base + PASEMI_STATUS, PASEMI_STATUS_XFER_ENDED, PASEMI_STATUS_XFER_ENDED,
+               50000)) {
+        printf(
+            "i2c: timeout while waiting for PASEMI_STATUS_XFER_ENDED to be set after write xfer\n");
         return -1;
     }
 

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
-#include "build_cfg.h"
-#include "build_tag.h"
+#include "../build/build_cfg.h"
+#include "../build/build_tag.h"
 
 #include "../config.h"
 
@@ -23,6 +23,7 @@
 #include "sep.h"
 #include "smp.h"
 #include "string.h"
+#include "tps6598x.h"
 #include "uart.h"
 #include "uartproxy.h"
 #include "usb.h"
@@ -67,87 +68,6 @@ void get_device_info(void)
 
     printf("\n");
 }
-
-#ifdef DUMP_T8142_PMGR
-//
-// T8142 replaced the pmgr `ps-regs` property (M4 and earlier: 16 entries of
-// {reg_idx, offset, mask}) with `ps-groups`, so pmgr_init() bails and nothing
-// gets powered -- which is why the USB DART faults.
-//
-// Working the new format out normally needs the interactive proxy, but the proxy
-// needs USB, which needs pmgr. This dumps the raw ADT data to the framebuffer so
-// the format can be worked out offline from a photograph instead.
-//
-// Reads only ADT properties and the pmgr node's own reg windows. It does not
-// touch any unpowered device, so it cannot repeat the DART fault.
-//
-static void dump_t8142_pmgr(void)
-{
-    int path[8];
-    int node = adt_path_offset_trace(adt, "/arm-io/pmgr", path);
-    if (node < 0) {
-        printf("PMGRDUMP: no /arm-io/pmgr\n");
-        return;
-    }
-
-    printf("\n=== PMGR DUMP (T8142) ===\n");
-
-    // pmgr's own reg windows -- these are what ps-regs/ps-groups index into.
-    for (int i = 0; i < 8; i++) {
-        u64 base, size;
-        if (adt_get_reg(adt, path, "reg", i, &base, &size) < 0)
-            break;
-        printf("reg[%d] 0x%09lx sz 0x%lx\n", i, base, size);
-    }
-
-    // The replacement property, raw. Only 36 bytes on J704.
-    u32 len = 0;
-    const u8 *p = adt_getprop(adt, node, "ps-groups", &len);
-    if (p) {
-        printf("ps-groups (%u bytes):\n ", len);
-        for (u32 i = 0; i < len && i < 64; i++) {
-            printf("%02x ", p[i]);
-            if ((i % 16) == 15)
-                printf("\n ");
-        }
-        printf("\n");
-    } else {
-        printf("ps-groups: ABSENT\n");
-    }
-
-    static const char *const other_props[] = {"ps-regs", "pwrgate-regs", "perf-regs",
-                                              "ps-groups", "perf-groups"};
-    for (u32 i = 0; i < sizeof(other_props) / sizeof(other_props[0]); i++) {
-        u32 l = 0;
-        printf("%-14s %s\n", other_props[i],
-               adt_getprop(adt, node, other_props[i], &l) ? "present" : "ABSENT");
-    }
-
-    //
-    // Device entries. struct pmgr_device is private to pmgr.c, so index the raw
-    // 48-byte records directly:
-    //   +0x00 flags  +0x03 id1  +0x0a addr_offset  +0x0b psreg_idx
-    //   +0x1a id2    +0x20 name[16]
-    //
-    const u8 *devs = adt_getprop(adt, node, "devices", &len);
-    if (devs) {
-        u32 stride = 48;
-        u32 count = len / stride;
-        printf("devices: %u bytes / %u = %u entries\n", len, stride, count);
-        for (u32 i = 0; i < count; i++) {
-            const u8 *d = devs + i * stride;
-            const char *nm = (const char *)(d + 0x20);
-            // Only the devices USB bringup powers, to fit on screen.
-            if (strncmp(nm, "ATC0", 4) && strncmp(nm, "DART_USB0", 9) &&
-                strncmp(nm, "USB_DRD0", 8))
-                continue;
-            printf("  %-14s ps_idx:%02x addr_off:%02x flags:%02x id1:%02x\n", nm, d[0x0b],
-                   d[0x0a], d[0x00], d[0x03]);
-        }
-    }
-    printf("=========================\n");
-}
-#endif
 
 void run_actions(void)
 {
@@ -207,42 +127,11 @@ void run_actions(void)
 
     printf("No valid payload found\n");
 
-#if !defined(BRINGUP) && !defined(SKIP_USB_BRINGUP)
+#ifndef BRINGUP
     if (!usb_up) {
         usb_init();
         usb_iodev_init();
     }
-#elif defined(SKIP_USB_BRINGUP)
-    printf("USB bringup skipped (SKIP_USB_BRINGUP) - no proxy console.\n");
-    //
-    // init_cpu() prints the MIDR part very early, before the boot-args dump, so
-    // on a 57-row framebuffer console it has already scrolled away by the time
-    // anything can be photographed. Reprint it here, at the bottom of the log.
-    //
-    // This is the one value we cannot obtain any other way: MIDR_EL1 is not
-    // readable from macOS userspace, and it is what gates the midr.h /
-    // chickens.c entries for T8142.
-    //
-    u64 midr = mrs(MIDR_EL1);
-    printf("\n=== T8142 CPU IDENTIFICATION ===\n");
-    printf("MIDR_EL1   : 0x%016lx\n", midr);
-    printf("  implementer 0x%02lx  part 0x%03lx  variant 0x%lx  revision 0x%lx\n",
-           (midr >> 24) & 0xff, (midr >> 4) & 0xfff, (midr >> 20) & 0xf, midr & 0xf);
-    printf("MPIDR_EL1  : 0x%016lx\n", mrs(MPIDR_EL1));
-    printf("================================\n");
-    //
-    // Deliberately fall through to uartproxy_run() below rather than halting.
-    //
-    // An earlier version spun here forever, purely so the boot log stayed on the
-    // framebuffer long enough to photograph. That is no longer the only way to
-    // read it: with serial up (macvdmtool from the M4), falling through gives a
-    // working proxy console over UART even though USB is skipped -- which is what
-    // makes the pmgr ps-groups reverse engineering possible at all.
-    //
-#endif
-
-#ifdef DUMP_T8142_PMGR
-    dump_t8142_pmgr();
 #endif
 
     printf("Running proxy...\n");
@@ -253,13 +142,6 @@ void run_actions(void)
 void m1n1_main(void)
 {
     printf("\n\nm1n1 %s\n", m1n1_version);
-    //
-    // The git tag stays "b791225-dirty" across every local build, and successive
-    // builds come out byte-identical in size, so there was no way to tell from a
-    // boot log which image was actually installed. Bump this by hand whenever a
-    // build is handed over for testing.
-    //
-    printf("T8142 work-in-progress build: M5-DEBUG-21\n");
     printf("Copyright The Asahi Linux Contributors\n");
     printf("Licensed under the MIT license\n\n");
 
@@ -274,38 +156,19 @@ void m1n1_main(void)
         gxf_init();
     mcc_init();
     mmu_init();
-#if defined(USE_FB) && defined(EARLY_FB_CONSOLE)
-    /*
-     * Bringup aid: get the console onto the screen before any SoC-specific init
-     * runs, so that a hang in aic_init(), pmgr_init() or display_init() on
-     * silicon we do not know yet leaves a readable log rather than a blank
-     * panel.
-     *
-     * fb_init() only needs malloc() (heapblock_init, above) and
-     * mmu_add_mapping() (mmu_init, above); chip_id and is_mac are set by
-     * get_device_info() in startup.c long before this point. It adopts the
-     * framebuffer iBoot already configured (cur_boot_args.video.base), so the
-     * DCP does not have to be up. The 8K console ring buffer is replayed on
-     * activation, so the banner and device info printed earlier are not lost.
-     *
-     * Caveat: this runs before display_init(), reversing the usual order. If the
-     * DCP relocates the framebuffer, the console can go stale from that point
-     * on -- but by then we have the early log, which is the entire purpose.
-     */
-    fb_init(!is_mac);
-    fb_set_active(true);
-#endif
     aic_init();
 #endif
     wdt_disable();
 #ifndef BRINGUP
     pmgr_init();
+#ifdef USE_DEBUG_USB
+    tps6598x_enable_debugusb();
+#endif
 #ifdef USE_FB
     display_init();
     // Kick DCP to sleep, so dodgy monitors which cause reconnect cycles don't cause us to lose the
     // framebuffer.
     display_shutdown(DCP_SLEEP_IF_EXTERNAL);
-#ifndef EARLY_FB_CONSOLE
     // On idevice we need to always clear, because otherwise it looks scuffed on white devices
     fb_init(!is_mac);
     fb_display_logo();
@@ -313,13 +176,6 @@ void m1n1_main(void)
     fb_set_active(!cur_boot_args.video.display);
 #else
     fb_set_active(true);
-#endif
-#else
-    /*
-     * Already initialised and activated above. Deliberately skip the logo and the
-     * FB_SILENT_MODE handling here: both would erase or hide the early boot log
-     * that is the whole point of EARLY_FB_CONSOLE.
-     */
 #endif
 #endif
 

@@ -40,11 +40,11 @@ class GFXHandoff:
 
         self.reg.LOCK_AP.val = 1
         while self.reg.LOCK_FW.val != 0:
-            if self.reg.TURN.val != 0:
-                self.reg.LOCK_AP.val = 0
-                while self.reg.TURN.val != 0:
+            if self.reg.TURN != 0:
+                self.reg.LOCK_AP = 0
+                while self.reg.TURN != 0:
                     pass
-                self.reg.LOCK_AP.val = 1
+                self.reg.LOCK_AP = 1
 
         self.is_locked = True
         try:
@@ -61,8 +61,8 @@ class GFXHandoff:
         print("[Handoff] Initializing...")
 
         self.reg.MAGIC_AP.val = PPL_MAGIC
-        self.reg.CUR_CTX.val = 0xffffffff
-        self.reg.UNK3.val = 0
+        self.reg.UNK = 0xffffffff
+        self.reg.UNK3 = 0
 
         with self.lock():
             print("[Handoff] Waiting for FW PPL init...")

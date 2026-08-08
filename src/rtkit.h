@@ -24,38 +24,12 @@ struct rtkit_buffer {
 
 rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,
                         iova_domain_t *dart_iovad, sart_dev_t *sart, bool sram);
-/*
- * Permit IOP-owned preallocated buffers only inside one explicit physical
- * aperture while retaining the normal DART/SART mapping path for AP-owned
- * buffers. This is intended for coprocessors such as MTP that combine a DART
- * with a dedicated SRAM region.
- */
-bool rtkit_set_phys_window(rtkit_dev_t *rtk, u64 base, size_t size);
-/* Translate IOP-provided SRAM IOVAs into one explicit CPU-visible SRAM
- * aperture. Apple ACIO uses IOVA 0x10000000 while its SRAM is mapped at a
- * different physical address; accepting the IOVA as a physical pointer is
- * incorrect. Valid only for an RTKit instance created with sram=true. */
-bool rtkit_set_sram_window(rtkit_dev_t *rtk, u64 iova_base, u64 phys_base,
-                          size_t size);
-/*
- * Serve AP-allocated buffer grants from a caller-owned, 16 KiB-aligned
- * physical region instead of the m1n1 heap. Required whenever the IOP keeps
- * running into the next OS: the pool region must be reserved out of that
- * OS's memory map, and exhaustion fails the request rather than falling
- * back to heap memory the IOP would scribble over post-boot.
- */
-bool rtkit_set_buffer_pool(rtkit_dev_t *rtk, u64 base, size_t size);
 bool rtkit_quiesce(rtkit_dev_t *rtk);
 bool rtkit_sleep(rtkit_dev_t *rtk);
 void rtkit_free(rtkit_dev_t *rtk);
 
 bool rtkit_start_ep(rtkit_dev_t *rtk, u8 ep);
 bool rtkit_boot(rtkit_dev_t *rtk);
-/*
- * Bounded boot variant. In addition to timing out while waiting for IOP=ON,
- * this waits for the AP=ON acknowledgement before returning.
- */
-bool rtkit_boot_timed(rtkit_dev_t *rtk, u32 timeout_usec);
 
 bool rtkit_can_recv(rtkit_dev_t *rtk);
 

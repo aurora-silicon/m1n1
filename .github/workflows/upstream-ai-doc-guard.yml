@@ -1,0 +1,25 @@
+name: Upstream AI document guard
+
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Reject inherited upstream AI documents
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out proposed tree
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare protected documents with provenance branch
+        run: .github/scripts/check-upstream-ai-docs.sh

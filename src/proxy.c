@@ -1,25 +1,19 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "proxy.h"
-#include "acio.h"
-#include "atcphy.h"
 #include "cpufreq.h"
 #include "dapf.h"
 #include "dart.h"
 #include "display.h"
 #include "exception.h"
 #include "fb.h"
-#include "gpu_handoff.h"
 #include "gxf.h"
 #include "heapblock.h"
 #include "hv.h"
-#include "hv_tpm.h"
-#include "hv_xfer.h"
 #include "iodev.h"
 #include "kboot.h"
 #include "malloc.h"
 #include "mcc.h"
-#include "media_handoff.h"
 #include "memory.h"
 #include "nvme.h"
 #include "pcie.h"
@@ -32,12 +26,13 @@
 #include "uartproxy.h"
 #include "usb.h"
 #include "utils.h"
-#include "wireless_handoff.h"
 #include "xnuboot.h"
-#include "hv_psci.h"
 
 #include "minilzlib/minlzma.h"
 #include "tinf/tinf.h"
+
+void *rust_read_gigalocker(size_t *);
+void rust_free_gigalocker(void *, size_t);
 
 int proxy_process(ProxyRequest *request, ProxyReply *reply)
 {
@@ -61,6 +56,15 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         }
         case P_GET_BOOTARGS:
             reply->retval = boot_args_addr;
+            break;
+        case P_GET_CPU_FEATURES:
+            if (request->args[0] == sizeof(struct midr_part_features))
+                reply->retval = (u64)cpu_features;
+            else {
+                printf("size mismatch: sizeof(struct midr_part_features) = %ld != %ld\n",
+                       sizeof(struct midr_part_features), request->args[0]);
+                reply->retval = 0;
+            }
             break;
         case P_GET_BASE:
             reply->retval = (u64)_base;
@@ -386,6 +390,9 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HEAPBLOCK_ALLOC:
             reply->retval = (u64)heapblock_alloc(request->args[0]);
             break;
+        case P_HEAPBLOCK_SET_LIMIT:
+            heapblock_set_limit((void *)request->args[0]);
+            break;
         case P_MALLOC:
             reply->retval = (u64)malloc(request->args[0]);
             break;
@@ -394,11 +401,6 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_FREE:
             free((void *)request->args[0]);
-            break;
-        case P_TOP_OF_MEMORY_ALLOC:
-            reply->retval = top_of_memory_alloc(request->args[0]);
-            /* A later run_guest reads the original boot_args, not this copy. */
-            memcpy((void *)boot_args_addr, &cur_boot_args, sizeof(cur_boot_args));
             break;
 
         case P_KBOOT_BOOT:
@@ -414,12 +416,15 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_KBOOT_PREPARE_DT:
             reply->retval = kboot_prepare_dt((void *)request->args[0]);
             break;
+        case P_KBOOT_SET_UBOOT:
+            reply->retval = kboot_set_uboot((void *)request->args[0], (void *)request->args[1]);
+            break;
 
         case P_PMGR_POWER_ENABLE:
             reply->retval = pmgr_power_enable(request->args[0]);
             break;
         case P_PMGR_POWER_DISABLE:
-            reply->retval = pmgr_power_enable(request->args[0]);
+            reply->retval = pmgr_power_disable(request->args[0]);
             break;
         case P_PMGR_ADT_POWER_ENABLE:
             reply->retval = pmgr_adt_power_enable((const char *)request->args[0]);
@@ -485,7 +490,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_HV_INIT:
-            reply->retval = (u64)(s64)hv_init();
+            hv_init();
             break;
         case P_HV_MAP:
             hv_map(request->args[0], request->args[1], request->args[2], request->args[3]);
@@ -502,30 +507,6 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_HV_MAP_VUART:
             hv_map_vuart(request->args[0], request->args[1], request->args[2]);
-            break;
-        case P_HV_MAP_TPM:
-            /*
-             * args[1] selects the backend: 0 = none (every command answers
-             * TPM_RC_FAILURE; interface bring-up only), 1 = host engine over
-             * the proxy, one HV_TPM event per command. Anything else is
-             * refused -- an unknown engine must not silently degrade into
-             * "no engine" or the operator would debug the wrong layer.
-             */
-            if (request->args[1] == 0)
-                reply->retval = hv_map_tpm(request->args[0], NULL, NULL);
-            else if (request->args[1] == 1)
-                reply->retval = hv_map_tpm_proxy(request->args[0]);
-            else
-                reply->retval = -1;
-            break;
-        case P_HV_MAP_XFER:
-            /*
-             * args: doorbell base, window physical base, window size. The
-             * window is allocated by the host out of the proxy heap, which
-             * sits below the guest's boot_args phys_base and is therefore
-             * invisible to the guest's memory map -- see hv_map_xfer().
-             */
-            reply->retval = hv_map_xfer(request->args[0], request->args[1], request->args[2]);
             break;
         case P_HV_MAP_VIRTIO:
             hv_map_virtio(request->args[0], (void *)request->args[1]);
@@ -562,35 +543,6 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HV_ADD_TIME:
             hv_add_time(request->args[0]);
             break;
-        case P_HV_PSCI_SUSPEND_CPU:
-            reply->retval =  hv_psci_suspend_cpu(request->args[0], request->args[1], request->args[2]);
-            break;
-        case P_HV_PSCI_TURN_OFF_CPU:
-            reply->retval = hv_psci_turn_off_cpu();
-            break;
-        case P_HV_PSCI_TURN_ON_CPU:
-            reply->retval = hv_psci_turn_on_cpu(request->args[0], request->args[1], request->args[2]);
-            break;
-        case P_HV_PSCI_TURN_OFF_SYSTEM:
-            hv_psci_turn_off_system();
-            //
-            // No return.
-            //
-            break;
-        case P_HV_PSCI_RESET_SYSTEM:
-            hv_psci_reset_system();
-            //
-            // No return.
-            //
-        case P_HV_PSCI_FEATURES:
-            reply->retval = hv_psci_features(request->args[0]);
-            break;
-        case P_HV_PSCI_MEM_PROTECT:
-            reply->retval = hv_psci_mem_protect(request->args[0]);
-            break;
-        case P_HV_PSCI_MEM_PROTECT_CHECK_RANGE:
-            reply->retval = hv_psci_mem_protect_check_range(request->args[0], request->args[1]);
-            break;
 
         case P_FB_INIT:
             fb_init(request->args[0]);
@@ -625,18 +577,10 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_PCIE_INIT:
-            /* Surface link-training failure to the host instead of silently
-             * launching a guest with an empty/dead PCI hierarchy. */
-            reply->retval = pcie_init();
+            pcie_init();
             break;
         case P_PCIE_SHUTDOWN:
             pcie_shutdown();
-            break;
-        case P_WIRELESS_HANDOFF_INIT:
-            reply->retval = wireless_handoff_init(request->args[0], request->args[1]);
-            break;
-        case P_PCIE_WIRELESS_INIT:
-            reply->retval = pcie_init_wireless();
             break;
 
         case P_NVME_INIT:
@@ -683,214 +627,20 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = cpufreq_init();
             break;
 
-        case P_ATCPHY_APPLY_MODE:
-            reply->retval =
-                (u64)(s64)atcphy_apply_mode(request->args[0], (atcphy_mode_t)request->args[1],
-                                            request->args[2] != 0,
-                                            (atcphy_pipe_policy_t)request->args[3],
-                                            request->args[4] != 0,
-                                            (atcphy_dp_rate_t)request->args[5]);
-            break;
-        case P_ATCPHY_SET_ORIENTATION:
-            reply->retval =
-                (u64)(s64)atcphy_set_orientation(request->args[0], request->args[1] != 0);
-            break;
-        case P_ATCPHY_POWER_OFF:
-            reply->retval = (u64)(s64)atcphy_power_off(request->args[0]);
-            break;
-        case P_ATCPHY_GET_REG_BASE:
-            reply->retval = atcphy_reg_base(request->args[0], request->args[1]);
-            break;
-        case P_ATCPHY_ARM_GUEST_MODE: {
-            /* args[4] is the pipe policy; absent (0) from an old client means
-             * REFUSE, so a stale client cannot silently get a mux switch. */
-            u32 port = (u32)request->args[0];
-            atcphy_mode_t mode = (atcphy_mode_t)request->args[1];
-            bool flipped = request->args[2] != 0;
-            bool armed = request->args[3] != 0;
-            atcphy_pipe_policy_t policy = (atcphy_pipe_policy_t)request->args[4];
-            const atcphy_mode_config_t *config = atcphy_mode_config(mode, flipped);
-
-            if (!config || policy < ATCPHY_PIPE_POLICY_REFUSE ||
-                policy > ATCPHY_PIPE_POLICY_DEFER) {
-                printf("atcphy%u: refusing guest arm with invalid mode %d or PIPE policy %d\n",
-                       port, (int)mode, (int)policy);
-                reply->retval = (u64)(s64)-1;
-                break;
-            }
-
-            /* USB3 lane programming is orientation-specific. Refuse an arm
-             * unless the same read-only CD3217 STATUS measurement proves a
-             * cable is present and agrees with the requested lane mapping.
-             * This prevents both unplugged pre-arming and a stale/guessed
-             * orientation from becoming a silent USB2 fallback. Disarming
-             * and USB2-only modes remain available without a cable. */
-            if (armed && config->pipe_state == ATCPHY_PIPE_STATE_USB3) {
-                u32 status = 0;
-                int orientation = usb_hpm_read_orientation(port, &status);
-                if (orientation == USB_HPM_ORIENTATION_UNREADABLE ||
-                    orientation == USB_HPM_ORIENTATION_NO_PLUG) {
-                    printf("atcphy%u: refusing USB3 guest arm: %s (STATUS=%#010x)\n", port,
-                           orientation == USB_HPM_ORIENTATION_NO_PLUG ? "no plug present"
-                                                                     : "orientation unreadable",
-                           status);
-                    reply->retval = (u64)(s64)-1;
-                    break;
-                }
-                bool measured_flipped = orientation == USB_HPM_ORIENTATION_FLIPPED;
-                if (flipped != measured_flipped) {
-                    printf("atcphy%u: refusing USB3 guest arm: requested orientation=%s but "
-                           "CD3217 measured %s (STATUS=%#010x)\n",
-                           port, flipped ? "flipped" : "normal",
-                           measured_flipped ? "flipped" : "normal", status);
-                    reply->retval = (u64)(s64)-1;
-                    break;
-                }
-            }
-
-            atcphy_arm_guest_mode(port, mode, flipped, armed, policy);
-            reply->retval = 0;
+        case P_READ_GIGALOCKER: {
+            size_t size = 0;
+            void *data = rust_read_gigalocker(&size);
+            size_t *cmd_buf = (size_t *)request->args[0];
+            cmd_buf[0] = (size_t)data;
+            cmd_buf[1] = size;
+            reply->retval = size == 0 ? -1 : 0;
             break;
         }
-        case P_ATCPHY_READ_ORIENTATION: {
-            /* See the ABI comment on P_ATCPHY_READ_ORIENTATION in proxy.h.
-             * The decode stays here in C so the client cannot drift from
-             * the STATUS bit definitions it is decoding. */
-            u32 status = 0;
-            int orientation = usb_hpm_read_orientation((u32)request->args[0], &status);
-            if (orientation < 0) {
-                reply->retval = ~0ULL;
-            } else {
-                reply->retval = (u64)status | BIT(32);
-                if (orientation != USB_HPM_ORIENTATION_NO_PLUG)
-                    reply->retval |= BIT(33);
-                if (orientation == USB_HPM_ORIENTATION_FLIPPED)
-                    reply->retval |= BIT(34);
-            }
+        case P_FREE_GIGALOCKER: {
+            size_t *cmd_buf = (size_t *)request->args[0];
+            rust_free_gigalocker((void *)cmd_buf[0], cmd_buf[1]);
             break;
         }
-        case P_ATCPHY_READ_LINK_STATE: {
-            usb_hpm_link_state_t state = {0};
-            if (usb_hpm_read_link_state((u32)request->args[0], &state) < 0) {
-                reply->retval = ~0ULL;
-            } else if (request->args[1] == 0) {
-                /* Selector 0: role/orientation and negotiated transport. */
-                reply->retval = (u64)state.data_status |
-                                ((u64)(state.status & 0xff) << 32) | BIT(40);
-            } else if (request->args[1] == 1) {
-                /* Selector 1: USB4 mode/EUDO and Apple router cable word. */
-                reply->retval = (u64)state.usb4_eudo |
-                                ((u64)state.usb4_mode_status << 32) |
-                                ((u64)(state.apple_cable_info & 0xffff) << 40) |
-                                BIT(63);
-            } else {
-                reply->retval = ~0ULL;
-            }
-            break;
-        }
-        case P_ACIO_TYPE5_FW_START:
-            reply->retval = (u64)(s64)acio_type5_firmware_start(
-                (u32)request->args[0], (const void *)request->args[1],
-                (size_t)request->args[2], request->args[3] != 0,
-                request->args[4] != 0, (u32)request->args[5]);
-            break;
-        case P_ACIO_TYPE5_ABORT:
-            reply->retval = (u64)(s64)acio_type5_runtime_abort((u32)request->args[0]);
-            break;
-        case P_ACIO_TYPE5_PHASE:
-            reply->retval = acio_type5_runtime_phase((u32)request->args[0]);
-            break;
-        case P_ACIO_TYPE5_CONFIG_READ32: {
-            u32 value;
-            if (acio_type5_config_read32(
-                    (u32)request->args[0], request->args[1],
-                    (u8)request->args[2], (u8)request->args[3],
-                    (u16)request->args[4], &value) < 0)
-                reply->retval = ~0ULL;
-            else
-                reply->retval = BIT(32) | value;
-            break;
-        }
-        case P_ACIO_TYPE5_CONFIG_WRITE32:
-            reply->retval = (u64)(s64)acio_type5_config_write32(
-                (u32)request->args[0], request->args[1],
-                (u8)request->args[2], (u8)request->args[3],
-                (u16)request->args[4], (u32)request->args[5]);
-            break;
-        case P_ACIO_TYPE5_USB3_TUNNEL:
-            reply->retval = (u64)(s64)(request->args[1]
-                ? acio_type5_usb3_tunnel_up((u32)request->args[0], request->args[2],
-                                            (u8)request->args[3], request->args[4],
-                                            (u8)request->args[5])
-                : acio_type5_usb3_tunnel_down((u32)request->args[0], request->args[2],
-                                              (u8)request->args[3], request->args[4],
-                                              (u8)request->args[5]));
-            break;
-        case P_ACIO_TYPE5_SCAN_DEVICE: {
-            u64 route;
-            u32 depth;
-            u8 up_adapter;
-            u8 upstream_port;
-            if (acio_type5_scan_device_router((u32)request->args[0],
-                                              (u8)request->args[1], &route,
-                                              &depth, &up_adapter,
-                                              &upstream_port) < 0)
-                reply->retval = ~0ULL;
-            else
-                reply->retval = BIT(63) | (route << 16) |
-                                ((u64)upstream_port << 8) | up_adapter;
-            break;
-        }
-        case P_ACIO_TYPE5_USB3_TUNNEL_DEVICE:
-            reply->retval = (u64)(s64)acio_type5_usb3_tunnel_device_up(
-                (u32)request->args[0], (u8)request->args[1],
-                (u8)request->args[2]);
-            break;
-        case P_ACIO_TYPE5_PIPE_COMMIT:
-            reply->retval = (u64)(s64)acio_type5_pipe_commit((u32)request->args[0]);
-            break;
-        case P_ACIO_TYPE5_ROUTER_CONFIGURE:
-            reply->retval = (u64)(s64)acio_type5_router_configure(
-                (u32)request->args[0], request->args[1], request->args[2] != 0);
-            break;
-        case P_ACIO_TYPE5_STATUS: {
-            acio_type5_status_t status;
-            if (acio_type5_runtime_status((u32)request->args[0], &status) < 0) {
-                reply->retval = ~0ULL;
-                break;
-            }
-            switch (request->args[1]) {
-                case 0:
-                    reply->retval = (u64)status.phase << 32 | status.last_error;
-                    break;
-                case 1:
-                    reply->retval = (u64)status.last_error_detail << 32 |
-                                    status.error_count;
-                    break;
-                case 2:
-                    reply->retval = (u64)status.config_requests << 32 |
-                                    status.config_failures;
-                    break;
-                case 3:
-                    reply->retval = status.router_state;
-                    break;
-                case 4:
-                    reply->retval = status.run_id;
-                    break;
-                default:
-                    reply->retval = ~0ULL;
-                    break;
-            }
-            break;
-        }
-
-        case P_MEDIA_HANDOFF_INIT:
-            reply->retval = media_handoff_init((u32)request->args[0]);
-            break;
-
-        case P_GPU_INITDATA_FILL:
-            reply->retval = gpu_handoff_init(request->args[0], request->args[1]);
-            break;
 
         default:
             reply->status = S_BADCMD;
