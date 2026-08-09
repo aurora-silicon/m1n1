@@ -20,32 +20,9 @@
 #define CPU_START_OFF_T6020    0x28000
 #define CPU_START_OFF_T6031    0x88000
 
-//
-// How many secondary CPUs to bring up. -1 means "all of them".
-//
-// T8142 (M5) can start secondaries -- the offset above is confirmed working, and
-// CPU 1 and CPU 2 both come up and complete the spin-table handshake.
-//
-// **SMP works.** m1n1 runs boot CPU + 2 secondaries on J704 and gets all the way
-// through hypervisor init, PSCI and vGIC setup.
-//
-// The long-running reset was **CPU 0**, not the number of cores, not any of the
-// register writes. See T8142_SKIP_CPU0 below. Skipping it fixed the machine
-// outright.
-//
-// Ruled out along the way, each by its own build:
-//   - the third CPU's start (resets at cap 2 as well)
-//   - PMU overcurrent / thermal (it resets, it does not power off)
-//   - the HV watchdog (hv_wdt_start() only runs from hv.start())
-//   - the fast-IPI Apple IMPDEF writes, SYS_IMP_APL_IPI_RR_GLOBAL_EL1 /
-//     SYS_IMP_APL_IPI_SR_EL1 -- skipping both entirely did not help
-//   - deep_wfi() retention (T8142_PLAIN_WFI, kept anyway)
-//   - secondary console traffic (T8142_QUIET_SECONDARY, kept anyway)
-//
-// Still capped at 2 because 3+ is simply untested, not because it is known bad.
-// Raise it and see; the machine is stable at 2.
-//
-#define SMP_MAX_SECONDARIES ((chip_id == T8142) ? 2 : -1)
+// Exercise every discoverable T8142 secondary except the separately quarantined
+// CPU 0 below. Keeping an artificial count cap hides valid ADT topology from the
+// hypervisor and PSCI implementation and prevents full-M5 validation.
 
 //
 // T8142: secondaries idle with plain WFI rather than deep_wfi().
@@ -170,6 +147,58 @@ extern u8 _vectors_start[0];
 int boot_cpu_idx = -1;
 u64 boot_cpu_mpidr = 0;
 
+// A RAM-chainloaded m1n1 can grow or shrink enough to move _vectors_start while
+// T8142 keeps each secondary RVBAR locked to the resident image's old vector
+// address. In that case the core wakes into the resident image and updates the
+// wrong spin table. Install a single-instruction, RAM-only relay at the locked
+// vector address so reset enters this candidate's vector table. A reboot reloads
+// the resident image, so this never modifies the installed m1n1 artifact.
+static bool t8142_prepare_locked_rvbar_relay(u64 locked_rvbar)
+{
+    if (chip_id != T8142 || !locked_rvbar)
+        return false;
+
+    s64 delta = (s64)(u64)_vectors_start - (s64)locked_rvbar;
+
+    // AArch64 B uses a signed imm26 scaled by four: +/-128 MiB.
+    if ((delta & 3) || delta < -(1LL << 27) || delta >= (1LL << 27)) {
+        printf("Failed!\n    Locked RVBAR relay target is out of range "
+               "(RVBAR=0x%lx target=0x%lx)\n",
+               locked_rvbar, (u64)_vectors_start);
+        return false;
+    }
+
+    u32 branch = 0x14000000 | (((u64)(delta >> 2)) & 0x03ffffff);
+    u32 *relay = (u32 *)locked_rvbar;
+
+    if (*relay != branch) {
+        // m1n1 remaps its text through _rodata_end RX after MMU startup. The
+        // resident vector page falls inside that range even after a different
+        // RAM image has overwritten the surrounding allocation. Make exactly
+        // one 16 KiB page writable for the patch, then restore the normal RX
+        // permission before any secondary can fetch from it.
+        bool remapped = mmu_active();
+        if (remapped)
+            mmu_add_mapping(locked_rvbar, locked_rvbar, 0x4000, MAIR_IDX_NORMAL, PERM_RWX);
+
+        write32(locked_rvbar, branch);
+        dc_cvau_range(relay, sizeof(*relay));
+        ic_ivau_range(relay, sizeof(*relay));
+        sysop("dsb sy");
+        sysop("isb");
+
+        if (remapped)
+            mmu_add_mapping(locked_rvbar, locked_rvbar, 0x4000, MAIR_IDX_NORMAL, PERM_RX_EL0);
+    }
+
+    if (*relay != branch) {
+        printf("Failed!\n    Locked RVBAR relay write did not stick at 0x%lx\n", locked_rvbar);
+        return false;
+    }
+
+    return true;
+}
+
 void smp_secondary_entry(void)
 {
     struct spin_table *me = &spin_table[target_cpu];
@@ -276,10 +305,16 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
     if (spin_table[index].flag)
         return;
 
-    if ((read64(impl) & RVBAR_LOCK) &&
-        (read64(impl) & RVBAR_ADDR) != (u64)_vectors_start) {
-        printf("Failed! \n    RVBAR (=0x%lx) is locked and differs from entry point (=0x%lx)\n",
-               read64(impl) & RVBAR_ADDR, (u64)_vectors_start);
+    u64 rvbar = read64(impl);
+    if ((rvbar & RVBAR_LOCK) && (rvbar & RVBAR_ADDR) != (u64)_vectors_start) {
+        u64 locked_rvbar = rvbar & RVBAR_ADDR;
+        if (!t8142_prepare_locked_rvbar_relay(locked_rvbar)) {
+            printf("Failed! \n    RVBAR (=0x%lx) is locked and differs from entry point (=0x%lx)\n",
+                   locked_rvbar, (u64)_vectors_start);
+            return;
+        }
+
+        printf("RVBAR relay 0x%lx -> 0x%lx; ", locked_rvbar, (u64)_vectors_start);
     }
 
     printf("Starting CPU %d (%d:%d:%d)... ", index, die, cluster, core);
@@ -533,8 +568,6 @@ void smp_start_secondaries(void)
 
     spin_table[boot_cpu_idx].mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
 
-    int started = 0;
-
     for (int i = 0; i < MAX_CPUS; i++) {
         int cpu_node = cpu_nodes[i];
 
@@ -584,19 +617,7 @@ void smp_start_secondaries(void)
         u8 cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
         u8 die = FIELD_GET(CPU_REG_DIE, reg);
 
-        //
-        // Cap on how many secondaries we bring up. See SMP_MAX_SECONDARIES.
-        //
-        if (SMP_MAX_SECONDARIES >= 0 && started >= SMP_MAX_SECONDARIES) {
-            printf("Not starting CPU %d: at the SMP_MAX_SECONDARIES limit of %d\n", i,
-                   SMP_MAX_SECONDARIES);
-            continue;
-        }
-
         smp_start_cpu(i, die, cluster, core, cpu_impl_reg[0], pmgr_reg + cpu_start_off);
-
-        if (spin_table[i].flag)
-            started++;
     }
 }
 

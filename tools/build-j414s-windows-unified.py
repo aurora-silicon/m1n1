@@ -57,7 +57,12 @@ TARGET_SCHEMAS = {
     "j414s": "ntasi.j414s.m1n1-unified.v1",
     "j813": "aurora.j813.m1n1-unified.v1",
 }
-WINDOWS_LINEAGE = "eb256adf60f181ab79e643d37fcd1aeee63224de"
+WINDOWS_LINEAGES = (
+    "eb256adf60f181ab79e643d37fcd1aeee63224de",
+    # Equivalent compacted import used by Aurora's intentionally squashed
+    # M5 history.  Keep accepting the original lineage for unsquashed trees.
+    "b010431b",
+)
 BCM4388_DORMANT_ORIGIN = "b661647696191a177ea15ea1a9d5f69ae422c31d"
 USB_ROLE_SWAP_EXPERIMENT = "f17a15d1"
 USB_INTERNAL_PHY_HANDOFF = "da86932a"
@@ -287,11 +292,23 @@ def validate(root: Path) -> tuple[str, str, dict[str, str], dict[str, object], d
             file=__import__("sys").stderr,
         )
     commit = run(root, "git", "rev-parse", "HEAD")
-    subprocess.run(
-        ["git", "merge-base", "--is-ancestor", WINDOWS_LINEAGE, commit],
-        cwd=root,
-        check=True,
+    windows_lineage = next(
+        (
+            candidate
+            for candidate in WINDOWS_LINEAGES
+            if subprocess.run(
+                ["git", "merge-base", "--is-ancestor", candidate, commit],
+                cwd=root,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode
+            == 0
+        ),
+        None,
     )
+    if windows_lineage is None:
+        expected = ", ".join(WINDOWS_LINEAGES)
+        raise SystemExit(f"missing audited Windows lineage; expected one of {expected}")
     # Source contracts are RECORDED, never ENFORCED.
     #
     # These used to abort the build when a tracked file stopped containing a
@@ -343,13 +360,22 @@ def validate(root: Path) -> tuple[str, str, dict[str, str], dict[str, object], d
         "--grep=feat(dart): add dormant BCM4388 SID1 handoff core",
     )
     if len(integration) != 40:
+        compacted_import = "b010431b"
+        if subprocess.run(
+            ["git", "merge-base", "--is-ancestor", compacted_import, commit],
+            cwd=root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0:
+            integration = run(root, "git", "rev-parse", compacted_import)
+    if len(integration) != 40:
         raise SystemExit("missing integrated dormant BCM4388 transaction commit")
 
     main_head = run(root, "git", "rev-parse", "main")
     merge_base = run(root, "git", "merge-base", commit, main_head)
     main_cherry = run(root, "git", "cherry", commit, main_head)
     provenance: dict[str, object] = {
-        "windows_native_aic_ancestor": WINDOWS_LINEAGE,
+        "windows_native_aic_ancestor": windows_lineage,
         "bcm4388_dormant_origin": BCM4388_DORMANT_ORIGIN,
         "bcm4388_dormant_integration": integration,
         "mainline_snapshot": {
