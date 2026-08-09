@@ -17,6 +17,7 @@ void *el0_stack_base = (void *)(u64)(&el0_stack[EL0_STACK_SIZE]);
 
 extern char _vectors_start[0];
 extern char _el1_vectors_start[0];
+extern bool vgic_serror_errata_present;
 
 volatile enum exc_guard_t exc_guard = GUARD_OFF;
 volatile int exc_count = 0;
@@ -187,15 +188,21 @@ void print_regs(u64 *regs, int el12)
     bool in_gl;
     u64 sp = ((u64)(regs)) + 256;
 
-    in_gl = in_gl12();
-    bool el3 = in_el3();
-
-    u64 spsr = in_gl ? mrs(SYS_IMP_APL_SPSR_GL1)
-                     : (el12 ? mrs(SPSR_EL12) : (el3 ? mrs(SPSR_EL3) : mrs(SPSR_EL1)));
-
-    printf("Exception taken from %s\n", get_exception_source(spsr));
-    printf("Running in %s\n", get_exception_level());
-    printf("MPIDR: 0x%lx\n", mrs(MPIDR_EL1));
+    //
+    // Dump the saved general-purpose registers FIRST, before touching a single
+    // system register.
+    //
+    // regs[] is plain memory that the vector already spilled, so printing it
+    // cannot fault. Everything below needs mrs(), and on T8142 (Apple M5)
+    // something in that sequence faults -- recursively, since we are already in
+    // the exception handler -- so the machine went silent after the bare
+    // "Exception: SYNC" line and every fault on this chip was reported with no
+    // detail whatsoever. Ordering the safe part first means a nested fault
+    // costs us the system-register detail instead of all of it.
+    //
+    // This is not hypothetical: x30 alone was what identified the UEFI PrePi
+    // null-stack crash, via image base + TE header + Sec.map.
+    //
     printf("Registers: (@%p)\n", regs);
     printf("  x0-x3: %016lx %016lx %016lx %016lx\n", regs[0], regs[1], regs[2], regs[3]);
     printf("  x4-x7: %016lx %016lx %016lx %016lx\n", regs[4], regs[5], regs[6], regs[7]);
@@ -205,6 +212,17 @@ void print_regs(u64 *regs, int el12)
     printf("x20-x23: %016lx %016lx %016lx %016lx\n", regs[20], regs[21], regs[22], regs[23]);
     printf("x24-x27: %016lx %016lx %016lx %016lx\n", regs[24], regs[25], regs[26], regs[27]);
     printf("x28-x30: %016lx %016lx %016lx\n", regs[28], regs[29], regs[30]);
+    printf("SP:       0x%lx\n", sp);
+
+    in_gl = in_gl12();
+    bool el3 = in_el3();
+
+    u64 spsr = in_gl ? mrs(SYS_IMP_APL_SPSR_GL1)
+                     : (el12 ? mrs(SPSR_EL12) : (el3 ? mrs(SPSR_EL3) : mrs(SPSR_EL1)));
+
+    printf("Exception taken from %s\n", get_exception_source(spsr));
+    printf("Running in %s\n", get_exception_level());
+    printf("MPIDR: 0x%lx\n", mrs(MPIDR_EL1));
 
     u64 elr = in_gl ? mrs(SYS_IMP_APL_ELR_GL1)
                     : (el12 ? mrs(ELR_EL12) : (el3 ? mrs(ELR_EL3) : mrs(ELR_EL1)));
@@ -214,7 +232,6 @@ void print_regs(u64 *regs, int el12)
                     : (el12 ? mrs(FAR_EL12) : (el3 ? mrs(FAR_EL3) : mrs(FAR_EL1)));
 
     printf("PC:       0x%lx (rel: 0x%lx)\n", elr, elr - (u64)_base);
-    printf("SP:       0x%lx\n", sp);
     printf("SPSR:     0x%lx\n", spsr);
     if (in_gl12()) {
         printf("ASPSR:    0x%lx\n", mrs(SYS_IMP_APL_ASPSR_GL1));
@@ -224,13 +241,68 @@ void print_regs(u64 *regs, int el12)
     const char *ec_desc = ec_table[(esr >> 26) & 0x3f];
     printf("ESR:      0x%lx (%s)\n", esr, ec_desc ? ec_desc : "?");
 
+    //
+    // Read the EL2 versions by name rather than relying on the VHE redirection
+    // of the _EL1 encodings above, so the two can be compared. If they disagree,
+    // everything derived from the _EL1 reads is worthless.
+    //
+    if (in_el2()) {
+        printf("ELR_EL2:  0x%lx\n", mrs(ELR_EL2));
+        printf("ESR_EL2:  0x%lx\n", mrs(ESR_EL2));
+        printf("FAR_EL2:  0x%lx\n", mrs(FAR_EL2));
+        printf("SPSR_EL2: 0x%lx\n", mrs(SPSR_EL2));
+        printf("HCR_EL2:  0x%lx\n", mrs(HCR_EL2));
+        printf("VBAR_EL2: 0x%lx\n", mrs(VBAR_EL2));
+    }
+
+    //
+    // The decisive one: the instruction word at the reported PC.
+    //
+    // On T8142 we kept getting ESR EC=0 ("unknown reason") at a PC whose
+    // disassembly is a plain store -- an instruction that cannot produce EC=0.
+    // Either the ELR is real and the chip is doing something surprising, or the
+    // ELR is not to be trusted and every conclusion drawn from it is void. This
+    // tells the two apart directly.
+    //
+    // Bounds-checked against m1n1's own image: a wild read here would fault
+    // inside the exception handler and take the machine down.
+    //
+    u64 img_lo = (u64)_base;
+    u64 img_hi = img_lo + 0x200000;
+    if (elr >= img_lo && elr < img_hi - 8 && (elr & 3) == 0) {
+        const u32 *insn = (const u32 *)elr;
+        printf("Insn@PC:  %08x  (prev %08x, next %08x)\n", insn[0], insn[-1], insn[1]);
+    } else {
+        printf("Insn@PC:  <PC 0x%lx outside m1n1 image 0x%lx..0x%lx>\n", elr, img_lo, img_hi);
+    }
+
     u64 sts = mrs(SYS_IMP_APL_L2C_ERR_STS);
     printf("L2C_ERR_STS: 0x%lx\n", sts);
     printf("L2C_ERR_ADR: 0x%lx\n", mrs(SYS_IMP_APL_L2C_ERR_ADR));
     printf("L2C_ERR_INF: 0x%lx\n", mrs(SYS_IMP_APL_L2C_ERR_INF));
-    if (cpu_features->apple_sysregs_unlocked) {
+    //
+    // Only acknowledge if there is actually something to acknowledge.
+    //
+    // L2C_ERR_STS is write-1-to-clear (gated by L2C_ERR_STS_ENABLE_W1C), so
+    // writing back a zero clears nothing -- the write was pointless in that case
+    // even on hardware that tolerates it.
+    //
+    // On T8142 (Apple M5) it is worse than pointless: the register reads fine but
+    // the WRITE traps, with ESR EC=0 "unknown reason". Because this is the
+    // exception printer, that turns every single exception into an infinite
+    // recursive fault -- the handler dies partway through reporting, re-enters,
+    // prints the same registers, and dies again. The genuine fault is never
+    // displayed, and the machine resets.
+    //
+    // That masked the real cause of every crash on this SoC. The repeated
+    // identical dumps at this PC were the handler eating itself, not the bug.
+    //
+    // NOTE: if a real L2C error ever does set sts on T8142 we will trap here
+    // again and need a chip_id-specific skip. Every occurrence so far has read
+    // back 0.
+    //
+    if (sts)
         msr(SYS_IMP_APL_L2C_ERR_STS, sts);
-    }
 
     if (is_ecore()) {
         printf("E_LSU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_E_LSU_ERR_STS));
@@ -333,10 +405,20 @@ void exc_sync(u64 *regs)
     if (!(exc_guard & GUARD_SILENT))
         print_regs(regs, el12);
 
-    if (cpu_features->apple_sysregs_unlocked) {
-        u64 l2c_err_sts = mrs(SYS_IMP_APL_L2C_ERR_STS);
+    //
+    // Second occurrence of the T8142 L2C_ERR_STS hazard -- the one in
+    // print_regs() was fixed earlier, this one was missed.
+    //
+    // The register is write-1-to-clear, so writing back a zero clears nothing
+    // and the write is pointless anyway. On T8142 (Apple M5) it is worse: the
+    // read is fine but the WRITE traps. Doing it unconditionally here means
+    // every single exception faults again *inside the exception handler*, which
+    // recurses and takes the machine down -- which is why every fault on this
+    // chip ended as a bare "Exception: SYNC" followed by a dead proxy.
+    //
+    u64 l2c_err_sts = mrs(SYS_IMP_APL_L2C_ERR_STS);
+    if (l2c_err_sts)
         msr(SYS_IMP_APL_L2C_ERR_STS, l2c_err_sts); // Clear the L2C_ERR flag bits
-    }
 
     switch (exc_guard & GUARD_TYPE_MASK) {
         case GUARD_SKIP:
@@ -462,6 +544,19 @@ void exc_fiq(u64 *regs)
 
 void exc_serr(u64 *regs)
 {
+    //
+    // m1n1_windows special handling: since we're using m1n1 as a hypervisor to virtualize the GIC - on M1 or M2 based SoCs, we will
+    // occasionally hit an errata where SErrors hit by the guest due to violating the GIC state machine will occasionally hit the host.
+    //
+    // While KVM/QEMU work around this by just trapping all accesses to GIC registers, we cannot afford this performance drop in our scenario
+    // so we'll have to infer whenever this occurs and then kick this to the guest, this way a malicious guest cannot take us down, while preserving
+    // the performance we require.
+    //
+    // On M3 and later, guest-generated SErrors in this manner will be routed to the guest as they should be so this workaround won't be
+    // required on those platforms.
+    //
+    // TODO: this handling - right now we're doing the "pray we don't have to implement this" strategy.
+    //
     if (!(exc_guard & GUARD_SILENT))
         printf("Exception: SError\n");
 

@@ -5,6 +5,7 @@ from construct import *
 
 from .asm import ARMAsm
 from .proxy import *
+from .proxy import CPUFeatures
 from .utils import Reloadable, chexdiff32
 from .tgtypes import *
 from .sysreg import *
@@ -38,6 +39,10 @@ VERSION_MAP = {
     "iBoot-8422.141.2": "V13_5",
 }
 
+def legacy_cpu_features():
+    """Return conservative feature flags for pre-P_GET_CPU_FEATURES m1n1."""
+    return CPUFeatures.parse(bytes(CPUFeatures.sizeof()))
+
 class ProxyUtils(Reloadable):
     CODE_BUFFER_SIZE = 0x10000
     def __init__(self, p, heap_size=1024 * 1024 * 1024, m1n1_heap=128 * 1024 * 1024):
@@ -45,9 +50,13 @@ class ProxyUtils(Reloadable):
         self.proxy = p
         self.base = p.get_base()
 
+        self.cpu_features = legacy_cpu_features()
         try:
             self.cpu_features = p.get_cpu_features()
         except ProxyRemoteError:
+            # Older resident m1n1 builds do not implement P_GET_CPU_FEATURES.
+            # Keep the conservative all-disabled flags so newer host tools can
+            # still drive them without assuming unlocked Apple system registers.
             pass
 
         (self.ba_addr, self.ba_rev) = p.get_bootargs_rev()

@@ -158,9 +158,9 @@ class UatAccessor(Reloadable):
     def write(self, addr, data, width):
         self.uat.u.write(self.translate(addr, width), data, width)
     def write8(self, addr, data):
-        self.uat.p.write8(self.translate(addr, 1), daat)
+        self.uat.p.write8(self.translate(addr, 1), data)
     def write16(self, addr, data):
-        self.uat.p.write6(self.translate(addr, 2), data)
+        self.uat.p.write16(self.translate(addr, 2), data)
     def write32(self, addr, data):
         self.uat.p.write32(self.translate(addr, 4), data)
     def write64(self, addr, data):
@@ -502,6 +502,8 @@ class UAT(Reloadable):
         for ctx, ranges in self.dirty_ranges.items():
             asid = ctx << 48
             self.u.inst("tlbi aside1os, x0", asid)
+
+        self.dirty_ranges.clear()
 
     def invalidate_cache(self):
         self.pt_cache = {}

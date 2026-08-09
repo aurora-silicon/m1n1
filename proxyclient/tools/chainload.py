@@ -12,6 +12,8 @@ parser.add_argument('-c', '--call', action="store_true", help="Use call mode")
 parser.add_argument('-r', '--raw', action="store_true", help="Image is raw")
 parser.add_argument('-E', '--entry-point', action="store", type=int, help="Entry point for the raw image", default=0x800)
 parser.add_argument('-x', '--xnu', action="store_true", help="Set up for chainloading XNU")
+parser.add_argument('--t8142-rvbar-mode', choices=("auto", "skip", "all"), default="auto",
+                    help="T8142 secondary RVBAR policy (default: auto)")
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
@@ -99,6 +101,22 @@ if rvbar != u.base:
     for cpu in u.adt["cpus"]:
         if cpu.state == "running":
             continue
+
+        # T8142 has asymmetric 6E+4P clusters.  The cluster-1 cpu-impl-reg
+        # window faults when accessed from the installed proxy, while the
+        # replacement m1n1 currently starts only cpu1 and cpu2 (cpu0 is a
+        # known-bad secondary and the remaining cores are capped in smp.c).
+        # Redirect exactly the secondaries that the replacement image will
+        # start; skipping every T8142 RVBAR leaves those cores pointing into
+        # the resident image, while touching cpu7+ raises an SError.
+        if u.adt["/chosen"].chip_id == 0x8142:
+            if args.t8142_rvbar_mode == "skip":
+                print(f"  {cpu.name}: RVBAR write skipped by T8142 policy")
+                continue
+            if args.t8142_rvbar_mode == "auto" and cpu.cpu_id not in (1, 2):
+                print(f"  {cpu.name}: not used by the T8142 chainload SMP set")
+                continue
+
         addr, size = cpu.cpu_impl_reg
         print(f"  {cpu.name}: [0x{addr:x}] = 0x{rvbar:x}")
         p.write64(addr, rvbar)

@@ -141,7 +141,7 @@ static void dart_t8110_tlb_invalidate(dart_dev_t *dart)
             FIELD_PREP(DART_T8110_TLB_CMD_OP, DART_T8110_TLB_CMD_OP_FLUSH_SID) |
                 FIELD_PREP(DART_T8110_TLB_CMD_STREAM, dart->device));
 
-    if (poll32(dart->regs + DART_T8110_TLB_CMD_OP, DART_T8110_TLB_CMD_BUSY, 0, 100))
+    if (poll32(dart->regs + DART_T8110_TLB_CMD, DART_T8110_TLB_CMD_BUSY, 0, 100))
         printf("dart: DART_T8110_TLB_CMD_BUSY did not clear.\n");
 }
 
@@ -708,7 +708,16 @@ u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len)
     if (start < 0 || start % SZ_16K)
         return -1;
 
-    uintptr_t end = 1LLU << 36;
+    /* The search ceiling used to be a bare 1<<36, which silently made this
+     * function unusable for any DART whose window starts above 64 GiB: the
+     * loop condition is false on the first test and the caller just gets
+     * DART_PTR_ERR.  The t8110 ACIO DARTs are exactly that case -- their ADT
+     * vm-base is 0x10000000000 (1 TiB) with a 3 TiB window.
+     *
+     * Anchoring the ceiling to the device's own base keeps the historical
+     * 64 GiB span for every DART that starts at 0, so existing callers are
+     * bit-for-bit unaffected, while making the high-base DARTs work. */
+    uintptr_t end = dart->vm_base + (1LLU << 36);
     uintptr_t iova = start;
 
     while (iova + len <= end) {

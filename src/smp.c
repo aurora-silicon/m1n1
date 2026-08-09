@@ -20,6 +20,105 @@
 #define CPU_START_OFF_T6020    0x28000
 #define CPU_START_OFF_T6031    0x88000
 
+//
+// How many secondary CPUs to bring up. -1 means "all of them".
+//
+// T8142 (M5) can start secondaries -- the offset above is confirmed working, and
+// CPU 1 and CPU 2 both come up and complete the spin-table handshake.
+//
+// **SMP works.** m1n1 runs boot CPU + 2 secondaries on J704 and gets all the way
+// through hypervisor init, PSCI and vGIC setup.
+//
+// The long-running reset was **CPU 0**, not the number of cores, not any of the
+// register writes. See T8142_SKIP_CPU0 below. Skipping it fixed the machine
+// outright.
+//
+// Ruled out along the way, each by its own build:
+//   - the third CPU's start (resets at cap 2 as well)
+//   - PMU overcurrent / thermal (it resets, it does not power off)
+//   - the HV watchdog (hv_wdt_start() only runs from hv.start())
+//   - the fast-IPI Apple IMPDEF writes, SYS_IMP_APL_IPI_RR_GLOBAL_EL1 /
+//     SYS_IMP_APL_IPI_SR_EL1 -- skipping both entirely did not help
+//   - deep_wfi() retention (T8142_PLAIN_WFI, kept anyway)
+//   - secondary console traffic (T8142_QUIET_SECONDARY, kept anyway)
+//
+// Still capped at 2 because 3+ is simply untested, not because it is known bad.
+// Raise it and see; the machine is stable at 2.
+//
+#define SMP_MAX_SECONDARIES ((chip_id == T8142) ? 2 : -1)
+
+//
+// T8142: secondaries idle with plain WFI rather than deep_wfi().
+//
+// deep_wfi() calls Apple's _deep_wfi_helper() retention sequence whenever
+// AIDR_EL1 reports architectural retention. That path is unverified on this SoC
+// -- features_m4 carries `sleep_mode = SLEEP_NONE` with the comment
+// "XXX probably new mode required", and neither cpufreq nor MCC are implemented
+// here, so nothing has configured the states it relies on.
+//
+// A started secondary reaches its idle loop and calls deep_wfi() within
+// microseconds of reporting "Started.", which matches when the machine resets.
+//
+// Plain WFI is architectural: the core parks until an interrupt or event and
+// cannot enter an Apple-specific retention state. It idles less efficiently,
+// which is irrelevant here.
+//
+// Ruled out before this: the fast-IPI Apple IMPDEF writes
+// (SYS_IMP_APL_IPI_RR_GLOBAL_EL1 / SYS_IMP_APL_IPI_SR_EL1). Skipping both of
+// them entirely did not stop the reset, so they are not the cause and are left
+// enabled -- IPIs are needed to wake a core out of WFI.
+//
+#define T8142_PLAIN_WFI (chip_id == T8142)
+
+//
+// T8142: keep secondary CPUs off the console.
+//
+// Narrowed from the logs: with 0 secondaries the boot log continues past
+// smp_start_secondaries() into hv_pt_init() ("HV: Initializing for 42-bit PA
+// range"). With 2 secondaries it stops right after "Started." and that line never
+// appears -- so the machine dies inside smp_start_secondaries() or immediately
+// after. The only code in that window is the remaining loop iterations printing
+// "Not starting CPU N", smp_set_wfe_mode() and hv_wdt_init(). None of it is
+// lethal on its own, and the IMPDEF content of smp_set_wfe_mode() was already
+// ruled out by skipping the fast-IPI writes.
+//
+// What is left is not logic but **contention**. A freshly started secondary
+// prints from _cpu_reset_c() and smp_secondary_entry() while the boot CPU is
+// also printing, through one spinlock-protected console that drives both the USB
+// proxy and the framebuffer. Concurrent USB/dwc3 access from two cores is a good
+// way to lose the controller, and it also explains the interleaved text on the
+// panel.
+//
+// So: secondaries stay silent here. Costs the "RVBAR entry on secondary CPU" /
+// "Index: N" lines, which we have already seen work.
+//
+// Ruled out before this: third-CPU start, PMU thermal/overcurrent, HV watchdog,
+// the fast-IPI IMPDEF writes, and deep_wfi() retention.
+//
+#define T8142_QUIET_SECONDARY (chip_id == T8142)
+
+//
+// T8142: do not attempt to start CPU 0 at all.
+//
+// CPU 0 reports "Failed!" on every single run while CPU 1 and CPU 2 start
+// cleanly. That is not a no-op: smp_start_cpu() had already written the RVBAR and
+// both PMGR start registers before the 100 ms handshake timeout expired. So CPU 0
+// is very likely out of reset and executing, just wedged somewhere before it can
+// set spin_table[0].flag.
+//
+// A core loose in that state is a far better candidate for the reset than
+// anything else tried so far, and it fits the one observation none of the other
+// theories explained: removing unrelated work moved the death point later, which
+// is what you would expect if the boot CPU is racing a rogue core rather than
+// executing a fatal instruction.
+//
+// Why CPU 0 specifically is unknown. Bit 0 *is* set in the 0x3bf mask at
+// pmgr+0x34000, so it is not masked off there. Possibilities: it is the cluster-0
+// primary and needs different handling, its cluster is not powered, or the
+// (die, cluster, core) decoding from its ADT reg is wrong for index 0.
+//
+#define T8142_SKIP_CPU0 (chip_id == T8142)
+
 #define CPU_REG_CORE    GENMASK(7, 0)
 #define CPU_REG_CLUSTER GENMASK(10, 8)
 #define CPU_REG_DIE     GENMASK(14, 11)
@@ -52,6 +151,20 @@ static int cpu_nodes[MAX_CPUS];
 static struct spin_table spin_table[MAX_CPUS];
 static u64 pmgr_reg;
 static u64 cpu_start_off;
+//
+// Whether cpu_start_off above is actually known for this SoC. T8142 was in this
+// position until its offset was found empirically (see the T8142 case below);
+// any future unknown SoC lands here rather than writing an arbitrary PMGR
+// register on a guess.
+//
+// This must not be conflated with "cannot proceed at all". Discovering which
+// CPU we are booted on (boot_cpu_idx) and writing the boot CPU's own RVBAR use
+// no PMGR start register whatsoever -- only starting *secondary* cores does.
+// Bailing out early left boot_cpu_idx == -1, which made hv_start() refuse with
+// "Boot CPU has not been found, can't start hypervisor" and blocked the
+// hypervisor entirely on an otherwise perfectly usable single core.
+//
+static bool cpu_start_off_known;
 
 extern u8 _vectors_start[0];
 int boot_cpu_idx = -1;
@@ -66,7 +179,9 @@ void smp_secondary_entry(void)
     else
         msr(TPIDR_EL1, target_cpu);
 
-    printf("  Index: %d (table: %p)\n\n", target_cpu, me);
+    // See T8142_QUIET_SECONDARY.
+    if (!T8142_QUIET_SECONDARY)
+        printf("  Index: %d (table: %p)\n\n", target_cpu, me);
 
     me->mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
 
@@ -82,7 +197,11 @@ void smp_secondary_entry(void)
             if (wfe_mode) {
                 sysop("wfe");
             } else {
-                deep_wfi();
+                // See T8142_PLAIN_WFI.
+                if (T8142_PLAIN_WFI)
+                    sysop("wfi");
+                else
+                    deep_wfi();
 
                 if (cpu_features->fast_ipi) {
                     msr(SYS_IMP_APL_IPI_SR_EL1, 1);
@@ -111,6 +230,39 @@ void smp_secondary_prep_el3(void)
     return;
 }
 
+//
+// Bit position for a core in the *global* CPU start/stop bitmaps at
+// cpu_start_base + 0x0 and cpu_start_base + 0x4.
+//
+// The stock formula, 1 << (4 * cluster + core), assumes every cluster holds four
+// cores so that cluster N begins at bit 4*N. That is wrong on T8142, whose two
+// clusters are asymmetric -- 6 E-cores (cpu0..cpu5) then 4 P-cores (cpu6..cpu9):
+//
+//   - the mask this SoC actually reports at pmgr+0x34000 is 0x3bf: bits 0..9
+//     set except bit 6, and bit 6 is the boot CPU (smp_id 0x6 == cpu6 ==
+//     cluster 1 core 0). That is a linear cpu index, not a 4-wide stride.
+//   - 4 * cluster + core cannot even reach bits 8 and 9 here -- its maximum is
+//     4*1 + 3 = 7 -- so it is incapable of producing the observed value.
+//
+// So on T8142 these bitmaps are indexed by the linear ADT cpu index.
+//
+// This has been latent rather than fatal only because the sole secondaries ever
+// started are cpu1 and cpu2, both in cluster 0, where the two formulas agree.
+// Starting any cluster-1 core would have written bits 4..7 -- including bit 6,
+// the *running boot CPU*.
+//
+// The per-cluster register at cpu_start_base + 0x8 + 4*cluster is unaffected: it
+// is already cluster-indexed and its bit is core-relative, which stays correct
+// for a 6-core cluster.
+//
+static inline u32 cpu_start_bit(int index, int cluster, int core)
+{
+    if (chip_id == T8142)
+        return 1 << index;
+
+    return 1 << (4 * cluster + core);
+}
+
 static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u64 cpu_start_base)
 {
     int i;
@@ -124,7 +276,7 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
     if (spin_table[index].flag)
         return;
 
-    if (!cpu_features->apple_sysregs_unlocked &&
+    if ((read64(impl) & RVBAR_LOCK) &&
         (read64(impl) & RVBAR_ADDR) != (u64)_vectors_start) {
         printf("Failed! \n    RVBAR (=0x%lx) is locked and differs from entry point (=0x%lx)\n",
                read64(impl) & RVBAR_ADDR, (u64)_vectors_start);
@@ -149,7 +301,7 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
 
     sysop("dsb sy");
 
-    if (cpu_features->apple_sysregs_unlocked) {
+    if (!(read64(impl) & RVBAR_LOCK)) {
         // This also clears RVBAR_LOCK, so that HV can set RVBAR later when the core is running
         write64(impl, (u64)_vectors_start);
     }
@@ -158,7 +310,7 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
 
     // Some kind of system level startup/status bit
     // Without this, IRQs don't work
-    write32(cpu_start_base + 0x4, 1 << (4 * cluster + core));
+    write32(cpu_start_base + 0x4, cpu_start_bit(index, cluster, core));
 
     // Actually start the core
     write32(cpu_start_base + 0x8 + 4 * cluster, 1 << core);
@@ -195,7 +347,7 @@ static void smp_stop_cpu(int index, int die, int cluster, int core, u64 impl, u6
     cpu_start_base += die * PMGR_DIE_OFFSET;
 
     // Request CPU stop
-    write32(cpu_start_base + 0x0, 1 << (4 * cluster + core));
+    write32(cpu_start_base + 0x0, cpu_start_bit(index, cluster, core));
 
     u64 dsleep = deep_sleep;
     // Put the CPU to sleep
@@ -256,6 +408,8 @@ void smp_start_secondaries(void)
 
     memset(cpu_nodes, 0, sizeof(cpu_nodes));
 
+    cpu_start_off_known = true;
+
     switch (chip_id) {
         case S5L8960X:
         case T7000:
@@ -281,7 +435,6 @@ void smp_start_secondaries(void)
         case T8122:
         case T8132:
         case T8140:
-        case T8142:
             cpu_start_off = CPU_START_OFF_T8112;
             break;
         case T6020:
@@ -290,6 +443,31 @@ void smp_start_secondaries(void)
             cpu_start_off = CPU_START_OFF_T6020;
             break;
         case T6030:
+            cpu_start_off = CPU_START_OFF_T8112;
+            break;
+        case T8142:
+            //
+            // Determined empirically on J704 (M5) by dumping the pmgr window
+            // read-only from the hypervisor shell, 0x4000 at a time:
+            //
+            //   pmgr reg[0] = 0x380700000
+            //   0x30000: 012206d7 00000000 00000000 00000000
+            //   0x34000: 000003bf 000003bf 00000000 00000000   <--
+            //   0x38000: 00000001 00000000 00000000 00000000
+            //   0x3c000 .. 0x58000: all zero
+            //
+            // 0x3bf is 0b11_1011_1111: bits 0..9 set except bit 6. That is ten
+            // cores with exactly the running one masked out -- m1n1 boots on
+            // smp_id 6, which is cpu6. These registers are indexed by the
+            // *linear* cpu index on this SoC, not 1 << (4*cluster + core): the
+            // clusters are 6 E-cores (cpu0..5) then 4 P-cores (cpu6..9), and a
+            // 4-wide stride could not set bits 8/9 at all. See cpu_start_bit().
+            // The surrounding block being zero marks it out from the pmgr
+            // power-state registers, which read like 0x...0f.
+            //
+            // Same offset T8112 / T8122 / T6030 use, which is corroboration but
+            // was not the reason for choosing it.
+            //
             cpu_start_off = CPU_START_OFF_T8112;
             break;
         case T6031:
@@ -301,8 +479,10 @@ void smp_start_secondaries(void)
             cpu_start_off = CPU_START_OFF_T6031;
             break;
         default:
-            printf("CPU start offset is unknown for this SoC!\n");
-            return;
+            printf("CPU start offset is unknown for this SoC! Secondary CPUs will not be "
+                   "started; continuing single-core.\n");
+            cpu_start_off_known = false;
+            break;
     }
 
     ADT_FOREACH_CHILD(adt, node)
@@ -353,6 +533,8 @@ void smp_start_secondaries(void)
 
     spin_table[boot_cpu_idx].mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
 
+    int started = 0;
+
     for (int i = 0; i < MAX_CPUS; i++) {
         int cpu_node = cpu_nodes[i];
 
@@ -386,16 +568,45 @@ void smp_start_secondaries(void)
             continue;
         }
 
+        // Everything above this point -- boot CPU discovery and the boot CPU's
+        // own RVBAR write -- works without cpu_start_off. Only the actual
+        // secondary start below needs it.
+        if (!cpu_start_off_known)
+            continue;
+
+        // See T8142_SKIP_CPU0.
+        if (T8142_SKIP_CPU0 && i == 0) {
+            printf("Not starting CPU 0: known to fail on this SoC, see T8142_SKIP_CPU0\n");
+            continue;
+        }
+
         u8 core = FIELD_GET(CPU_REG_CORE, reg);
         u8 cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
         u8 die = FIELD_GET(CPU_REG_DIE, reg);
 
+        //
+        // Cap on how many secondaries we bring up. See SMP_MAX_SECONDARIES.
+        //
+        if (SMP_MAX_SECONDARIES >= 0 && started >= SMP_MAX_SECONDARIES) {
+            printf("Not starting CPU %d: at the SMP_MAX_SECONDARIES limit of %d\n", i,
+                   SMP_MAX_SECONDARIES);
+            continue;
+        }
+
         smp_start_cpu(i, die, cluster, core, cpu_impl_reg[0], pmgr_reg + cpu_start_off);
+
+        if (spin_table[i].flag)
+            started++;
     }
 }
 
 void smp_stop_secondaries(bool deep_sleep)
 {
+    // Nothing was ever started, and pmgr_reg + cpu_start_off would be an
+    // arbitrary PMGR register. See cpu_start_off_known.
+    if (!cpu_start_off_known)
+        return;
+
     printf("Stopping secondary CPUs...\n");
     int arm_io_node;
     if ((arm_io_node = adt_path_offset(adt, "/arm-io")) < 0) {
@@ -515,8 +726,50 @@ uint64_t smp_get_mpidr(int cpu)
     return spin_table[cpu].mpidr;
 }
 
-u64 smp_get_release_addr(int cpu)
+int smp_get_id(uint64_t mpidr){
+    for(int cpu = 0; cpu < MAX_CPUS; cpu++){
+        if(MPIDR_AFF3(spin_table[cpu].mpidr) == MPIDR_AFF3(mpidr) &&
+            MPIDR_AFF2(spin_table[cpu].mpidr) == MPIDR_AFF2(mpidr) &&
+            MPIDR_AFF1(spin_table[cpu].mpidr) == MPIDR_AFF1(mpidr) &&
+            MPIDR_AFF0(spin_table[cpu].mpidr) == MPIDR_AFF0(mpidr)){
+            return cpu;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Number of CPU nodes actually populated in the ADT, i.e. the number of
+ * entries `smp_start_secondaries()` found while walking `/cpus` and
+ * recording each child's `cpu-id`/`reg` into `cpu_nodes[]` (above). This is
+ * the SoC's *real*, bin-aware core count -- e.g. a binned 10-core M2 Pro
+ * (T6020) reports 10 here, a full 12-core M2 Pro/Max reports 12 -- as
+ * opposed to a chip-id-keyed literal, which cannot distinguish bins of the
+ * same chip_id. Only valid after smp_start_secondaries() has run (hv_init()
+ * calls it before hv_vgicv3_init(), hv.c:64,119).
+ */
+int smp_cpu_count(void)
 {
+    int count = 0;
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (cpu_nodes[cpu])
+            count++;
+    }
+    return count;
+}
+
+u64 smp_get_release_addr(int cpu, bool from_adt)
+{
+    if(from_adt){
+        u64 *release_addr;
+        u32 length;
+        char cpu_str[32];
+        snprintf(cpu_str, sizeof(cpu_str), "/cpus/cpu%d", cpu);
+        int node = adt_path_offset(adt, cpu_str);
+        release_addr = (u64*)adt_getprop(adt, node, "reg-private", &length);
+        return *release_addr;
+    }
+
     struct spin_table *target = &spin_table[cpu];
 
     if (cpu >= MAX_CPUS)

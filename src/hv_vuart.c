@@ -6,6 +6,7 @@
 #include "uart.h"
 #include "uart_regs.h"
 #include "usb.h"
+#include "utils.h"
 
 bool active = false;
 
@@ -14,6 +15,13 @@ u32 utrstat = 0;
 u32 ufstat = 0;
 
 int vuart_irq = 0;
+
+/*
+ * Guest TX bytes discarded because the host end of the CDC pipe was not
+ * draining. Non-zero means "currently dropping"; it is reset to 0 and reported
+ * when the host catches up. See the UTXH case in handle_vuart().
+ */
+static u32 vuart_tx_dropped = 0;
 
 static void update_irq(void)
 {
@@ -42,7 +50,16 @@ static void update_irq(void)
     }
 
     if (vuart_irq) {
-        uart_clear_irqs();
+        /*
+         * The guest UART is fully emulated here.  On T8142 the physical
+         * uart0 block can be clock-gated when an installed USB-proxy m1n1
+         * starts the hypervisor directly.  Touching uart0 from the host tick
+         * then raises an asynchronous external abort in EL2 before the guest
+         * executes its first instruction.  Clearing the physical UART is not
+         * part of the virtual interrupt contract, so leave it alone on M5.
+         */
+        if (chip_id != T8142)
+            uart_clear_irqs();
         if (utrstat & (UTRSTAT_TXTHRESH | UTRSTAT_RXTHRESH | UTRSTAT_RXTO)) {
             aic_set_sw(vuart_irq, true);
         } else {
@@ -94,8 +111,45 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                 break;
             case UTXH: {
                 uint8_t b = *val;
-                if (iodev_can_write(IODEV_USB_VUART))
+                /*
+                 * NEVER let a guest TX byte block here.
+                 *
+                 * This runs in EL2 exception context, under the big hypervisor
+                 * lock, with the 1 s HV watchdog armed. iodev_write() ->
+                 * usb_dwc3_queue() spins until the TX ring accepts the byte, and
+                 * iodev_can_write() only reports "the host configured the CDC
+                 * pipe", not "there is room". So the previous guard was not a
+                 * guard at all: any host that stops draining the secondary TTY
+                 * (terminal closed, socat SIGKILLed, client crashed, or simply a
+                 * guest that outruns the reader) would wedge EL2 and trip the
+                 * watchdog -- stranding the single physical serial link and
+                 * forcing a physical reboot.
+                 *
+                 * Policy is therefore drop-on-full, which is the standard
+                 * behaviour of a real UART whose FIFO has overrun: the guest is
+                 * told the byte was accepted (UTRSTAT already reports TXBE/TXE
+                 * unconditionally in update_irq()), and the byte is discarded.
+                 * Losing console output is recoverable; losing the link is not.
+                 */
+                if (usb_iodev_vuart_write_space() > 0) {
+                    if (vuart_tx_dropped) {
+                        printf("HV: vuart: host drained, resuming TX (dropped %u byte%s)\n",
+                               vuart_tx_dropped, vuart_tx_dropped == 1 ? "" : "s");
+                        vuart_tx_dropped = 0;
+                    }
                     iodev_write(IODEV_USB_VUART, &b, 1);
+                } else {
+                    /*
+                     * Report only the transition into the dropping state, once.
+                     * The recovery message above reports the total. Printing per
+                     * dropped byte would flood m1n1's own console -- the very
+                     * link we are protecting.
+                     */
+                    if (!vuart_tx_dropped)
+                        printf("HV: vuart: TX buffer full, host is not draining; dropping bytes\n");
+                    if (vuart_tx_dropped != UINT32_MAX)
+                        vuart_tx_dropped++;
+                }
                 handle_vuart_passthrough(b);
                 break;
             }
@@ -121,7 +175,14 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                 *val = utrstat;
                 break;
             case UFSTAT:
-                *val = ufstat;
+                //
+                // HACK HACK: the below code needs to account for whether we require SAM5250 semantics for the Windows
+                // UART driver or if we can get away with using the 8900 UART raw (they're basically compatible but not fully.)
+                //
+                *val = utrstat & UTRSTAT_TXBE ? ufstat : ufstat | BIT(24);
+                break;
+            case UERSTAT:
+                *val = 0;
                 break;
             default:
                 *val = 0;

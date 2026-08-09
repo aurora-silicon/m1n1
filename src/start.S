@@ -65,6 +65,77 @@ _vectors_start:
 .globl _start
 .type _start, @function
 _start:
+#ifdef T8142_ENTRY_HALT
+1:
+    b 1b
+#endif
+#ifdef T8142_ENTRY_WDT_HALT
+    /* T8142 primary watchdog control: /arm-io/wdt reg[0] + WDT_CTL. */
+    movz x1, #0x001c
+    movk x1, #0x782b, lsl #16
+    movk x1, #0x0001, lsl #32
+    str wzr, [x1]
+
+    /* T8142 secondary watchdog control: /arm-io/wdt reg[2]. */
+    movz x1, #0x8008
+    movk x1, #0x782b, lsl #16
+    movk x1, #0x0001, lsl #32
+    str wzr, [x1]
+    dsb sy
+    isb
+1:
+    wfe
+    b 1b
+#endif
+#ifdef T8142_ENTRY_FB_HALT
+    /* Disable both T8142 watchdogs before touching the framebuffer. */
+    movz x1, #0x001c
+    movk x1, #0x782b, lsl #16
+    movk x1, #0x0001, lsl #32
+    str wzr, [x1]
+
+    movz x1, #0x8008
+    movk x1, #0x782b, lsl #16
+    movk x1, #0x0001, lsl #32
+    str wzr, [x1]
+    dsb sy
+
+    /*
+     * x0 is iBoot's struct boot_args pointer.  Paint the current scanout
+     * buffer white using video.base, video.stride, and video.height.  Cap
+     * the write at 64 MiB if the arguments are unexpectedly large.
+     */
+    ldr x2, [x0, #40]  /* boot_args.video.base */
+    ldr x3, [x0, #56]  /* boot_args.video.stride */
+    ldr x4, [x0, #72]  /* boot_args.video.height */
+    cbz x2, 2f
+    cbz x3, 2f
+    cbz x4, 2f
+
+    mul x6, x3, x4
+    movz x7, #0x0400, lsl #16 /* 64 MiB */
+    cmp x6, x7
+    csel x6, x6, x7, ls
+    and x6, x6, #-64
+    add x6, x2, x6
+    mov x5, #-1
+
+1:
+    stp x5, x5, [x2, #0]
+    stp x5, x5, [x2, #16]
+    stp x5, x5, [x2, #32]
+    stp x5, x5, [x2, #48]
+    dc civac, x2
+    add x2, x2, #64
+    cmp x2, x6
+    b.lo 1b
+    dsb sy
+    isb
+
+2:
+    wfe
+    b 2b
+#endif
     mov x19, x0
 
     mov w0, 'm'

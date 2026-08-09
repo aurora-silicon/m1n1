@@ -58,10 +58,32 @@
 #define MIDR_PART_T6051_SOTRAC_MCORE     0x68
 #define MIDR_PART_T6051_SOTRAC_PCORE     0x69
 
-#define MIDR_REV_LOW     GENMASK(3, 0)
-#define MIDR_PART        GENMASK(15, 4)
+//
+// T8142 (Apple M5).
+//
+// The P-core value is MEASURED on J704 hardware:
+//     MIDR_EL1 = 0x612f0630  -> implementer 0x61 (Apple), part 0x063,
+//                               variant 0x2, revision 0x0
+// read on the boot CPU, whose MPIDR_EL1 was 0x80010100 (Aff2=1, Aff1=1, Aff0=0),
+// i.e. cluster 1 core 0 -- a P-core.
+//
+// The E-core value is INFERRED, not measured. Every generation in the list above
+// pairs an even E-core part with the P-core immediately after it (0x22/0x23,
+// 0x32/0x33, 0x44/0x45, 0x52/0x53), so 0x62 follows. It has not been read off an
+// E-core, because that needs either SMP or a boot CPU in cluster 0. Confirm it
+// before relying on it for anything that differs per core type.
+//
+// Naming: Apple's ADT calls these "everest"/"sawtooth" on both M4 and M5, but
+// those are recycled M3 core names and Asahi independently calls the M4 cores
+// "donan". Rather than invent a codename for M5, these are just ECORE/PCORE.
+//
+#define MIDR_PART_T8142_ECORE 0x62 /* inferred from the pattern, unverified */
+#define MIDR_PART_T8142_PCORE 0x63 /* measured on J704 */
+
+#define MIDR_REV_LOW  GENMASK(3, 0)
+#define MIDR_PART     GENMASK(15, 4)
 #define MIDR_CORE_TYPE_P BIT(16)
 #define MIDR_CORE_TYPE_M BIT(18)
-#define MIDR_REV_HIGH    GENMASK(23, 20)
+#define MIDR_REV_HIGH GENMASK(23, 20)
 
 #endif

@@ -1,10 +1,20 @@
 # SPDX-License-Identifier: MIT
 import struct
 
-from .spmi1 import SPMI1Regs, R_CMD, R_REPLY
+from .spmi1 import SPMI1Regs, R_ACTION, R_CMD, R_PEEK_POS, R_REPLY
 from .spmi4 import SPMI4Regs
 
-__all__ = ["SPMI"]
+__all__ = ["SPMI", "SPMITimeout"]
+
+# The STATUS poll loops below used to be unbounded. On T8142 under the
+# hypervisor the RX FIFO can read as permanently non-empty, which wedged the
+# host in an infinite read32 loop with no way out but ^C.
+# Each poll is a USB round-trip, so this is already several seconds of patience;
+# a healthy transaction settles in one or two iterations.
+SPMI_POLL_LIMIT = 1000
+
+class SPMITimeout(Exception):
+    pass
 
 OPC_RESET       = 0x10
 OPC_SLEEP       = 0x11
@@ -36,18 +46,34 @@ class SPMI:
             # which is the case on older macOS versions
             self.regs = SPMI1Regs(u, self.base)
 
-    def raw_read(self) -> int:
-        for _ in range(1000):
-            if not self.regs.STATUS.reg.RX_EMPTY:
-                return self.regs.REPLY.val
-        raise Exception('timeout waiting for data on RX FIFO')
+    def _drain(self, verbose=False):
+        for _ in range(SPMI_POLL_LIMIT):
+            if self.regs.STATUS.reg.RX_EMPTY:
+                return
+            v = self.regs.REPLY.val
+            if verbose:
+                print(">", v)
+        raise SPMITimeout(f"SPMI @ {self.base:#x}: RX FIFO never drained "
+                          f"(STATUS = {self.regs.STATUS.val:#x})")
 
-    def raw_command(self, slave: int, opc: int, extra=0, data=b"", size=0, alert=True):
-        while not self.regs.STATUS.reg.RX_EMPTY:
-            print(">", self.regs.REPLY.val)
+    def _await_reply(self):
+        for _ in range(SPMI_POLL_LIMIT):
+            if not self.regs.STATUS.reg.RX_EMPTY:
+                return
+        raise SPMITimeout(f"SPMI @ {self.base:#x}: no reply "
+                          f"(STATUS = {self.regs.STATUS.val:#x})")
+
+    def raw_read(self):
+        self._await_reply()
+        return self.regs.REPLY.val
+
+    def raw_command(self, slave, opc, extra=0, data=b"", size=0, alert=True):
+        self._drain(verbose=True)
 
         assert 0 <= slave < 16 and 0 <= opc < 256 and 0 <= extra < 0x10000
-        self.regs.CMD.reg = R_CMD(EXTRA=extra, ALERT=alert, SLAVE_ID=slave, OPCODE=opc)
+        self.regs.CMD.reg = R_CMD(
+            EXTRA=extra, ALERT=alert, SLAVE_ID=slave, OPCODE=opc
+        )
 
         while data:
             blk = (data[:4] + b"\0\0\0")[:4]
@@ -55,7 +81,11 @@ class SPMI:
             data = data[4:]
 
         reply = R_REPLY(self.raw_read())
-        assert reply.SLAVE_ID == slave and reply.OPCODE == opc
+        if reply.SLAVE_ID != slave or reply.OPCODE != opc:
+            raise RuntimeError(
+                f"unexpected SPMI reply: slave {reply.SLAVE_ID}, "
+                f"opcode {reply.OPCODE:#x}"
+            )
 
         buf = b""
         left = size
@@ -64,78 +94,60 @@ class SPMI:
             left -= 4
 
         if reply.FRAME_PARITY != (1 << size) - 1:
-            raise Exception(f'some response frames were not received correctly: {reply.FRAME_PARITY:b}')
-        assert not any(buf[size:])
+            raise RuntimeError(
+                "some SPMI response frames were not received correctly: "
+                f"{reply.FRAME_PARITY:b}"
+            )
+        if any(buf[size:]):
+            raise RuntimeError("non-zero padding in SPMI response")
         if not size != bool(reply.ACK):
-            raise Exception(f'command not acknowledged')
+            raise RuntimeError("SPMI command not acknowledged")
         return buf[:size] or None
 
-    # for these commands, extra is empty
-
-    def reset(self, slave: int):
+    def reset(self, slave):
         return self.raw_command(slave, OPC_RESET)
 
-    def sleep(self, slave: int):
+    def sleep(self, slave):
         return self.raw_command(slave, OPC_SLEEP)
 
-    def shutdown(self, slave: int):
+    def shutdown(self, slave):
         return self.raw_command(slave, OPC_SHUTDOWN)
 
-    def wakeup(self, slave: int):
+    def wakeup(self, slave):
         return self.raw_command(slave, OPC_WAKEUP)
 
-    def get_descriptor(self, slave: int):
+    def get_descriptor(self, slave):
         return self.raw_command(slave, OPC_SLAVE_DESC, size=10)
 
-    # for these commands: extra[7..0] = register address, extra[15..8] = value
-
-    def read_reg(self, slave: int, reg: int):
-        ''' perform a register read command '''
+    def read_reg(self, slave, reg):
         assert 0 <= reg < 32
-        opc = OPC_READ | reg
-        return self.raw_command(slave, opc, reg, size=1)[0]
+        return self.raw_command(slave, OPC_READ | reg, reg, size=1)[0]
 
-    def write_reg(self, slave: int, reg: int, value: int):
-        ''' perform a register write command '''
+    def write_reg(self, slave, reg, value):
         assert 0 <= reg < 32 and 0 <= value < 0x100
-        opc = OPC_WRITE | reg
-        return self.raw_command(slave, opc, reg | value << 8)
+        return self.raw_command(slave, OPC_WRITE | reg, reg | value << 8)
 
-    def write_zero(self, slave: int, value: int):
-        ''' perform a register 0 write command '''
+    def write_zero(self, slave, value):
         assert 0 <= value < 0x80
-        opc = OPC_ZERO_WRITE | value
-        return self.raw_command(slave, opc, value << 8)
+        return self.raw_command(slave, OPC_ZERO_WRITE | value, value << 8)
 
-    # for these commands, extra = register address
-
-    def read_ext(self, slave: int, reg: int, size: int):
-        ''' perform an extended read command '''
+    def read_ext(self, slave, reg, size):
         assert 1 <= size <= 16 and 0 <= reg < 0x100
-        opc = OPC_EXT_READ | (size - 1)
-        return self.raw_command(slave, opc, reg, size=size)
+        return self.raw_command(slave, OPC_EXT_READ | (size - 1), reg, size=size)
 
-    def write_ext(self, slave: int, reg: int, data: bytes):
-        ''' perform an extended write command '''
+    def write_ext(self, slave, reg, data):
         size = len(data)
         assert 1 <= size <= 16 and 0 <= reg < 0x100
-        opc = OPC_EXT_WRITE | (size - 1)
-        return self.raw_command(slave, opc, reg, data=data)
+        return self.raw_command(slave, OPC_EXT_WRITE | (size - 1), reg, data=data)
 
-    def read_extl(self, slave: int, reg: int, size: int):
-        ''' perform an extended read long command '''
+    def read_extl(self, slave, reg, size):
         assert 1 <= size <= 8 and 0 <= reg < 0x10000
-        opc = OPC_EXT_READL | (size - 1)
-        return self.raw_command(slave, opc, reg, size=size)
+        return self.raw_command(slave, OPC_EXT_READL | (size - 1), reg, size=size)
 
-    def write_extl(self, slave: int, reg: int, data: bytes):
-        ''' perform an extended write long command '''
+    def write_extl(self, slave, reg, data):
         size = len(data)
         assert 1 <= size <= 8 and 0 <= reg < 0x10000
-        opc = OPC_EXT_WRITEL | (size - 1)
-        return self.raw_command(slave, opc, reg, data=data)
-
-    # convenience functions
+        return self.raw_command(slave, OPC_EXT_WRITEL | (size - 1), reg, data=data)
 
     def read8(self, slave, reg):
         return struct.unpack("<B", self.read_extl(slave, reg, 1))[0]

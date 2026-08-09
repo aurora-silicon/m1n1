@@ -3,7 +3,7 @@
 import sys, pathlib, traceback
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
-import argparse, pathlib
+import argparse, pathlib, os
 from io import BytesIO
 
 def volumespec(s):
@@ -13,6 +13,8 @@ parser = argparse.ArgumentParser(description='Run a Mach-O payload under the hyp
 parser.add_argument('-s', '--symbols', type=pathlib.Path)
 parser.add_argument('-m', '--script', type=pathlib.Path, action='append', default=[])
 parser.add_argument('-c', '--command', action="append", default=[])
+parser.add_argument('--abort-on-script-error', action="store_true",
+                    help="exit instead of entering the guest shell when a preload script/command fails")
 parser.add_argument('-S', '--shell', action="store_true")
 parser.add_argument('-e', '--hook-exceptions', action="store_true")
 parser.add_argument('-d', '--debug-xnu', action="store_true")
@@ -23,6 +25,9 @@ parser.add_argument('--strip-node', action="append", default=[], metavar='SUBSTR
 parser.add_argument('-r', '--raw', action="store_true")
 parser.add_argument('-E', '--entry-point', action="store", type=int, help="Entry point for the raw image", default=0x800)
 parser.add_argument('-a', '--append-payload', type=pathlib.Path, action="append", default=[])
+parser.add_argument('--proxy-heap-size', type=lambda value: int(value, 0),
+                    default=int(os.environ.get("M1N1_PROXY_HEAP_SIZE", 768 * 1024 * 1024)),
+                    help="proxy scratch heap size in bytes (accepts 0x-prefixed values)")
 parser.add_argument('-v', '--volume', type=volumespec, action='append',
                     help='Attach a 9P virtio device for file export to the guest. The argument is a host path to the '
                          'exported tree, joined by colon (\':\') with a tag under which the tree will be advertised '
@@ -43,7 +48,9 @@ from m1n1.hw.pmu import PMU
 iface = UartInterface()
 p = M1N1Proxy(iface, debug=False)
 bootstrap_port(iface, p)
-u = ProxyUtils(p, heap_size = 128 * 1024 * 1024)
+if args.proxy_heap_size < 256 * 1024 * 1024:
+    parser.error("--proxy-heap-size must be at least 256 MiB")
+u = ProxyUtils(p, heap_size=args.proxy_heap_size)
 
 # Setup counter redirect / AHCR_EL2 as expected by macOS for macho payloads
 if not args.raw:
@@ -115,13 +122,18 @@ if args.raw:
 else:
     hv.load_macho(payload, symfile=symfile)
 
-PMU(u).reset_panic_counter()
+if hv.adt["/chosen"].chip_id == 0x8142:
+    print("Skipping unsupported PMU panic-counter reset on T8142")
+else:
+    PMU(u).reset_panic_counter()
 
 for i in args.script:
     try:
         hv.run_script(i)
     except:
         traceback.print_exc()
+        if args.abort_on_script_error:
+            raise
         args.shell = True
 
 for i in args.command:
@@ -129,6 +141,8 @@ for i in args.command:
         hv.run_code(i)
     except:
         traceback.print_exc()
+        if args.abort_on_script_error:
+            raise
         args.shell = True
 
 if args.shell:

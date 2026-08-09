@@ -2,6 +2,7 @@
 
 #include "usb.h"
 #include "adt.h"
+#include "atcphy.h"
 #include "dart.h"
 #include "i2c.h"
 #include "iodev.h"
@@ -9,6 +10,7 @@
 #include "pmgr.h"
 #include "string.h"
 #include "tps6598x.h"
+#include "tps6598x_host_policy.h"
 #include "types.h"
 #include "usb_dwc3.h"
 #include "usb_dwc3_regs.h"
@@ -40,6 +42,7 @@ struct usb_drd_regs {
 // HPM_PATH string is at most
 // "/arm-io/i2cX" (12) + "/" + hpmBusManagerX (14) + "/" + "hpmX" (4) + '\0'
 #define MAX_HPM_PATH_LEN 40
+#define J414S_USB_CONTROLLER_COUNT 3
 
 static tps6598x_irq_state_t tps6598x_irq_state[USB_IODEV_COUNT];
 static bool usb_is_initialized = false;
@@ -61,6 +64,24 @@ static bool usb_is_initialized = false;
 #define PIPEHANDLER_NATIVE_RESET         BIT(12)
 #define PIPEHANDLER_DUMMY_PHY_EN         BIT(15)
 #define PIPEHANDLER_NATIVE_POWER_DOWN    GENMASK(3, 0)
+
+#define USB2PHY_USBCTL           0x00
+#define USB2PHY_USBCTL_RUN       2
+#define USB2PHY_USBCTL_ISOLATION 4
+
+#define USB2PHY_CTL             0x04
+#define USB2PHY_CTL_RESET       BIT(0)
+#define USB2PHY_CTL_PORT_RESET  BIT(1)
+#define USB2PHY_CTL_APB_RESET_N BIT(2)
+#define USB2PHY_CTL_SIDDQ       BIT(3)
+
+#define USB2PHY_SIG      0x08
+#define USB2PHY_SIG_VBUS (BIT(0) | BIT(1) | BIT(2) | BIT(3))
+#define USB2PHY_SIG_HOST (7 << 12)
+
+#define USB2PHY_MISCTUNE              0x1c
+#define USB2PHY_MISCTUNE_APB_GATE_OFF BIT(29)
+#define USB2PHY_MISCTUNE_REF_GATE_OFF BIT(30)
 
 static dart_dev_t *usb_dart_init(u32 idx)
 {
@@ -156,6 +177,123 @@ int usb_phy_bringup(u32 idx)
     write32(usb_regs.drd_regs_unk3 + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
     write32(usb_regs.drd_regs_unk3 + PIPEHANDLER_NONSELECTED_OVERRIDE, 0x9332);
 
+    return 0;
+}
+
+/*
+ * m1n1 initially brings every available controller up in device mode so any
+ * one of them can carry the proxy.  Before handing an unused port to a host
+ * guest, select the USB2 host role while both the PHY and DWC3 are held in
+ * reset.  T6020 can otherwise latch the old device role until a later reset,
+ * leaving a healthy xHCI root hub that never reports a connected device.
+ */
+static int usb_phy_handoff_host(u32 idx)
+{
+    struct usb_drd_regs regs;
+    if (usb_drd_get_regs(idx, &regs) < 0)
+        return -1;
+
+    /* Assert DWC3 reset and clamp its PIPE interface. */
+    clear32(regs.drd_regs_unk3 + PIPEHANDLER_AON_GEN,
+            PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+    set32(regs.drd_regs_unk3 + PIPEHANDLER_AON_GEN,
+          PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+
+    /* Power the USB2 PHY off before changing its latched role. */
+    write32(regs.atc + USB2PHY_USBCTL, USB2PHY_USBCTL_ISOLATION);
+    udelay(10);
+    set32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_SIDDQ);
+    udelay(10);
+    set32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_PORT_RESET);
+    udelay(10);
+    set32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_RESET);
+    udelay(10);
+    clear32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_APB_RESET_N);
+    udelay(10);
+    set32(regs.atc + USB2PHY_MISCTUNE,
+          USB2PHY_MISCTUNE_APB_GATE_OFF | USB2PHY_MISCTUNE_REF_GATE_OFF);
+
+    set32(regs.atc + USB2PHY_SIG, USB2PHY_SIG_HOST);
+
+    /* Power the PHY back up in host mode while DWC3 remains reset. */
+    set32(regs.atc + USB2PHY_SIG, USB2PHY_SIG_VBUS);
+    udelay(10);
+    clear32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_SIDDQ);
+    udelay(10);
+    clear32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_RESET);
+    udelay(10);
+    clear32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_PORT_RESET);
+    udelay(10);
+    set32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_APB_RESET_N);
+    udelay(10);
+    clear32(regs.atc + USB2PHY_MISCTUNE,
+            USB2PHY_MISCTUNE_APB_GATE_OFF | USB2PHY_MISCTUNE_REF_GATE_OFF);
+    write32(regs.atc + USB2PHY_USBCTL, USB2PHY_USBCTL_RUN);
+
+    /*
+     * Leave SuperSpeed on the safe dummy backend.  Keep the Apple AON reset
+     * asserted and its PIPE clamp enabled across the m1n1 -> Mu boundary.
+     * Mu reprograms both DART instances before it initializes this DWC3; a
+     * released controller could otherwise issue DMA while its TCRs/TTBRs are
+     * being replaced.  The Mu USB bringup driver verifies this exact held
+     * state and only releases it immediately before generic DWC3 core init.
+     */
+    write32(regs.drd_regs_unk3 + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_DUMMY);
+
+    /*
+     * If the operator armed an ATC PHY guest mode over the proxy
+     * (P_ATCPHY_ARM_GUEST_MODE), re-apply it now: the dummy parking above is
+     * the boot-chain default and this is the last point before the guest
+     * owns the port, with dwc3 freshly reset and no guest driver bound --
+     * the one window where a PIPE-mux switch is safe. No-op if not armed.
+     */
+    if (atcphy_reapply_guest_mode(idx) < 0) {
+        printf("USB%d: FATAL: armed ATCPHY guest mode re-apply FAILED; SuperSpeed is "
+               "on an undefined backend for this boot\n",
+               idx);
+        return -1;
+    }
+
+    /*
+     * Match Asahi's external-reset/USB2-PHY ownership boundary exactly.
+     * The host role is selected while the USB2 PHY is powered off, and the
+     * PHY stays off while DWC3 remains reset+clamped.  Mu releases the Apple
+     * AON reset after completing both DARTs, then powers this PHY back on
+     * immediately before generic DWC3 core init.  Keeping the PHY live for
+     * the whole m1n1 -> Mu gap can desynchronise the stateful eUSB2 repeater
+     * from DWC3 and leaves xHCI reporting speed 0 / SET_ADDRESS failures.
+     *
+     * The armed ATCPHY re-apply above powers USB2 as part of the full PHY
+     * configuration, so this final power-off must deliberately follow it.
+     */
+    write32(regs.atc + USB2PHY_USBCTL, USB2PHY_USBCTL_ISOLATION);
+    udelay(10);
+    set32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_SIDDQ);
+    udelay(10);
+    set32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_PORT_RESET);
+    udelay(10);
+    set32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_RESET);
+    udelay(10);
+    clear32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_APB_RESET_N);
+    udelay(10);
+    set32(regs.atc + USB2PHY_MISCTUNE,
+          USB2PHY_MISCTUNE_APB_GATE_OFF | USB2PHY_MISCTUNE_REF_GATE_OFF);
+    set32(regs.atc + USB2PHY_SIG, USB2PHY_SIG_HOST);
+
+    u32 aon = read32(regs.drd_regs_unk3 + PIPEHANDLER_AON_GEN);
+    if ((aon & (PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN |
+                PIPEHANDLER_AON_GEN_DWC3_RESET_N)) !=
+        PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN) {
+        printf("USB%d: FATAL: DWC3 did not remain reset+clamped for Mu DART handoff "
+               "(AON_GEN=%#x)\n",
+               idx, aon);
+        return -1;
+    }
+
+    printf("USB%d: USB2 PHY off in guest host mode; DWC3 held for Mu DART handoff "
+           "(USBCTL=%#x SIG=%#x CTL=%#x AON_GEN=%#x)\n",
+           idx, read32(regs.atc + USB2PHY_USBCTL), read32(regs.atc + USB2PHY_SIG),
+           read32(regs.atc + USB2PHY_CTL), aon);
     return 0;
 }
 
@@ -281,7 +419,7 @@ static int usb_init_i2c(const char *i2c_path)
     if (!hpm_mngr_name || strnlen(hpm_mngr_name, 16) >= 16)
         return 0;
 
-    i2c_dev_t *i2c = i2c_init(i2c_path);
+    i2c_dev_t *i2c = i2c_init_allow_powered(i2c_path);
     if (!i2c) {
         printf("usb: i2c init failed for %s\n", i2c_path);
         return -1;
@@ -369,7 +507,7 @@ void usb_i2c_restore_irqs(const char *i2c_path, bool force)
     if (!hpm_mngr_name || strnlen(hpm_mngr_name, 16) >= 16)
         return;
 
-    i2c_dev_t *i2c = i2c_init(i2c_path);
+    i2c_dev_t *i2c = i2c_init_allow_powered(i2c_path);
     if (!i2c) {
         printf("usb: i2c init failed.\n");
         return;
@@ -423,6 +561,312 @@ void usb_hpm_restore_irqs(bool force)
     usb_i2c_restore_irqs("/arm-io/i2c0", force);
 }
 
+static void usb_i2c_handoff_host(const char *i2c_path, iodev_id_t keep)
+{
+    char hpm_path[MAX_HPM_PATH_LEN];
+
+    int node = adt_path_offset(adt, i2c_path);
+    if (node < 0)
+        return;
+
+    node = adt_first_child_offset(adt, node);
+    if (node < 0 || !adt_is_compatible(adt, node, "usbc,manager"))
+        return;
+
+    const char *hpm_mngr_name = adt_get_name(adt, node);
+    if (!hpm_mngr_name || strnlen(hpm_mngr_name, 16) >= 16)
+        return;
+
+    s32 preserved_index = -1;
+    if (keep >= IODEV_USB0 && keep < IODEV_USB0 + USB_IODEV_COUNT)
+        preserved_index = (s32)(keep - IODEV_USB0);
+
+    i2c_dev_t *i2c = i2c_init_allow_powered(i2c_path);
+    if (!i2c) {
+        printf("usb: host handoff i2c init failed for %s\n", i2c_path);
+        return;
+    }
+
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        const char *name = adt_get_name(adt, node);
+        if (!name || strnlen(name, 16) >= 16)
+            continue;
+
+        u32 rid_size = 0;
+        u32 port_number_size = 0;
+        u32 port_location_size = 0;
+        const u32 *rid = adt_getprop(adt, node, "rid", &rid_size);
+        const u32 *port_number = adt_getprop(adt, node, "port-number", &port_number_size);
+        const char *port_location = adt_getprop(adt, node, "port-location", &port_location_size);
+        if (!rid || rid_size != sizeof(*rid) || !port_number ||
+            port_number_size != sizeof(*port_number) || !port_location || !port_location_size) {
+            printf("usb: skipping non-port HPM node %s\n", name);
+            continue;
+        }
+
+        u32 idx;
+        if (tps6598x_host_port_resolve(*rid, *port_number, port_location, port_location_size,
+                                       J414S_USB_CONTROLLER_COUNT, &idx) < 0) {
+            printf("usb: refusing unmapped HPM node %s (rid=%u port=%u)\n", name, *rid,
+                   *port_number);
+            continue;
+        }
+        if ((s32)idx == preserved_index)
+            continue;
+
+        snprintf(hpm_path, sizeof(hpm_path), "%s/%s/%s", i2c_path, hpm_mngr_name, name);
+        tps6598x_dev_t *tps = hpm_init(i2c, hpm_path);
+        if (!tps) {
+            printf("usb: failed to init %s for host policy\n", name);
+            continue;
+        }
+
+        if (tps6598x_prepare_host(tps, idx, J414S_USB_CONTROLLER_COUNT, preserved_index) < 0)
+            printf("usb: unable to prepare %s as Source/DFP\n", name);
+        tps6598x_shutdown(tps);
+    }
+
+    i2c_shutdown(i2c);
+}
+
+void usb_hpm_handoff_host(iodev_id_t keep)
+{
+    if (adt_is_compatible(adt, 0, "J180dAP"))
+        usb_i2c_handoff_host("/arm-io/i2c3", keep);
+    usb_i2c_handoff_host("/arm-io/i2c0", keep);
+}
+
+/*
+ * Cable orientation, read out of a port's CD3217 ("hpm") USB-PD controller.
+ *
+ * WHY THIS EXISTS.  The ATC PHY has to know which way round the plug is
+ * *before* it programs the SuperSpeed lanes.  A flipped cable selects a
+ * completely different mode-table entry -- different ACIOPHY_CROSSBAR
+ * protocol, mirrored ACIOPHY_LANE_MODE fields, ATCPHY_MISC.LANE_SWAP set,
+ * and the USB3 vs DP calibration blobs applied to the other physical lane
+ * (Asahi atc.c:686-701, :868-875, :877-918, :1176-1179).  Get it wrong and
+ * our SuperSpeed transmit pair lands on the partner's transmit pins:
+ * receiver detection finds no far-end Rx termination, the link never
+ * trains, and the device silently drops to USB2 -- which is
+ * indistinguishable from a broken port.  Linux never guesses this; it
+ * reads it (tipd/core.c:768-772) and pushes it to the PHY through
+ * typec_switch_set.  Until this function existed, m1n1's callers passed a
+ * hardcoded "not flipped", i.e. a coin flip.
+ *
+ * READ-ONLY BY CONSTRUCTION.  Exactly one SMBus read of STATUS (0x1a), no
+ * writes, no commands.  In particular this deliberately does NOT go
+ * through hpm_init(): that calls tps6598x_powerup(), which can issue an
+ * "SSPS" command, and a command is a write.  The CD3217 on this machine
+ * rejects System Configuration writes and refused an earlier PortInfo
+ * rewrite, and the same i2c0 bus carries the PD controller behind the
+ * proxy's own console port -- so this path stays strictly interrogative.
+ *
+ * The read is bounded: i2c_smbus_read() times out on a stuck controller
+ * rather than spinning, and this touches no MMIO outside the already-live
+ * i2c block, so it cannot raise the synchronous external abort that an
+ * access to an unpowered region would.
+ */
+
+/*
+ * Hardware anchor, grade A: measured on this J414s on 2026-07-29 and
+ * recorded in proxyclient/m1n1/atcphy.py:333-337 -- the right-side port's
+ * PD controller is hpm2 at I2C address 0x3b.  If the ADT decode disagrees
+ * then the DECODE is wrong, and probing a random address on a bus that
+ * also carries the proxy console's PD controller is not an acceptable way
+ * to discover that.  Refuse instead.  0 means "no anchor known".
+ */
+static u8 usb_hpm_anchor_addr(u32 idx)
+{
+    if (!adt_is_compatible(adt, 0, "J414sAP"))
+        return 0;
+    if (idx == 2)
+        return 0x3b;
+    return 0;
+}
+
+static int usb_i2c_read_link_state(const char *i2c_path, u32 want_idx,
+                                   usb_hpm_link_state_t *state_out, bool include_data_status)
+{
+    char hpm_path[MAX_HPM_PATH_LEN];
+
+    int node = adt_path_offset(adt, i2c_path);
+    if (node < 0)
+        return -1;
+
+    node = adt_first_child_offset(adt, node);
+    if (node < 0 || !adt_is_compatible(adt, node, "usbc,manager"))
+        return -1;
+
+    const char *hpm_mngr_name = adt_get_name(adt, node);
+    if (!hpm_mngr_name || strnlen(hpm_mngr_name, 16) >= 16)
+        return -1;
+
+    int ret = -1;
+    i2c_dev_t *i2c = NULL;
+
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        const char *name = adt_get_name(adt, node);
+        if (!name || strnlen(name, 16) >= 16)
+            continue;
+
+        /*
+         * Resolve the port the same way usb_i2c_handoff_host() does, via
+         * rid/port-number/port-location rather than the node name. That
+         * path carries its own corroboration -- it insists rid 2 is the
+         * node whose port-location string is literally "right" -- so a
+         * mismatched ADT cannot quietly hand us the wrong port's
+         * orientation.
+         */
+        u32 rid_size = 0;
+        u32 port_number_size = 0;
+        u32 port_location_size = 0;
+        const u32 *rid = adt_getprop(adt, node, "rid", &rid_size);
+        const u32 *port_number = adt_getprop(adt, node, "port-number", &port_number_size);
+        const char *port_location = adt_getprop(adt, node, "port-location", &port_location_size);
+        if (!rid || rid_size != sizeof(*rid) || !port_number ||
+            port_number_size != sizeof(*port_number) || !port_location || !port_location_size)
+            continue; // not a port node
+
+        u32 idx;
+        if (tps6598x_host_port_resolve(*rid, *port_number, port_location, port_location_size,
+                                       J414S_USB_CONTROLLER_COUNT, &idx) < 0)
+            continue;
+        if (idx != want_idx)
+            continue;
+
+        snprintf(hpm_path, sizeof(hpm_path), "%s/%s/%s", i2c_path, hpm_mngr_name, name);
+
+        i2c = i2c_init_allow_powered(i2c_path);
+        if (!i2c) {
+            printf("usb: orientation read: i2c init failed for %s\n", i2c_path);
+            return -1;
+        }
+
+        /* tps6598x_init() only parses the ADT and allocates; it touches no bus. */
+        tps6598x_dev_t *tps = tps6598x_init(hpm_path, i2c);
+        if (!tps) {
+            printf("usb: orientation read: cannot resolve %s\n", hpm_path);
+            break;
+        }
+
+        u8 addr = tps6598x_i2c_addr(tps);
+        u8 anchor = usb_hpm_anchor_addr(idx);
+        if (addr < 0x08 || addr > 0x77) {
+            printf("usb: orientation read: %s decoded I2C address %#x outside the valid 7-bit "
+                   "range -- decode is wrong, refusing to talk to the bus\n",
+                   hpm_path, addr);
+            tps6598x_shutdown(tps);
+            break;
+        }
+        if (anchor && addr != anchor) {
+            printf("usb: orientation read: %s decoded I2C address %#x contradicts the "
+                   "hardware-measured %#x for port %u -- decode is wrong, refusing\n",
+                   hpm_path, addr, anchor, idx);
+            tps6598x_shutdown(tps);
+            break;
+        }
+
+        tps6598x_link_state_t state = {0};
+        int state_ret = include_data_status ? tps6598x_read_link_state(tps, &state)
+                                            : tps6598x_read_status(tps, &state.status);
+        if (state_ret < 0) {
+            printf("usb: link-state read: %s read failed for %s (addr %#x)\n",
+                   include_data_status ? "STATUS/DATA_STATUS" : "STATUS", hpm_path, addr);
+            tps6598x_shutdown(tps);
+            break;
+        }
+        tps6598x_shutdown(tps);
+
+        bool plug = !!(state.status & TPS6598X_STATUS_PLUG_PRESENT);
+        bool flipped = !!(state.status & TPS6598X_STATUS_PLUG_UPSIDE_DOWN);
+
+        printf("usb: port %u orientation: %s addr %#x STATUS=%#010x plug_present=%d "
+               "flipped=%d (data_role=%s, vconn=%d)\n",
+               idx, name, addr, state.status, plug, flipped,
+               (state.status & TPS6598X_STATUS_DATAROLE) ? "host" : "device",
+               !!(state.status & TPS6598X_STATUS_VCONN));
+        if (include_data_status)
+            printf("usb: port %u negotiated DATA_STATUS=%#010x direct_usb3=%d usb4=%d "
+                   "tbt=%d dp=%d\n",
+                   idx, state.data_status,
+                   tps6598x_direct_usb3_ready(state.status, state.data_status),
+                   !!(state.data_status & TPS6598X_DATA_USB4_CONNECTION),
+                   !!(state.data_status & TPS6598X_DATA_TBT_CONNECTION),
+                   !!(state.data_status & TPS6598X_DATA_DP_CONNECTION));
+        if (include_data_status && (state.data_status & TPS6598X_DATA_USB4_CONNECTION))
+            printf("usb: port %u USB4_STATUS mode=%#04x EUDO=%#010x unknown=%#010x "
+                   "apple_cable=%#010x\n",
+                   idx, state.usb4_mode_status, state.usb4_eudo,
+                   state.usb4_unknown, state.apple_cable_info);
+
+        if (state_out) {
+            state_out->status = state.status;
+            state_out->data_status = state.data_status;
+            state_out->usb4_mode_status = state.usb4_mode_status;
+            state_out->usb4_eudo = state.usb4_eudo;
+            state_out->usb4_unknown = state.usb4_unknown;
+            state_out->apple_cable_info = state.apple_cable_info;
+        }
+
+        if (!plug)
+            ret = USB_HPM_ORIENTATION_NO_PLUG;
+        else
+            ret = flipped ? USB_HPM_ORIENTATION_FLIPPED : USB_HPM_ORIENTATION_NORMAL;
+        break;
+    }
+
+    if (i2c)
+        i2c_shutdown(i2c);
+
+    return ret;
+}
+
+int usb_hpm_read_orientation(u32 idx, u32 *status_out)
+{
+    if (idx >= USB_IODEV_COUNT) {
+        printf("usb: orientation read: port index %u out of range\n", idx);
+        return USB_HPM_ORIENTATION_UNREADABLE;
+    }
+
+    usb_hpm_link_state_t state = {0};
+    int ret = -1;
+    if (adt_is_compatible(adt, 0, "J180dAP"))
+        ret = usb_i2c_read_link_state("/arm-io/i2c3", idx, &state, false);
+    if (ret < 0)
+        ret = usb_i2c_read_link_state("/arm-io/i2c0", idx, &state, false);
+
+    if (ret < 0) {
+        printf("usb: orientation read: no readable HPM found for port %u -- the caller MUST NOT "
+               "guess an orientation from this\n",
+               idx);
+        return USB_HPM_ORIENTATION_UNREADABLE;
+    }
+
+    if (status_out)
+        *status_out = state.status;
+
+    return ret;
+}
+
+int usb_hpm_read_link_state(u32 idx, usb_hpm_link_state_t *state_out)
+{
+    if (idx >= USB_IODEV_COUNT || !state_out) {
+        printf("usb: link-state read: invalid port %u or output pointer\n", idx);
+        return -1;
+    }
+
+    int ret = -1;
+    if (adt_is_compatible(adt, 0, "J180dAP"))
+        ret = usb_i2c_read_link_state("/arm-io/i2c3", idx, state_out, true);
+    if (ret < 0)
+        ret = usb_i2c_read_link_state("/arm-io/i2c0", idx, state_out, true);
+    if (ret < 0)
+        printf("usb: link-state read: no readable HPM found for port %u\n", idx);
+    return ret < 0 ? -1 : 0;
+}
+
 void usb_iodev_init(void)
 {
     for (int i = FIRST_USB_IODEV; i < USB_IODEV_COUNT; i++) {
@@ -460,10 +904,49 @@ void usb_iodev_shutdown(void)
     }
 }
 
+int usb_iodev_shutdown_except(iodev_id_t keep)
+{
+    for (int i = 0; i < USB_IODEV_COUNT; i++) {
+        iodev_id_t id = IODEV_USB0 + i;
+        if (id == keep)
+            continue;
+
+        struct iodev *usb_iodev = iodev_unregister_device(id);
+        if (!usb_iodev)
+            continue;
+
+        printf("USB%d: releasing controller for guest\n", i);
+        usb_dwc3_shutdown(usb_iodev->opaque);
+        free(usb_iodev);
+        if (usb_phy_handoff_host(i) < 0) {
+            printf("USB%d: FATAL: guest host handoff is ambiguous; refusing guest entry\n", i);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 void usb_iodev_vuart_setup(iodev_id_t iodev)
 {
     if (iodev < IODEV_USB0 || iodev >= IODEV_USB0 + USB_IODEV_COUNT)
         return;
 
     iodev_usb_vuart.opaque = iodev_get_opaque(iodev);
+}
+
+/*
+ * Bytes the vuart channel (CDC ACM pipe 1) can absorb without blocking.
+ *
+ * Callers running in EL2 exception context must bound every write by this value;
+ * see the comment on usb_dwc3_write_space() for why iodev_can_write() is not a
+ * sufficient guard. Returns 0 if the vuart has not been pointed at a DWC3
+ * controller yet, which is also the correct "drop the byte" answer.
+ */
+size_t usb_iodev_vuart_write_space(void)
+{
+    if (!iodev_usb_vuart.opaque)
+        return 0;
+
+    return usb_dwc3_write_space(iodev_usb_vuart.opaque, CDC_ACM_PIPE_1);
 }

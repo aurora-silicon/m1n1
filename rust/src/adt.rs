@@ -536,11 +536,8 @@ impl ADTNode {
     }
 
     pub fn is_compatible(&self, compatible: &str) -> Result<bool, AdtError> {
-        match self.named_prop("compatible") {
-            Ok(prop) => Ok(prop.str_iter().any(|c| c == compatible)),
-            Err(AdtError::NotFound) => Ok(false),
-            Err(e) => Err(e),
-        }
+        let prop = self.named_prop("compatible")?;
+        Ok(prop.str_iter().any(|c| c == compatible))
     }
 
     pub fn compatible(&self, index: usize) -> Option<&str> {
@@ -916,10 +913,27 @@ pub unsafe extern "C" fn adt_is_compatible(
 ) -> bool {
     let strcompat: &str = unsafe { CStr::from_ptr(compat).to_str().unwrap() };
     let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr)
-        .unwrap()
-        .is_compatible(strcompat)
-        .unwrap()
+
+    //
+    // Both of these used to be .unwrap(), which panics the whole of m1n1.
+    //
+    // is_compatible() returns Err(NotFound) when the node simply has no
+    // "compatible" property, which is perfectly normal -- plenty of ADT nodes
+    // have none. The C API this replaced returned false in that case, and every
+    // caller here treats the result as a plain boolean predicate, so a missing
+    // property must mean "not compatible", not "abort".
+    //
+    // Hit on T8142 after chainload.py pushes its re-serialised ADT and m1n1
+    // reloads: startup calls adt_is_compatible() on a node without the property
+    // and panics at this line, taking the machine down before the chainloaded
+    // payload ever runs.
+    //
+    let node = match ADTNode::from_ptr(ptr) {
+        Ok(node) => node,
+        Err(_) => return false,
+    };
+
+    node.is_compatible(strcompat).unwrap_or(false)
 }
 
 #[no_mangle]
@@ -937,7 +951,24 @@ pub unsafe extern "C" fn adt_is_compatible_at(
 #[no_mangle]
 pub unsafe extern "C" fn adt_get_name(_dt: *const c_void, offset: c_int) -> *const c_char {
     let ptr: *const ADTNode = unsafe { adt.add(offset as usize) as *const ADTNode };
-    ADTNode::from_ptr(ptr).unwrap().name().unwrap().as_ptr() as *const c_char
+
+    //
+    // Same panic hazard as adt_is_compatible() above: two .unwrap()s on a path
+    // that C callers expect to fail softly. Return an empty string rather than a
+    // null pointer -- callers like usb.c do check for NULL, but others pass the
+    // result straight to strcmp(), and an empty string is safe for both.
+    //
+    static EMPTY: &[u8] = b"\0";
+
+    let node = match ADTNode::from_ptr(ptr) {
+        Ok(node) => node,
+        Err(_) => return EMPTY.as_ptr() as *const c_char,
+    };
+
+    match node.name() {
+        Ok(name) => name.as_ptr() as *const c_char,
+        Err(_) => EMPTY.as_ptr() as *const c_char,
+    }
 }
 
 #[no_mangle]

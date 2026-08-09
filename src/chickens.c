@@ -44,6 +44,7 @@ const struct midr_part_features features_a7 = {
     .disable_dc_mva = true,
     .acc_cfg = true,
     .apple_sysregs_unlocked = true,
+    .cyc_ovrd = true,
     .workaround_cyclone_cache = true,
     .sleep_mode = SLEEP_LEGACY,
 };
@@ -52,6 +53,7 @@ const struct midr_part_features features_a10 = {
     .disable_dc_mva = true,
     .acc_cfg = true,
     .apple_sysregs_unlocked = true,
+    .cyc_ovrd = true,
     .workaround_cyclone_cache = false,
     .sleep_mode = SLEEP_GLOBAL,
 };
@@ -60,6 +62,7 @@ const struct midr_part_features features_a11 = {
     .disable_dc_mva = true,
     .acc_cfg = true,
     .apple_sysregs_unlocked = true,
+    .cyc_ovrd = true,
     .sleep_mode = SLEEP_GLOBAL,
     .uncore_version = UNCORE_V1,
     .nex_powergating = true,
@@ -70,6 +73,7 @@ const struct midr_part_features features_m1 = {
     .disable_dc_mva = true,
     .acc_cfg = true,
     .apple_sysregs_unlocked = true,
+    .cyc_ovrd = true,
     .sleep_mode = SLEEP_GLOBAL,
     .uncore_version = UNCORE_V2,
     .nex_powergating = true,
@@ -83,6 +87,7 @@ const struct midr_part_features features_m2 = {
     .disable_dc_mva = true,
     .acc_cfg = true,
     .apple_sysregs_unlocked = true,
+    .cyc_ovrd = true,
     .sleep_mode = SLEEP_GLOBAL,
     .uncore_version = UNCORE_V2,
     .nex_powergating = true,
@@ -97,6 +102,7 @@ const struct midr_part_features features_m3 = {
     .disable_dc_mva = true,
     .acc_cfg = true,
     .apple_sysregs_unlocked = true,
+    .cyc_ovrd = true,
     .sleep_mode = SLEEP_GLOBAL,
     .uncore_version = UNCORE_V2,
     .nex_powergating = true,
@@ -153,18 +159,18 @@ const struct midr_part_info midr_parts[] = {
     {MIDR_PART_T8122_SAWTOOTH, "M3 Sawtooth", init_t8122_sawtooth, &features_m3},
     {MIDR_PART_T8132_DONAN_ECORE, "M4 Donan (E core)", NULL, &features_m4},
     {MIDR_PART_T8132_DONAN_PCORE, "M4 Donan (P core)", NULL, &features_m4},
-    {MIDR_PART_T6040_BRAVA_CHOP_ECORE, "M4 Pro Brava Chop (E core)", NULL, &features_m4},
-    {MIDR_PART_T6040_BRAVA_CHOP_PCORE, "M4 Pro Brava Chop (P core)", NULL, &features_m4},
-    {MIDR_PART_T6041_BRAVA_ECORE, "M4 Max Brava (E core)", NULL, &features_m4},
-    {MIDR_PART_T6041_BRAVA_PCORE, "M4 Max Brava (P core)", NULL, &features_m4},
-    {MIDR_PART_T8140_TAHITI_ECORE, "A18 Pro Tahiti (E core)", NULL, &features_m4},
-    {MIDR_PART_T8140_TAHITI_PCORE, "A18 Pro Tahiti (P core)", NULL, &features_m4},
-    {MIDR_PART_T8142_HIDRA_ECORE, "M5 Hidra (E core)", NULL, &features_m4},
-    {MIDR_PART_T8142_HIDRA_PCORE, "M5 Hidra (P core)", NULL, &features_m4},
-    {MIDR_PART_T6050_SOTRA_MCORE, "M5 Pro Sotra (M core)", NULL, &features_m4},
-    {MIDR_PART_T6050_SOTRA_PCORE, "M5 Pro Sotra (P core)", NULL, &features_m4},
-    {MIDR_PART_T6051_SOTRAC_MCORE, "M5 Max Sotra C (M core)", NULL, &features_m4},
-    {MIDR_PART_T6051_SOTRAC_PCORE, "M5 Max Sotra C (P core)", NULL, &features_m4},
+    //
+    // T8142 (M5). No init function yet -- the chicken-bit sequences have not been
+    // reverse engineered, same situation as M4 above.
+    //
+    // Reusing features_m4: T8142 is derived from T8132 (identical AIC, PMGR,
+    // watchdog and GPIO base addresses, same 6E+4P topology, same 1TB DRAM base),
+    // so M4's feature set is the best-supported guess. Unverified -- in
+    // particular sleep_mode is inherited as SLEEP_NONE, which M4 itself marks
+    // "XXX probably new mode required".
+    //
+    {MIDR_PART_T8142_ECORE, "M5 (E core)", NULL, &features_m4},
+    {MIDR_PART_T8142_PCORE, "M5 (P core)", NULL, &features_m4},
 };
 
 const struct midr_part_features features_unknown = {
@@ -242,7 +248,7 @@ void init_cpu(void)
         reg_clr(SYS_IMP_APL_ACC_CFG, ACC_CFG_DEEP_SLEEP);
     }
 
-    if (cpu_features->apple_sysregs_unlocked) {
+    if (cpu_features->cyc_ovrd) {
         /* Unmask external IRQs, set WFI mode to up (2), enable WFI retention */
         reg_mask(SYS_IMP_APL_CYC_OVRD,
                  CYC_OVRD_FIQ_MODE_MASK | CYC_OVRD_IRQ_MODE_MASK | CYC_OVRD_WFI_MODE_MASK |

@@ -574,6 +574,7 @@ void mmu_init(void)
     // Enable EL0 memory access by EL1
     if (supports_pan())
         msr(PAN, 0);
+    sysop("dmb sy");
 
     // RES1 bits
     u64 sctlr = SCTLR_LSMAOE | SCTLR_nTLSMD | SCTLR_TSCXT | SCTLR_ITD;
@@ -594,6 +595,7 @@ static void mmu_secondary_setup(void)
     // Enable EL0 memory access by EL1
     if (supports_pan())
         msr(PAN, 0);
+    sysop("dmb sy");
 
     // RES1 bits
     u64 sctlr = SCTLR_LSMAOE | SCTLR_nTLSMD | SCTLR_TSCXT | SCTLR_ITD;

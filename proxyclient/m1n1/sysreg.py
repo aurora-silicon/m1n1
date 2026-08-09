@@ -289,6 +289,7 @@ class HACR(Register64):
     TRAP_HID = 50
     TRAP_s3_0_c15_c12_1z2 = 51
     TRAP_ACC = 52
+    TRAP_PMUV3 = 56
     TRAP_PM = 57
     TRAP_UPM = 58
     TRAP_s3_1z7_c15_cx_3 = 59
@@ -298,6 +299,10 @@ class AMX_CONFIG(Register64):
     EN_EL1 = 62
 
 class MDCR(Register64):
+    # Trap architectural PMUv3 accesses from EL1 so the hypervisor can map
+    # Apple's implementation-defined counters onto the standard ARM view.
+    TPMCR = 5
+    TPM = 6
     TDE = 8
     TDA = 9
     TDOSA = 10

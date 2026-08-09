@@ -4,10 +4,12 @@
 #include "adt.h"
 #include "assert.h"
 #include "firmware.h"
+#include "gpu_initdata.h"
 #include "malloc.h"
 #include "math.h"
 #include "pmgr.h"
 #include "soc.h"
+#include "string.h"
 #include "utils.h"
 
 #include "libfdt/libfdt.h"
@@ -60,6 +62,9 @@ struct initdata_inputs {
 
 int32_t rust_fill_gpu_initdata(struct initdata_inputs *ins, void *data_a, void *data_b,
                                void *globals);
+
+int32_t rust_fill_gpu_initdata_stamped(struct initdata_inputs *ins, void *data_a, void *data_b,
+                                       void *globals, struct gpu_initdata_ident *ident);
 
 static int get_core_counts(u32 *count, u32 nclusters, u32 ncores)
 {
@@ -427,7 +432,7 @@ static int dt_set_region(void *dt, int sgx, const char *name, const char *path)
         bail("ADT: GPU: failed to find %s property\n", prop);
 
     snprintf(prop, sizeof(prop), "%s-size", name);
-    if (ADT_GETPROP(adt, sgx, prop, &size) < 0 || !base)
+    if (ADT_GETPROP(adt, sgx, prop, &size) < 0 || !size)
         bail("ADT: GPU: failed to find %s property\n", prop);
 
     return dt_set_resvmem(dt, path, base, size);
@@ -471,12 +476,12 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
     {
         fdt32_t volts[MAX_DIES];
 
+        if (i >= count)
+            bail("FDT: GPU: Expected %d operating points, but found more\n", count);
+
         for (u32 j = 0; j < dies; j++) {
             volts[j] = cpu_to_fdt32(ps->states[i + j * ps->count].volt);
         }
-
-        if (i >= count)
-            bail("FDT: GPU: Expected %d operating points, but found more\n", count);
 
         if (fdt_setprop_inplace(dt, opp, "opp-microvolt", &volts, sizeof(u32) * dies))
             bail("FDT: GPU: Failed to set opp-microvolt for aux PS %d\n", i);
@@ -487,44 +492,293 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
         i++;
     }
 
+    if (i != count)
+        bail("FDT: GPU: Expected %d operating points, but found %d\n", count, i);
+
+    return 0;
+}
+
+static int validate_aux_perf_states(const char *name, const struct aux_perf_states *ps, u32 len,
+                                    u32 dies, u32 max_count)
+{
+    if (!ps)
+        bail("ADT: GPU: %s not found\n", name);
+    if (ps->dies != dies || !ps->count || ps->count > max_count)
+        bail("ADT: GPU: invalid %s dimensions (%llu dies, %llu states)\n", name,
+             (unsigned long long)ps->dies, (unsigned long long)ps->count);
+
+    size_t expected = sizeof(*ps) + (size_t)dies * (size_t)ps->count * sizeof(ps->states[0]);
+
+    /* J414s (T6020) carries EIGHT TRAILING BYTES past the declared array.
+     * Measured on this machine's live ADT: cs-perf-states and afr-perf-states
+     * are both 136 bytes with dies=1, count=7, i.e. 16 + 7*16 = 128 for the
+     * array plus one extra u64 (0x000c63e0, a value that sorts between the
+     * 6th and 7th voltages -- most likely a nominal/base point).
+     *
+     * Requiring exact equality rejected the whole property, which took out
+     * initdata generation entirely ("cannot gather initdata inputs (-1)") and,
+     * because the launcher aborts on script error, cost the whole boot.
+     *
+     * The tolerance is deliberately ONE trailing element and no more: a wrong
+     * `count`, a truncated array, or a genuinely unexpected layout still fails,
+     * because those miss by at least a whole `struct aux_perf_state`. What is
+     * NOT claimed here is any knowledge of what the trailing u64 means -- it is
+     * tolerated, never parsed, and never fed to the power model.
+     */
+    if (len != expected && len != expected + sizeof(u64))
+        bail("ADT: GPU: invalid %s length (got %u, expected %zu or %zu)\n", name, len, expected,
+             expected + sizeof(u64));
+
+    return 0;
+}
+
+typedef int (*gpu_calc_power_fn)(u32 count, u32 table_count, const struct perf_state *core,
+                                 const struct perf_state *sram, const struct aux_perf_states *cs,
+                                 u32 *max_pwr, float *core_leak, float *sram_leak, float *cs_leak,
+                                 float *afr_leak);
+
+/*
+ * Pick the per-SoC power model. Returns 0 on success and 1 for a chip this
+ * file has no model for, which every caller treats as "there is nothing to
+ * publish", not as an error.
+ */
+static int gpu_select_chip(u32 *dies, bool *has_cs_afr, gpu_calc_power_fn *calc_power)
+{
+    *dies = 1;
+    *has_cs_afr = false;
+
+    switch (chip_id) {
+        case T8103:
+            *calc_power = calc_power_t8103;
+            break;
+        case T6022:
+            *dies = 2;
+            // fallthrough
+        case T6021:
+        case T6020:
+            *has_cs_afr = true;
+            *calc_power = calc_power_t600x;
+            break;
+        case T6002:
+            *dies = 2;
+            // fallthrough
+        case T6001:
+        case T6000:
+        case T8112:
+            *calc_power = calc_power_t600x;
+            break;
+        default:
+            printf("ADT: GPU: unsupported chip!\n");
+            return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * Every input rust_fill_gpu_initdata() consumes, gathered in ONE place.
+ *
+ * dt_set_gpu() (Linux device-tree boot) and gpu_initdata_generate() (the
+ * Windows preboot handoff, src/gpu_handoff.c) both go through this. That is
+ * deliberate: two copies of this gathering would be two chances to produce
+ * subtly different initdata from the same machine, and the failure mode of
+ * "subtly different initdata" is an unrecoverable firmware crash, not a wrong
+ * pixel. There is exactly one reader of the ADT power tables in this file.
+ */
+struct gpu_initdata_source {
+    u32 dies;
+    bool has_cs_afr;
+    int sgx;
+    u32 perf_state_count;
+    u32 perf_state_table_count;
+    const struct perf_state *perf_states;
+    const struct perf_state *perf_states_sram;
+    const struct aux_perf_states *perf_states_cs;
+    const struct aux_perf_states *perf_states_afr;
+    u32 max_pwr[MAX_PSTATES];
+    float core_leak[MAX_CLUSTERS];
+    float sram_leak[MAX_CLUSTERS];
+    float cs_leak[MAX_DIES];
+    float afr_leak[MAX_DIES];
+    const struct fw_version_info *compat;
+};
+
+/* 0 = ok, -1 = hard failure, 1 = unsupported chip (caller publishes nothing). */
+static int gpu_collect_initdata_source(struct gpu_initdata_source *src)
+{
+    gpu_calc_power_fn calc_power;
+    int rc;
+
+    memset(src, 0, sizeof(*src));
+
+    rc = gpu_select_chip(&src->dies, &src->has_cs_afr, &calc_power);
+    if (rc)
+        return rc;
+
+    src->sgx = adt_path_offset(adt, "/arm-io/sgx");
+    if (src->sgx < 0)
+        bail("ADT: GPU: /arm-io/sgx node not found\n");
+
+    if (ADT_GETPROP(adt, src->sgx, "perf-state-count", &src->perf_state_count) < 0 ||
+        !src->perf_state_count)
+        bail("ADT: GPU: missing perf-state-count\n");
+
+    if (ADT_GETPROP(adt, src->sgx, "perf-state-table-count", &src->perf_state_table_count) < 0 ||
+        !src->perf_state_table_count)
+        bail("ADT: GPU: missing perf-state-table-count\n");
+
+    if (src->perf_state_count > MAX_PSTATES)
+        bail("ADT: GPU: perf-state-count too large\n");
+
+    if (src->perf_state_table_count > MAX_CLUSTERS)
+        bail("ADT: GPU: perf-state-table-count too large\n");
+
+    u32 perf_states_len;
+
+    src->perf_states = adt_getprop(adt, src->sgx, "perf-states", &perf_states_len);
+    if (!src->perf_states || perf_states_len != sizeof(*src->perf_states) *
+                                                    src->perf_state_count *
+                                                    src->perf_state_table_count)
+        bail("ADT: GPU: invalid perf-states length\n");
+
+    src->perf_states_sram = adt_getprop(adt, src->sgx, "perf-states-sram", &perf_states_len);
+    if (chip_id != T8103 && !src->perf_states_sram)
+        bail("ADT: GPU: perf-states-sram not found\n");
+    if (src->perf_states_sram && perf_states_len != sizeof(*src->perf_states) *
+                                                        src->perf_state_count *
+                                                        src->perf_state_table_count)
+        bail("ADT: GPU: invalid perf-states-sram length\n");
+
+    u32 perf_states_afr_len = 0, perf_states_cs_len = 0;
+    src->perf_states_afr = adt_getprop(adt, src->sgx, "afr-perf-states", &perf_states_afr_len);
+    src->perf_states_cs = adt_getprop(adt, src->sgx, "cs-perf-states", &perf_states_cs_len);
+
+    if (src->has_cs_afr && (validate_aux_perf_states("cs-perf-states", src->perf_states_cs,
+                                                     perf_states_cs_len, src->dies, 16) ||
+                            validate_aux_perf_states("afr-perf-states", src->perf_states_afr,
+                                                     perf_states_afr_len, src->dies, 8)))
+        return -1;
+
+    if (calc_power(src->perf_state_count, src->perf_state_table_count, src->perf_states,
+                   src->perf_states_sram, src->perf_states_cs, src->max_pwr, src->core_leak,
+                   src->sram_leak, src->cs_leak, src->afr_leak))
+        return -1;
+
+    switch (os_firmware.version) {
+        case V12_3_1:
+            src->compat = &fw_versions[V12_3];
+            break;
+        case V13_5B4:
+        case V13_6_2:
+            src->compat = &fw_versions[V13_5];
+            break;
+        default:
+            src->compat = &os_firmware;
+            break;
+    }
+
+    return 0;
+}
+
+/*
+ * Run the generator over one already-zeroed triple. `ident` receives the
+ * identity of the arm that actually ran, straight out of the generator.
+ */
+static int gpu_initdata_fill_from_source(const struct gpu_initdata_source *src, void *data_a,
+                                         void *data_b, void *globals,
+                                         struct gpu_initdata_ident *ident)
+{
+    size_t n_perf_states_cs = 0, n_perf_states_afr = 0;
+    const struct aux_perf_state *pstate_cs_raw = NULL, *pstate_afr_raw = NULL;
+
+    if (src->has_cs_afr) {
+        n_perf_states_cs = src->perf_states_cs->count;
+        n_perf_states_afr = src->perf_states_afr->count;
+        pstate_cs_raw = src->perf_states_cs->states;
+        pstate_afr_raw = src->perf_states_afr->states;
+    }
+
+    struct initdata_inputs ins = {
+        .perf_state_table_count = src->perf_state_table_count,
+        .perf_state_count = src->perf_state_count,
+        .c_perf_states = src->perf_states,
+        .max_pwr = (u32 *)src->max_pwr,
+        .core_leak = (float *)src->core_leak,
+        .sram_leak = (float *)src->sram_leak,
+        .cs_leak = (float *)src->cs_leak,
+        .afr_leak = (float *)src->afr_leak,
+        .n_perf_states_cs = n_perf_states_cs,
+        .pstates_cs = pstate_cs_raw,
+        .n_perf_states_afr = n_perf_states_afr,
+        .pstates_afr = pstate_afr_raw,
+        .compat_maj = src->compat->num[0],
+        .compat_min = src->compat->num[1],
+    };
+
+    return rust_fill_gpu_initdata_stamped(&ins, data_a, data_b, globals, ident);
+}
+
+int gpu_initdata_generate(void *data_a, size_t data_a_capacity, void *data_b,
+                          size_t data_b_capacity, void *globals, size_t globals_capacity,
+                          struct gpu_initdata_ident *ident)
+{
+    struct gpu_initdata_source src;
+    size_t data_a_size, data_b_size, globals_size;
+    int rc;
+
+    if (!data_a || !data_b || !globals || !ident)
+        return -1;
+
+    memset(ident, 0, sizeof(*ident));
+
+    rc = gpu_collect_initdata_source(&src);
+    if (rc)
+        bail("ADT: GPU: cannot gather initdata inputs on this machine (%d)\n", rc);
+
+    if (rust_gpu_initdata_size(src.compat->num[0], src.compat->num[1], &data_a_size, &data_b_size,
+                               &globals_size) == -1)
+        bail("ADT: GPU: no initdata layout for firmware %d.%d\n", src.compat->num[0],
+             src.compat->num[1]);
+
+    if (data_a_size > data_a_capacity || data_b_size > data_b_capacity ||
+        globals_size > globals_capacity)
+        bail("ADT: GPU: initdata 0x%lx/0x%lx/0x%lx does not fit 0x%lx/0x%lx/0x%lx\n", data_a_size,
+             data_b_size, globals_size, data_a_capacity, data_b_capacity, globals_capacity);
+
+    memset(data_a, 0, data_a_capacity);
+    memset(data_b, 0, data_b_capacity);
+    memset(globals, 0, globals_capacity);
+
+    if (gpu_initdata_fill_from_source(&src, data_a, data_b, globals, ident))
+        bail("ADT: GPU: initdata generation failed\n");
+
+    if (ident->data_a_size != data_a_size || ident->data_b_size != data_b_size ||
+        ident->globals_size != globals_size)
+        bail("ADT: GPU: generator reported 0x%x/0x%x/0x%x but sizing said 0x%lx/0x%lx/0x%lx\n",
+             ident->data_a_size, ident->data_b_size, ident->globals_size, data_a_size, data_b_size,
+             globals_size);
+
+    printf("ADT: GPU: initdata built by arm %u for chip %#x gen %u variant %c core %u rev %u "
+           "(%u cores), firmware ABI %u.%u, sizes 0x%x/0x%x/0x%x\n",
+           ident->builder_arm, ident->chip_id, ident->gpu_gen, (char)ident->gpu_variant,
+           ident->gpu_core, ident->gpu_rev_id, ident->num_cores, ident->compat_maj,
+           ident->compat_min, ident->data_a_size, ident->data_b_size, ident->globals_size);
+
     return 0;
 }
 
 int dt_set_gpu(void *dt)
 {
-    bool has_cs_afr = false;
-    int (*calc_power)(u32 count, u32 table_count, const struct perf_state *core,
-                      const struct perf_state *sram, const struct aux_perf_states *cs, u32 *max_pwr,
-                      float *core_leak, float *sram_leak, float *cs_leak, float *afr_leak);
-
-    u32 dies = 1;
+    struct gpu_initdata_source src;
+    gpu_calc_power_fn calc_power;
+    bool has_cs_afr;
+    u32 dies;
+    int rc;
 
     printf("FDT: GPU: Initializing GPU info\n");
 
-    switch (chip_id) {
-        case T8103:
-            calc_power = calc_power_t8103;
-            break;
-        case T6022:
-            dies = 2;
-            // fallthrough
-        case T6021:
-        case T6020:
-            has_cs_afr = true;
-            calc_power = calc_power_t600x;
-            break;
-        case T6002:
-            dies = 2;
-            // fallthrough
-        case T6001:
-        case T6000:
-        case T8112:
-            calc_power = calc_power_t600x;
-            break;
-        default:
-            printf("ADT: GPU: unsupported chip!\n");
-            return 0;
-    }
+    if (gpu_select_chip(&dies, &has_cs_afr, &calc_power))
+        return 0;
 
     int gpu = fdt_path_offset(dt, "gpu");
     if (gpu < 0) {
@@ -543,57 +797,24 @@ int dt_set_gpu(void *dt)
     downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6021") == 0;
     downstream_dtb |= fdt_node_check_compatible(dt, gpu, "apple,agx-t6022") == 0;
 
-    int sgx = adt_path_offset(adt, "/arm-io/sgx");
-    if (sgx < 0)
-        bail("ADT: GPU: /arm-io/sgx node not found\n");
-
-    u32 perf_state_count;
-    if (ADT_GETPROP(adt, sgx, "perf-state-count", &perf_state_count) < 0 || !perf_state_count)
-        bail("ADT: GPU: missing perf-state-count\n");
-
-    u32 perf_state_table_count;
-    if (ADT_GETPROP(adt, sgx, "perf-state-table-count", &perf_state_table_count) < 0 ||
-        !perf_state_table_count)
-        bail("ADT: GPU: missing perf-state-table-count\n");
-
-    if (perf_state_count > MAX_PSTATES)
-        bail("ADT: GPU: perf-state-count too large\n");
-
-    if (perf_state_table_count > MAX_CLUSTERS)
-        bail("ADT: GPU: perf-state-table-count too large\n");
-
-    u32 perf_states_len;
-    const struct perf_state *perf_states, *perf_states_sram;
-    const struct aux_perf_states *perf_states_afr, *perf_states_cs;
-
-    perf_states = adt_getprop(adt, sgx, "perf-states", &perf_states_len);
-    if (!perf_states ||
-        perf_states_len != sizeof(*perf_states) * perf_state_count * perf_state_table_count)
-        bail("ADT: GPU: invalid perf-states length\n");
-
-    perf_states_sram = adt_getprop(adt, sgx, "perf-states-sram", &perf_states_len);
-    if (perf_states_sram &&
-        perf_states_len != sizeof(*perf_states) * perf_state_count * perf_state_table_count)
-        bail("ADT: GPU: invalid perf-states-sram length\n");
-
-    perf_states_afr = adt_getprop(adt, sgx, "afr-perf-states", NULL);
-    perf_states_cs = adt_getprop(adt, sgx, "cs-perf-states", NULL);
-
-    if (has_cs_afr && !perf_states_cs)
-        bail("ADT: GPU: cs-perf-states not found\n");
-
-    if (has_cs_afr && !perf_states_afr)
-        bail("ADT: GPU: afr-perf-states not found\n");
-
-    u32 max_pwr[MAX_PSTATES];
-    float core_leak[MAX_CLUSTERS];
-    float sram_leak[MAX_CLUSTERS];
-    float cs_leak[MAX_DIES];
-    float afr_leak[MAX_DIES];
-
-    if (calc_power(perf_state_count, perf_state_table_count, perf_states, perf_states_sram,
-                   perf_states_cs, max_pwr, core_leak, sram_leak, cs_leak, afr_leak))
+    rc = gpu_collect_initdata_source(&src);
+    if (rc < 0)
         return -1;
+    if (rc > 0)
+        return 0;
+
+    /* Names kept so the FDT half of this function reads exactly as before. */
+    int sgx = src.sgx;
+    u32 perf_state_count = src.perf_state_count;
+    u32 perf_state_table_count = src.perf_state_table_count;
+    const struct perf_state *perf_states = src.perf_states;
+    const struct aux_perf_states *perf_states_cs = src.perf_states_cs;
+    const struct aux_perf_states *perf_states_afr = src.perf_states_afr;
+    u32 *max_pwr = src.max_pwr;
+    float *core_leak = src.core_leak;
+    float *sram_leak = src.sram_leak;
+    float *cs_leak = src.cs_leak;
+    float *afr_leak = src.afr_leak;
 
     printf("FDT: GPU: Max power table: ");
     for (u32 i = 0; i < perf_state_count; i++) {
@@ -645,12 +866,12 @@ int dt_set_gpu(void *dt)
         {
             fdt32_t volts[MAX_CLUSTERS];
 
+            if (i >= perf_state_count)
+                bail("FDT: GPU: Expected %d operating points, but found more\n", perf_state_count);
+
             for (u32 j = 0; j < perf_state_table_count; j++) {
                 volts[j] = cpu_to_fdt32(perf_states[i + j * perf_state_count].volt * 1000);
             }
-
-            if (i >= perf_state_count)
-                bail("FDT: GPU: Expected %d operating points, but found more\n", perf_state_count);
 
             if (fdt_setprop_inplace(dt, opp, "opp-microvolt", &volts,
                                     sizeof(u32) * perf_state_table_count))
@@ -700,20 +921,7 @@ int dt_set_gpu(void *dt)
         return 0;
     }
 
-    const struct fw_version_info *compat;
-
-    switch (os_firmware.version) {
-        case V12_3_1:
-            compat = &fw_versions[V12_3];
-            break;
-        case V13_5B4:
-        case V13_6_1:
-            compat = &fw_versions[V13_5];
-            break;
-        default:
-            compat = &os_firmware;
-            break;
-    }
+    const struct fw_version_info *compat = src.compat;
 
     if (downstream_dtb) {
         if (firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware))
@@ -736,32 +944,9 @@ int dt_set_gpu(void *dt)
     memset(data_b, 0, data_b_size);
     memset(globals, 0, globals_size);
 
-    size_t n_perf_states_cs = 0, n_perf_states_afr = 0;
-    const struct aux_perf_state *pstate_cs_raw = NULL, *pstate_afr_raw = NULL;
+    struct gpu_initdata_ident ident;
 
-    if (has_cs_afr) {
-        n_perf_states_cs = perf_states_cs->count;
-        n_perf_states_afr = perf_states_afr->count;
-        pstate_cs_raw = perf_states_cs->states;
-        pstate_afr_raw = perf_states_afr->states;
-    }
-    struct initdata_inputs ins = {
-        .perf_state_table_count = perf_state_table_count,
-        .perf_state_count = perf_state_count,
-        .c_perf_states = perf_states,
-        .max_pwr = max_pwr,
-        .core_leak = core_leak,
-        .sram_leak = sram_leak,
-        .cs_leak = cs_leak,
-        .afr_leak = afr_leak,
-        .n_perf_states_cs = n_perf_states_cs,
-        .pstates_cs = pstate_cs_raw,
-        .n_perf_states_afr = n_perf_states_afr,
-        .pstates_afr = pstate_afr_raw,
-        .compat_maj = compat->num[0],
-        .compat_min = compat->num[1],
-    };
-    if (rust_fill_gpu_initdata(&ins, data_a, data_b, globals) == -1)
+    if (gpu_initdata_fill_from_source(&src, data_a, data_b, globals, &ident) == -1)
         return -1;
 
     if (dt_set_resvmem(dt, "/reserved-memory/hw-cal-a", (u64)data_a, ALIGN_UP(data_a_size, SZ_16K)))

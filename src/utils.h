@@ -26,6 +26,12 @@
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #define max(a, b) (((a) > (b)) ? (a) : (b))
 
+#define MPIDR_AFF0(mpidr)  ((mpidr) & 0xFF)
+#define MPIDR_AFF1(mpidr)  (((mpidr) >> 8) & 0xFF)
+#define MPIDR_AFF2(mpidr)  (((mpidr) >> 16) & 0xFF)
+#define MPIDR_AFF3(mpidr)  (((mpidr) >> 32) & 0xFF)
+
+
 #define USEC_PER_SEC 1000000L
 
 static inline u64 read64(u64 addr)
@@ -502,6 +508,7 @@ struct midr_part_features {
     bool disable_dc_mva;
     bool acc_cfg;
     bool apple_sysregs_unlocked;
+    bool cyc_ovrd;
     bool workaround_cyclone_cache;
     bool nex_powergating;
     bool fast_ipi;
