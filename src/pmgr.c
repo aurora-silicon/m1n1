@@ -458,6 +458,23 @@ int pmgr_reset(int die, const char *name)
     return pmgr_reset_device(die, dev);
 }
 
+int pmgr_power_enable_name(int die, const char *name)
+{
+    const struct pmgr_device *dev = NULL;
+
+    for (unsigned int i = 0; i < pmgr_devices_len; ++i) {
+        if (strncmp(pmgr_devices[i].name, name, 0x10) == 0) {
+            dev = &pmgr_devices[i];
+            break;
+        }
+    }
+
+    if (!dev)
+        return -1;
+
+    return pmgr_set_mode_recursive(die, pmgr_adt_get_id(dev), PMGR_PS_ACTIVE, true);
+}
+
 int pmgr_power_on(int die, const char *name)
 {
     const struct pmgr_device *dev = NULL;

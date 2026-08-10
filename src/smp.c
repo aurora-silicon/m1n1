@@ -25,7 +25,7 @@
 // hypervisor and PSCI implementation and prevents full-M5 validation.
 
 //
-// T8142: secondaries idle with plain WFI rather than deep_wfi().
+// T8142: secondaries idle with architectural WFE rather than deep_wfi().
 //
 // deep_wfi() calls Apple's _deep_wfi_helper() retention sequence whenever
 // AIDR_EL1 reports architectural retention. That path is unverified on this SoC
@@ -33,19 +33,17 @@
 // "XXX probably new mode required", and neither cpufreq nor MCC are implemented
 // here, so nothing has configured the states it relies on.
 //
-// A started secondary reaches its idle loop and calls deep_wfi() within
-// microseconds of reporting "Started.", which matches when the machine resets.
-//
-// Plain WFI is architectural: the core parks until an interrupt or event and
-// cannot enter an Apple-specific retention state. It idles less efficiently,
-// which is irrelevant here.
+// WFE is architectural, cannot enter Apple-specific retention, and lets the
+// boot CPU wake a parked core with SEV. Plain WFI avoided retention too, but it
+// required an unverified M4 fast-IPI write before P_SMP_CALL could dispatch any
+// work. That left the proxy waiting forever despite a live secondary.
 //
 // Ruled out before this: the fast-IPI Apple IMPDEF writes
 // (SYS_IMP_APL_IPI_RR_GLOBAL_EL1 / SYS_IMP_APL_IPI_SR_EL1). Skipping both of
 // them entirely did not stop the reset, so they are not the cause and are left
 // enabled -- IPIs are needed to wake a core out of WFI.
 //
-#define T8142_PLAIN_WFI (chip_id == T8142)
+#define T8142_EVENT_IDLE (chip_id == T8142)
 
 //
 // T8142: keep secondary CPUs off the console.
@@ -128,6 +126,14 @@ static int cpu_nodes[MAX_CPUS];
 static struct spin_table spin_table[MAX_CPUS];
 static u64 pmgr_reg;
 static u64 cpu_start_off;
+
+// T8142 shares the framebuffer/USB console between the boot CPU and newly
+// released secondaries.  Printing from the startup loop can leave the proxy
+// request waiting forever even though every secondary reached its spin table.
+// Keep machine-readable results instead; host-side probes can resolve these
+// symbols from the ELF and inspect them without touching the console.
+volatile u64 smp_started_mask;
+volatile u64 smp_start_fail_mask;
 //
 // Whether cpu_start_off above is actually known for this SoC. T8142 was in this
 // position until its offset was found empirically (see the T8142 case below);
@@ -223,14 +229,10 @@ void smp_secondary_entry(void)
 
     while (1) {
         while (!(target = me->target)) {
-            if (wfe_mode) {
+            if (wfe_mode || T8142_EVENT_IDLE) {
                 sysop("wfe");
             } else {
-                // See T8142_PLAIN_WFI.
-                if (T8142_PLAIN_WFI)
-                    sysop("wfi");
-                else
-                    deep_wfi();
+                deep_wfi();
 
                 if (cpu_features->fast_ipi) {
                     msr(SYS_IMP_APL_IPI_SR_EL1, 1);
@@ -309,15 +311,19 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
     if ((rvbar & RVBAR_LOCK) && (rvbar & RVBAR_ADDR) != (u64)_vectors_start) {
         u64 locked_rvbar = rvbar & RVBAR_ADDR;
         if (!t8142_prepare_locked_rvbar_relay(locked_rvbar)) {
-            printf("Failed! \n    RVBAR (=0x%lx) is locked and differs from entry point (=0x%lx)\n",
-                   locked_rvbar, (u64)_vectors_start);
+            smp_start_fail_mask |= BIT(index);
+            if (chip_id != T8142)
+                printf("Failed! \n    RVBAR (=0x%lx) is locked and differs from entry point (=0x%lx)\n",
+                       locked_rvbar, (u64)_vectors_start);
             return;
         }
 
-        printf("RVBAR relay 0x%lx -> 0x%lx; ", locked_rvbar, (u64)_vectors_start);
+        if (chip_id != T8142)
+            printf("RVBAR relay 0x%lx -> 0x%lx; ", locked_rvbar, (u64)_vectors_start);
     }
 
-    printf("Starting CPU %d (%d:%d:%d)... ", index, die, cluster, core);
+    if (chip_id != T8142)
+        printf("Starting CPU %d (%d:%d:%d)... ", index, die, cluster, core);
 
     memset(&spin_table[index], 0, sizeof(struct spin_table));
 
@@ -357,10 +363,15 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
         udelay(1000);
     }
 
-    if (i >= 100)
-        printf("Failed!\n");
-    else
-        printf("  Started.\n");
+    if (i >= 100) {
+        smp_start_fail_mask |= BIT(index);
+        if (chip_id != T8142)
+            printf("Failed!\n");
+    } else {
+        smp_started_mask |= BIT(index);
+        if (chip_id != T8142)
+            printf("  Started.\n");
+    }
 
     _reset_stack = dummy_stack + DUMMY_STACK_SIZE;
     _reset_stack_el1 = dummy_stack_el1 + DUMMY_STACK_SIZE;
@@ -416,7 +427,11 @@ static void smp_stop_cpu(int index, int die, int cluster, int core, u64 impl, u6
 
 void smp_start_secondaries(void)
 {
-    printf("Starting secondary CPUs...\n");
+    smp_started_mask = 0;
+    smp_start_fail_mask = 0;
+
+    if (chip_id != T8142)
+        printf("Starting secondary CPUs...\n");
 
     int pmgr_path[8];
 
@@ -609,7 +624,7 @@ void smp_start_secondaries(void)
 
         // See T8142_SKIP_CPU0.
         if (T8142_SKIP_CPU0 && i == 0) {
-            printf("Not starting CPU 0: known to fail on this SoC, see T8142_SKIP_CPU0\n");
+            smp_start_fail_mask |= BIT(0);
             continue;
         }
 
@@ -724,9 +739,13 @@ void smp_set_wfe_mode(bool new_mode)
     wfe_mode = new_mode;
     sysop("dsb sy");
 
-    for (int cpu = 0; cpu < MAX_CPUS; cpu++)
-        if (cpu != boot_cpu_idx && smp_is_alive(cpu))
-            smp_send_ipi(cpu);
+    // T8142 secondaries are already parked in WFE, so SEV below is sufficient
+    // and deliberately avoids the still-unverified M4 fast-IPI registers.
+    if (chip_id != T8142) {
+        for (int cpu = 0; cpu < MAX_CPUS; cpu++)
+            if (cpu != boot_cpu_idx && smp_is_alive(cpu))
+                smp_send_ipi(cpu);
+    }
 
     sysop("sev");
 }

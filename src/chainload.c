@@ -120,7 +120,7 @@ int chainload_load(const char *spec, char **vars, size_t var_cnt)
     size_t size;
     int ret;
 
-    if (!nvme_init()) {
+    if (!nvme_init(0)) {
         printf("chainload: NVME init failed\n");
         return -1;
     }

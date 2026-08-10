@@ -662,7 +662,13 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_NVME_INIT:
-            reply->retval = nvme_init();
+            /* NVMe initialization runs synchronously on the proxy/boot CPU.
+             * That CPU has its normal architectural timer context, including
+             * on T8142, so retain real time-based deadlines.  Timerless mode
+             * is reserved for an explicitly dispatched diagnostic worker;
+             * forcing it here turns short controller timeouts into very long
+             * USB-blocking iteration loops. */
+            reply->retval = nvme_init(0);
             break;
         case P_NVME_SHUTDOWN:
             nvme_shutdown();

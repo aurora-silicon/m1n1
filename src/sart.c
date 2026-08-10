@@ -54,6 +54,45 @@ struct sart_dev {
 
 #define APPLE_SART3_FLAGS_ALLOW 0xff
 
+#define APPLE_SART_POWER_ON           0
+#define APPLE_SART_POWER_POLL_US      100
+#define APPLE_SART_POWER_POLL_RETRIES 10000
+
+static bool sart_power_on(int node, int *sart_path, const char *adt_path)
+{
+    if (!adt_getprop(adt, node, "sart-power-managed", NULL))
+        return true;
+
+    u64 power_base;
+    if (adt_get_reg(adt, sart_path, "reg", 2, &power_base, NULL) < 0) {
+        printf("sart: Error getting SART %s power register base.\n", adt_path);
+        return false;
+    }
+
+    const u32 *power_offset = adt_getprop(adt, node, "sart-power-reg-offset", NULL);
+    if (!power_offset) {
+        printf("sart: SART %s is power managed but has no power register offset.\n", adt_path);
+        return false;
+    }
+
+    uintptr_t power_reg = power_base + *power_offset;
+    printf("sart: Powering on %s via 0x%lx\n", adt_path, power_reg);
+
+    /*
+     * IOCoastGuardSARTMapper writes zero, waits 100 us, and polls until the
+     * same register reads back as zero before touching the SART table.
+     */
+    for (unsigned int i = 0; i < APPLE_SART_POWER_POLL_RETRIES; ++i) {
+        write32(power_reg, APPLE_SART_POWER_ON);
+        udelay(APPLE_SART_POWER_POLL_US);
+        if (read32(power_reg) == APPLE_SART_POWER_ON)
+            return true;
+    }
+
+    printf("sart: Timed out powering on SART %s.\n", adt_path);
+    return false;
+}
+
 static void sart0_get_entry(sart_dev_t *sart, int index, u8 *flags, void **paddr, size_t *size)
 {
     u32 cfg = read32(sart->base + APPLE_SART0_CONFIG(index));
@@ -176,6 +215,9 @@ sart_dev_t *sart_init(const char *adt_path)
             return NULL;
         }
     }
+
+    if (!sart_power_on(node, sart_path, adt_path))
+        return NULL;
 
     sart_dev_t *sart = calloc(1, sizeof(*sart));
     if (!sart)

@@ -37,6 +37,20 @@ static bool hv_has_ecv;
 static bool hv_should_exit[MAX_CPUS];
 bool hv_started_cpus[MAX_CPUS];
 u64 hv_cpus_in_guest;
+
+/*
+ * T8142's architectural CNTPCT view is redirected/trapped for the guest and
+ * is not a dependable EL2 bookkeeping clock. Apple's always-on counter alias
+ * is the same source used to emulate guest CNTPCT_EL0 reads.
+ */
+u64 hv_host_counter(void)
+{
+    if (chip_id == T8142)
+        return mrs(SYS_IMP_APL_CNTVCT_ALIAS_EL0);
+
+    return mrs(CNTPCT_EL0);
+}
+
 /*
  * Set for the duration of hv_rendezvous().  hv_cpus_in_guest is cleared ONLY by
  * hv_exc_entry(), and hv_exc_sync()'s fast path -- the one that handles an
@@ -246,6 +260,18 @@ int hv_init(void)
 
     hv_has_ecv = mrs(ID_AA64MMFR0_EL1) & (0xfULL << 60);
 
+    if (chip_id == T8142 && hv_has_ecv) {
+        /*
+         * T8142 reports ECV in ID_AA64MMFR0_EL1, but CNTPOFF_EL2 is not
+         * implemented.  Enabling the ECV aliases consequently leaves Mu's
+         * first CNTPCT_EL0 delay loop unable to observe forward progress.
+         * Use the architectural direct-counter path until the T8142 offset
+         * mechanism is understood and can be enabled safely.
+         */
+        printf("HV: T8142: ECV advertised without CNTPOFF_EL2; using direct-counter fallback\n");
+        hv_has_ecv = false;
+    }
+
     if (hv_has_ecv) {
         printf("HV: ECV enabled\n");
         // VHE uses the EL1 physical-timer view for the host tick.  Do not
@@ -256,8 +282,32 @@ int hv_init(void)
         hv_secondary_tick_interval = mrs(CNTFRQ_EL0) / HV_SLOW_TICK_RATE;
     } else {
         printf("HV: No ECV supported\n");
-        // Enable physical timer for EL1
-        msr(CNTHCTL_EL2, CNTHCTL_EL1PTEN | CNTHCTL_EL1PCTEN);
+        // Enable the physical timer for EL1.
+        if (chip_id == T8142) {
+            /*
+             * The native EL1 CNTPCT view is frozen on T8142.  Keep physical
+             * timer programming available, but trap physical-counter reads so
+             * hv_exc can return the advancing EL2 architectural counter.
+             */
+            /*
+             * Trap both the physical counter and the EL1 physical-timer
+             * programming interface on T8142.  Leaving EL1PTEN set lets Mu's
+             * TimerDxe arm CNTP_CTL_EL0 without passing through
+             * hv_timer_reflect_guest_rearm().  m1n1 then never observes the
+             * final unmasked ENABLE write, mu_timer_ready remains false, and
+             * the first expired CNTP interrupt becomes a permanent EL2 FIQ
+             * storm before Mu can execute its next instruction.
+             *
+             * The trapped CNTP_{CTL,CVAL,TVAL}_EL0 cases below map to the EL02
+             * bank and complete the native-AIC software-IRQ handshake; the
+             * trapped CNTPCT_EL0 case supplies the advancing Apple counter
+             * alias.  No EL1 physical-timer permission is needed here.
+             */
+            msr(CNTHCTL_EL2, 0);
+            printf("HV: T8142: trapping EL1 CNTP timer and counter accesses for reflection\n");
+        } else {
+            msr(CNTHCTL_EL2, CNTHCTL_EL1PTEN | CNTHCTL_EL1PCTEN);
+        }
 
         hv_secondary_tick_interval = hv_tick_interval;
     }
@@ -301,12 +351,29 @@ void hv_start(void *entry, u64 regs[4])
      * enable ICH/LRs: this is a topology carrier, not an interrupt-delivery path.
      */
 #ifdef ENABLE_VGIC_MODULE
-    hv_vgicv3_init();
-    init_vgic_irq_queues();
+    if (chip_id == T8142) {
+        /*
+         * The current startup-carrier implementation resets T8142 before Mu
+         * executes its first instruction.  Keep the carrier compiled into the
+         * image, but defer activation while bringing up Mu's ANS/NVMe path.
+         * Windows interrupt delivery is enabled again only after firmware and
+         * bootmgfw handoff are independently proven.
+         */
+        printf("HV: T8142: deferring Windows vGIC startup carrier during Mu/NVMe bring-up\n");
+    } else {
+        printf("HV: windows-native-aic: initializing virtual IRQ queues\n");
+        hv_vgicv3_init();
+        printf("HV: windows-native-aic: vGIC MMIO carrier ready\n");
+        init_vgic_irq_queues();
+        printf("HV: windows-native-aic: virtual IRQ queues ready\n");
+    }
 #endif
 
     /* Host MMIO mappings are complete before hv_start(), so these hooks persist. */
-    hv_native_aic_transition_init();
+    if (chip_id == T8142)
+        printf("HV: T8142: deferring native-AIC transition hooks during Mu/NVMe bring-up\n");
+    else
+        hv_native_aic_transition_init();
 #endif
 
     //
@@ -352,9 +419,27 @@ void hv_start(void *entry, u64 regs[4])
     hv_vgicv3_init_list_registers();
 #endif
 
+    if (chip_id == T8142 && cpu_features->counter_redirect) {
+        /*
+         * The J813 launcher supplies Mu as a raw FD, so run_guest.py does not
+         * apply its Mach-O counter-redirect setup.  Mu still expects the
+         * architectural counter view rather than Apple's scaled redirect.
+         * Program both the host and guest aliases before the first EL1 read.
+         */
+        msr(SYS_IMP_APL_AGTCNTRDIR_EL1,
+            AGTCNTRDIR_DISABLE | AGTCNTRDIR_EL0_TRAP_CTL);
+        msr(SYS_IMP_APL_AGTCNTRDIR_EL12,
+            AGTCNTRDIR_DISABLE | AGTCNTRDIR_EL0_TRAP_CTL);
+        sysop("isb");
+        printf("HV: T8142: architectural counter redirect selected for raw Mu guest\n");
+    }
+
     printf("HV: Aurora timer probe CNTHCTL_EL2=0x%lx HCR_EL2=0x%lx\n", mrs(CNTHCTL_EL2),
            mrs(HCR_EL2));
-    printf("HV: Arming host tick\n");
+    if (chip_id == T8142)
+        hv_tick_interval = mrs(CNTFRQ_EL0) / HV_SLOW_TICK_RATE;
+
+    printf("HV: Arming %s host tick\n", chip_id == T8142 ? "slow T8142" : "primary");
     hv_arm_tick(false);
     hv_pinned_cpu = -1;
     hv_want_cpu = -1;
@@ -466,7 +551,10 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     if (gxf_enabled())
         gl2_call(hv_set_gxf_vbar, 0, 0, 0, 0);
 
-    hv_arm_tick(true);
+    if (chip_id == T8142)
+        printf("HV: T8142: deferring secondary EL2 host tick during Mu/NVMe bring-up\n");
+    else
+        hv_arm_tick(true);
 }
 
 static void hv_enter_secondary(void *entry, u64 regs[4])
@@ -599,7 +687,7 @@ void hv_rendezvous(void)
     __atomic_store_n(&hv_rendezvous_pending, 1, __ATOMIC_RELEASE);
 
     u64 ipi_period = hv_usecs_to_ticks(HV_RENDEZVOUS_IPI_PERIOD_US);
-    u64 now = mrs(CNTPCT_EL0);
+    u64 now = hv_host_counter();
     u64 deadline = now + hv_usecs_to_ticks(HV_RENDEZVOUS_TIMEOUT_US);
     u64 next_ipi = now; /* fire the first round immediately */
     u64 missing;
@@ -612,7 +700,7 @@ void hv_rendezvous(void)
             return;
         }
 
-        now = mrs(CNTPCT_EL0);
+        now = hv_host_counter();
 
         if ((s64)(now - next_ipi) >= 0) {
             /*

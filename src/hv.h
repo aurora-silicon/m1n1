@@ -121,6 +121,7 @@ void hv_exit_cpu(int cpu);
 void hv_rendezvous(void);
 bool hv_switch_cpu(int cpu);
 void hv_pin_cpu(int cpu);
+u64 hv_host_counter(void);
 void hv_arm_tick(bool secondary);
 bool hv_mask_pending_tick(void);
 void hv_rearm(void);

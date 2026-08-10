@@ -94,7 +94,7 @@ void hv_wdt_main(void)
             sysop("dmb ish");
             u64 timestamp = hv_wdt_timestamp;
             sysop("isb");
-            u64 now = mrs(CNTPCT_EL0);
+            u64 now = hv_host_counter();
             sysop("isb");
             if ((now - timestamp) > hv_wdt_timeout)
                 hv_wdt_bark();
@@ -108,7 +108,7 @@ void hv_wdt_main(void)
 
 void hv_wdt_pet(void)
 {
-    hv_wdt_timestamp = mrs(CNTPCT_EL0);
+    hv_wdt_timestamp = hv_host_counter();
     sysop("dmb ish");
 }
 

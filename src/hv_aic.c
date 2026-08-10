@@ -74,7 +74,7 @@ static void native_aic_trace_write(u16 code, u64 arg0, u64 arg1, u64 elr,
     struct hv_native_aic_trace_entry *entry =
         &native_aic_trace[cpu][sequence % HV_NATIVE_AIC_TRACE_DEPTH];
 
-    entry->timestamp = mrs(CNTPCT_EL0);
+    entry->timestamp = hv_host_counter();
     entry->elr = elr;
     entry->far = far;
     entry->hcr = mrs(HCR_EL2);
@@ -224,10 +224,31 @@ void hv_native_aic_enter_cpu(void)
 
 void hv_native_aic_timer_ready(void)
 {
-    if (!__atomic_load_n(&mu_aic_ready, __ATOMIC_ACQUIRE) ||
-        __atomic_load_n(&mu_timer_ready, __ATOMIC_ACQUIRE) ||
+    if (__atomic_load_n(&mu_timer_ready, __ATOMIC_ACQUIRE) ||
         hv_native_aic_windows_active())
         return;
+
+    if (!__atomic_load_n(&mu_aic_ready, __ATOMIC_ACQUIRE)) {
+        /*
+         * J813/T8142 deliberately leaves the CONFIG/EVENT transition hooks
+         * unmapped during Mu and NVMe bring-up.  Consequently we cannot learn
+         * that AppleAicDxe enabled AIC2 from handle_native_aic_transition().
+         * The final TimerDxe CTL write is nevertheless a safe place to sample
+         * the real, non-destructive CONFIG register: the timer callback has
+         * already been registered and CONFIG.ENABLE proves the native AIC
+         * handler is live.  Initialize only the Mu timer-reflection state here;
+         * do not install the deferred Windows transition hooks.
+         */
+        if (chip_id != T8142 ||
+            !(read32(aic->base + AIC2_GLOBAL_CONFIG) &
+              AIC2_GLOBAL_CONFIG_ENABLE))
+            return;
+
+        hv_timer_reflect_init();
+        __atomic_store_n(&native_aic_active, true, __ATOMIC_RELEASE);
+        __atomic_store_n(&mu_aic_ready, true, __ATOMIC_RELEASE);
+        printf("HV: T8142: observed live Mu AIC2 CONFIG without transition hooks\n");
+    }
 
     /*
      * TimerDxe registers its callback before enabling the architectural timer.
@@ -315,6 +336,7 @@ static bool handle_native_aic_transition(struct exc_info *ctx, u64 addr, u64 *va
 
 void hv_native_aic_transition_init(void)
 {
+    printf("HV: windows-native-aic: initializing transition state\n");
     memset(native_aic_trace, 0, sizeof(native_aic_trace));
     memset(native_aic_trace_head, 0, sizeof(native_aic_trace_head));
     __atomic_store_n(&native_aic_active, true, __ATOMIC_RELEASE);
@@ -327,10 +349,14 @@ void hv_native_aic_transition_init(void)
      * not hv_init), otherwise pt_update overwrites these hooks.  CONFIG lives
      * in the first page and EVENT in the split AIC2 event aperture.
      */
+    printf("HV: windows-native-aic: mapping CONFIG hook\n");
     hv_map_hook(aic->base, handle_native_aic_transition, 0x1000);
+    printf("HV: windows-native-aic: mapping EVENT hook\n");
     hv_map_hook((aic->base + aic->regs.event) & ~0xfffULL,
                 handle_native_aic_transition, 0x1000);
+    printf("HV: windows-native-aic: initializing timer reflection\n");
     hv_timer_reflect_init();
+    printf("HV: windows-native-aic: applying boot-CPU routing\n");
     hv_native_aic_enter_cpu();
     printf("HV: windows-native-aic: pure AIC active; watching CONFIG 0x%llx and EVENT 0x%llx\n",
            (unsigned long long)(aic->base + AIC2_GLOBAL_CONFIG),

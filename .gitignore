@@ -1,5 +1,6 @@
 !build/.keep
 build/
+/build-m5-*/
 __pycache__
 *.pyc
 *.macho
@@ -17,3 +18,4 @@ __pycache__
 .vscode/
 /.venv/
 null.d
+/tools/ghidra/*-decomp.txt

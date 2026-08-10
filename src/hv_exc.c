@@ -313,13 +313,13 @@ static void hv_timer_diag_note_fiq(bool physical)
     unsigned int source = hv_timer_diag_source(physical);
     struct hv_native_aic_timer_diag *diag =
         &native_aic_timer_diag[smp_id()];
-    u64 guest_counter = physical ? mrs(CNTPCT_EL0) : mrs(CNTVCT_EL0);
+    u64 guest_counter = physical ? hv_host_counter() : mrs(CNTVCT_EL0);
     u64 cval = physical ? mrs(CNTP_CVAL_EL02) : mrs(CNTV_CVAL_EL02);
     u64 lateness = (s64)(guest_counter - cval) > 0
                        ? guest_counter - cval
                        : 0;
 
-    diag->last_fiq_counter[source] = mrs(CNTPCT_EL0);
+    diag->last_fiq_counter[source] = hv_host_counter();
     diag->last_fiq_guest_counter[source] = guest_counter;
     diag->last_programmed_cval[source] = cval;
     if (lateness > diag->max_deadline_lateness[source])
@@ -331,7 +331,7 @@ static void hv_timer_diag_note_event(bool physical)
     unsigned int source = hv_timer_diag_source(physical);
     struct hv_native_aic_timer_diag *diag =
         &native_aic_timer_diag[smp_id()];
-    u64 now = mrs(CNTPCT_EL0);
+    u64 now = hv_host_counter();
     u64 latency = now - diag->last_fiq_counter[source];
 
     diag->last_event_counter[source] = now;
@@ -345,7 +345,7 @@ static void hv_timer_diag_note_rearm(bool physical)
     unsigned int source = hv_timer_diag_source(physical);
     struct hv_native_aic_timer_diag *diag =
         &native_aic_timer_diag[smp_id()];
-    u64 now = mrs(CNTPCT_EL0);
+    u64 now = hv_host_counter();
 
     if (diag->last_event_counter[source] != 0 &&
         diag->last_rearm_counter[source] <
@@ -364,7 +364,7 @@ static void hv_timer_diag_note_ipi_bypass(void)
 {
     struct hv_native_aic_timer_diag *diag =
         &native_aic_timer_diag[smp_id()];
-    u64 now = mrs(CNTPCT_EL0);
+    u64 now = hv_host_counter();
 
     for (unsigned int source = 0; source < 2; source++) {
         bool unread = source == 0 ? PERCPU(timer_p_event_unread)
@@ -635,7 +635,7 @@ static bool hv_guest_ipi_doorbell_pending(void)
 
 static u32 hv_guest_ipi_clock_now(void)
 {
-    return (u32)(mrs(CNTPCT_EL0) >> HV_GUEST_IPI_CLOCK_SHIFT) &
+    return (u32)(hv_host_counter() >> HV_GUEST_IPI_CLOCK_SHIFT) &
            HV_GUEST_IPI_CLOCK_MASK;
 }
 
@@ -915,7 +915,7 @@ static void _hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, 
     if (time_stealing)
         hv_rendezvous();
 
-    u64 entry_time = mrs(CNTPCT_EL0);
+    u64 entry_time = hv_host_counter();
 
     ctx->elr_phys = hv_translate(ctx->elr, false, false, NULL);
     ctx->far_phys = hv_translate(ctx->far, false, false, NULL);
@@ -936,7 +936,7 @@ static void _hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, 
         case EXC_RET_HANDLED:
             hv_wdt_breadcrumb('p');
             if (time_stealing) {
-                u64 lost = mrs(CNTPCT_EL0) - entry_time;
+                u64 lost = hv_host_counter() - entry_time;
                 stolen_time += lost;
             }
             break;
@@ -1829,6 +1829,18 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
     switch (reg) {
         SYSREG_PASS(SYS_IMP_APL_CORE_NRG_ACC_DAT);
         SYSREG_PASS(SYS_IMP_APL_CORE_SRM_NRG_ACC_DAT);
+        case SYSREG_ISS(sys_reg(3, 3, 14, 0, 1)): /* CNTPCT_EL0 */
+            if (!is_read || chip_id != T8142)
+                return false;
+            /*
+             * T8142's standard physical and virtual counter views remain frozen
+             * while an EL1 exception is active.  Apple's ACNTVCT_EL0 alias is
+             * monotonic at the same CNTFRQ in that context, so use it as the
+             * timebase for the trapped physical-counter read.  Mu and bootmgfw
+             * only depend on monotonic deltas here.
+             */
+            regs[rt] = mrs(SYS_IMP_APL_CNTVCT_ALIAS_EL0);
+            return true;
         /* Architectural timer, for ECV */
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
 #define SYSREG_MAP_REFLECT(sr, to, physical, control)                                               \
@@ -2957,7 +2969,7 @@ static void hv_exc_entry(void)
     __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
     spin_lock(&bhl);
     hv_wdt_breadcrumb('X');
-    exc_entry_time = mrs(CNTPCT_EL0);
+    exc_entry_time = hv_host_counter();
     /* disable PMU counters in the hypervisor */
     u64 pmcr0 = mrs(SYS_IMP_APL_PMCR0);
     PERCPU(exc_entry_pmcr0_cnt) = pmcr0 & PMCR0_CNT_MASK;

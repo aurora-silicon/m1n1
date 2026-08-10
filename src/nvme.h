@@ -5,7 +5,7 @@
 
 #include "types.h"
 
-bool nvme_init(void);
+bool nvme_init(u64 diagnostic_mode);
 void nvme_shutdown(void);
 
 bool nvme_flush(u32 nsid);
