@@ -423,6 +423,8 @@ static u32 *hv_fb_scanout;
 static u32 hv_fb_stride_px;
 static u32 hv_fb_height;
 static u32 hv_fb_cursor;
+static u32 hv_fb_lines;
+static u64 hv_fb_report_next;
 
 static void hv_fb_init(struct boot_args *gba)
 {
@@ -514,6 +516,30 @@ void hv_fb_convert_slice(u32 lines)
             dst[x] = ((p & 0xff) << 2) | (((p >> 8) & 0xff) << 12) | (((p >> 16) & 0xff) << 22);
         }
     }
+
+    __atomic_fetch_add(&hv_fb_lines, end - start, __ATOMIC_RELAXED);
+}
+
+/*
+ * Refresh rate actually achieved, once a second.
+ *
+ * Worth carrying: what limits this is how often the engines run, not the memory
+ * system, and that is not something you can read off the source.  The slice
+ * sizes in hv.h are derived from this number.
+ */
+void hv_fb_report(void)
+{
+    if (!hv_fb_shadow)
+        return;
+
+    u64 now = mrs(CNTPCT_EL0);
+    if (now < hv_fb_report_next)
+        return;
+    hv_fb_report_next = now + mrs(CNTFRQ_EL0);
+
+    u32 lines = __atomic_exchange_n(&hv_fb_lines, 0, __ATOMIC_RELAXED);
+    printf("HV: fb: %u lines/s = %u.%02u fps\n", lines, lines / hv_fb_height,
+           (lines * 100 / hv_fb_height) % 100);
 }
 
 void hv_start(void *entry, u64 regs[4])
@@ -1188,6 +1214,7 @@ void hv_tick(struct exc_info *ctx)
      * work, unlocked. See hv_fb_convert_slice().
      */
     hv_fb_convert_slice(HV_FB_SLICE_TICK);
+    hv_fb_report();
 #ifdef ENABLE_GUEST_PC_SAMPLER
     hv_sample_guest_pc(ctx);
 #endif

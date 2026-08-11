@@ -130,14 +130,30 @@ void hv_arm_wfi_wake(void);
 /*
  * Scanlines converted per call from the guest's BGRA shadow into the panel's
  * X2R10G10B10 scanout. Idle cores about to park in WFI do the bulk of it on the
- * unlocked path, so their slice is small and frequent (they arrive at
- * HV_WFI_WAKE_RATE); the tick's slice is a floor for a guest that never idles,
- * and is bounded because hv_tick() holds the big hypervisor lock.
+ * unlocked path; the tick's slice is a floor for a guest that never idles, and
+ * is bounded because hv_tick() holds the big hypervisor lock.
+ *
+ * Sized from a measurement of this machine's memory system, taken from
+ * hv_fb_init() before the guest exists:
+ *
+ *   read cached 38 GB/s, read NC 20 GB/s, write NC 21 GB/s
+ *   full-frame convert 5239 MB/s -- 3 ms for all 17 MB, a 322 fps ceiling
+ *
+ * So a scanline costs about 1.95 us and bandwidth was never the constraint.
+ * The old idle slice of 8 was: cores reach the WFI path roughly 80 times a
+ * second each, so nine of them moved 9 * 80 * 8 = 5760 lines/s, and against a
+ * 1664-line panel that is 3.5 fps -- which is exactly the "4 fps" this was
+ * assumed to be capped at by memory bandwidth.  It was a scheduling limit the
+ * whole time.
+ *
+ * 160 lines puts the same nine cores at 9 * 80 * 160 = 115,200 lines/s, near
+ * 70 fps, for 0.31 ms of work per wakeup on a core that was about to sleep.
  */
-#define HV_FB_SLICE_IDLE 8
+#define HV_FB_SLICE_IDLE 160
 #define HV_FB_SLICE_TICK 64
 
 void hv_fb_convert_slice(u32 lines);
+void hv_fb_report(void);
 bool hv_mask_pending_tick(void);
 void hv_rearm(void);
 void hv_maybe_exit(void);
