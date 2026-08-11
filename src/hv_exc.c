@@ -3023,6 +3023,29 @@ static bool hv_patch_t8142_pmu_site(u64 va, u32 insn)
 }
 
 /*
+ * Probe for the open bugcheck 0xA.
+ *
+ * The fault is x26 == 0 at ntoskrnl RVA 0x2c3d8c, on return from the indirect
+ * call four instructions earlier, inside CPU idle accounting.  x26 is
+ * callee-saved, holds x20 + 0x89af, and the identical register is dereferenced
+ * successfully before the call, so it is destroyed across it.
+ *
+ * Two things are unknown and one boot with this probe answers both.  Which
+ * function the call reaches: it is `blr x15`, so x15 is the answer, and nothing
+ * static can tell us because the target comes from [x19 + 0x260].  And whether
+ * m1n1 is the writer: the MRS emulation for rewritten absent-register sites
+ * assigns ctx->regs[rt] directly, and `out` is 0 for every PMU register this
+ * SoC lacks -- which would produce exactly the zero observed.
+ *
+ * Emulating the branch afterwards is free: the HVC has already advanced ELR to
+ * the instruction after the call, which is precisely the link address.
+ */
+#define HV_T8142_0XA_BLR_RVA  0x2c3d84
+#define HV_T8142_0XA_BLR_INSN 0xd63f01e0 /* blr x15 */
+
+static u64 t8142_0xa_probe_va;
+
+/*
  * Replace every absent-register access in a guest image before any of them runs.
  *
  * Discovering these lazily, one fault at a time, cannot work for the NT kernel:
@@ -3281,6 +3304,46 @@ static void hv_scan_guest_image_absent_regs(u64 va_in_image)
     printf("HV: T8142: image at 0x%lx: scanned %ld words, redirected %ld absent-register "
            "accesses (%ld sites total)\n",
            base, (u64)words, (u64)patched, (u64)t8142_pmu_site_count);
+
+    /*
+     * How many rewritten sites can write a callee-saved register at all.  The
+     * individual addresses were dumped once and answered their question (58 of
+     * 581, six of them into x26); what matters now is which ones execute, and
+     * that is reported from the emulation path instead.
+     */
+    u32 rt_callee_saved = 0;
+    for (u32 i = 0; i < t8142_pmu_site_count; i++) {
+        u32 rt = t8142_pmu_site[i].orig & 0x1f;
+
+        if (rt >= 19 && rt <= 28)
+            rt_callee_saved++;
+    }
+    printf("HV: T8142: absent-register sites writing x19-x28: %u of %ld\n", rt_callee_saved,
+           (u64)t8142_pmu_site_count);
+
+    /*
+     * Arm the bugcheck 0xA probe once the kernel itself has been swept.  The
+     * RVA is fixed for this build of ntoskrnl and the encoding is checked
+     * before anything is written, so a different kernel simply declines.
+     */
+    if (base == t8142_kernel_base && !t8142_0xa_probe_va) {
+        u64 va = base + HV_T8142_0XA_BLR_RVA;
+        u64 pa = hv_translate(va, false, false, NULL);
+        u32 cur = pa ? read32(pa) : 0;
+
+        if (pa && cur == HV_T8142_0XA_BLR_INSN) {
+            hv_write_guest_insn(pa, HV_T8142_UNDEF_HVC_INSN);
+            if (read32(pa) == HV_T8142_UNDEF_HVC_INSN) {
+                t8142_0xa_probe_va = va;
+                printf("HV: T8142: 0xA probe armed at 0x%lx (pa 0x%lx)\n", va, pa);
+            } else {
+                printf("HV: T8142: 0xA probe: write to pa 0x%lx did not stick\n", pa);
+            }
+        } else {
+            printf("HV: T8142: 0xA probe not armed: va 0x%lx pa 0x%lx insn 0x%08x (want 0x%08x)\n",
+                   va, pa, cur, HV_T8142_0XA_BLR_INSN);
+        }
+    }
 }
 
 /*
@@ -3308,14 +3371,75 @@ static bool hv_handle_t8142_pmu_site(struct exc_info *ctx)
             ctx->regs[rt] = out;
 
         static u64 site_emulated;
+        static u32 callee_saved_emulated;
 
-        if (site_emulated < 8 || (site_emulated % 4096) == 0)
+        /*
+         * An MRS into x19-x28 makes m1n1 the writer of a register the ABI says
+         * the callee must preserve.  That is the exact shape of the open
+         * bugcheck 0xA, so print those in full rather than under the throttle
+         * that hid them: the aggregate scan says only 58 of ~581 sites can do
+         * it, and how many of those ever execute is the open question.
+         */
+        if (((insn & 0xffe00000U) == 0xd5200000U) && rt >= 19 && rt <= 28) {
+            if (callee_saved_emulated < 64)
+                printf("HV: T8142: CALLEE-SAVED WRITE x%ld = 0x%lx at 0x%lx (insn 0x%08x)\n", rt,
+                       out, site, insn);
+            callee_saved_emulated++;
+        } else if (site_emulated < 8 || (site_emulated % 4096) == 0) {
             printf("HV: T8142: site emulated 0x%08x at 0x%lx (#%ld)\n", insn, site, site_emulated);
+        }
         site_emulated++;
         return true;
     }
 
     return false;
+}
+
+/*
+ * The guest reached the indirect call that bugcheck 0xA returns from.  Report
+ * where it is about to go, what x26 looks like on the way in, and whether any
+ * instruction we rewrote lives inside the target -- then perform the branch.
+ */
+static bool hv_handle_t8142_0xa_probe(struct exc_info *ctx)
+{
+    static u32 hits;
+
+    if (!t8142_0xa_probe_va || (ctx->elr - sizeof(u32)) != t8142_0xa_probe_va)
+        return false;
+
+    u64 callee = ctx->regs[15];
+
+    if (hits < 8) {
+        printf("HV: T8142: 0xA probe #%u: callee=0x%lx (kernel rva 0x%lx) x19=0x%lx x20=0x%lx "
+               "x26=0x%lx\n",
+               hits, callee, callee - t8142_kernel_base, ctx->regs[19], ctx->regs[20],
+               ctx->regs[26]);
+
+        /*
+         * Only the callee's own body is in range here.  A site in something it
+         * calls in turn would still be saved and restored by that function, so
+         * the interesting case is a rewrite in the target itself.
+         */
+        u32 inside = 0;
+        for (u32 i = 0; i < t8142_pmu_site_count; i++) {
+            u64 va = t8142_pmu_site[i].va;
+
+            if (va < callee || va >= callee + 0x4000)
+                continue;
+
+            inside++;
+            printf("HV: T8142: 0xA probe:   site 0x%lx (+0x%lx) insn=0x%08x rt=x%u\n", va,
+                   va - callee, t8142_pmu_site[i].orig, t8142_pmu_site[i].orig & 0x1f);
+        }
+        if (!inside)
+            printf("HV: T8142: 0xA probe:   no rewritten site within 0x4000 of the callee\n");
+    }
+    hits++;
+
+    /* Emulate `blr x15`.  ELR is already the return address the branch links. */
+    ctx->regs[30] = ctx->elr;
+    ctx->elr = callee;
+    return true;
 }
 
 /*
@@ -3329,6 +3453,10 @@ static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
         return false;
     if ((ctx->esr & 0xffff) != HV_T8142_UNDEF_HVC_IMM)
         return false;
+
+    /* The 0xA probe is a single known address; check it before the site table. */
+    if (hv_handle_t8142_0xa_probe(ctx))
+        return true;
 
     /* A replaced access site is unambiguous and needs no fault state. */
     if (hv_handle_t8142_pmu_site(ctx))
