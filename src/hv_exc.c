@@ -2940,8 +2940,14 @@ void hv_verify_t8142_undef_vectors(void)
     }
 }
 
-/* Put one guest vector back exactly as it was and stop tracking it. */
-static void hv_unpatch_t8142_undef_vector(u64 va)
+/*
+ * Put one guest vector back exactly as it was and stop tracking it.
+ *
+ * Returns whether anything was actually restored.  Callers that rewind ELR to
+ * re-execute the address must check this: rewinding onto a word we did not
+ * replace means re-executing our own HVC, which never terminates.
+ */
+static bool hv_unpatch_t8142_undef_vector(u64 va)
 {
     for (u32 i = 0; i < t8142_undef_vec_count; i++) {
         if (t8142_undef_vec[i].va != va || t8142_undef_vec[i].refused)
@@ -2952,8 +2958,10 @@ static void hv_unpatch_t8142_undef_vector(u64 va)
             hv_write_guest_insn(pa, t8142_undef_vec[i].orig);
 
         t8142_undef_vec[i] = t8142_undef_vec[--t8142_undef_vec_count];
-        return;
+        return pa != 0;
     }
+
+    return false;
 }
 
 /*
@@ -3367,13 +3375,29 @@ static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
         return true;
 
     /*
-     * Should be unreachable: nothing is displaced unless it can be replayed.
-     * Fail safe by handing the vector back to the guest intact rather than
-     * resuming into a handler that is missing its first instruction.
+     * Documented as unreachable, and it is not.  Measured on J813: 72166 times
+     * in a single boot, always with orig == 0, at just two addresses -- neither
+     * of them in the kernel image.  So this is an HVC carrying our immediate at
+     * a location we have no record of displacing, and there is nothing to
+     * replay.
+     *
+     * Restoring and rewinding is right when we really did displace the word,
+     * and catastrophic otherwise: with nothing to put back, ELR lands on our
+     * own HVC again and the guest spins here forever.  That livelock is what
+     * produced those 72166 lines. Only rewind if something was actually
+     * restored; otherwise step past and let the guest make progress, which
+     * turns an unbounded spin into one diagnosable event.
      */
-    printf("HV: T8142: trampoline lost vector 0x%lx (orig 0x%08x); restoring\n", vec_va, orig);
-    hv_unpatch_t8142_undef_vector(vec_va);
-    ctx->elr = vec_va;
+    static u64 lost;
+
+    if (lost < 8 || (lost % 4096) == 0)
+        printf("HV: T8142: trampoline lost vector 0x%lx (orig 0x%08x) (#%ld)\n", vec_va, orig,
+               lost);
+    lost++;
+
+    if (hv_unpatch_t8142_undef_vector(vec_va))
+        ctx->elr = vec_va; /* restored: re-execute the real instruction */
+
     return true;
 }
 
