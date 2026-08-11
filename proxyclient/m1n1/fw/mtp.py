@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 
 import struct
+import time
 from construct import *
 from ..constructutils import *
 from ..utils import *
@@ -77,11 +78,29 @@ class DeviceEnableMsg(ConstructClass):
     )
 
 class DeviceResetMsg(ConstructClass):
+    """Apple's "power method 2" interface power transition.
+
+    9 bytes, not the 4 the older form used.  The J813 firmware's 0x40 handler
+    checks, in this order:
+        ldrh w1, [msg+2]; cmp #9        -- total length must be 9
+        ldrb w1, [msg+1]; cmp #2        -- method must be 2 (old form sent 1)
+        ldrb w1, [msg+3]; cmp #6, b.lo  -- state must be < 6
+    Because the length test comes first, a 4-byte message is rejected with
+    0xe00002c2 (kIOReturnBadArgument) before any field is read -- so sweeping
+    the fields of a 4-byte message returns that same error for every
+    combination, which looks like a parameter problem and is not one.
+
+    Apple sends these in Will/HasChanged pairs:
+        setInterfacePowerWillChange:  40 02 <iface> <state> 00 00 00 00 00
+        setInterfacePowerHasChanged:  40 02 <iface> <state> 01 <status le32>
+    """
     subcon = Struct(
         "command" / Const(0x40, Int8ul),
         "unk1" / Int8ul,
         "device_id" / Int8ul,
         "state" / Int8ul,
+        "phase" / Int8ul,
+        "status" / Int32ul,
     )
 
 class InitBufMsg(ConstructClass):
@@ -220,6 +239,10 @@ class MTPCommInterface(MTPInterface):
         super().__init__(*args, **kwargs)
         self.last_cmd = None
         self.gpios = {}
+        # Interfaces whose init packets have all arrived but whose
+        # initialize() must not run yet; see report() and drain_init().
+        self.pending_init = []
+        self.in_control = False
 
 
     def device_control(self, dcmsg):
@@ -232,9 +255,19 @@ class MTPCommInterface(MTPInterface):
         msg.msg = dcmsg
         #self.log(f"Send device control {dcmsg}")
         self.last_cmd = dcmsg.command
-        self.send(msg.build())
-        while self.last_cmd is not None:
-            self.proto.work()
+        self.in_control = True
+        try:
+            self.send(msg.build())
+            while self.last_cmd is not None:
+                self.proto.work()
+        finally:
+            self.in_control = False
+
+    def drain_init(self):
+        # Runs only from the top-level pump, never from the nested one inside
+        # device_control().
+        while self.pending_init and not self.in_control:
+            self.pending_init.pop(0).initialize()
 
     def enable_device(self, iface):
         msg = DeviceEnableMsg()
@@ -250,6 +283,16 @@ class MTPCommInterface(MTPInterface):
             self.log(f"{iface}: init complete")
         elif isinstance(msg, InitMsg):
             iface = self.proto.get_interface(msg.device_id, msg.device_name)
+            if iface is None:
+                # An unmodelled interface name must not take the rest of the
+                # bus down with it.  report() runs inside the work() pump that
+                # device_control() spins while another device is mid-initialize,
+                # so raising here aborts *that* device's initialize(), not just
+                # this one -- which is how one unknown name on J813 left
+                # keyboard and multi-touch permanently uninitialized.
+                self.log(f"ignoring init for unmodelled interface "
+                         f"{msg.device_id}/{msg.device_name}")
+                return
             for blk in msg.msg:
                 if isinstance(blk.payload, HIDDescriptor):
                     self.log(f"Got HID descriptor for {iface}:")
@@ -264,7 +307,14 @@ class MTPCommInterface(MTPInterface):
                     self.log(f"GPIO key: {key}")
                     self.gpios[(msg.device_id, blk.payload.gpio_id)] = key, val
             if not msg.more_packets:
-                iface.initialize()
+                # Deferred, not called here.  report() runs inside the work()
+                # pump that device_control() spins while waiting for its ACK,
+                # so initializing inline issues a second device-control command
+                # before the first is acknowledged.  That overwrites last_cmd,
+                # and the earlier command's ACK then trips the assert in ack().
+                # J813 enumerates six interfaces back to back, so this fires
+                # every boot and leaves keyboard and multi-touch uninitialized.
+                self.pending_init.append(iface)
         elif isinstance(msg, GPIORequestMsg):
             self.log(f"GPIO request: {msg}")
             smcep = self.proto.smc.epmap[0x20]
@@ -299,13 +349,50 @@ class MTPCommInterface(MTPInterface):
         afemsg.buf_size = len(data)
         self.device_control(afemsg)
 
-    def device_reset(self, iface, unk1, state):
-        self.log(f"device_reset({iface}, {unk1}, {state})")
+    def device_reset(self, iface, unk1, state, phase=0, status=0):
+        self.log(f"device_reset({iface}, {unk1}, {state}, phase={phase})")
         rmsg = DeviceResetMsg()
         rmsg.device_id = iface
         rmsg.unk1 = unk1
         rmsg.state = state
+        rmsg.phase = phase
+        rmsg.status = status
         self.device_control(rmsg)
+
+    def set_interface_power(self, iface, state, delay=0):
+        """Will/HasChanged pair for one power state, method 2.
+
+        The delay sits between the two halves: the interface's enable sequence
+        specifies 50 ms for the transition into state 2, and the firmware only
+        accepts HasChanged once the hardware has actually settled.
+        """
+        self.device_reset(iface, 2, state, phase=0)
+        if delay:
+            time.sleep(delay)
+        self.device_reset(iface, 2, state, phase=1, status=0)
+
+DCHID_FW_MAGIC = 0x46444948     # "HIDF"
+
+def dchid_firmware_payload(data, index):
+    """Turn a tpmtfw-*.bin file into the buffer the IOP is given.
+
+    The file is a 20-byte header (padded to header_length) followed by the CBOR
+    image.  Only the image is DMAed, and the interface index has to be stamped
+    into it at interface_offset -- the image is built per-machine but not per
+    interface, so the IOP uses that byte to know which one it is describing.
+    Handing over the whole file, header included, is ACKed by the 0x95 command
+    and then silently ignored: no "cbor image received", no bootload.
+    """
+    magic, version, header_length, data_length, interface_offset = \
+        struct.unpack_from("<5I", data, 0)
+    if magic != DCHID_FW_MAGIC:
+        raise ValueError("bad firmware magic %#x" % magic)
+    payload = bytearray(data[header_length:header_length + data_length])
+    if len(payload) != data_length:
+        raise ValueError("firmware truncated: %d < %d" % (len(payload), data_length))
+    if interface_offset:
+        payload[interface_offset] = index
+    return bytes(payload)
 
 class MTPHIDInterface(MTPInterface):
     pass
@@ -313,13 +400,26 @@ class MTPHIDInterface(MTPInterface):
 class MTPMultitouchInterface(MTPHIDInterface):
     NAME = "multi-touch"
 
+    # The CBOR ("HIDF") image built from the machine's own Multitouch.im4p, not
+    # the raw mtfw plist.  The plist is the source form -- a register load list
+    # keyed by touch controller part number (C1FD1,4 on J813) plus TCAL/FCAL
+    # calibration blobs -- and asahi_firmware.multitouch.plist_to_bin_trackpad
+    # packs it into the image the IOP actually accepts.  Handing over the plist
+    # itself is ACKed by init_afe and then rejected downstream with
+    # "Invalid blob: Touch" from touch_algs_platform.c.
+    AFE_FIRMWARE = None
+
     def initialize(self):
         super().initialize()
 
-        #data = open("afe.bin", "rb").read()
-        #self.proto.comm.init_afe(self.iface, data)
-        #self.proto.comm.device_reset(self.iface, 1, 0)
-        #self.proto.comm.device_reset(self.iface, 1, 2)
+        if self.AFE_FIRMWARE:
+            payload = dchid_firmware_payload(self.AFE_FIRMWARE, self.iface)
+            self.log("sending CBOR image: %d bytes" % len(payload))
+            self.proto.comm.init_afe(self.iface, payload)
+            # Apple's performCBORBootload: register the image, then drive the
+            # interface through power state 0 and then 2.
+            self.proto.comm.set_interface_power(self.iface, 0)
+            self.proto.comm.set_interface_power(self.iface, 2, delay=0.05)
 
 class MTPKeyboardInterface(MTPHIDInterface):
     NAME = "keyboard"
@@ -331,7 +431,15 @@ class MTPActuatorInterface(MTPHIDInterface):
     NAME = "actuator"
 
 class MTPTPAccelInterface(MTPHIDInterface):
-    NAME = "tp_accel"
+    # The IOP spells this with a hyphen on the wire, like every other interface
+    # name; the underscore spelling here never matched, so J813's tp-accel fell
+    # through to the "unknown interface" path.  get_interface() already converts
+    # to an underscore for the attribute name.
+    NAME = "tp-accel"
+
+class MTPMTPInterface(MTPHIDInterface):
+    # J813 advertises the IOP itself as an interface after actuator.
+    NAME = "mtp"
 
 class MTPProtocol:
     INTERFACES = [
@@ -341,6 +449,7 @@ class MTPProtocol:
         MTPSTMInterface,
         MTPActuatorInterface,
         MTPTPAccelInterface,
+        MTPMTPInterface,
     ]
 
     def __init__(self, u, node, mtp, dockchannel, smc):
@@ -366,7 +475,14 @@ class MTPProtocol:
             return None
         obj = cls(self, iface)
         self.iface[iface] = obj
-        setattr(self, name.replace("-", "_"), obj)
+        # Interface names come off the wire and are not guaranteed to be safe
+        # attribute names on this object.  J813 advertises one literally called
+        # "mtp", which would otherwise replace self.mtp -- the StandardASC the
+        # transport runs on -- and break read_pkt() on the very next packet.
+        attr = name.replace("-", "_")
+        if hasattr(self, attr):
+            attr = "iface_" + attr
+        setattr(self, attr, obj)
         return obj
 
     def checksum(self, d):
@@ -406,6 +522,7 @@ class MTPProtocol:
     def work(self):
         devid, pkt = self.read_pkt()
         self.iface[devid].packet(pkt)
+        self.comm.drain_init()
 
     def wait_init(self, name):
         self.log(f"Waiting for {name}...")

@@ -114,6 +114,7 @@ struct rtkit_dev {
     size_t pool_size;
     size_t pool_used;
 
+    bool early_ap_power;
     enum rtkit_power_state iop_power;
     enum rtkit_power_state ap_power;
 
@@ -299,6 +300,15 @@ bool rtkit_set_buffer_pool(rtkit_dev_t *rtk, u64 base, size_t size)
     rtk->pool_base = base;
     rtk->pool_size = size;
     rtk->pool_used = 0;
+    return true;
+}
+
+bool rtkit_set_early_ap_power(rtkit_dev_t *rtk, bool enable)
+{
+    if (!rtk)
+        return false;
+
+    rtk->early_ap_power = enable;
     return true;
 }
 
@@ -819,6 +829,7 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
     bool has_syslog = false;
     bool has_oslog = false;
     bool got_epmap = false;
+    u32 other_eps = 0;
     while (!got_epmap) {
         if (!asc_recv_timeout(rtk->asc, &msg, USEC_PER_SEC)) {
             rtkit_printf("couldn't receive message while waiting for endpoint map\n");
@@ -864,7 +875,20 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
                     case RTKIT_EP_MGMT:
                         break;
                     default:
-                        rtkit_printf("unknown system endpoint 0x%02x\n", ep_idx);
+                        /*
+                         * Advertised but not one we model.  It still has to be
+                         * started: RTKit gates its own POWER_ON on every system
+                         * endpoint it announced being started, so skipping one
+                         * leaves the IOP alive and idle forever.  Measured on
+                         * the J813 MTP IOP, which announces 0x0a (tracekit) and
+                         * then never reaches ON -- its CPU is still running at
+                         * the timeout, with the buffer it asked for untouched.
+                         * proxyclient/m1n1/fw/asc/mgmt.py starts every
+                         * advertised endpoint below 0x10 for exactly this
+                         * reason.
+                         */
+                        other_eps |= 1U << ep_idx;
+                        rtkit_printf("starting unmodelled system endpoint 0x%02x\n", ep_idx);
                 }
             }
         }
@@ -899,16 +923,55 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
     if (has_oslog && !rtkit_start_ep(rtk, RTKIT_EP_OSLOG))
         return false;
 
+    /*
+     * Started last so the endpoints modelled above keep the exact order the
+     * existing callers (smc, nvme, dcp) already boot with; those advertise
+     * nothing here, so other_eps is zero for them and this loop is a no-op.
+     */
+    for (unsigned int ep = 0; ep < 32; ep++) {
+        if ((other_eps & (1U << ep)) && !rtkit_start_ep(rtk, ep))
+            return false;
+    }
+
+    /*
+     * Some IOPs will not declare themselves ON until the AP has declared itself
+     * ON first, so waiting for IOP power before sending this deadlocks: each
+     * side is waiting for the other.  The J813 MTP IOP is one of them -- it
+     * completes the endpoint map, asks for its crashlog buffer, and then goes
+     * silent forever with the buffer untouched.
+     *
+     * proxyclient/m1n1/fw/asc/mgmt.py, which drives this IOP successfully,
+     * sends AP power ON from the endpoint-map handler immediately after
+     * starting the endpoints and only then waits for both power states.  Doing
+     * the same is harmless for an IOP that would have announced ON by itself:
+     * it just acks the AP state earlier, and the end state is identical.
+     *
+     * Opt-in rather than unconditional because rtkit_boot()'s other callers
+     * here (smc.c, nvme.c, dcp.c) work with the original ordering, and NVMe in
+     * particular is load-bearing for booting off internal storage.
+     */
+    if (rtk->early_ap_power) {
+        msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_AP_PWR_STATE) |
+                   FIELD_PREP(MGMT_PWR_STATE, RTKIT_POWER_ON);
+        msg.msg1 = RTKIT_EP_MGMT;
+        if (!asc_send(rtk->asc, &msg)) {
+            rtkit_printf("unable to send early AP power message\n");
+            return false;
+        }
+    }
+
     if (!rtkit_wait_for_power(rtk, &rtk->iop_power, RTKIT_POWER_ON, timeout_usec, "IOP"))
         return false;
 
-    /* this enables syslog */
-    msg.msg0 =
-        FIELD_PREP(MGMT_TYPE, MGMT_MSG_AP_PWR_STATE) | FIELD_PREP(MGMT_PWR_STATE, RTKIT_POWER_ON);
-    msg.msg1 = RTKIT_EP_MGMT;
-    if (!asc_send(rtk->asc, &msg)) {
-        rtkit_printf("unable to send AP power message\n");
-        return false;
+    /* this enables syslog; already sent above when early_ap_power is set */
+    if (!rtk->early_ap_power) {
+        msg.msg0 = FIELD_PREP(MGMT_TYPE, MGMT_MSG_AP_PWR_STATE) |
+                   FIELD_PREP(MGMT_PWR_STATE, RTKIT_POWER_ON);
+        msg.msg1 = RTKIT_EP_MGMT;
+        if (!asc_send(rtk->asc, &msg)) {
+            rtkit_printf("unable to send AP power message\n");
+            return false;
+        }
     }
 
     /* Preserve the historical asynchronous return for existing callers. */

@@ -30,5 +30,7 @@ struct platform_identity {
 
 bool platform_identity_matches_j414s(const struct platform_identity *identity);
 bool platform_is_j414s(void);
+bool platform_identity_matches_j813(const struct platform_identity *identity);
+bool platform_is_j813(void);
 
 #endif

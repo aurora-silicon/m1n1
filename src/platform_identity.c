@@ -13,6 +13,15 @@ static const char j414s_root_target_type[] = "J414s";
 static const char j414s_model[] = "Mac14,9";
 static const char j414s_compatible[] = "J414sAP\0Mac14,9\0AppleARM";
 
+/*
+ * J813 is the M5 MacBook Air.  Unlike the J414s check below this one does not
+ * look at board_id: the MTP addresses it gates were read from this machine's
+ * live ADT, and the root identity strings already pin the board.
+ */
+static const char j813_root_target_type[] = "J813";
+static const char j813_model[] = "Mac17,3";
+static const char j813_compatible[] = "J813AP\0Mac17,3\0AppleARM";
+
 static bool property_equals(const void *property, u32 property_len, const void *expected,
                             size_t expected_len)
 {
@@ -37,24 +46,54 @@ bool platform_identity_matches_j414s(const struct platform_identity *identity)
                            sizeof(j414s_compatible));
 }
 
-#ifndef PLATFORM_IDENTITY_HOST_TEST
-bool platform_is_j414s(void)
+bool platform_identity_matches_j813(const struct platform_identity *identity)
 {
-    int chosen = adt_path_offset(adt, "/chosen");
-    struct platform_identity identity = {
-        .chip_id = chip_id,
-        .board_id = board_id,
-    };
-
-    if (chosen < 0)
+    if (!identity)
         return false;
 
-    identity.chosen_target_type =
-        adt_getprop(adt, chosen, "target-type", &identity.chosen_target_type_len);
-    identity.root_target_type = adt_getprop(adt, 0, "target-type", &identity.root_target_type_len);
-    identity.model = adt_getprop(adt, 0, "model", &identity.model_len);
-    identity.compatible = adt_getprop(adt, 0, "compatible", &identity.compatible_len);
+    return identity->chip_id == T8142 &&
+           property_equals(identity->root_target_type, identity->root_target_type_len,
+                           j813_root_target_type, sizeof(j813_root_target_type)) &&
+           property_equals(identity->model, identity->model_len, j813_model,
+                           sizeof(j813_model)) &&
+           property_equals(identity->compatible, identity->compatible_len, j813_compatible,
+                           sizeof(j813_compatible));
+}
 
+#ifndef PLATFORM_IDENTITY_HOST_TEST
+static void platform_identity_read(struct platform_identity *identity)
+{
+    int chosen = adt_path_offset(adt, "/chosen");
+
+    identity->chip_id = chip_id;
+    identity->board_id = board_id;
+
+    if (chosen >= 0)
+        identity->chosen_target_type =
+            adt_getprop(adt, chosen, "target-type", &identity->chosen_target_type_len);
+
+    identity->root_target_type =
+        adt_getprop(adt, 0, "target-type", &identity->root_target_type_len);
+    identity->model = adt_getprop(adt, 0, "model", &identity->model_len);
+    identity->compatible = adt_getprop(adt, 0, "compatible", &identity->compatible_len);
+}
+
+bool platform_is_j414s(void)
+{
+    struct platform_identity identity = {};
+
+    if (adt_path_offset(adt, "/chosen") < 0)
+        return false;
+
+    platform_identity_read(&identity);
     return platform_identity_matches_j414s(&identity);
+}
+
+bool platform_is_j813(void)
+{
+    struct platform_identity identity = {};
+
+    platform_identity_read(&identity);
+    return platform_identity_matches_j813(&identity);
 }
 #endif

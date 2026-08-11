@@ -45,6 +45,13 @@ bool rtkit_set_sram_window(rtkit_dev_t *rtk, u64 iova_base, u64 phys_base,
  * back to heap memory the IOP would scribble over post-boot.
  */
 bool rtkit_set_buffer_pool(rtkit_dev_t *rtk, u64 base, size_t size);
+/*
+ * Declare AP power ON as soon as the system endpoints are started, instead of
+ * waiting for the IOP to announce itself first. Required by IOPs that gate
+ * their own ON transition on the AP's, where the default ordering deadlocks;
+ * harmless for IOPs that announce ON unprompted, which simply ack earlier.
+ */
+bool rtkit_set_early_ap_power(rtkit_dev_t *rtk, bool enable);
 bool rtkit_quiesce(rtkit_dev_t *rtk);
 bool rtkit_sleep(rtkit_dev_t *rtk);
 void rtkit_free(rtkit_dev_t *rtk);

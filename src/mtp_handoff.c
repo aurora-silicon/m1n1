@@ -30,8 +30,17 @@
 #define MTP_DART_PATH        "/arm-io/dart-mtp"
 #define MTP_DOCKCHANNEL_PATH "/arm-io/dockchannel-mtp"
 
-/* DockChannel index 1 is the MTP transport on J414s. */
+/* DockChannel index 1 is the MTP transport on J414s and on J813. */
 #define MTP_DOCKCHANNEL_INDEX 1
+
+/*
+ * Which reg tuple of the DART node carries the DAPF registers.  Not a stream
+ * id: this is the index dapf_init() passes to adt_get_reg(), and it matches
+ * dapf.c's own dapf_entries[] table, which lists {"/arm-io/dart-mtp", 1}.
+ * It happened to equal the DART stream on J414s, which is why the two were
+ * one constant until J813 pulled them apart.
+ */
+#define MTP_DAPF_REG_INDEX 1
 
 /*
  * J414s' physical resource layout.  The values are checked before any state
@@ -75,6 +84,72 @@
 #define J414S_MTP_FIXED_BUFFER_SIZE 0x100000ULL
 
 /*
+ * J813 (M5 MacBook Air, T8142).  Same topology as J414s down to the register
+ * offsets inside the DockChannel block -- irq at +0xb14000, config at
+ * +0xb30000, data at +0xb34000 from the arm-io base -- so the ADT reg indices
+ * and DOCKCHANNEL_DATA_OFFSET below carry over unchanged.
+ *
+ * ADT reg values under arm-io are arm-io relative; absolute is +0x210000000,
+ * verified against uart0 (0x195200000 -> 0x3a5200000, which is EARLY_UART_BASE
+ * in soc.h).
+ *
+ * The fixed-buffer window is the one value that could not be read from the
+ * IPSW device tree: iBoot fills segment-ranges in at runtime.  Read from the
+ * live machine it is __TEXT 0x394c00000/+0x54000 and __DATA 0x394c54000/
+ * +0x6c000, so the carveout starts at 0x394c00000 and the same 1 MiB window
+ * the Linux binding pins for J414s covers it with room for the IOP's own heap
+ * allocations.
+ */
+#define J813_MTP_IRQ_BASE           0x394b14000ULL
+#define J813_MTP_CONFIG_BASE        0x394b30000ULL
+#define J813_MTP_DATA_BASE          0x394b34000ULL
+#define J813_MTP_FIXED_BUFFER_BASE  0x394c00000ULL
+#define J813_MTP_FIXED_BUFFER_SIZE  0x100000ULL
+
+struct mtp_platform {
+    const char *name;
+    u64 irq_base;
+    u64 config_base;
+    u64 data_base;
+    u64 fixed_buffer_base;
+    u64 fixed_buffer_size;
+    /*
+     * DART stream the IOP's own DMA goes through, from the ADT: the mapper
+     * child of /arm-io/dart-mtp named by /arm-io/mtp's iommu-parent, whose
+     * "reg" is the stream id.  J414s uses 1; J813's /arm-io/dart-mtp/mapper-mtp
+     * has reg=0 and both /arm-io/mtp and mtp-transport point at it.
+     *
+     * Getting this wrong is silent and total: every mapping lands in a stream
+     * the IOP never consults, so it boots from its carveout, answers HELLO,
+     * completes the endpoint map, asks for its crashlog buffer, and then waits
+     * forever -- still running, with the buffer untouched.
+     */
+    u32 dart_stream;
+};
+
+static const struct mtp_platform mtp_platform_j414s = {
+    .name = "J414s",
+    .irq_base = J414S_MTP_IRQ_BASE,
+    .config_base = J414S_MTP_CONFIG_BASE,
+    .data_base = J414S_MTP_DATA_BASE,
+    .fixed_buffer_base = J414S_MTP_FIXED_BUFFER_BASE,
+    .fixed_buffer_size = J414S_MTP_FIXED_BUFFER_SIZE,
+    .dart_stream = 1,
+};
+
+static const struct mtp_platform mtp_platform_j813 = {
+    .name = "J813",
+    .irq_base = J813_MTP_IRQ_BASE,
+    .config_base = J813_MTP_CONFIG_BASE,
+    .data_base = J813_MTP_DATA_BASE,
+    .fixed_buffer_base = J813_MTP_FIXED_BUFFER_BASE,
+    .fixed_buffer_size = J813_MTP_FIXED_BUFFER_SIZE,
+    .dart_stream = 0,
+};
+
+static const struct mtp_platform *mtp_platform;
+
+/*
  * t8110 DART registers needed to leave stream 1 provably inert if the
  * handoff rolls back.  Offsets mirror src/dart.c (DART_T8110_TCR_OFF,
  * DART_T8110_TLB_CMD, DART_T8110_PROTECT, DART_T8110_DISABLE_STREAMS);
@@ -92,9 +167,21 @@
 /*
  * Keep RTKit's boot-time DART mappings out of the low/null IOVA region and
  * leave a compact, isolated window for the system endpoint buffers it maps.
+ *
+ * SZ_32M is also the smallest base iovad_init() accepts, and measurement showed
+ * the value does not matter here: a window at 0x8000, matching the range the
+ * working reference driver uses, produced exactly the same IOP stall with the
+ * grant reading back correctly translated.
  */
 #define MTP_IOVA_WINDOW_BASE SZ_32M
 #define MTP_IOVA_WINDOW_SIZE 0x10000000ULL
+/*
+ * Bounded by the proxy, not by the IOP: mtp_handoff_init() runs inside
+ * hv_init(), which is a proxy call, and proxyclient's UART read timeout is 3
+ * seconds (M1N1TIMEOUT in proxy.py).  Blocking m1n1 here for longer than that
+ * makes the Python side give up with UartTimeout before the guest ever starts,
+ * so this ceiling is a transport constraint and raising it is not an option.
+ */
 #define MTP_READY_TIMEOUT    (3 * USEC_PER_SEC)
 
 /*
@@ -219,10 +306,10 @@ static void mtp_log_segment_ranges(void)
                "flags=%#x\n",
                i, seg[i].phys, seg[i].iop_va, seg[i].remap, seg[i].size, seg[i].flags);
 
-    if (seg[0].phys != J414S_MTP_FIXED_BUFFER_BASE)
+    if (seg[0].phys != mtp_platform->fixed_buffer_base)
         printf("mtp-handoff: WARNING: carveout starts at %#lx, fixed-buffer window "
-               "pinned at %#llx\n",
-               seg[0].phys, J414S_MTP_FIXED_BUFFER_BASE);
+               "pinned at %#lx\n",
+               seg[0].phys, mtp_platform->fixed_buffer_base);
 }
 
 static bool mtp_handoff_get_resources(void)
@@ -242,19 +329,19 @@ static bool mtp_handoff_get_resources(void)
     mtp_handoff.data_base = mtp_handoff.config_base + DOCKCHANNEL_DATA_OFFSET;
 
     if (irq_size < J414S_MTP_APERTURE_SIZE || config_size < J414S_MTP_APERTURE_SIZE ||
-        mtp_handoff.irq_base != J414S_MTP_IRQ_BASE ||
-        mtp_handoff.config_base != J414S_MTP_CONFIG_BASE ||
-        mtp_handoff.data_base != J414S_MTP_DATA_BASE) {
-        printf("mtp-handoff: unexpected J414s DockChannel map irq=%#lx/+%#lx "
+        mtp_handoff.irq_base != mtp_platform->irq_base ||
+        mtp_handoff.config_base != mtp_platform->config_base ||
+        mtp_handoff.data_base != mtp_platform->data_base) {
+        printf("mtp-handoff: unexpected %s DockChannel map irq=%#lx/+%#lx "
                "config=%#lx/+%#lx data=%#lx\n",
-               mtp_handoff.irq_base, irq_size, mtp_handoff.config_base, config_size,
-               mtp_handoff.data_base);
+               mtp_platform->name, mtp_handoff.irq_base, irq_size, mtp_handoff.config_base,
+               config_size, mtp_handoff.data_base);
         return false;
     }
 
-    /* See the J414S_MTP_FIXED_BUFFER_* comment for why this is not an ADT read. */
-    mtp_handoff.sram_base = J414S_MTP_FIXED_BUFFER_BASE;
-    mtp_handoff.sram_size = J414S_MTP_FIXED_BUFFER_SIZE;
+    /* See the *_MTP_FIXED_BUFFER_* comments for why this is not an ADT read. */
+    mtp_handoff.sram_base = mtp_platform->fixed_buffer_base;
+    mtp_handoff.sram_size = mtp_platform->fixed_buffer_size;
 
     mtp_log_segment_ranges();
 
@@ -276,20 +363,20 @@ static void mtp_handoff_block_dart_stream(void)
 
     if (read32(mtp_handoff.dart_regs + MTP_DART_T8110_PROTECT) &
         MTP_DART_T8110_PROTECT_TTBR_TCR) {
-        printf("mtp-handoff: DART locked; cannot block stream %d\n", MTP_DOCKCHANNEL_INDEX);
+        printf("mtp-handoff: DART locked; cannot block stream %d\n", mtp_platform->dart_stream);
         return;
     }
 
-    write32(mtp_handoff.dart_regs + MTP_DART_T8110_TCR(MTP_DOCKCHANNEL_INDEX), 0);
+    write32(mtp_handoff.dart_regs + MTP_DART_T8110_TCR(mtp_platform->dart_stream), 0);
     write32(mtp_handoff.dart_regs + MTP_DART_T8110_DISABLE_STREAMS,
-            BIT(MTP_DOCKCHANNEL_INDEX));
+            BIT(mtp_platform->dart_stream));
     write32(mtp_handoff.dart_regs + MTP_DART_T8110_TLB_CMD,
-            MTP_DART_T8110_TLB_CMD_OP_FLUSH_SID | MTP_DOCKCHANNEL_INDEX);
+            MTP_DART_T8110_TLB_CMD_OP_FLUSH_SID | mtp_platform->dart_stream);
     if (poll32(mtp_handoff.dart_regs + MTP_DART_T8110_TLB_CMD, MTP_DART_T8110_TLB_CMD_BUSY,
                0, 100))
         printf("mtp-handoff: DART TLB flush did not complete\n");
 
-    printf("mtp-handoff: DART stream %d left blocked\n", MTP_DOCKCHANNEL_INDEX);
+    printf("mtp-handoff: DART stream %d left blocked\n", mtp_platform->dart_stream);
 }
 
 static void mtp_handoff_rollback(void)
@@ -317,10 +404,15 @@ void mtp_handoff_init(void)
     if (mtp_handoff.ready)
         return;
 
-    if (!platform_is_j414s())
+    if (platform_is_j414s())
+        mtp_platform = &mtp_platform_j414s;
+    else if (platform_is_j813())
+        mtp_platform = &mtp_platform_j813;
+    else
         return;
 
-    printf("mtp-handoff: preparing J414s MTP for Windows DockChannel ownership\n");
+    printf("mtp-handoff: preparing %s MTP for Windows DockChannel ownership\n",
+           mtp_platform->name);
 
     if (!mtp_handoff_get_resources() || !mtp_power_enable_if_gated(MTP_PATH) ||
         !mtp_power_enable_if_gated(MTP_DART_PATH) ||
@@ -332,7 +424,14 @@ void mtp_handoff_init(void)
      * once it has programmed the filter, so the persistent power enable above
      * is repeated afterwards before touching the stream's page tables.
      */
-    if (dapf_init(MTP_DART_PATH, MTP_DOCKCHANNEL_INDEX) < 0 ||
+    /*
+     * Only this DART.  dapf_init_all() was tried, to match the reference's
+     * opening p.dapf_init_all() and because the transport is muxed through AOP
+     * (hid-transport-mux = "mtp-aop-mux"), but it takes an SError here: the
+     * other DARTs it walks (aop, pmp, isp) are still clock-gated this early in
+     * hv_init, which kboot.c's late call never has to deal with.
+     */
+    if (dapf_init(MTP_DART_PATH, MTP_DAPF_REG_INDEX) < 0 ||
         !mtp_power_enable_if_gated(MTP_DART_PATH)) {
         printf("mtp-handoff: DAPF setup failed\n");
         goto fail;
@@ -347,15 +446,15 @@ void mtp_handoff_init(void)
     int dart_path[8];
     if (adt_path_offset_trace(adt, MTP_DART_PATH, dart_path) < 0 ||
         adt_get_reg(adt, dart_path, "reg", 0, &mtp_handoff.dart_regs, NULL) < 0) {
-        printf("mtp-handoff: DART stream %d setup failed\n", MTP_DOCKCHANNEL_INDEX);
+        printf("mtp-handoff: DART stream %d setup failed\n", mtp_platform->dart_stream);
         goto fail;
     }
-    printf("mtp-handoff: DART stream %d cold TCR=%#x\n", MTP_DOCKCHANNEL_INDEX,
-           read32(mtp_handoff.dart_regs + MTP_DART_T8110_TCR(MTP_DOCKCHANNEL_INDEX)));
+    printf("mtp-handoff: DART stream %d cold TCR=%#x\n", mtp_platform->dart_stream,
+           read32(mtp_handoff.dart_regs + MTP_DART_T8110_TCR(mtp_platform->dart_stream)));
 
-    mtp_handoff.dart = dart_init_adt(MTP_DART_PATH, 0, MTP_DOCKCHANNEL_INDEX, false);
+    mtp_handoff.dart = dart_init_adt(MTP_DART_PATH, 0, mtp_platform->dart_stream, false);
     if (!mtp_handoff.dart) {
-        printf("mtp-handoff: DART stream %d setup failed\n", MTP_DOCKCHANNEL_INDEX);
+        printf("mtp-handoff: DART stream %d setup failed\n", mtp_platform->dart_stream);
         goto fail;
     }
 
@@ -389,11 +488,23 @@ void mtp_handoff_init(void)
 
     mtp_handoff.rtkit = rtkit_init("mtp-handoff", mtp_handoff.asc, mtp_handoff.dart,
                                    mtp_handoff.iovad, NULL, false);
+    /*
+     * early AP power: the J813 MTP IOP gates its own ON transition on the AP
+     * declaring itself ON first, so m1n1's default order (wait for IOP, then
+     * announce AP) deadlocks -- measured as the IOP completing the endpoint
+     * map, asking for its crashlog buffer, and then going silent forever with
+     * that buffer still all zeros.  Neither the DVA (0x2000000 vs 0x8000) nor
+     * the backing physical memory (reserved pool vs m1n1 heap) changed the
+     * outcome; the ordering is the only thing that differed from the working
+     * reference driver, which announces AP power straight after starting the
+     * system endpoints.
+     */
     if (!mtp_handoff.rtkit ||
         !rtkit_set_phys_window(mtp_handoff.rtkit, mtp_handoff.sram_base,
                                mtp_handoff.sram_size) ||
         !rtkit_set_buffer_pool(mtp_handoff.rtkit, MTP_RTKIT_POOL_PHYS,
                                MTP_RTKIT_POOL_SIZE) ||
+        !rtkit_set_early_ap_power(mtp_handoff.rtkit, true) ||
         !rtkit_boot_timed(mtp_handoff.rtkit, MTP_READY_TIMEOUT)) {
         printf("mtp-handoff: MTP RTKit boot failed\n");
         goto fail;
