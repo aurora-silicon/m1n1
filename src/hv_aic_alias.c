@@ -61,6 +61,19 @@ u32 hv_aic_alias_to_physical(u32 published)
     return published;
 }
 
+bool hv_aic_alias_is_owned(u32 published)
+{
+    u32 count;
+    const struct hv_aic_alias *table = hv_aic_alias_table(&count);
+
+    for (u32 i = 0; i < count; i++) {
+        if (table[i].published == published)
+            return true;
+    }
+
+    return false;
+}
+
 u32 hv_aic_alias_to_published(u32 physical)
 {
     u32 count;

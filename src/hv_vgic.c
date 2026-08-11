@@ -449,10 +449,19 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
                     value_ic_enabler |= BIT(i);      
                     irq_num = (32 * reg_num) + i;
 
-                    aic_set_mask(hv_aic_alias_to_physical(irq_num), false);
-                    hv_vgic_arm_device_delivery(irq_num);
-                    vgic_log("HV vGIC DEBUG [Info] [AIC]: unmasking irq %d (physical %d)\n",
-                             irq_num, hv_aic_alias_to_physical(irq_num));
+                    /*
+                     * Only for a line m1n1 actually owns.  The alias helpers
+                     * are identity on a miss, so unmasking unconditionally
+                     * turned every guest SPI into an unmask of the
+                     * same-numbered real AIC line -- see
+                     * hv_aic_alias_is_owned().
+                     */
+                    if (hv_aic_alias_is_owned(irq_num)) {
+                        aic_set_mask(hv_aic_alias_to_physical(irq_num), false);
+                        hv_vgic_arm_device_delivery(irq_num);
+                        vgic_log("HV vGIC DEBUG [Info] [AIC]: unmasking irq %d (physical %d)\n",
+                                 irq_num, hv_aic_alias_to_physical(irq_num));
+                    }
                 }
             }
             if(reg_num == 0) {
@@ -499,9 +508,11 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
                      * switched off keeps asserting into a CPU interface that no
                      * longer expects it.
                      */
-                    aic_set_mask(hv_aic_alias_to_physical(irq_num), true);
-                    vgic_log("HV vGIC DEBUG [Info] [AIC]: masking irq %d (physical %d)\n",
-                             irq_num, hv_aic_alias_to_physical(irq_num));
+                    if (hv_aic_alias_is_owned(irq_num)) {
+                        aic_set_mask(hv_aic_alias_to_physical(irq_num), true);
+                        vgic_log("HV vGIC DEBUG [Info] [AIC]: masking irq %d (physical %d)\n",
+                                 irq_num, hv_aic_alias_to_physical(irq_num));
+                    }
                 }
             }
             if(reg_num == 0) {

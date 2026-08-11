@@ -189,8 +189,40 @@ void aic_init(void)
     }
 }
 
+/*
+ * Reject a line number that would address outside this AIC's registers.
+ *
+ * Both setters derive `die = irq / max_irq` on a signed int, so a negative or
+ * oversized value produces a negative die and an offset that walks out of the
+ * aperture entirely -- an MMIO write to whatever happens to live there, which
+ * on T8142 raises an SError.  A guest-supplied INTID reached these functions
+ * unvalidated once (the ICC_EOIR1_EL1 trap in hv_exc.c); the callers are fixed,
+ * and this makes the class of bug impossible rather than merely absent.
+ *
+ * Complains once so a bad caller names itself instead of storming the console.
+ */
+static bool aic_irq_valid(int irq, const char *what)
+{
+    static bool complained = false;
+
+    if (!aic || !aic->max_irq)
+        return false;
+    if (irq >= 0 && (u32)irq < aic->max_irq * aic->nr_die)
+        return true;
+
+    if (!complained) {
+        complained = true;
+        printf("AIC: rejecting out-of-range irq %d in %s (max %u x %u dies)\n", irq, what,
+               aic->max_irq, aic->nr_die);
+    }
+    return false;
+}
+
 void aic_set_sw(int irq, bool active)
 {
+    if (!aic_irq_valid(irq, "aic_set_sw"))
+        return;
+
     u32 die = irq / aic->max_irq;
     irq = irq % aic->max_irq;
     if (active)
@@ -203,6 +235,9 @@ void aic_set_sw(int irq, bool active)
 
 void aic_set_mask(int irq, bool active)
 {
+    if (!aic_irq_valid(irq, "aic_set_mask"))
+        return;
+
     u32 die = irq / aic->max_irq;
     irq = irq % aic->max_irq;
     if (active)

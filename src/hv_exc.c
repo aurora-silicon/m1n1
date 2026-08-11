@@ -2565,7 +2565,14 @@ static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
                  */
                 if (intid >= 32) {
                     hv_gic_bitmap_clear(s->pending, intid);
-                    aic_set_mask(hv_aic_alias_to_physical(intid), false);
+                    /*
+                     * Only re-arm a line m1n1 owns.  A purely virtual SPI has
+                     * no AIC line behind it, and unmasking the same-numbered
+                     * real one is how an unowned device ends up asserting at
+                     * a CPU with no handler -- see hv_aic_alias_is_owned().
+                     */
+                    if (hv_aic_alias_is_owned(intid))
+                        aic_set_mask(hv_aic_alias_to_physical(intid), false);
                 }
                 hv_gic_cpuif_sync_vi();
             }
@@ -4533,8 +4540,20 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             if (is_read) {
                 regs[rt] = 0;
             } else {
+                u32 eoi_intid = (u32)(regs[rt] & GENMASK(23, 0));
+
                 hv_vgic3_do_eoir1(regs[rt]);
-                aic_set_mask(regs[rt], false);
+                /*
+                 * regs[rt] is a guest-written register: unbounded, and a
+                 * guest INTID rather than a physical line.  Passing it
+                 * straight to aic_set_mask() was an arbitrary MMIO write --
+                 * that function derives `die = irq / max_irq` on a signed
+                 * int, so a large or negative value walks the address
+                 * outside the AIC aperture and bus-errors.  Mask the INTID
+                 * field, translate it, and only touch a line we own.
+                 */
+                if (eoi_intid >= 32 && hv_aic_alias_is_owned(eoi_intid))
+                    aic_set_mask(hv_aic_alias_to_physical(eoi_intid), false);
             }
             return true;
 #endif
@@ -5996,10 +6015,10 @@ void hv_exc_irq(struct exc_info *ctx)
                     u64 lr_val = hv_vgic3_read_lr(lr);
                     u64 intd = (lr_val >> ICH_LR_VIRTUAL_SHIFT) & ICH_LR_VIRTUAL_MASK;
                     hv_vgic3_write_lr(lr, 0);
-                    if(intd > 31)
-                        //TODO: check distributor
-                        //`intd` came out of a list register, so it is a guest
-                        //INTID; aic_set_mask() wants the physical line.
+                    //`intd` came out of a list register, so it is a guest
+                    //INTID; aic_set_mask() wants the physical line, and only
+                    //for a line m1n1 owns (hv_aic_alias_is_owned()).
+                    if(intd > 31 && hv_aic_alias_is_owned(intd))
                         aic_set_mask(hv_aic_alias_to_physical(intd), false);
                 }
             }

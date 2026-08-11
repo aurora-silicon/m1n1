@@ -42,4 +42,24 @@ u32 hv_aic_alias_to_physical(u32 published);
 /* Physical AIC line -> guest INTID.  Identity when no alias covers it. */
 u32 hv_aic_alias_to_published(u32 physical);
 
+/*
+ * Does this guest INTID name a physical AIC line m1n1 owns on the guest's
+ * behalf?
+ *
+ * Only the aliased lines do.  Every other SPI the guest enables is a purely
+ * virtual interrupt: the guest's GICv3 is a software carrier, and most of the
+ * SPI space behind it has no device at all on this SoC.
+ *
+ * This distinction is load-bearing, not tidiness.  The translation helpers
+ * above are identity on a miss, which is right for renumbering but wrong as an
+ * ownership test: routing every guest GICD_ISENABLER straight to
+ * aic_set_mask() unmasked a same-numbered *real* AIC line for every SPI
+ * Windows enabled.  Measured on J813: lines belonging to other devices then
+ * asserted into AIC target 0 with nothing to service them, CPU 6 took 117k
+ * interrupts against ~8k on every other core, MTP interrupt delivery starved
+ * to a stop, and the machine eventually wedged.  Ask this before touching
+ * hardware on the guest's behalf.
+ */
+bool hv_aic_alias_is_owned(u32 published);
+
 #endif
