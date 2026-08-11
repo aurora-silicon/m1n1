@@ -213,6 +213,41 @@ void aic_set_mask(int irq, bool active)
                 MASK_BIT(irq));
 }
 
+/*
+ * Master enable for AIC2/AIC3.
+ *
+ * iBoot hands the machine over with this clear -- measured on J813, at the m1n1
+ * proxy prompt with no guest ever started -- and m1n1 has never needed to touch
+ * it, because nothing below a guest OS consumes an AIC-routed device interrupt.
+ * Mu enables it for its own DXE phase and then clears it again in its
+ * ExitBootServices callback, so by the time an OS runs it is off no matter what
+ * ran before.
+ *
+ * That is the correct default for a guest that owns the AIC itself.  It is not
+ * correct when m1n1 owns the AIC on the guest's behalf, which is the case on
+ * T8142: there is no Windows AIC HAL extension for this machine, so the guest
+ * drives an emulated GICv3 and never writes this register.  Whoever routes the
+ * interrupts has to turn the controller on.
+ */
+void aic_set_enabled(bool enabled)
+{
+    if (!aic || aic->version < 2)
+        return;
+
+    if (enabled)
+        set32(aic->base + AIC23_GLOBAL_CFG, AIC23_GLOBAL_CFG_ENABLE);
+    else
+        clear32(aic->base + AIC23_GLOBAL_CFG, AIC23_GLOBAL_CFG_ENABLE);
+}
+
+bool aic_is_enabled(void)
+{
+    if (!aic || aic->version < 2)
+        return false;
+
+    return (read32(aic->base + AIC23_GLOBAL_CFG) & AIC23_GLOBAL_CFG_ENABLE) != 0;
+}
+
 void aic_set_affinity(int irq, int cpu){
     if(aic->version != 1)//TODO: check if it can be done on v2+
         return;

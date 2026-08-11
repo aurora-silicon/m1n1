@@ -16,6 +16,7 @@
 #include "asc.h"
 #include "dapf.h"
 #include "dart.h"
+#include "hv.h"
 #include "iova.h"
 #include "mtp_handoff.h"
 #include "platform_identity.h"
@@ -559,9 +560,107 @@ fail:
     printf("mtp-handoff: disabled after setup failure; Windows will not receive partial state\n");
 }
 
+/*
+ * Keep servicing the MTP IOP's RTKit mailbox for as long as the guest runs.
+ *
+ * Handing the DockChannel to Windows does not hand over the mailbox: MTP.asl
+ * publishes no ASC aperture and AppleMtpHid contains no mailbox code at all, so
+ * once m1n1 stops polling, nothing in the system ever reads it again.
+ *
+ * That is not merely untidy, it stops input dead.  RTKit syslog requires the AP
+ * to acknowledge every MSG_SYSLOG_LOG so the IOP can reuse the log buffer.
+ * Measured on J813 with delivery working end to end: the IOP had filled its
+ * outbound mailbox with eight unacknowledged syslog entries plus one oslog
+ * message (I2A_CONTROL = 0x810801, FULL) and had stopped emitting HID reports
+ * entirely -- 60 seconds of typing and swiping produced zero DockChannel bytes.
+ * Draining the mailbox by hand emptied it but did not restart the IOP, because
+ * what it waits for is the acknowledgement, not the space.
+ *
+ * rtkit_recv() already does all of this: it acknowledges syslog, answers
+ * management and buffer requests, and returns 1 only for an app-endpoint
+ * message.  The missing piece was never the logic, only that nobody called it.
+ *
+ * Runs from hv_tick() under the big hypervisor lock, so it is deliberately
+ * bounded: drain a few messages per tick and leave the rest for the next one.
+ * Nothing here writes to the console -- a printf at EL2 on this machine is both
+ * slow and a known SError source.
+ */
+static u32 mtp_handoff_app_messages;
+
+void mtp_handoff_poll(void)
+{
+    unsigned int budget = 8;
+
+    if (!mtp_handoff.ready || !mtp_handoff.rtkit)
+        return;
+
+    while (budget-- && rtkit_can_recv(mtp_handoff.rtkit)) {
+        struct rtkit_message msg;
+        int ret = rtkit_recv(mtp_handoff.rtkit, &msg);
+
+        if (ret < 0) {
+            /*
+             * A crashed or wedged endpoint must not be polled forever: stop
+             * touching it and let the rest of the system carry on.
+             */
+            mtp_handoff.ready = false;
+            return;
+        }
+
+        if (ret > 0)
+            mtp_handoff_app_messages++;
+    }
+}
+
+void mtp_handoff_map_guest_staging(void)
+{
+    /*
+     * Give the guest the staging window at the *bus* address as well.
+     *
+     * The fourth _CRS memory resource declares AddressMinimum 0x1800000 (the
+     * MTP DART bus address) with an AddressTranslation that raises it to the
+     * reserved CPU carveout, on the assumption that Windows applies the
+     * translation and hands the driver the physical address.  Measured on J813:
+     * it does not.  Windows maps the raw AddressMinimum, so AppleMtpHid's 1 MiB
+     * firmware copy faulted at "Unmapped IPA 0x1800000" the moment interrupt
+     * delivery let it get that far.
+     *
+     * Backing that IPA with the same carveout the DART already maps makes the
+     * two agree by construction and removes the dependency on translation
+     * entirely: the address the driver writes to and the address it sends in
+     * command 0x95 are then the same number, and both name the memory the IOP
+     * reads.  The window sits well below DRAM base and inside no device
+     * aperture, so it collides with nothing else in the guest's IPA space.
+     */
+    /*
+     * Only when the preboot handoff actually ran.  Without it nothing has
+     * programmed the DART, the carveout holds no firmware, and there is no
+     * reason to place a DRAM window at a low IPA on a board that has no MTP.
+     */
+    if (!mtp_handoff.ready)
+        return;
+
+    if (hv_map_hw(MTP_FW_STAGING_DVA, MTP_FW_STAGING_PHYS, MTP_FW_STAGING_SIZE) < 0) {
+        printf("mtp-handoff: could not map guest staging window %#llx -> %#llx\n",
+               MTP_FW_STAGING_DVA, MTP_FW_STAGING_PHYS);
+        return;
+    }
+
+    printf("mtp-handoff: guest staging IPA %#llx -> %#llx/+%#llx\n", MTP_FW_STAGING_DVA,
+           MTP_FW_STAGING_PHYS, MTP_FW_STAGING_SIZE);
+}
+
 #else
 
 void mtp_handoff_init(void)
+{
+}
+
+void mtp_handoff_map_guest_staging(void)
+{
+}
+
+void mtp_handoff_poll(void)
 {
 }
 

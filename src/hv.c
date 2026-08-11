@@ -595,6 +595,13 @@ void hv_start(void *entry, u64 regs[4])
     printf("HV: windows-native-aic: virtual IRQ queues ready\n");
 #endif
 
+    /*
+     * Same reasoning as the hooks below: the host's broad mappings are done, so
+     * a mapping added here survives into the guest instead of being overwritten
+     * by a later pt_update.
+     */
+    mtp_handoff_map_guest_staging();
+
     /* Host MMIO mappings are complete before hv_start(), so these hooks persist. */
     if (chip_id == T8142)
         printf("HV: T8142: deferring native-AIC transition hooks during Mu/NVMe bring-up\n");
@@ -1235,6 +1242,31 @@ void hv_tick(struct exc_info *ctx)
     hv_scan_t8142_guest_modules();
     hv_report_t8142_process(ctx);
     hv_report_t8142_gic_activity();
+    /*
+     * DISABLED -- mtp_handoff_poll() is correct in intent but not safe here.
+     *
+     * Nothing in the guest owns the MTP IOP's mailbox (MTP.asl publishes no ASC
+     * aperture and AppleMtpHid has no mailbox code), so an unacknowledged RTKit
+     * syslog backlog wedges the IOP and input dies -- see the measurement in
+     * mtp_handoff_poll().  Calling it from here did fix the mailbox: I2A_CONTROL
+     * stayed EMPTY for a whole boot where it had previously latched FULL.
+     *
+     * But Windows then froze at the boot spinner, with the hypervisor still
+     * live and CPU 6 -- the AIC target, and the core that runs this tick --
+     * taking roughly ten times the interrupts of any other core.  Two reasons
+     * this call site is wrong, either of which could be the cause:
+     *
+     *   - hv_tick() runs with the big hypervisor lock held, so anything slow
+     *     here starves every guest CPU; and
+     *   - rtkit_recv() services MSG_BUFFER_REQUEST by allocating from the m1n1
+     *     heap, which after handoff is Windows' own conventional memory.
+     *     Granting the IOP a DMA buffer out of it corrupts the guest.
+     *
+     * The replacement wants to be a narrow acknowledge-only drain: ACK syslog
+     * and oslog, never allocate, never grant a buffer, and preferably run
+     * outside the big lock.
+     */
+    /* mtp_handoff_poll(); */
     smp_report_wfe_reg_loss();
     hv_check_t8142_bugcheck();
     hv_recover_t8142_sysreg_undef(ctx);

@@ -24,6 +24,15 @@
 #define AIC2_MAXNUMIRQ 0x000c
 #define AIC2_LATENCY   0x0204
 
+/*
+ * Global configuration.  AIC2 hardcodes this offset; AIC3 publishes the same
+ * value as the ADT's "aicglbcfg-offset" (measured 0x14 on T8142).  Bit 0 is the
+ * master enable: with it clear the controller latches HW_STATE and honours
+ * mask/unmask, but presents nothing to any CPU's EVENT register.
+ */
+#define AIC23_GLOBAL_CFG        0x0014
+#define AIC23_GLOBAL_CFG_ENABLE BIT(0)
+
 #define AIC2_IRQ_CFG         0x2000
 #define AIC23_IRQ_CFG_TARGET GENMASK(3, 0)
 #define AIC3_IRQ_CFG         0x10000

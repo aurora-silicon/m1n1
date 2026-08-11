@@ -1971,6 +1971,41 @@ static bool hv_handle_t8142_pmu(u64 reg, bool is_read, u64 rt, u64 regs[32])
  * through this file.  Do not read the presence of these cases as GIC delivery
  * working; they let initialization complete and nothing more.
  */
+/*
+ * Guest INTID space modelled by the software CPU interface: SGIs, PPIs and the
+ * whole architectural SPI range, i.e. everything below the 1020..1023 special
+ * block.  hv_aic_alias.c is what keeps physical AIC lines inside it.
+ */
+#define HV_GIC_MAX_INTID   1020
+#define HV_GIC_INTID_WORDS ((HV_GIC_MAX_INTID + 31) / 32)
+
+static bool hv_gic_bitmap_test(const u32 *map, u32 intid)
+{
+    return (__atomic_load_n(&map[intid / 32], __ATOMIC_ACQUIRE) & BIT(intid % 32)) != 0;
+}
+
+static void hv_gic_bitmap_set(u32 *map, u32 intid)
+{
+    __atomic_fetch_or(&map[intid / 32], (u32)BIT(intid % 32), __ATOMIC_ACQ_REL);
+}
+
+static void hv_gic_bitmap_clear(u32 *map, u32 intid)
+{
+    __atomic_fetch_and(&map[intid / 32], ~(u32)BIT(intid % 32), __ATOMIC_ACQ_REL);
+}
+
+/* Lowest INTID set in the map, or -1 when it is empty.  Diagnostics only. */
+static int hv_gic_bitmap_first_set(const u32 *map)
+{
+    for (u32 word = 0; word < HV_GIC_INTID_WORDS; word++) {
+        u32 bits = __atomic_load_n(&map[word], __ATOMIC_ACQUIRE);
+        if (bits)
+            return (int)((word * 32) + __builtin_ctz(bits));
+    }
+
+    return -1;
+}
+
 struct hv_gic_cpuif {
     u64 pmr;
     u64 bpr1;
@@ -1978,14 +2013,23 @@ struct hv_gic_cpuif {
     u64 igrpen1;
     u64 ctlr;
     /*
-     * Pending/active bitmaps for INTIDs 0..31.  Only the banked per-CPU range
-     * is modelled: the sole producer today is the architectural timer, whose
-     * GTDT GSIVs are both PPIs.  Anything wider needs a distributor-side model
-     * that does not exist yet, so an out-of-range INTID is refused rather than
-     * silently aliased into this word.
+     * Pending/active bitmaps, indexed by guest INTID.
+     *
+     * This was a single word covering the banked 0..31 range for as long as the
+     * only producer was the architectural timer, whose GTDT GSIVs are both PPIs.
+     * J813's built-in keyboard and trackpad are the first device that has to be
+     * delivered through this interface, and their published GSIV is an SPI, so
+     * an out-of-range INTID can no longer simply be refused.
+     *
+     * There is still no distributor model here, and none is needed: on this
+     * machine the AIC *is* the distributor.  It owns masking and it decides
+     * which CPU a line targets, handing the event to that CPU's EVENT register.
+     * hv_exc_irq() therefore marks the INTID pending on exactly the interface
+     * the hardware already selected.  What these arrays add is the ability to
+     * represent that selection at all.
      */
-    u32 pending;
-    u32 active;
+    u32 pending[HV_GIC_INTID_WORDS];
+    u32 active[HV_GIC_INTID_WORDS];
     /*
      * Firmware residue.  Mu's TimerDxe drives the virtual timer and leaves its
      * last deadline expired when it exits, so an already-asserted CNTx sits
@@ -2020,6 +2064,7 @@ static bool gic_cpuif_blocked_logged[MAX_CPUS];
 static bool gic_cpuif_eoi_logged[MAX_CPUS];
 static bool gic_cpuif_brought_up[MAX_CPUS];
 static bool gic_cpuif_vi_logged[MAX_CPUS];
+static bool gic_cpuif_aic_logged[MAX_CPUS];
 static u32 gic_cpuif_ack_count[MAX_CPUS];
 static u32 gic_cpuif_eoi_count[MAX_CPUS];
 
@@ -2100,21 +2145,26 @@ static int hv_gic_cpuif_select(struct hv_gic_cpuif *s)
     if (!s->igrpen1)
         return -1;
 
-    u32 candidates = __atomic_load_n(&s->pending, __ATOMIC_ACQUIRE) & ~s->active;
     int best = -1;
     u32 best_prio = 0x100;
 
-    while (candidates) {
-        u32 intid = __builtin_ctz(candidates);
-        candidates &= ~((u32)BIT(intid));
+    for (u32 word = 0; word < HV_GIC_INTID_WORDS; word++) {
+        u32 candidates = __atomic_load_n(&s->pending[word], __ATOMIC_ACQUIRE) &
+                         ~__atomic_load_n(&s->active[word], __ATOMIC_ACQUIRE);
 
-        u32 prio = hv_gic_cpuif_priority(intid);
-        if (prio >= s->pmr || prio >= s->running)
-            continue;
+        while (candidates) {
+            u32 index = __builtin_ctz(candidates);
+            candidates &= ~((u32)BIT(index));
 
-        if (best < 0 || prio < best_prio) {
-            best = (int)intid;
-            best_prio = prio;
+            u32 intid = (word * 32) + index;
+            u32 prio = hv_gic_cpuif_priority(intid);
+            if (prio >= s->pmr || prio >= s->running)
+                continue;
+
+            if (best < 0 || prio < best_prio) {
+                best = (int)intid;
+                best_prio = prio;
+            }
         }
     }
 
@@ -2129,7 +2179,26 @@ static void hv_gic_cpuif_sync_vi(void)
 
     u64 hcr = mrs(HCR_EL2);
     int selected = hv_gic_cpuif_select(s);
-    u64 want = (selected >= 0) ? (hcr | HCR_IMO | HCR_VI) : (hcr & ~HCR_VI);
+
+    /*
+     * Assert IMO for as long as this interface is live, not merely while
+     * something is already pending.
+     *
+     * Both directions of delivery need it: HCR.VI can only signal a virtual
+     * interrupt to EL1 while IMO is set, and a physical AIC IRQ can only reach
+     * hv_exc_irq() while IMO is set.  Tying it to "something is pending" works
+     * for the timer, whose FIQ arrives by another route and creates the pending
+     * state first, but it is a chicken-and-egg for a device: the physical IRQ
+     * that would make it pending is exactly what IMO gates.
+     *
+     * This runs from hv_update_fiq() on every EL2 exit, so it is also what
+     * makes the route self-healing -- measured on hardware, a core that took
+     * IMO at its ICC_IGRPEN1_EL1 write was later observed back at the pristine
+     * base HCR with IMO clear, and a one-shot assert had no way to recover.
+     */
+    bool live = s->igrpen1 != 0;
+    u64 want = live ? (hcr | HCR_IMO) : hcr;
+    want = (selected >= 0) ? (want | HCR_VI) : (want & ~HCR_VI);
 
     if (want == hcr)
         return;
@@ -2155,7 +2224,7 @@ static void hv_gic_cpuif_sync_vi(void)
 static void hv_gic_cpuif_set_pending(u32 intid)
 {
     struct hv_gic_cpuif *s = hv_gic_cpuif_this();
-    if (s == NULL || !s->valid || intid >= 32)
+    if (s == NULL || !s->valid || intid >= HV_GIC_MAX_INTID)
         return;
 
     /*
@@ -2164,14 +2233,14 @@ static void hv_gic_cpuif_set_pending(u32 intid)
      * completed and the clock has stopped for good -- worth saying out loud
      * once rather than leaving it to be inferred from a silent timeout.
      */
-    if ((s->active & BIT(intid)) && !gic_cpuif_blocked_logged[smp_id()]) {
+    if (hv_gic_bitmap_test(s->active, intid) && !gic_cpuif_blocked_logged[smp_id()]) {
         gic_cpuif_blocked_logged[smp_id()] = true;
         printf("HV: T8142: INTID %u still active on CPU %d; further ticks are "
                "blocked until the guest completes it\n",
                intid, (int)smp_id());
     }
 
-    __atomic_fetch_or(&s->pending, (u32)BIT(intid), __ATOMIC_ACQ_REL);
+    hv_gic_bitmap_set(s->pending, intid);
     hv_gic_cpuif_sync_vi();
 }
 
@@ -2232,7 +2301,7 @@ static void hv_gic_cpuif_send_sgi(u64 val)
         if (!t->valid)
             continue;
 
-        __atomic_fetch_or(&t->pending, (u32)BIT(intid), __ATOMIC_ACQ_REL);
+        hv_gic_bitmap_set(t->pending, intid);
 
         if (cpu == self)
             hv_gic_cpuif_sync_vi();
@@ -2287,8 +2356,8 @@ static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
         s->igrpen0 = 0;
         s->igrpen1 = 0;
         s->ctlr = 0;
-        s->pending = 0;
-        s->active = 0;
+        memset(s->pending, 0, sizeof(s->pending));
+        memset(s->active, 0, sizeof(s->active));
         s->running = 0xff;
         s->valid = true;
     }
@@ -2340,9 +2409,30 @@ static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
                      * record the expired deadlines that must not be mistaken
                      * for the guest's own.
                      */
-                    __atomic_store_n(&s->pending, 0, __ATOMIC_RELEASE);
-                    s->active = 0;
+                    memset(s->pending, 0, sizeof(s->pending));
+                    memset(s->active, 0, sizeof(s->active));
+                    __atomic_thread_fence(__ATOMIC_RELEASE);
                     s->running = 0xff;
+
+                    /*
+                     * Take ownership of physical IRQ routing on this core.
+                     *
+                     * Both halves of delivery need it: a physical AIC IRQ only
+                     * reaches hv_exc_irq() while HCR.IMO is set, and HCR.VI is
+                     * only signalled to the guest while it is set.  Until now
+                     * sync_vi() raised it as a side effect of the first pending
+                     * timer tick, which is too late for a device -- the AIC
+                     * would deliver to EL1, where an OS driving an emulated
+                     * GICv3 cannot acknowledge it and the level would never
+                     * drop.
+                     *
+                     * This is the safe moment: the guest has just enabled its
+                     * CPU interface, Mu is gone, and the AIC master enable is
+                     * still off until the first GICD_ISENABLER for an SPI
+                     * (hv_vgic_arm_device_delivery()), so no physical interrupt
+                     * can be asserted while the route changes underneath it.
+                     */
+                    hv_write_hcr(mrs(HCR_EL2) | HCR_IMO);
                     s->stale_p = hv_timer_firing(mrs(CNTP_CTL_EL02));
                     s->stale_v = hv_timer_firing(mrs(CNTV_CTL_EL02));
                     s->stale_cval_p = mrs(CNTP_CVAL_EL02);
@@ -2402,9 +2492,8 @@ static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
              * it on the floor before the guest ever ran.
              */
             if (!probe) {
-                __atomic_fetch_and(&s->pending, ~((u32)BIT(intid)),
-                                   __ATOMIC_ACQ_REL);
-                s->active |= BIT(intid);
+                hv_gic_bitmap_clear(s->pending, intid);
+                hv_gic_bitmap_set(s->active, intid);
                 s->running = hv_gic_cpuif_priority(intid);
                 gic_cpuif_ack_count[cpu]++;
                 hv_gic_cpuif_sync_vi();
@@ -2448,8 +2537,8 @@ static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
                 break;
 
             u32 intid = regs[rt] & 0xffffff;
-            if (intid < 32 && !probe) {
-                s->active &= ~BIT(intid);
+            if (intid < HV_GIC_MAX_INTID && !probe) {
+                hv_gic_bitmap_clear(s->active, intid);
                 s->running = 0xff;
                 gic_cpuif_eoi_count[cpu]++;
                 if (!gic_cpuif_eoi_logged[cpu]) {
@@ -2458,12 +2547,25 @@ static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
                            intid, (int)cpu);
                 }
                 /*
-                 * Deliberately does not clear pending.  The GTDT declares both
-                 * timer GSIVs level-triggered, and the guest's own re-arm is
-                 * what drops the level -- hv_update_fiq() stops re-asserting
+                 * PPIs deliberately keep their pending bit.  The GTDT declares
+                 * both timer GSIVs level-triggered, and the guest's own re-arm
+                 * is what drops the level -- hv_update_fiq() stops re-asserting
                  * once CNTx_CTL.ISTATUS clears.  Dropping it here instead would
                  * lose a tick whose deadline had already passed again.
+                 *
+                 * An SPI is the opposite case, because its level lives in real
+                 * hardware rather than in this model.  Reading AIC EVENT both
+                 * acknowledged and auto-masked the source, so completion has to
+                 * clear the software pending bit and unmask the physical line
+                 * again.  If the device is still asserting, the AIC raises a
+                 * fresh event immediately and hv_exc_irq() marks it pending
+                 * once more; leaving the bit set instead would re-signal an
+                 * interrupt the hardware never repeated.
                  */
+                if (intid >= 32) {
+                    hv_gic_bitmap_clear(s->pending, intid);
+                    aic_set_mask(hv_aic_alias_to_physical(intid), false);
+                }
                 hv_gic_cpuif_sync_vi();
             }
             break;
@@ -4119,8 +4221,9 @@ void hv_report_t8142_gic_activity(void)
          * which interrupt, because "stuck in the clock" and "stuck in an IPI"
          * point at completely different faults.
          */
-        if (gic_cpuif[cpu].active)
-            printf("(act=0x%x)", gic_cpuif[cpu].active);
+        int stuck = hv_gic_bitmap_first_set(gic_cpuif[cpu].active);
+        if (stuck >= 0)
+            printf("(act=%d)", stuck);
         last_ack[cpu] = gic_cpuif_ack_count[cpu];
         last_eoi[cpu] = gic_cpuif_eoi_count[cpu];
     }
@@ -5783,7 +5886,24 @@ void hv_exc_irq(struct exc_info *ctx)
      * Do not acknowledge their pending AIC EVENT at EL2: clear IMO and return,
      * allowing the still-pending physical IRQ to be taken again by Windows EL1.
      */
-    if (hv_native_aic_active()) {
+    /*
+     * ...unless this core is running the emulated GICv3 CPU interface, in which
+     * case m1n1 owns the line and must acknowledge it here.
+     *
+     * The native handoff below deliberately returns *without* reading EVENT and
+     * clears HCR.IMO, so that a guest with the Windows AIC HAL extension can
+     * take the still-asserted physical IRQ at EL1 and read EVENT itself.  J813
+     * has no such HAL extension: nothing at EL1 will ever read EVENT, so the
+     * line stays asserted and unmasked forever and the device wedges.
+     *
+     * This test has to come first, because native_aic_active is latched for the
+     * entire run on this machine -- hv_aic.c sets it the moment Mu's own AIC
+     * CONFIG is observed live, long before Windows exists -- which made the
+     * vGIC tail at the bottom of this function unreachable on T8142.
+     * hv_gic_cpuif_active() is false until the guest enables Group 1, so Mu,
+     * which does drive the AIC itself, keeps the native path unchanged.
+     */
+    if (hv_native_aic_active() && !hv_gic_cpuif_active()) {
         if (hv_native_aic_windows_ready() &&
             PERCPU(carrier_irq_active)) {
             /*
@@ -5847,7 +5967,8 @@ void hv_exc_irq(struct exc_info *ctx)
      * AIC EOI path that can clear the SW-pending bit, so the same event would
      * be acknowledged and injected forever.
      */
-    if (!hv_native_aic_active() && irq >= HV_TIMER_SWIRQ_BASE &&
+    if ((!hv_native_aic_active() || hv_gic_cpuif_active()) &&
+        irq >= HV_TIMER_SWIRQ_BASE &&
         irq < HV_TIMER_SWIRQ_BASE + (2 * MAX_CPUS)) {
         aic_set_mask(irq, true);
         aic_set_sw(irq, false);
@@ -5945,6 +6066,36 @@ void hv_exc_irq(struct exc_info *ctx)
      * hv_aic_alias.h for why J813's MTP line needs one.
      */
     u32 guest_irq = hv_aic_alias_to_published(irq);
+
+    /*
+     * T8142 delivers through the software CPU interface, not through a list
+     * register.  The guest's ICC_* accesses are trapped and emulated (see the
+     * hv_gic_cpuif block above), so it never reads the hardware virtual CPU
+     * interface and an LR would simply never be consumed.
+     *
+     * Marking the INTID pending here is the whole handoff.  This runs on the
+     * CPU the AIC chose as the line's target, which is the CPU whose interface
+     * must signal it, and reading EVENT above already acknowledged and
+     * auto-masked the physical source -- the guest's EOIR trap is what unmasks
+     * it again.
+     */
+    if (chip_id == T8142) {
+        /*
+         * One line per core the first time a real device interrupt makes it to
+         * EL2.  Without it, "the AIC never presented it" and "EL2 never took
+         * it" are indistinguishable from outside -- both leave the line
+         * unmasked and asserted, which is the state that cost a boot cycle to
+         * tell apart by hand.  One-shot, because this is a hot vector.
+         */
+        if (!gic_cpuif_aic_logged[smp_id()]) {
+            gic_cpuif_aic_logged[smp_id()] = true;
+            printf("HV: T8142: AIC line %u -> INTID %u at EL2 on CPU %d "
+                   "(hcr 0x%lx)\n",
+                   irq, guest_irq, (int)smp_id(), mrs(HCR_EL2));
+        }
+        hv_gic_cpuif_set_pending(guest_irq);
+        return;
+    }
 
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     if (hv_native_aic_windows_active() && !hv_native_aic_windows_ready()) {

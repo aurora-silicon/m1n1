@@ -37,6 +37,38 @@
 #include "string.h"
 #include "types.h"
 #include "uartproxy.h"
+#include "soc.h"
+
+/*
+ * Turn the AIC on the first time the guest asks for a device interrupt.
+ *
+ * The controller is off at this point: iBoot hands over with it clear and Mu's
+ * ExitBootServices callback clears it again, so a line can be unmasked and
+ * asserted -- both observable in MASK_SET and HW_STATE -- and still reach no
+ * CPU at all.  That was the state J813's keyboard sat in with its driver
+ * started and its FIFO full.
+ *
+ * A GICD_ISENABLER write for an SPI is the right trigger: it is the guest
+ * saying it wants a specific device line delivered, which on this machine is
+ * also the moment m1n1 becomes responsible for delivering it.  Doing it here
+ * rather than at hv_start() keeps the controller off for the whole of Mu, which
+ * owns its own interrupts and must not have them redirected to EL2.
+ *
+ * SGIs and PPIs deliberately do not arm it.  They are not AIC lines.
+ */
+static bool hv_vgic_aic_armed = false;
+
+static void hv_vgic_arm_device_delivery(u32 irq_num)
+{
+    if (hv_vgic_aic_armed || irq_num < 32 || chip_id != T8142)
+        return;
+
+    hv_vgic_aic_armed = true;
+    aic_set_enabled(true);
+    printf("HV vGIC: guest enabled SPI %u; AIC master enable now %d "
+           "(hcr 0x%lx on CPU %d)\n",
+           irq_num, (int)aic_is_enabled(), mrs(HCR_EL2), (int)smp_id());
+}
 
 /**
  * General idea of how this should work:
@@ -418,6 +450,7 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
                     irq_num = (32 * reg_num) + i;
 
                     aic_set_mask(hv_aic_alias_to_physical(irq_num), false);
+                    hv_vgic_arm_device_delivery(irq_num);
                     vgic_log("HV vGIC DEBUG [Info] [AIC]: unmasking irq %d (physical %d)\n",
                              irq_num, hv_aic_alias_to_physical(irq_num));
                 }
@@ -457,7 +490,16 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
                     value_ic_enabler &= ~BIT(i);      
                     irq_num = (32 * reg_num) + i;
 
-                    aic_set_mask(hv_aic_alias_to_physical(irq_num), false);
+                    /*
+                     * Mask, not unmask.  This passed `false` -- the same
+                     * argument as the ISENABLER path above -- so a guest
+                     * disabling an interrupt left the physical line enabled.
+                     * That was inert while nothing was ever delivered; now that
+                     * SPIs reach the guest it would mean a device the OS has
+                     * switched off keeps asserting into a CPU interface that no
+                     * longer expects it.
+                     */
+                    aic_set_mask(hv_aic_alias_to_physical(irq_num), true);
                     vgic_log("HV vGIC DEBUG [Info] [AIC]: masking irq %d (physical %d)\n",
                              irq_num, hv_aic_alias_to_physical(irq_num));
                 }
