@@ -51,6 +51,8 @@ typedef enum _hv_entry_type {
     HV_PANIC,
     HV_TPM,  /* one event per TPM command -- see hv_tpm.c */
     HV_XFER, /* one event per bulk-channel doorbell -- see hv_xfer.c */
+    /* Mu has initialized its vectors and reached a safe exception-hook point. */
+    HV_SYSREG_ASSIST_READY,
 } hv_entry_type;
 
 
@@ -127,6 +129,13 @@ bool hv_mask_pending_tick(void);
 void hv_rearm(void);
 void hv_maybe_exit(void);
 void hv_tick(struct exc_info *ctx);
+bool hv_handle_t8142_sysreg_assist(u32 instruction, u64 input, u64 *output);
+bool hv_recover_t8142_sysreg_undef(struct exc_info *ctx);
+void hv_track_t8142_undef_vector(struct exc_info *ctx);
+void hv_verify_t8142_undef_vectors(void);
+void hv_scan_t8142_guest_modules(void);
+void hv_report_t8142_gic_activity(void);
+void hv_check_t8142_bugcheck(void);
 
 //
 // PSCI init

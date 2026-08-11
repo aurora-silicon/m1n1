@@ -151,11 +151,18 @@ elif tba.revision == 3:
 
 print(f"Copying stub...")
 
+# "dc cvac" (Point of Coherency), not "dc cvau" (Point of Unification).
+#
+# The copied image is not only fetched by this core.  Secondary cores are
+# released from reset with MMU and caches off, so they fetch it as Normal
+# Non-cacheable, which resolves at the PoC.  A PoU-only clean leaves the image
+# in the copying core's cluster L2, and on T8142 m1n1 boots on cpu6 in the
+# P-cluster while cpu0..cpu5 are in the E-cluster and share none of it.
 stub = asm.ARMAsm(f"""
 1:
         ldp x4, x5, [x1], #16
         stp x4, x5, [x2]
-        dc cvau, x2
+        dc cvac, x2
         ic ivau, x2
         add x2, x2, #16
         sub x3, x3, #16

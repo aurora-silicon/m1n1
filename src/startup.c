@@ -12,6 +12,7 @@
 #include "utils.h"
 #include "xnuboot.h"
 
+
 u64 boot_args_addr;
 struct boot_args cur_boot_args;
 void *adt;
@@ -223,6 +224,14 @@ void _cpu_reset_c(void *stack)
     // src/smp.c for why. The boot CPU still prints normally.
     //
     bool quiet = (chip_id == T8142) && !is_boot_cpu();
+    int secondary_cpu = -1;
+
+    if (!is_boot_cpu()) {
+        secondary_cpu = smp_secondary_prepare();
+        if (secondary_cpu < 0)
+            while (1)
+                sysop("wfe");
+    }
 
     if (!quiet) {
         if (!is_boot_cpu())
@@ -235,6 +244,9 @@ void _cpu_reset_c(void *stack)
     }
 
     init_cpu();
+
+    if (secondary_cpu >= 0)
+        smp_secondary_mark_init_complete(secondary_cpu);
 
     if (!quiet)
         printf("  Running in EL%lu\n\n", mrs(CurrentEL) >> 2);

@@ -227,6 +227,23 @@ int hv_init(void)
                  HCR_VM);  // Enable stage 2 translation
 #endif
 
+    if (chip_id == T8142) {
+        /*
+         * T8142 does not provide the older Apple PMC register bank used by
+         * the imported architectural-PMU redirect.  Keep every architectural
+         * PMUv3 access at EL2 and advertise no directly owned counters; the
+         * synchronous handler supplies the small, deterministic interface
+         * needed by unmodified Mu and Windows binaries.
+         */
+        u64 mdcr = mrs(MDCR_EL2);
+        mdcr &= ~(MDCR_EL2_HPMN | MDCR_EL2_HPME);
+        mdcr |= MDCR_EL2_TPMCR | MDCR_EL2_TPM;
+        msr(MDCR_EL2, mdcr);
+        sysop("isb");
+        printf("HV: T8142: architectural PMUv3 trapped to synthetic EL2 backend (MDCR=0x%lx)\n",
+               mdcr);
+    }
+
     // No guest vectors initially
     msr(VBAR_EL12, 0);
 
@@ -351,22 +368,25 @@ void hv_start(void *entry, u64 regs[4])
      * enable ICH/LRs: this is a topology carrier, not an interrupt-delivery path.
      */
 #ifdef ENABLE_VGIC_MODULE
-    if (chip_id == T8142) {
-        /*
-         * The current startup-carrier implementation resets T8142 before Mu
-         * executes its first instruction.  Keep the carrier compiled into the
-         * image, but defer activation while bringing up Mu's ANS/NVMe path.
-         * Windows interrupt delivery is enabled again only after firmware and
-         * bootmgfw handoff are independently proven.
-         */
-        printf("HV: T8142: deferring Windows vGIC startup carrier during Mu/NVMe bring-up\n");
-    } else {
-        printf("HV: windows-native-aic: initializing virtual IRQ queues\n");
-        hv_vgicv3_init();
-        printf("HV: windows-native-aic: vGIC MMIO carrier ready\n");
-        init_vgic_irq_queues();
-        printf("HV: windows-native-aic: virtual IRQ queues ready\n");
-    }
+    /*
+     * The carrier was deferred on T8142 because an earlier implementation reset
+     * the machine before Mu executed its first instruction, and the deferral was
+     * written to last only "after firmware and bootmgfw handoff are
+     * independently proven".  Both are now proven: firmware reaches
+     * ExitBootServices and the boot manager hands off to a kernel that runs.
+     *
+     * Keeping it deferred is no longer neutral.  Mu advertises GICD and GICR
+     * records in its MADT unconditionally, so with no carrier the kernel
+     * classifies its startup controller by reading GICD_PIDR2 at dist_base +
+     * 0xFFE8 and takes an unmapped-IPA fault on a region nothing backs.  This is
+     * still only a topology carrier: HCR.IMO stays clear and no list registers
+     * are enabled, so it answers the classification and delivers nothing.
+     */
+    printf("HV: windows-native-aic: initializing virtual IRQ queues\n");
+    hv_vgicv3_init();
+    printf("HV: windows-native-aic: vGIC MMIO carrier ready\n");
+    init_vgic_irq_queues();
+    printf("HV: windows-native-aic: virtual IRQ queues ready\n");
 #endif
 
     /* Host MMIO mappings are complete before hv_start(), so these hooks persist. */
@@ -434,13 +454,23 @@ void hv_start(void *entry, u64 regs[4])
         printf("HV: T8142: architectural counter redirect selected for raw Mu guest\n");
     }
 
-    printf("HV: Aurora timer probe CNTHCTL_EL2=0x%lx HCR_EL2=0x%lx\n", mrs(CNTHCTL_EL2),
+    printf("HV: Timer state CNTHCTL_EL2=0x%lx HCR_EL2=0x%lx\n", mrs(CNTHCTL_EL2),
            mrs(HCR_EL2));
-    if (chip_id == T8142)
+    if (chip_id == T8142) {
         hv_tick_interval = mrs(CNTFRQ_EL0) / HV_SLOW_TICK_RATE;
-
-    printf("HV: Arming %s host tick\n", chip_id == T8142 ? "slow T8142" : "primary");
-    hv_arm_tick(false);
+        /*
+         * The installed USB-proxy path can leave uart0 clock-gated on J813, so
+         * hv_tick() suppresses virtual-UART/AIC polling until Mu's TimerDxe
+         * readiness edge. The remaining tick body is safe and load-bearing:
+         * it services the USB proxy and gives EL2 a bounded rendezvous point
+         * even when firmware spins without taking another exception.
+         */
+        printf("HV: T8142: arming safe primary EL2 liveness tick\n");
+        hv_arm_tick(false);
+    } else {
+        printf("HV: Arming primary host tick\n");
+        hv_arm_tick(false);
+    }
     hv_pinned_cpu = -1;
     hv_want_cpu = -1;
     hv_cpus_in_guest = BIT(smp_id());
@@ -863,9 +893,118 @@ void hv_maybe_exit(void)
     }
 }
 
+#ifdef ENABLE_GUEST_PC_SAMPLER
+/*
+ * See ENABLE_GUEST_PC_SAMPLER in config.h.  Driven from the EL2 host tick, so
+ * it reports guest progress even when the guest has stopped producing output
+ * of its own -- which is the normal state once an EFI application takes the
+ * console.
+ *
+ * The per-sample PC delta is the useful part: a guest making progress moves by
+ * large and irregular amounts, while one wedged in a spin loop stays inside a
+ * span of a few dozen bytes.  SPSR and VBAR_EL1 then say which kind of stall
+ * it is:
+ *   - VBAR_EL1 moving off the firmware's vector table proves the guest has
+ *     installed its own exception handlers, so firmware-side assists no longer
+ *     see the guest's traps at all.
+ *   - SPSR.I separates a guest sitting with interrupts masked (typically
+ *     inside an exception handler) from one spinning with them enabled
+ *     (typically waiting on an interrupt that is never delivered).
+ */
+static void hv_sample_guest_pc(struct exc_info *ctx)
+{
+    static u32 ticks;
+    static u64 seq;
+    static u64 prev_pc;
+
+    /*
+     * The host tick rate is chip-dependent -- T8142 deliberately runs the
+     * primary tick at HV_SLOW_TICK_RATE, not HV_TICK_RATE -- so derive the
+     * reporting interval from the interval actually armed.  Keying off the
+     * compile-time constant instead silently stretches the report period by
+     * the ratio between the two rates.
+     */
+    u32 per_report = 1;
+    if (hv_tick_interval)
+        per_report = (u32)(mrs(CNTFRQ_EL0) / hv_tick_interval);
+    if (per_report < 1)
+        per_report = 1;
+
+    if (++ticks < per_report)
+        return;
+    ticks = 0;
+
+    u64 pc = ctx->elr;
+    s64 delta = (s64)(pc - prev_pc);
+
+    u64 n = seq++;
+
+    printf("HV: guest[%ld] pc=0x%lx d=%s0x%lx spsr=0x%lx EL%ld%s vbar_el1=0x%lx "
+           "sp_el1=0x%lx lr=0x%lx\n",
+           n, pc, delta < 0 ? "-" : "+", delta < 0 ? (u64)-delta : (u64)delta, ctx->spsr,
+           (ctx->spsr >> 2) & 3, (ctx->spsr & BIT(7)) ? " I-masked" : "", mrs(VBAR_EL12),
+           ctx->sp[1], ctx->regs[30]);
+
+    /*
+     * The guest's own EL1 fault state.  A guest stopped inside its exception
+     * path leaves the triage registers standing, and the ESR exception class
+     * names the failure outright rather than leaving it to inference.
+     *
+     * These MUST use the _EL12 aliases.  m1n1 runs at EL2 with HCR_EL2.E2H
+     * set, and under E2H the plain _EL1 register names are redirected to their
+     * _EL2 counterparts when named from EL2 -- so mrs(ESR_EL1) here would
+     * silently report ESR_EL2, i.e. m1n1's own last trap, not the guest's
+     * fault.  Same reason hv.c writes the guest's vectors via VBAR_EL12.
+     *
+     * x1/x2/x3 are printed alongside because a guest fault-capture stub has
+     * typically just read ELR/SPSR/ESR into them, so they corroborate the
+     * sysregs independently.
+     */
+    printf("HV: guest[%ld]   el1 esr=0x%lx ec=0x%lx elr=0x%lx far=0x%lx spsr_el1=0x%lx "
+           "x1=0x%lx x2=0x%lx x3=0x%lx\n",
+           n, mrs(ESR_EL12), (mrs(ESR_EL12) >> 26) & 0x3f, mrs(ELR_EL12), mrs(FAR_EL12),
+           mrs(SPSR_EL12), ctx->regs[1], ctx->regs[2], ctx->regs[3]);
+
+    /*
+     * For an undefined instruction, the opcode itself is the whole story: it
+     * names the register the hardware refused.  Fetch it rather than inferring
+     * from where the guest stopped.
+     */
+    if (mrs(ESR_EL12) == 0x02000000) {
+        u64 fault_pa = hv_translate(mrs(ELR_EL12), false, false, NULL);
+        if (fault_pa)
+            printf("HV: guest[%ld]   undef insn 0x%08x at 0x%lx\n", n, read32(fault_pa),
+                   mrs(ELR_EL12));
+    }
+
+    prev_pc = pc;
+}
+#endif
+
 void hv_tick(struct exc_info *ctx)
 {
     hv_wdt_pet();
+#ifdef ENABLE_GUEST_PC_SAMPLER
+    hv_sample_guest_pc(ctx);
+#endif
+    /*
+     * The host tick is the only place EL2 regains control from a guest that
+     * has wedged itself, so it is where an absent-system-register hang has to
+     * be unwedged.  Costs one guest-PC read per tick when nothing is stuck.
+     */
+    hv_track_t8142_undef_vector(ctx);
+    /*
+     * A redirect can be invalidated without VBAR_EL1 ever changing -- a guest
+     * that rebuilds its page tables can leave the vector VA resolving to a
+     * different physical page than the one we patched -- and tracking keyed on
+     * VBAR alone cannot see that.  Re-assert the redirects here, where the cost
+     * is per tick rather than per trap.
+     */
+    hv_verify_t8142_undef_vectors();
+    hv_scan_t8142_guest_modules();
+    hv_report_t8142_gic_activity();
+    hv_check_t8142_bugcheck();
+    hv_recover_t8142_sysreg_undef(ctx);
     iodev_handle_events(uartproxy_iodev);
     if (iodev_can_read(uartproxy_iodev)) {
         printf("HV: User interrupt\n");
@@ -873,5 +1012,15 @@ void hv_tick(struct exc_info *ctx)
         if (hv_pinned_cpu == -1 || hv_pinned_cpu == smp_id())
             hv_exc_proxy(ctx, START_HV, HV_USER_INTERRUPT, NULL);
     }
-    hv_vuart_poll();
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    /*
+     * J813 can enter the hypervisor with uart0 clock-gated and before Mu has
+     * configured AIC2. Keep the early T8142 host tick useful for watchdog and
+     * USB-proxy polling, but do not drive the virtual UART's AIC software line
+     * until TimerDxe proves that Mu's native interrupt handler is live.
+     */
+    if (chip_id != T8142 || hv_native_aic_mu_timer_active() ||
+        hv_native_aic_windows_active())
+#endif
+        hv_vuart_poll();
 }

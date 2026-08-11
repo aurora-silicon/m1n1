@@ -189,6 +189,12 @@
 #define HCR_SWIO     BIT(1)
 #define HCR_VM       BIT(0)
 
+/* MDCR_EL2 architectural PMUv3 trap controls. */
+#define MDCR_EL2_HPMN  GENMASK(4, 0)
+#define MDCR_EL2_TPMCR BIT(5)
+#define MDCR_EL2_TPM   BIT(6)
+#define MDCR_EL2_HPME  BIT(7)
+
 #define ID_AA64PFR0_EL1        sys_reg(3, 0, 0, 4, 0)
 #define ID_AA64PFR0_EL1_GIC    GENMASK(27, 24) //defines what version of the GIC System Register interface is supported.
 #define ID_AA64PFR1_EL1        sys_reg(3, 0, 0, 4, 1)
@@ -647,6 +653,8 @@
 #define ICC_CTLR_EL1    sys_reg(3, 0, 12, 12, 4)
 #define ICC_PMR_EL1     sys_reg(3, 0, 4, 6, 0)
 #define ICC_IGRPEN0_EL1 sys_reg(3, 0, 12, 12, 6)
+#define ICC_HPPIR1_EL1  sys_reg(3, 0, 12, 12, 2)
+#define ICC_RPR_EL1     sys_reg(3, 0, 12, 11, 3)
 #define ICC_SRE_SRE     BIT(0)
 #define ICC_SRE_DFB     BIT(1)
 #define ICC_SRE_DIB     BIT(2)

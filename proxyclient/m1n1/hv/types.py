@@ -41,6 +41,7 @@ class HV_EVENT(IntEnum):
     PANIC = 7
     TPM = 8
     XFER = 9
+    SYSREG_ASSIST_READY = 10
 
 VMProxyHookData = Struct(
     "flags" / RegAdapter(MMIOTraceFlags),

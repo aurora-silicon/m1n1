@@ -73,26 +73,157 @@
 #define T8142_QUIET_SECONDARY (chip_id == T8142)
 
 //
-// T8142: do not attempt to start CPU 0 at all.
+// CPU 0 used to be quarantined after its 100 ms startup handshake timed out.
+// That exposed a more fundamental bug: reset stack and CPU identity were global
+// hand-off variables.  Continuing to CPU 1 overwrote both while a late CPU 0 was
+// still leaving reset, so the late core could run on CPU 1's stack and publish to
+// CPU 1's spin table.  T8142 now derives the dense CPU index from MPIDR at the
+// reset vector and uses the matching per-CPU stack.  A cold cluster-primary gets
+// a longer observation window, but can no longer become a misidentified rogue.
+#define T8142_CPU0_START_TIMEOUT_MS 2000
+#define T8142_MISC_CORES_REG_INDEX  41
+
 //
-// CPU 0 reports "Failed!" on every single run while CPU 1 and CPU 2 start
-// cleanly. That is not a no-op: smp_start_cpu() had already written the RVBAR and
-// both PMGR start registers before the 100 ms handshake timeout expired. So CPU 0
-// is very likely out of reset and executing, just wedged somewhere before it can
-// set spin_table[0].flag.
+// T8142: drive the secondary release through ApplePMGR::MISC_CORES in addition
+// to the PMGR start bank.
 //
-// A core loose in that state is a far better candidate for the reset than
-// anything else tried so far, and it fits the one observation none of the other
-// theories explained: removing unrelated work moved the death point later, which
-// is what you would expect if the boot CPU is racing a rogue core rather than
-// executing a fatal instruction.
+// DISABLED, and neither written nor read while disabled. Evidence from J813:
 //
-// Why CPU 0 specifically is unknown. Bit 0 *is* set in the 0x3bf mask at
-// pmgr+0x34000, so it is not masked off there. Possibilities: it is the cluster-0
-// primary and needs different handling, its cluster is not powered, or the
-// (die, cluster, core) decoding from its ADT reg is wrong for index 0.
+//   - The bring-up this file descends from
+//     (OtherResources/Windows On Silicon/m1n1_windows.git/src/smp.c) starts
+//     T8142 secondaries with the PMGR bank *alone*, has no MISC_CORES step at
+//     all, and is recorded there as confirmed working on J704.
+//   - Every J813 run carrying this step failed identically:
+//     smp_start_fail_mask == 0x3bf with smp_reset_entered_mask == 0, i.e. not
+//     one core ever reached the reset vector -- including cpu1/cpu2, which the
+//     chainloader had supposedly re-pointed.
+//   - Removing this step is what fixed it: the very next run reached
+//     smp_started_mask == 0x3be with reset_entered == 0x3be, i.e. all nine
+//     secondaries including every cluster-1 core.
 //
-#define T8142_SKIP_CPU0 (chip_id == T8142)
+// The window itself is fine, and an earlier draft of this comment was wrong to
+// call it non-responding. A guarded probe (GUARD_MARK) of both this bank and
+// the PMGR start bank fails to fault and simply reads zero, so these are
+// write-only/auto-clearing registers rather than dead address space. The defect
+// is therefore in what the sequence *does* -- writing BIT(0) here as a "disable"
+// edge holds the armed cores in reset -- not in where it writes.
+//
+// The reg index itself is not obviously wrong -- /arm-io/pmgr on J813 really
+// does have 54 reg tuples and reg[41] really is 0x3803c0000 -- so this is kept
+// intact behind a switch rather than deleted. Re-enable only once the window is
+// shown to respond.
+//
+#define T8142_MISC_CORES_RELEASE 0
+
+//
+// T8142: kick cpu0 with SEV + a targeted fast IPI while waiting for it to start.
+//
+// DISABLED. This was added on the theory that cpu0 was already awake and parked,
+// and needed an architectural wake rather than a reset. A cold-boot measurement
+// disproves the premise it rested on:
+//
+//   Straight after a hand cold boot, before anything had been chainloaded and
+//   before smp_start_secondaries() had ever run, every stopped core -- cpu0
+//   included -- read cpu_impl+0x100 = 0x0000d800, differing only in the core-id
+//   nibbles at +0x104. cpu0 is born in exactly the same state as cpu1..cpu9.
+//
+// The 0x0f845102 "live/parked" status that cpu0 shows after a failed start is
+// therefore something we do to it, not how we find it. cpu0 is also the only
+// core this signalling is applied to, and smp_wait_cpu() fires the first kick at
+// i == 0 -- immediately, before the core has had any time to leave reset. Firing
+// an IMPDEF cross-core IPI at a core that is mid-reset is a far better candidate
+// for wedging it than for waking it.
+//
+// Apple's own code supports leaving this off: ApplePMGR::enableCPUCore ->
+// enableCPUCores -> configMiscCores contains no cpu0 special case whatsoever,
+// and releases core 0 with the same two register writes as every other core.
+//
+#define T8142_SIGNAL_PARKED_CPU0 0
+
+//
+// T8142: release cpu0 after its cluster siblings rather than before them.
+//
+// cpu0 is the lowest ADT index, so the start loop releases it first, while every
+// other core in cluster 0 is still in reset. That ordering is the only remaining
+// property unique to cpu0 once the fast-IPI kick is ruled out
+// (T8142_SIGNAL_PARKED_CPU0), and the hardware does distinguish cpu0's outcome:
+//
+//   cpu_impl+0x104 bits [15:8] read 0x40 cold, 0x80 once a core is running, and
+//   0x10 for cpu0 after a failed start -- a third state, not a failure to
+//   respond. cpu0 does leave its cold state, it just does not land in the
+//   running one.
+//
+// TESTED, MADE NO DIFFERENCE, so left off. Releasing cpu0 last on an otherwise
+// clean cold boot still yields started == 0x3be and fail == 0x1, bit-for-bit the
+// same as releasing it first. Ordering is not the cause. Kept behind the switch
+// only so the next person does not have to re-run the experiment.
+//
+// NOTE when re-testing any of this: a RAM chainload does NOT reset cores that a
+// previous run already started. Chainloading on top of a successful run leaves
+// every secondary already released, so the next start request is a no-op for all
+// of them and the result reads as a total failure (0x3bf, reset_entered 0). Cold
+// boot or reboot between SMP tests or the measurement is meaningless.
+//
+#define T8142_START_CPU0_LAST 0
+
+//
+// Two further cpu0 theories eliminated, both from a live Windows run rather
+// than a dedicated experiment, so neither cost a boot.
+//
+//   Cluster power. Ruled out by its siblings: cpu1..cpu5 share cluster 0 with
+//   cpu0 and all five start and run Windows. The cluster is demonstrably
+//   powered and clocked while cpu0 fails inside it.
+//
+//   The (die, cluster, core) decode for index 0. Ruled out by the reset
+//   vectors m1n1 reserves, which are derived from that decode: all ten appear
+//   and all ten are correctly strided -- cluster 0 at 0x210050000 + n*0x100000
+//   for n = 0..5, cluster 1 at 0x211050000 + n*0x100000 for n = 0..3. cpu0's
+//   entry at 0x210050000 is exactly where the pattern puts it, so the decode
+//   produces the right address for index 0 and the entry point is written to
+//   the right register.
+//
+// RESOLVED: cpu0 is not broken. The RAM chainload breaks it.
+//
+// Measured on J813 with the proxy, all within single boots:
+//
+//   - Released from cold by raw register writes, cpu0 starts perfectly:
+//     +0x104 bits[15:8] go 0x40 -> 0x80 and +0x100 goes 0x0000d800 ->
+//     0x0f205102, the exact running-core signature, stable indefinitely. Done
+//     both after its cluster siblings and as the very first core released into
+//     a completely cold cluster. The hardware start path for cpu0 is fine.
+//
+//   - cpu0 reads cold (0x40) in the resident image immediately before a
+//     chainload, and already reads the stuck third state (0x10, +0x100 =
+//     0x0f845102) at the *first instruction of _start* in the chainloaded
+//     image -- with the PMGR start bank still untouched at 0x3bf and cpu1
+//     still cold. A probe at every init step from image entry through
+//     sep_init() shows the value never changes: this image never touches cpu0.
+//
+//   - Once in 0x10 the core is unrecoverable. No combination of the stop
+//     register, the W1C release bit and the per-cluster trigger returns it to
+//     cold or to running, which is why every previous attempt to "start cpu0
+//     harder" failed: by the time smp_start_secondaries() runs, cpu0 is
+//     already dead and the release is a no-op.
+//
+// So the damage happens inside the chainload handover -- the resident image's
+// shutdown path and the copy stub -- before this image executes anything. That
+// also disposes of the remaining theories: ordering (re-tested with the
+// race-free breadcrumb below; cpu0 still fails with reset_entered[0] == 0),
+// the fast-IPI kick, cluster power, and the address decode.
+//
+// Consequence for testing: a directly booted (installed) image has no handover
+// window, so cpu0 should be cold when smp_start_secondaries() runs -- the state
+// proven above to start. Confirming that means replacing the resident image,
+// which is deliberately not done here. Until then every chainloaded run,
+// including every Windows boot, will see nine cores and must not be read as
+// evidence about cpu0.
+//
+// This matters more than it used to. Windows requests cpu0 first, and answering
+// a CPU_ON failure truthfully makes it issue PSCI SYSTEM_RESET and end the boot
+// -- measured. cpu0 is therefore a hard prerequisite for handing this machine
+// ten cores, not an item that can be finished later; the MADT currently hides
+// it to let the other nine run.
+//
 
 #define CPU_REG_CORE    GENMASK(7, 0)
 #define CPU_REG_CLUSTER GENMASK(10, 8)
@@ -119,6 +250,26 @@ u8 dummy_stack_el1[DUMMY_STACK_SIZE]; // EL1 stack if EL3 exists
 u8 *secondary_stacks[MAX_CPUS] = {dummy_stack};
 u8 *secondary_stacks_el3[MAX_EL3_CPUS];
 
+// Consumed by start.S before a secondary has a C stack.  This is intentionally
+// enabled only after the T8142 boot CPU has allocated per-CPU reset stacks.
+volatile u32 smp_use_per_cpu_reset_stacks;
+
+// Race-free reset breadcrumb, one byte per dense ADT CPU index, stored by the
+// core itself from start.S before it has a stack.
+//
+// The _mask breadcrumbs below are read-modify-write from every core at once and
+// silently lose updates, which is why they have disagreed with reality: a run
+// that started nine cores recorded reset_entered 0x39a while started_mask was
+// 0x3be.  A one-byte store per core cannot race, so this is the only breadcrumb
+// safe to reason from.  Written with the MMU off, so invalidate before reading.
+volatile u8 smp_reset_entered[MAX_CPUS];
+
+// Read-only hardware breadcrumbs.  Each bit is the dense ADT CPU index.
+volatile u64 smp_reset_entered_mask;
+volatile u64 smp_c_entry_mask;
+volatile u64 smp_init_complete_mask;
+volatile u64 smp_spin_entry_mask;
+
 static bool wfe_mode = false;
 
 static int target_cpu;
@@ -126,6 +277,8 @@ static int cpu_nodes[MAX_CPUS];
 static struct spin_table spin_table[MAX_CPUS];
 static u64 pmgr_reg;
 static u64 cpu_start_off;
+static u64 t8142_misc_cores_reg;
+static bool t8142_misc_cores_reg_known;
 
 // T8142 shares the framebuffer/USB console between the boot CPU and newly
 // released secondaries.  Printing from the startup loop can leave the proxy
@@ -134,6 +287,73 @@ static u64 cpu_start_off;
 // symbols from the ELF and inspect them without touching the console.
 volatile u64 smp_started_mask;
 volatile u64 smp_start_fail_mask;
+// Post-mortem for a core that never completed the handshake: the relay word we
+// actually left at the locked RVBAR, and each core's impl status after its wait
+// window ([0] = +0x100, [1] = +0x104; +0x104 bits[15:8] read 0x40 cold and 0x80
+// running on T8142).
+volatile u64 smp_t8142_relay_addr;
+volatile u32 smp_t8142_relay_word;
+volatile u32 smp_t8142_impl_status[MAX_CPUS][2];
+volatile u64 smp_cpu0_wake_attempts;
+volatile u64 smp_cpu_release_base;
+volatile u32 smp_t8142_misc_before[4];
+volatile u32 smp_t8142_misc_after_disable[4];
+volatile u32 smp_t8142_misc_after_enable[4];
+
+static void t8142_capture_misc_cores(volatile u32 values[4])
+{
+    if (!t8142_misc_cores_reg_known)
+        return;
+
+    for (int i = 0; i < 4; i++)
+        values[i] = read32(t8142_misc_cores_reg + 4 * i);
+
+    sysop("dmb sy");
+}
+
+static int t8142_cpu_index_from_mpidr(u64 mpidr)
+{
+    u32 core = FIELD_GET(CPU_REG_CORE, mpidr);
+    u32 cluster = FIELD_GET(CPU_REG_CLUSTER, mpidr);
+
+    if (cluster == 0 && core < 6)
+        return core;
+    if (cluster == 1 && core < 4)
+        return 6 + core;
+
+    return -1;
+}
+
+int smp_secondary_prepare(void)
+{
+    int index = target_cpu;
+
+    if (chip_id == T8142)
+        index = t8142_cpu_index_from_mpidr(mrs(MPIDR_EL1));
+
+    if (index < 0 || index >= MAX_CPUS)
+        return -1;
+
+    if (in_el3())
+        msr(TPIDR_EL3, index);
+    else if (in_el2())
+        msr(TPIDR_EL2, index);
+    else
+        msr(TPIDR_EL1, index);
+
+    smp_c_entry_mask |= BIT(index);
+    sysop("dmb sy");
+    return index;
+}
+
+void smp_secondary_mark_init_complete(int cpu)
+{
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return;
+
+    smp_init_complete_mask |= BIT(cpu);
+    sysop("dmb sy");
+}
 //
 // Whether cpu_start_off above is actually known for this SoC. T8142 was in this
 // position until its offset was found empirically (see the T8142 case below);
@@ -188,7 +408,22 @@ static bool t8142_prepare_locked_rvbar_relay(u64 locked_rvbar)
             mmu_add_mapping(locked_rvbar, locked_rvbar, 0x4000, MAIR_IDX_NORMAL, PERM_RWX);
 
         write32(locked_rvbar, branch);
-        dc_cvau_range(relay, sizeof(*relay));
+        //
+        // Clean to the Point of Coherency, not just the Point of Unification.
+        //
+        // The core that consumes this relay is coming out of reset with its
+        // MMU and caches OFF, so its instruction fetch is Normal Non-cacheable
+        // and resolves at the PoC (DRAM).  DC CVAU only guarantees the line has
+        // reached the PoU, which on this SoC is the *writing* core's cluster
+        // L2.  m1n1 boots on cpu6, a cluster-1 P-core, and cluster 0 does not
+        // share that L2, so a PoU-only clean can leave a released cluster-0
+        // core fetching the stale pre-relay instruction -- which on T8142 is
+        // the resident image's "mov x9, '0'" falling through into the resident
+        // m1n1's cpu_reset.  That core then runs, and updates the *resident*
+        // spin table, so this image's smp_wait_cpu() times out on a CPU that is
+        // demonstrably alive.  See the cpu0 note above.
+        //
+        dc_cvac_range(relay, sizeof(*relay));
         ic_ivau_range(relay, sizeof(*relay));
         sysop("dsb sy");
         sysop("isb");
@@ -196,6 +431,9 @@ static bool t8142_prepare_locked_rvbar_relay(u64 locked_rvbar)
         if (remapped)
             mmu_add_mapping(locked_rvbar, locked_rvbar, 0x4000, MAIR_IDX_NORMAL, PERM_RX_EL0);
     }
+
+    smp_t8142_relay_addr = locked_rvbar;
+    smp_t8142_relay_word = *relay;
 
     if (*relay != branch) {
         printf("Failed!\n    Locked RVBAR relay write did not stick at 0x%lx\n", locked_rvbar);
@@ -207,16 +445,27 @@ static bool t8142_prepare_locked_rvbar_relay(u64 locked_rvbar)
 
 void smp_secondary_entry(void)
 {
-    struct spin_table *me = &spin_table[target_cpu];
+    int index = chip_id == T8142 ? smp_id() : target_cpu;
 
-    if (in_el2())
-        msr(TPIDR_EL2, target_cpu);
-    else
-        msr(TPIDR_EL1, target_cpu);
+    if (index < 0 || index >= MAX_CPUS)
+        while (1)
+            sysop("wfe");
+
+    struct spin_table *me = &spin_table[index];
+
+    if (chip_id != T8142) {
+        if (in_el2())
+            msr(TPIDR_EL2, index);
+        else
+            msr(TPIDR_EL1, index);
+    }
+
+    smp_spin_entry_mask |= BIT(index);
+    sysop("dmb sy");
 
     // See T8142_QUIET_SECONDARY.
     if (!T8142_QUIET_SECONDARY)
-        printf("  Index: %d (table: %p)\n\n", target_cpu, me);
+        printf("  Index: %d (table: %p)\n\n", index, me);
 
     me->mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
 
@@ -257,7 +506,8 @@ void smp_secondary_entry(void)
 
 void smp_secondary_prep_el3(void)
 {
-    msr(TPIDR_EL3, target_cpu);
+    if (chip_id != T8142)
+        msr(TPIDR_EL3, target_cpu);
     return;
 }
 
@@ -294,18 +544,16 @@ static inline u32 cpu_start_bit(int index, int cluster, int core)
     return 1 << (4 * cluster + core);
 }
 
-static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u64 cpu_start_base)
+static bool smp_prepare_cpu(int index, int die, int cluster, int core, u64 impl)
 {
-    int i;
-
     if (index >= MAX_CPUS)
-        return;
+        return false;
 
     if (has_el3() && index >= MAX_EL3_CPUS)
-        return;
+        return false;
 
     if (spin_table[index].flag)
-        return;
+        return false;
 
     u64 rvbar = read64(impl);
     if ((rvbar & RVBAR_LOCK) && (rvbar & RVBAR_ADDR) != (u64)_vectors_start) {
@@ -315,7 +563,7 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
             if (chip_id != T8142)
                 printf("Failed! \n    RVBAR (=0x%lx) is locked and differs from entry point (=0x%lx)\n",
                        locked_rvbar, (u64)_vectors_start);
-            return;
+            return false;
         }
 
         if (chip_id != T8142)
@@ -338,6 +586,10 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
     } else
         _reset_stack = secondary_stacks[index] + SECONDARY_STACK_SIZE;
 
+    dc_civac_range(&secondary_stacks[index], sizeof(secondary_stacks[index]));
+    if (has_el3())
+        dc_civac_range(&secondary_stacks_el3[index], sizeof(secondary_stacks_el3[index]));
+
     dc_civac_range(&_reset_stack, sizeof(void *));
 
     sysop("dsb sy");
@@ -346,6 +598,78 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
         // This also clears RVBAR_LOCK, so that HV can set RVBAR later when the core is running
         write64(impl, (u64)_vectors_start);
     }
+
+    return true;
+}
+
+// CPU 0 is not in the same cold-off state as the other T8142 secondaries.
+// AppleARMCPU::startCPU() first releases a core through ApplePMGR, and the
+// non-boot init path then calls ml_cpu_signal().  On J813 the PMGR release is
+// sufficient for cpu1..5 and cpu7..9, while cpu0 keeps reporting a live/parked
+// status and never refetches RVBAR.  Mirror the missing architectural wake here
+// after the reset vector and per-CPU stack are ready.
+//
+// MPIDR 0 is cpu0 on T8142.  A zero fast-IPI route value is therefore a valid
+// target, not an empty mask.  SEV covers a core parked in WFE; the targeted IPI
+// covers Apple's interrupt-based park path.  This remains RAM-chainload-only
+// until the hardware breadcrumb proves cpu0 reached spin_table[0].
+static void t8142_signal_parked_cpu0(void)
+{
+    if (chip_id != T8142)
+        return;
+
+    sysop("dsb sy");
+    sysop("sev");
+
+    if (cpu_features->fast_ipi)
+        msr(SYS_IMP_APL_IPI_RR_GLOBAL_EL1, 0);
+    else
+        aic_write(AIC_IPI_SEND, AIC_IPI_SEND_CPU(0));
+
+    sysop("isb");
+    sysop("sev");
+    smp_cpu0_wake_attempts++;
+    sysop("dmb sy");
+}
+
+static void smp_wait_cpu(int index)
+{
+    int i;
+
+    int timeout_ms = chip_id == T8142 && index == 0 ? T8142_CPU0_START_TIMEOUT_MS : 100;
+    for (i = 0; i < timeout_ms; i++) {
+        if (T8142_SIGNAL_PARKED_CPU0 && chip_id == T8142 && index == 0 &&
+            (i == 0 || i == 10 || i == 100 || i == 500))
+            t8142_signal_parked_cpu0();
+
+        sysop("dmb ld");
+        if (spin_table[index].flag)
+            break;
+        udelay(1000);
+    }
+
+    if (i >= timeout_ms) {
+        smp_start_fail_mask |= BIT(index);
+        if (chip_id != T8142)
+            printf("Failed!\n");
+    } else {
+        smp_started_mask |= BIT(index);
+        if (chip_id != T8142)
+            printf("  Started.\n");
+    }
+}
+
+static void smp_finish_cpu_start(void)
+{
+    _reset_stack = dummy_stack + DUMMY_STACK_SIZE;
+    _reset_stack_el1 = dummy_stack_el1 + DUMMY_STACK_SIZE;
+}
+
+static bool smp_start_cpu(int index, int die, int cluster, int core, u64 impl,
+                          u64 cpu_start_base)
+{
+    if (!smp_prepare_cpu(index, die, cluster, core, impl))
+        return false;
 
     cpu_start_base += die * PMGR_DIE_OFFSET;
 
@@ -356,25 +680,17 @@ static void smp_start_cpu(int index, int die, int cluster, int core, u64 impl, u
     // Actually start the core
     write32(cpu_start_base + 0x8 + 4 * cluster, 1 << core);
 
-    for (i = 0; i < 100; i++) {
-        sysop("dmb ld");
-        if (spin_table[index].flag)
-            break;
-        udelay(1000);
-    }
+    smp_wait_cpu(index);
 
-    if (i >= 100) {
-        smp_start_fail_mask |= BIT(index);
-        if (chip_id != T8142)
-            printf("Failed!\n");
-    } else {
-        smp_started_mask |= BIT(index);
-        if (chip_id != T8142)
-            printf("  Started.\n");
-    }
+    // Post-mortem: whether the core is cold (0x40), running (0x80) or somewhere
+    // else, plus its own race-free reset breadcrumb.  Written with the MMU off
+    // by the core itself, so invalidate before believing what we read.
+    smp_t8142_impl_status[index][0] = read32(impl + 0x100);
+    smp_t8142_impl_status[index][1] = read32(impl + 0x104);
+    dc_ivac_range((void *)smp_reset_entered, sizeof(smp_reset_entered));
 
-    _reset_stack = dummy_stack + DUMMY_STACK_SIZE;
-    _reset_stack_el1 = dummy_stack_el1 + DUMMY_STACK_SIZE;
+    smp_finish_cpu_start();
+    return true;
 }
 
 static void smp_stop_cpu(int index, int die, int cluster, int core, u64 impl, u64 cpu_start_base,
@@ -429,6 +745,48 @@ void smp_start_secondaries(void)
 {
     smp_started_mask = 0;
     smp_start_fail_mask = 0;
+    smp_reset_entered_mask = 0;
+    smp_c_entry_mask = 0;
+    smp_init_complete_mask = 0;
+    smp_spin_entry_mask = 0;
+    smp_cpu0_wake_attempts = 0;
+    smp_cpu_release_base = 0;
+    memset((void *)smp_t8142_misc_before, 0, sizeof(smp_t8142_misc_before));
+    memset((void *)smp_t8142_misc_after_disable, 0,
+           sizeof(smp_t8142_misc_after_disable));
+    memset((void *)smp_t8142_misc_after_enable, 0,
+           sizeof(smp_t8142_misc_after_enable));
+    smp_use_per_cpu_reset_stacks = chip_id == T8142;
+    dc_civac_range((void *)&smp_use_per_cpu_reset_stacks,
+                   sizeof(smp_use_per_cpu_reset_stacks));
+
+    memset((void *)smp_reset_entered, 0, sizeof(smp_reset_entered));
+    dc_civac_range((void *)smp_reset_entered, sizeof(smp_reset_entered));
+
+    //
+    // Publish this whole image to the Point of Coherency before releasing any
+    // core.
+    //
+    // A released core runs with MMU and caches off until it reaches its own
+    // init, so every instruction it fetches and every hand-off variable it
+    // reads resolves at the PoC.  A RAM-chainloaded image never gets there on
+    // its own: proxyclient/tools/chainload.py copies it with a "dc cvau" loop,
+    // which only reaches the Point of Unification -- the boot CPU's cluster L2.
+    // m1n1 boots on cpu6 in cluster 1, so nothing in cluster 0 shares that L2.
+    //
+    // The cores released late were only ever working by accident: cpu0 is
+    // released first and given a 2000 ms handshake window, and that delay is
+    // long enough for the dirty lines to be evicted to DRAM naturally before
+    // any other core is released.  Publishing explicitly removes the race
+    // instead of depending on cpu0's timeout to launder it.
+    //
+    // Text and rodata only, not _end: the tail of BSS is not backed by a live
+    // mapping and cleaning it faults (measured -- a dc cvac at _base + 0x154000
+    // took a level-3 translation fault and rebooted the machine).  Instruction
+    // fetch is what has to be visible; the individual hand-off variables below
+    // are already published with dc_civac_range at their own sites.
+    dc_cvac_range((void *)_base, (size_t)(_rodata_end - _base));
+    sysop("dsb sy");
 
     if (chip_id != T8142)
         printf("Starting secondary CPUs...\n");
@@ -442,6 +800,30 @@ void smp_start_secondaries(void)
     if (adt_get_reg(adt, pmgr_path, "reg", 0, &pmgr_reg, NULL) < 0) {
         printf("Error getting /arm-io/pmgr regs\n");
         return;
+    }
+
+    t8142_misc_cores_reg = 0;
+    t8142_misc_cores_reg_known = false;
+    //
+    // Leaving t8142_misc_cores_reg_known false is what disables the MISC_CORES
+    // path: t8142_capture_misc_cores() early-returns on it and the release block
+    // at the end of this function is gated on it, so nothing reads or writes
+    // that window. See T8142_MISC_CORES_RELEASE.
+    //
+    if (T8142_MISC_CORES_RELEASE && chip_id == T8142) {
+        /*
+         * AppleT8142PMGR::initRegMaps() maps ApplePMGR::MISC_CORES
+         * (RegMap 8) to the 42nd /arm-io/pmgr register tuple.  Do not derive
+         * this from reg[0]: on J813 the block is reg[41] at 0x3803c0000,
+         * while reg[0] + the legacy 0x34000 offset points at a different
+         * status block.
+         */
+        if (adt_get_reg(adt, pmgr_path, "reg", T8142_MISC_CORES_REG_INDEX,
+                        &t8142_misc_cores_reg, NULL) < 0) {
+            printf("Error getting T8142 MISC_CORES register\n");
+        } else {
+            t8142_misc_cores_reg_known = true;
+        }
     }
 
     int arm_io_node;
@@ -583,7 +965,23 @@ void smp_start_secondaries(void)
 
     spin_table[boot_cpu_idx].mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
 
-    for (int i = 0; i < MAX_CPUS; i++) {
+    if (chip_id == T8142) {
+        // The historical hardware-proven build released cpu1..5 and cpu7..9
+        // through the ordinary PMGR start bank.  MISC_CORES is useful as a
+        // read-only breadcrumb, but replacing PMGR release writes with it held
+        // every secondary in reset on J813.
+        smp_cpu_release_base = pmgr_reg + cpu_start_off;
+        t8142_capture_misc_cores(smp_t8142_misc_before);
+    }
+
+    u32 t8142_global_mask = 0;
+    u32 t8142_cluster_masks[2] = {0};
+    u64 t8142_prepared_mask = 0;
+
+    for (int n = 0; n < MAX_CPUS; n++) {
+        // See T8142_START_CPU0_LAST: visit 1,2,..,MAX_CPUS-1,0 so cpu0 is
+        // released after its cluster siblings instead of before them.
+        int i = (T8142_START_CPU0_LAST && chip_id == T8142) ? (n + 1) % MAX_CPUS : n;
         int cpu_node = cpu_nodes[i];
 
         if (!cpu_node)
@@ -622,17 +1020,42 @@ void smp_start_secondaries(void)
         if (!cpu_start_off_known)
             continue;
 
-        // See T8142_SKIP_CPU0.
-        if (T8142_SKIP_CPU0 && i == 0) {
-            smp_start_fail_mask |= BIT(0);
-            continue;
-        }
-
         u8 core = FIELD_GET(CPU_REG_CORE, reg);
         u8 cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
         u8 die = FIELD_GET(CPU_REG_DIE, reg);
 
-        smp_start_cpu(i, die, cluster, core, cpu_impl_reg[0], pmgr_reg + cpu_start_off);
+        bool prepared =
+            smp_start_cpu(i, die, cluster, core, cpu_impl_reg[0], pmgr_reg + cpu_start_off);
+        if (chip_id == T8142 && prepared) {
+            t8142_prepared_mask |= BIT(i);
+            t8142_global_mask |= cpu_start_bit(i, cluster, core);
+            if (cluster < ARRAY_SIZE(t8142_cluster_masks))
+                t8142_cluster_masks[cluster] |= BIT(core);
+        }
+    }
+
+    if (chip_id == T8142 && t8142_prepared_mask && t8142_misc_cores_reg_known) {
+        // J813 needs both edges, in this order.  PMGR above arms each reset
+        // vector and per-cluster start request; publishing the complete desired
+        // state through MISC_CORES then lets the armed cores leave reset.
+        sysop("dsb sy");
+        write32(t8142_misc_cores_reg, BIT(0));
+        sysop("dsb sy");
+        udelay(100);
+        t8142_capture_misc_cores(smp_t8142_misc_after_disable);
+
+        write32(t8142_misc_cores_reg + 0x4, t8142_global_mask);
+        write32(t8142_misc_cores_reg + 0x8, t8142_cluster_masks[0]);
+        write32(t8142_misc_cores_reg + 0xc, t8142_cluster_masks[1]);
+        sysop("dsb sy");
+        udelay(100);
+        t8142_capture_misc_cores(smp_t8142_misc_after_enable);
+
+        for (int i = 0; i < MAX_CPUS; i++) {
+            if (t8142_prepared_mask & BIT(i))
+                smp_wait_cpu(i);
+        }
+        smp_finish_cpu_start();
     }
 }
 

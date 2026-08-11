@@ -51,7 +51,7 @@ class WindowsUnifiedContractTests(unittest.TestCase):
         builder = (ROOT / "tools/build-j414s-windows-unified.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn('AURORA_BRANCHES = ("main",)', builder)
+        self.assertIn('AURORA_BRANCHES = ("main", "M5-Dev")', builder)
         self.assertIn("ALLOWED_BRANCHES = AURORA_BRANCHES", builder)
         self.assertIn('"j813": "aurora.j813.m1n1-unified.v1"', builder)
         self.assertIn('"j414s": "ntasi.j414s.m1n1-unified.v1"', builder)
@@ -148,6 +148,27 @@ class WindowsUnifiedContractTests(unittest.TestCase):
         )
         self.assertIn('"hpm2": {"rid": 2, "port-number": 3, "port-location": "right"}', verifier)
         self.assertIn('hpm5.getprop("port-location") is not None', verifier)
+
+    def test_t8142_arms_safe_primary_tick_but_defers_secondary_tick(self) -> None:
+        hv = (ROOT / "src/hv.c").read_text(encoding="utf-8")
+
+        primary = hv.split("HV: Timer state", 1)[1].split("hv_pinned_cpu", 1)[0]
+        self.assertIn("if (chip_id == T8142)", primary)
+        self.assertIn("arming safe primary EL2 liveness tick", primary)
+        self.assertRegex(primary, r"if \(chip_id == T8142\)[\s\S]*?hv_arm_tick\(false\);")
+        self.assertRegex(primary, r"else\s*\{[\s\S]*?hv_arm_tick\(false\);")
+
+        tick = hv.split("void hv_tick(struct exc_info *ctx)", 1)[1].split(
+            "void hv_arm_tick", 1
+        )[0]
+        self.assertIn("hv_native_aic_mu_timer_active()", tick)
+        self.assertIn("hv_native_aic_windows_active()", tick)
+
+        secondary = hv.split("hv_configure_guest_wfi_mode();", 1)[1].split(
+            "static void hv_enter_secondary", 1
+        )[0]
+        self.assertIn("deferring secondary EL2 host tick", secondary)
+        self.assertRegex(secondary, r"else\s+hv_arm_tick\(true\);")
 
     def test_type5_power_states_match_apple_t6020_contract(self) -> None:
         runtime = (ROOT / "src/acio_runtime.c").read_text(encoding="utf-8")

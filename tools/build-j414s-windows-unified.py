@@ -12,7 +12,7 @@ import shutil
 import subprocess
 
 
-AURORA_BRANCHES = ("main",)
+AURORA_BRANCHES = ("main", "M5-Dev")
 ALLOWED_BRANCHES = AURORA_BRANCHES
 FILES = ("m1n1.macho", "m1n1.elf", "m1n1.bin")
 REQUIRED_BINARY_SYMBOLS = {

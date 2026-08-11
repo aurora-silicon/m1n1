@@ -105,6 +105,24 @@
 // only WRITES DRAM; it never powers the GPU down.
 #define ENABLE_J414S_WINDOWS_GPU_INITDATA_HANDOFF
 
+//
+// Diagnostic only; not part of any boot path's behaviour.
+//
+// Firmware is the only thing on this platform that writes to the serial
+// console, so the console goes quiet the instant an EFI application takes
+// over -- and a healthy application is indistinguishable from a wedged one
+// from outside.  That blind spot starts exactly where the Windows boot
+// manager starts.
+//
+// The EL2 host tick keeps running whatever the guest does, so sample the
+// guest's own PC from it and print a low-rate heartbeat.  Read-only: it
+// touches no guest state and changes no control register, so a boot with
+// this enabled follows the same path as one without, just noisier.
+//
+// Leave this off for measurement runs; the printing itself costs guest time.
+//
+#define ENABLE_GUEST_PC_SAMPLER
+
 #if defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && !defined(ENABLE_VGIC_MODULE)
 #error "ENABLE_NATIVE_AIC_PASSTHROUGH requires ENABLE_VGIC_MODULE -- see config.h comment above"
 #endif

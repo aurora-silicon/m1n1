@@ -1165,6 +1165,29 @@ int hv_psci_turn_on_cpu(uint64_t target_cpu, uint64_t entry_point, uint64_t cont
     * is installed and the entry runs at guest EL1.  PSCI passes context_id in
     * X0 on the target CPU.
     */
+   /*
+    * Refuse a core m1n1 never got running, rather than blocking on it.
+    *
+    * hv_start_secondary() ends in smp_wait(), which spins until the target
+    * acknowledges.  A core that never left reset never will, so this was not a
+    * slow path, it was a deadlock: measured with Windows, which issues CPU_ON
+    * for MPIDR 0 first, and the boot stopped dead on "Initializing secondary 0"
+    * with the hypervisor spinning forever and the guest unable to make
+    * progress or even fail.
+    *
+    * PSCI has an answer for exactly this.  Reporting INTERNAL_FAILURE lets the
+    * OS mark that processor unavailable and carry on with the ones that do
+    * work, which is both the truthful reply and the one that keeps the system
+    * usable.  Note this is a robustness fix, not a fix for the underlying
+    * startup defect on cpu0 -- that core is still not being delivered, and
+    * saying so through the interface built to say it is the point.
+    */
+   if (!smp_is_alive(cpu_identifier)) {
+      printf("PSCI DEBUG: CPU%d is not running; refusing CPU_ON\n",
+             cpu_identifier);
+      return PSCI_STATUS_INTERNAL_FAILURE;
+   }
+
    uint64_t regs[4] = {context_id, 0, 0, 0};
    hv_start_secondary(cpu_identifier, (void *)entry_point, regs);
    return retval;

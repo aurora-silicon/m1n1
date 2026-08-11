@@ -13,6 +13,11 @@
 .extern _v_sp0_serr
 .extern _reset_stack
 .extern _cpu_reset_c
+.extern smp_use_per_cpu_reset_stacks
+.extern smp_reset_entered
+.extern smp_reset_entered_mask
+.extern secondary_stacks
+.extern secondary_stacks_el3
 .extern wdt_reboot
 
 .section .init, "ax"
@@ -221,9 +226,67 @@ cpu_reset:
     mov w0, 'O'
     bl debug_putc
 
+    /*
+     * T8142 has asymmetric MPIDR topology: Aff1=0 cores 0..5 map to dense
+     * indices 0..5, Aff1=1 cores 0..3 map to dense indices 6..9.  Select the
+     * per-core stack before entering C so a slow CPU0 cannot consume a later
+     * CPU's global reset stack.
+     */
+    adrp x1, smp_use_per_cpu_reset_stacks
+    add x1, x1, :lo12:smp_use_per_cpu_reset_stacks
+    ldr w1, [x1]
+    cbz w1, 2f
+
+    mrs x2, MPIDR_EL1
+    and x3, x2, #0xff
+    ubfx x4, x2, #8, #8
+    cbz x4, 1f
+    cmp x4, #1
+    b.ne 2f
+    add x3, x3, #6
+1:
+    cmp x3, #10
+    b.hs 2f
+
+    /*
+     * Race-free reset breadcrumb: one byte, owned by this core alone.  The
+     * mask below is a read-modify-write from every core at once and loses
+     * updates, so it cannot be used to decide whether a given core ran.
+     */
+    adrp x5, smp_reset_entered
+    add x5, x5, :lo12:smp_reset_entered
+    mov w6, #1
+    strb w6, [x5, x3]
+    dsb sy
+
+    adrp x5, smp_reset_entered_mask
+    add x5, x5, :lo12:smp_reset_entered_mask
+    ldr x6, [x5]
+    mov x7, #1
+    lsl x7, x7, x3
+    orr x6, x6, x7
+    str x6, [x5]
+    dsb sy
+
+    mrs x5, CurrentEL
+    cmp x5, #0xc
+    b.eq 3f
+    adrp x1, secondary_stacks
+    add x1, x1, :lo12:secondary_stacks
+    b 4f
+3:
+    adrp x1, secondary_stacks_el3
+    add x1, x1, :lo12:secondary_stacks_el3
+4:
+    ldr x1, [x1, x3, lsl #3]
+    cbz x1, 2f
+    add x1, x1, #0x10, lsl #12
+    b 5f
+2:
     adrp x1, _reset_stack
     add x1, x1, :lo12:_reset_stack
     ldr x1, [x1]
+5:
     mov sp, x1
 
     ldr x2, [sp, #-8]

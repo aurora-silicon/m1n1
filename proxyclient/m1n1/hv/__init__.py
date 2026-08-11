@@ -115,6 +115,7 @@ class HV(Reloadable):
         self.smp = True
         self.hook_exceptions = False
         self.started_cpus = {}
+        self.boot_cpu_id = None
         self.started = False
         self.ctx = None
         self.hvcall_handlers = {}
@@ -1386,6 +1387,11 @@ class HV(Reloadable):
                 elif code == HV_EVENT.USER_INTERRUPT:
                     handled = True
                     user_interrupt = True
+                elif code == HV_EVENT.SYSREG_ASSIST_READY:
+                    if self.hook_exceptions:
+                        self.log("T8142 Mu context ready; installing guest exception hooks")
+                        self.patch_exception_handling()
+                    handled = True
         except Exception as e:
             self.log(f"Python exception while handling guest exception:")
             traceback.print_exc()
@@ -2102,7 +2108,11 @@ class HV(Reloadable):
             yield i
 
     def patch_exception_handling(self):
-        if self.ctx.cpu_id != 0:
+        # Apple does not guarantee that the boot CPU has logical ID zero.
+        # J813/T8142 enters Mu on CPU 6, so key exception-vector patching to
+        # the CPU that start() actually launched instead of a platform-era
+        # CPU0 assumption.
+        if self.boot_cpu_id is None or self.ctx.cpu_id != self.boot_cpu_id:
             return
 
         if self.want_vbar is not None:
@@ -2202,6 +2212,9 @@ class HV(Reloadable):
         self.iface.set_handler(START.HV, HV_EVENT.CPU_SWITCH, self.handle_exception)
         self.iface.set_handler(START.HV, HV_EVENT.VIRTIO, self.handle_virtio)
         self.iface.set_handler(START.HV, HV_EVENT.TPM, self.handle_tpm)
+        self.iface.set_handler(
+            START.HV, HV_EVENT.SYSREG_ASSIST_READY, self.handle_exception
+        )
         # Registered unconditionally, even with no channel attached. An
         # HV_XFER event with no handler would leave the target sitting in
         # uartproxy_run() forever with the guest parked; answering -ENODEV
@@ -2858,6 +2871,7 @@ class HV(Reloadable):
             if cpu_node.state == "running":
                 break
         self.started_cpus[cpu_node.cpu_id] = (getattr(cpu_node, "die_id", 0), cpu_node.cluster_id, cpu_node.cpu_id)
+        self.boot_cpu_id = cpu_node.cpu_id
         self.sysreg[cpu_node.cpu_id] = {}
 
         # Pre-launch breakpoint commands run before start() performs the final

@@ -37,6 +37,8 @@ extern spinlock_t bhl;
  * low userspace stack after ExitBootServices must never be canonicalized.
  */
 static bool t8142_sp_el0_repair_logged[MAX_CPUS];
+static bool t8142_sysreg_assist_logged;
+static bool t8142_sysreg_assist_ready_reported;
 #endif
 
 /*
@@ -91,6 +93,7 @@ static bool t8142_sp_el0_repair_logged[MAX_CPUS];
 #define HV_TIMER_P_SWIRQ(cpu)    (HV_TIMER_SWIRQ_BASE + (cpu))
 #define HV_TIMER_V_SWIRQ(cpu)    (HV_TIMER_SWIRQ_BASE + MAX_CPUS + (cpu))
 #define HV_TIMER_REFLECT_CALL_MAGIC 0x4e54414943ULL /* "NTAIC" */
+#define HV_SYSREG_ASSIST_CALL_MAGIC 0x4e54535247ULL /* "NTSRG" */
 #define HV_TIMER_REFLECT_CALL_REPOST_P 0x100
 #define HV_TIMER_REFLECT_CALL_REPOST_V 0x101
 #define HV_TIMER_REFLECT_REPOST_STALE 0
@@ -1244,8 +1247,28 @@ static bool hv_carrier_irq_pending(void)
     return false;
 }
 
+/*
+ * GTDT NonSecurePL1TimerGSIV / VirtualTimerGSIV as published by
+ * T8142FamilyPkg/AcpiTables/GTDT.aslc (PcdArmArchTimerIntrNum /
+ * PcdArmArchTimerVirtIntrNum).  The numbers are arbitrary -- Apple has no GIC
+ * and wires the timers to FIQ -- but they are what the guest connected its
+ * clock ISR to, so they are what has to be acknowledged back to it.
+ */
+#define HV_VGIC_TIMER_P_INTID 17
+#define HV_VGIC_TIMER_V_INTID 18
+
+/*
+ * T8142's emulated GICv3 CPU interface.  Defined with the rest of that model
+ * further down; declared here because hv_update_fiq() is the timer's producer.
+ */
+static bool hv_gic_cpuif_active(void);
+static void hv_gic_cpuif_set_pending(u32 intid);
+static void hv_gic_cpuif_timer_pend(bool physical);
+static void hv_gic_cpuif_send_sgi(u64 val);
+static void hv_gic_cpuif_sync_vi(void);
+
 static void hv_update_fiq(struct exc_info *ctx)
-{ 
+{
     u64 hcr = mrs(HCR_EL2);
     bool fiq_pending = false;
 
@@ -1361,6 +1384,43 @@ static void hv_update_fiq(struct exc_info *ctx)
                 PERCPU(timer_v_reflection_pending) = false;
                 vm_tmr_fiq_set( VM_TMR_FIQ_ENA_ENA_V);
             }
+        }
+    } else if (hv_gic_cpuif_active()) {
+        /*
+         * Unmodified Windows on T8142.
+         *
+         * The MADT and GTDT this platform publishes describe a GICv3, so NT
+         * arms the architectural timer and then waits for GSIV 17 or 18 to
+         * arrive through the interrupt controller.  Apple wires the timers to
+         * a per-core FIQ instead, and this SoC never reaches the AIC handoff
+         * that drives the native bridge: the CONFIG/EVENT hooks are
+         * deliberately left unmapped during Mu/NVMe bring-up, so
+         * windows_aic_phase never flips and hv_native_aic_mu_timer_active()
+         * stays true for the whole of the guest's life.
+         *
+         * The consequence was measured: every expiry kept being reflected into
+         * Mu's reserved real-AIC software IRQ, which nothing reads once Mu has
+         * exited.  The HAL spins three seconds in clockint.c waiting for a
+         * clock that cannot arrive, then bugchecks 0x5C with
+         * STATUS_UNSUCCESSFUL.  This branch must therefore be tested before
+         * the Mu one, not after it.
+         *
+         * Mask the Apple FIQ source and mark the matching GTDT PPI pending;
+         * hv_gic_cpuif_sync_vi() raises HCR.VI and the guest acknowledges
+         * through ICC_IAR1_EL1 exactly as it would on real GICv3 hardware.
+         */
+        if (hv_timer_firing(mrs(CNTP_CTL_EL02))) {
+            vm_tmr_fiq_clr(VM_TMR_FIQ_ENA_ENA_P);
+            hv_gic_cpuif_timer_pend(true);
+        } else {
+            vm_tmr_fiq_set(VM_TMR_FIQ_ENA_ENA_P);
+        }
+
+        if (hv_timer_firing(mrs(CNTV_CTL_EL02))) {
+            vm_tmr_fiq_clr(VM_TMR_FIQ_ENA_ENA_V);
+            hv_gic_cpuif_timer_pend(false);
+        } else {
+            vm_tmr_fiq_set(VM_TMR_FIQ_ENA_ENA_V);
         }
     } else if (hv_native_aic_mu_timer_active()) {
         /*
@@ -1490,6 +1550,15 @@ static void hv_update_fiq(struct exc_info *ctx)
         if (!(hcr & HCR_VI))
             hv_native_aic_apply_hcr_route(
                 HV_NATIVE_AIC_HCR_STARTUP_PENDING);
+    } else if (hv_gic_cpuif_active()) {
+        /*
+         * The emulated CPU interface is the sole owner of HCR.VI while it is
+         * live.  Without this the unconditional clear below would strip the
+         * line on the very next EL2 exit -- the guest would be interrupted
+         * only if it happened to be at EL1 with IRQs unmasked at that instant,
+         * which is exactly the race that makes a lost tick look like a hang.
+         */
+        hv_gic_cpuif_sync_vi();
     } else if (hcr & HCR_VI) {
         hv_native_aic_apply_hcr_route(HV_NATIVE_AIC_HCR_CLEAR_VI);
     }
@@ -1815,6 +1884,1920 @@ static bool hv_ring_id_doorbell(void)
             _msr(sr_tkn(sr), regs[rt]);                                                            \
         return true;
 
+/*
+ * Identical to SYSREG_PASS_DOORBELL, except that `clr` is cleared from the
+ * value handed to the guest.  For ID registers whose hardware answer is
+ * architecturally correct but advertises a feature the guest must not reach.
+ */
+#define SYSREG_PASS_DOORBELL_CLR(sr, clr)                                                          \
+    case SYSREG_ISS(sr):                                                                           \
+        if (is_read && hv_ring_id_doorbell())                                                      \
+            return false;                                                                          \
+        if (is_read)                                                                               \
+            regs[rt] = _mrs(sr_tkn(sr)) & ~((u64)(clr));                                           \
+        else                                                                                       \
+            _msr(sr_tkn(sr), regs[rt]);                                                            \
+        return true;
+
+/* ID_AA64DFR0_EL1.PMUVer, bits [11:8]. */
+#define ID_AA64DFR0_PMUVER_MASK (0xfUL << 8)
+
+/*
+ * T8142 removed the older Apple implementation-defined PMC register bank.
+ * Accessing that bank from EL2 aborts, so the generic Apple-to-architectural
+ * redirect below cannot be used on M5.  Windows preboot only requires a
+ * monotonic cycle source plus well-defined PMU control registers.  Present a
+ * deliberately counter-free PMUv3 view and consume writes in software.  This
+ * is equivalent to the instruction-level compatibility contract previously
+ * proven with patched binaries, but keeps every Microsoft image untouched.
+ */
+static bool hv_handle_t8142_pmu(u64 reg, bool is_read, u64 rt, u64 regs[32])
+{
+    if (chip_id != T8142)
+        return false;
+
+    switch (reg) {
+        case SYSREG_ISS(SYS_PMCCNTR_EL0):
+            if (is_read)
+                regs[rt] = mrs(SYS_IMP_APL_CNTVCT_ALIAS_EL0);
+            break;
+
+        case SYSREG_ISS(SYS_PMCR_EL0):
+        case SYSREG_ISS(SYS_PMCCFILTR_EL0):
+        case SYSREG_ISS(SYS_PMCEID0_EL0):
+        case SYSREG_ISS(SYS_PMCEID1_EL0):
+        case SYSREG_ISS(SYS_PMCNTENCLR_EL0):
+        case SYSREG_ISS(SYS_PMCNTENSET_EL0):
+        case SYSREG_ISS(SYS_PMEVCNTR0_EL0):
+        case SYSREG_ISS(SYS_PMINTENCLR_EL1):
+        case SYSREG_ISS(SYS_PMINTENSET_EL1):
+        case SYSREG_ISS(SYS_PMMIR_EL1):
+        case SYSREG_ISS(SYS_PMOVSCLR_EL0):
+        case SYSREG_ISS(SYS_PMOVSSET_EL0):
+        case SYSREG_ISS(SYS_PMSELR_EL0):
+        case SYSREG_ISS(SYS_PMUSERENR_EL0):
+            if (is_read)
+                regs[rt] = 0;
+            break;
+
+        default:
+            return false;
+    }
+
+    return true;
+}
+
+/*
+ * The GIC CPU interface, which this SoC also does not have.
+ *
+ * Apple silicon implements no GICv3 at all, so the ICC_* system registers do
+ * not decode and an access from EL1 is an undefined instruction -- the same
+ * failure as the absent PMU bank, in a different register file.  It reaches us
+ * the same way and is fixed by the same mechanism.
+ *
+ * This exists because m1n1 hands the guest an emulated GICv3 distributor and
+ * redistributors (hv_vgic.c) so the kernel can classify its interrupt
+ * controller.  Having accepted that classification, the kernel then programs
+ * the CPU interface, and Windows takes an unhandled STATUS_ILLEGAL_INSTRUCTION
+ * on the first write -- measured as bugcheck 0x1E at `msr ICC_IGRPEN1_EL1, x8`.
+ *
+ * WHAT IS AND IS NOT REAL HERE.  The configuration registers are genuinely
+ * emulated: they hold the value the guest wrote and give it back.  The
+ * acknowledge/complete registers are NOT an interrupt delivery path.  IAR1 and
+ * HPPIR1 return the spurious INTID 1023, which is the truthful answer for an
+ * interface that never has an interrupt pending, because interrupts arrive
+ * through the native-AIC bridge instead (hv_exc.c, hv_update_fiq()) and never
+ * through this file.  Do not read the presence of these cases as GIC delivery
+ * working; they let initialization complete and nothing more.
+ */
+struct hv_gic_cpuif {
+    u64 pmr;
+    u64 bpr1;
+    u64 igrpen0;
+    u64 igrpen1;
+    u64 ctlr;
+    /*
+     * Pending/active bitmaps for INTIDs 0..31.  Only the banked per-CPU range
+     * is modelled: the sole producer today is the architectural timer, whose
+     * GTDT GSIVs are both PPIs.  Anything wider needs a distributor-side model
+     * that does not exist yet, so an out-of-range INTID is refused rather than
+     * silently aliased into this word.
+     */
+    u32 pending;
+    u32 active;
+    /*
+     * Firmware residue.  Mu's TimerDxe drives the virtual timer and leaves its
+     * last deadline expired when it exits, so an already-asserted CNTx sits
+     * there waiting the instant delivery becomes possible.  Handing that to the
+     * guest as its first interrupt is worse than dropping it: the OS has
+     * enabled its CPU interface but not yet connected the clock ISR, so nothing
+     * acknowledges the INTID, it stays active forever, and every genuine tick
+     * after it is blocked by that active bit.  That is exactly what happened --
+     * one INTID 18 delivered the moment ICC_IGRPEN1_EL1 went to 1, then silence
+     * and the same three-second HAL timeout.
+     *
+     * So the expired deadline inherited at that moment is recorded and refused
+     * until the guest programs a different one.  Nothing is written to guest
+     * state to achieve this; it is purely an observation about whose deadline
+     * is being reported.
+     */
+    u64 stale_cval_p;
+    u64 stale_cval_v;
+    /*
+     * Running priority: the priority of the interrupt currently being serviced,
+     * or 0xff when idle.  Kept alongside pmr because both gate delivery.
+     */
+    u64 running;
+    bool stale_p;
+    bool stale_v;
+    bool valid;
+};
+
+static struct hv_gic_cpuif gic_cpuif[MAX_CPUS];
+static bool gic_cpuif_acked[MAX_CPUS];
+static bool gic_cpuif_blocked_logged[MAX_CPUS];
+static bool gic_cpuif_eoi_logged[MAX_CPUS];
+static bool gic_cpuif_brought_up[MAX_CPUS];
+static bool gic_cpuif_vi_logged[MAX_CPUS];
+static u32 gic_cpuif_ack_count[MAX_CPUS];
+static u32 gic_cpuif_eoi_count[MAX_CPUS];
+
+#define GIC_SPURIOUS_INTID 1023
+
+static struct hv_gic_cpuif *hv_gic_cpuif_this(void)
+{
+    if (chip_id != T8142)
+        return NULL;
+
+    u64 cpu = smp_id();
+    if (cpu >= MAX_CPUS)
+        return NULL;
+
+    return &gic_cpuif[cpu];
+}
+
+/*
+ * True once the guest has enabled Group 1 on this core's CPU interface.  That
+ * write is the unambiguous "an OS is driving the emulated GICv3" signal: Mu is
+ * an AIC build and never touches ICC_IGRPEN1_EL1, and it is the instruction NT
+ * used to die on before the interface existed at all.
+ */
+static bool hv_gic_cpuif_active(void)
+{
+    struct hv_gic_cpuif *s = hv_gic_cpuif_this();
+
+    return s != NULL && s->valid && s->igrpen1 != 0;
+}
+
+/*
+ * Drive the virtual IRQ line from the software pending/active state.
+ *
+ * HCR.VI is only signalled while HCR.IMO is set, so enabling delivery also
+ * takes ownership of physical IRQ routing on this core.  That is safe in the
+ * window this path serves: Mu cleared AIC2 CONFIG on its way out and the guest
+ * has not enabled it, so no physical IRQ is asserted.  IMO is left set once
+ * raised -- flapping it underneath a guest that is mid-handler would lose the
+ * very interrupt we are trying to deliver.
+ *
+ * Priority is deliberately not modelled.  HCR.VI bypasses the CPU interface's
+ * priority filter, and with a single producer there is nothing to arbitrate;
+ * PMR and BPR1 are stored so reads are honest, not because they gate anything.
+ */
+static u8 hv_gic_cpuif_priority(u32 intid)
+{
+#ifdef ENABLE_VGIC_MODULE
+    /*
+     * The guest's own GICR_IPRIORITYR state, as recorded by the vGIC carrier's
+     * redistributor hooks.  Using anything else would invent a priority the OS
+     * never chose and then filter against it.
+     */
+    return hv_vgic3_get_priority(intid);
+#else
+    (void)intid;
+    return 0;
+#endif
+}
+
+/*
+ * The highest-priority interrupt this CPU interface may signal right now, or
+ * -1 if none.
+ *
+ * GICv3 signals an interrupt only when its priority is strictly higher --
+ * numerically lower -- than both ICC_PMR_EL1 and the running priority.  That
+ * filter is not a refinement here, it is load-bearing: Windows implements IRQL
+ * with ICC_PMR_EL1 rather than PSTATE.I, so an emulated interface that ignores
+ * the mask delivers interrupts inside regions the OS believes cannot be
+ * interrupted.  Measured: with the mask ignored, the first tick arrived during
+ * HAL initialization and NT bugchecked 0x2B, PANIC_STACK_SWITCH, immediately --
+ * no sampler reading fell between acknowledgement and the bugcheck.
+ *
+ * PMR resets to 0, which masks everything.  That is also why nothing can be
+ * delivered before the guest has configured its own interface.
+ */
+static int hv_gic_cpuif_select(struct hv_gic_cpuif *s)
+{
+    if (!s->igrpen1)
+        return -1;
+
+    u32 candidates = __atomic_load_n(&s->pending, __ATOMIC_ACQUIRE) & ~s->active;
+    int best = -1;
+    u32 best_prio = 0x100;
+
+    while (candidates) {
+        u32 intid = __builtin_ctz(candidates);
+        candidates &= ~((u32)BIT(intid));
+
+        u32 prio = hv_gic_cpuif_priority(intid);
+        if (prio >= s->pmr || prio >= s->running)
+            continue;
+
+        if (best < 0 || prio < best_prio) {
+            best = (int)intid;
+            best_prio = prio;
+        }
+    }
+
+    return best;
+}
+
+static void hv_gic_cpuif_sync_vi(void)
+{
+    struct hv_gic_cpuif *s = hv_gic_cpuif_this();
+    if (s == NULL || !s->valid)
+        return;
+
+    u64 hcr = mrs(HCR_EL2);
+    int selected = hv_gic_cpuif_select(s);
+    u64 want = (selected >= 0) ? (hcr | HCR_IMO | HCR_VI) : (hcr & ~HCR_VI);
+
+    if (want == hcr)
+        return;
+
+    /*
+     * One line the first time this core actually asserts the virtual IRQ line,
+     * with the guest context it is about to interrupt.  Which instruction NT is
+     * on, and whether it had interrupts unmasked there, is the difference
+     * between "the tick was never delivered" and "the tick was delivered
+     * somewhere NT could not survive it" -- and those two have opposite fixes.
+     */
+    if ((want & HCR_VI) && !gic_cpuif_vi_logged[smp_id()]) {
+        gic_cpuif_vi_logged[smp_id()] = true;
+        printf("HV: T8142: raising virtual IRQ %d on CPU %d at guest pc 0x%lx "
+               "spsr 0x%lx pmr 0x%lx prio 0x%x\n",
+               selected, (int)smp_id(), mrs(ELR_EL2), mrs(SPSR_EL2), s->pmr,
+               hv_gic_cpuif_priority((u32)selected));
+    }
+
+    hv_write_hcr(want);
+}
+
+static void hv_gic_cpuif_set_pending(u32 intid)
+{
+    struct hv_gic_cpuif *s = hv_gic_cpuif_this();
+    if (s == NULL || !s->valid || intid >= 32)
+        return;
+
+    /*
+     * One line the first time a tick is held off by an unacknowledged
+     * predecessor.  If this ever prints, the guest took an interrupt it never
+     * completed and the clock has stopped for good -- worth saying out loud
+     * once rather than leaving it to be inferred from a silent timeout.
+     */
+    if ((s->active & BIT(intid)) && !gic_cpuif_blocked_logged[smp_id()]) {
+        gic_cpuif_blocked_logged[smp_id()] = true;
+        printf("HV: T8142: INTID %u still active on CPU %d; further ticks are "
+               "blocked until the guest completes it\n",
+               intid, (int)smp_id());
+    }
+
+    __atomic_fetch_or(&s->pending, (u32)BIT(intid), __ATOMIC_ACQ_REL);
+    hv_gic_cpuif_sync_vi();
+}
+
+/*
+ * ICC_SGI1R_EL1.  There is no distributor to forward this to, so it is decoded
+ * and delivered here: each target gets the INTID marked pending on its own
+ * software CPU interface, then a physical kick so it enters EL2 and re-evaluates
+ * HCR.VI for itself.  Without the kick a core already running in the guest would
+ * not notice the new pending state until its next unrelated trap, which for an
+ * idle core is never.
+ */
+static void hv_gic_cpuif_send_sgi(u64 val)
+{
+    u32 intid = (val >> 24) & 0xf;
+    bool irm = (val >> 40) & 1;
+    u64 aff1 = (val >> 16) & 0xff;
+    u64 aff2 = (val >> 32) & 0xff;
+    u64 aff3 = (val >> 48) & 0xff;
+    u16 targets = val & 0xffff;
+    int self = smp_id();
+    int count = smp_cpu_count();
+
+    if (count > MAX_CPUS)
+        count = MAX_CPUS;
+
+    for (int cpu = 0; cpu < count; cpu++) {
+        if (irm) {
+            /* Routing mode 1 is "everyone but me". */
+            if (cpu == self)
+                continue;
+        } else {
+            u64 mpidr = smp_get_mpidr(cpu);
+            u64 aff0 = mpidr & 0xff;
+
+            if (((mpidr >> 8) & 0xff) != aff1 ||
+                ((mpidr >> 16) & 0xff) != aff2 ||
+                ((mpidr >> 32) & 0xff) != aff3)
+                continue;
+            if (aff0 >= 16 || !(targets & (1u << aff0)))
+                continue;
+        }
+
+        /*
+         * smp_is_alive() means "came up through the spin table", which the boot
+         * CPU never does -- its flag is always clear.  Testing it alone
+         * therefore dropped every IPI aimed at the boot processor.
+         *
+         * That is not a lost tick, it is a hang: measured with Windows running
+         * nine cores, where seven sat inside an IPI handler with active=0x1
+         * forever while the initiator spun waiting for a rendezvous the boot
+         * CPU was never told to join.  hv_vgic.c already words this test as
+         * "cpu == boot_cpu_idx || smp_is_alive(cpu)" for the same reason.
+         */
+        if (cpu != self && cpu != boot_cpu_idx && !smp_is_alive(cpu))
+            continue;
+
+        struct hv_gic_cpuif *t = &gic_cpuif[cpu];
+        if (!t->valid)
+            continue;
+
+        __atomic_fetch_or(&t->pending, (u32)BIT(intid), __ATOMIC_ACQ_REL);
+
+        if (cpu == self)
+            hv_gic_cpuif_sync_vi();
+        else
+            smp_send_ipi(cpu);
+    }
+}
+
+/*
+ * Pend an architectural timer, unless the deadline being reported is the one
+ * inherited from firmware rather than one the guest asked for.  See the
+ * stale_cval_* fields for why that distinction is load-bearing.
+ */
+static void hv_gic_cpuif_timer_pend(bool physical)
+{
+    struct hv_gic_cpuif *s = hv_gic_cpuif_this();
+    if (s == NULL || !s->valid)
+        return;
+
+    bool *stale = physical ? &s->stale_p : &s->stale_v;
+
+    if (*stale) {
+        u64 armed = physical ? mrs(CNTP_CVAL_EL02) : mrs(CNTV_CVAL_EL02);
+        u64 residue = physical ? s->stale_cval_p : s->stale_cval_v;
+
+        if (armed == residue)
+            return;
+
+        *stale = false;
+    }
+
+    hv_gic_cpuif_set_pending(physical ? HV_VGIC_TIMER_P_INTID
+                                      : HV_VGIC_TIMER_V_INTID);
+}
+
+static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32],
+                                      bool probe)
+{
+    if (chip_id != T8142)
+        return false;
+
+    u64 cpu = smp_id();
+    if (cpu >= MAX_CPUS)
+        return false;
+
+    struct hv_gic_cpuif *s = &gic_cpuif[cpu];
+
+    if (!s->valid) {
+        /* Architectural reset values, so a read before any write is not a lie. */
+        s->pmr = 0;
+        s->bpr1 = 0;
+        s->igrpen0 = 0;
+        s->igrpen1 = 0;
+        s->ctlr = 0;
+        s->pending = 0;
+        s->active = 0;
+        s->running = 0xff;
+        s->valid = true;
+    }
+
+    switch (reg) {
+        case SYSREG_ISS(ICC_PMR_EL1):
+            if (is_read) {
+                regs[rt] = s->pmr;
+            } else {
+                s->pmr = regs[rt] & 0xff;
+                /* Lowering IRQL unmasks: re-evaluate before returning. */
+                if (!probe)
+                    hv_gic_cpuif_sync_vi();
+            }
+            break;
+
+        case SYSREG_ISS(ICC_BPR1_EL1):
+            if (is_read)
+                regs[rt] = s->bpr1;
+            else
+                s->bpr1 = regs[rt] & 0x7;
+            break;
+
+        case SYSREG_ISS(ICC_IGRPEN0_EL1):
+            if (is_read)
+                regs[rt] = s->igrpen0;
+            else
+                s->igrpen0 = regs[rt] & 1;
+            break;
+
+        case SYSREG_ISS(ICC_IGRPEN1_EL1):
+            if (is_read) {
+                regs[rt] = s->igrpen1;
+            } else {
+                u64 was = s->igrpen1;
+                s->igrpen1 = regs[rt] & 1;
+                /*
+                 * Only the first enable is treated as bring-up.  An OS may
+                 * toggle Group 1 around a critical section, and re-running the
+                 * reset below on such a toggle would discard an interrupt the
+                 * guest had already acknowledged but not yet completed.
+                 */
+                if (!probe && s->igrpen1 && !was && !gic_cpuif_brought_up[cpu]) {
+                    gic_cpuif_brought_up[cpu] = true;
+                    /*
+                     * The OS is initializing this CPU interface.  Anything
+                     * pending or active here predates it and belongs to
+                     * firmware, so start from the architectural reset state and
+                     * record the expired deadlines that must not be mistaken
+                     * for the guest's own.
+                     */
+                    __atomic_store_n(&s->pending, 0, __ATOMIC_RELEASE);
+                    s->active = 0;
+                    s->running = 0xff;
+                    s->stale_p = hv_timer_firing(mrs(CNTP_CTL_EL02));
+                    s->stale_v = hv_timer_firing(mrs(CNTV_CTL_EL02));
+                    s->stale_cval_p = mrs(CNTP_CVAL_EL02);
+                    s->stale_cval_v = mrs(CNTV_CVAL_EL02);
+
+                    printf("HV: T8142: guest enabled emulated GIC group 1 on CPU %d; "
+                           "timer PPIs %d/%d deliverable (inherited expiry p=%d v=%d)\n",
+                           (int)cpu, HV_VGIC_TIMER_P_INTID, HV_VGIC_TIMER_V_INTID,
+                           s->stale_p, s->stale_v);
+                }
+            }
+            break;
+
+        case SYSREG_ISS(ICC_SRE_EL1):
+            /*
+             * System-register access is the only interface we present; there
+             * is no MMIO CPU interface to fall back to.  SRE is therefore
+             * RAO/WI, which is exactly how a GICv3 with no memory-mapped
+             * interface behaves.
+             */
+            if (is_read)
+                regs[rt] = ICC_SRE_SRE | ICC_SRE_DFB | ICC_SRE_DIB;
+            break;
+
+        case SYSREG_ISS(ICC_CTLR_EL1):
+            if (is_read) {
+                /*
+                 * Report 5 priority bits and 16-bit INTIDs, and leave ExtRange
+                 * clear -- the kernel tests that bit before using extended
+                 * INTIDs, and the emulated distributor does not implement them.
+                 */
+                regs[rt] = (4UL << 8);
+            } else {
+                s->ctlr = regs[rt];
+            }
+            break;
+
+        case SYSREG_ISS(ICC_IAR1_EL1): {
+            if (!is_read)
+                break;
+
+            int selected = hv_gic_cpuif_select(s);
+            if (selected < 0) {
+                regs[rt] = GIC_SPURIOUS_INTID;
+                break;
+            }
+            u32 intid = (u32)selected;
+
+            /*
+             * Lowest INTID wins.  With one producer this is not a priority
+             * decision, it is just a deterministic order; see the note on
+             * hv_gic_cpuif_sync_vi() about priority not being modelled.
+             *
+             * A probe must not acknowledge: the pre-emptive image scan runs
+             * this decoder over every word of the guest's text to decide what
+             * to redirect, and consuming an interrupt while asking would drop
+             * it on the floor before the guest ever ran.
+             */
+            if (!probe) {
+                __atomic_fetch_and(&s->pending, ~((u32)BIT(intid)),
+                                   __ATOMIC_ACQ_REL);
+                s->active |= BIT(intid);
+                s->running = hv_gic_cpuif_priority(intid);
+                gic_cpuif_ack_count[cpu]++;
+                hv_gic_cpuif_sync_vi();
+                /*
+                 * First acknowledgement per core only.  The clock ticks
+                 * forever once it works; logging every one is what turned a
+                 * previous diagnostic into an 885k-line flood that stalled the
+                 * boot it was meant to observe.
+                 */
+                if (!gic_cpuif_acked[cpu]) {
+                    gic_cpuif_acked[cpu] = true;
+                    printf("HV: T8142: guest acknowledged emulated INTID %u on CPU %d "
+                           "from pc 0x%lx spsr 0x%lx\n",
+                           intid, (int)cpu, mrs(ELR_EL2), mrs(SPSR_EL2));
+                }
+            }
+            regs[rt] = intid;
+            break;
+        }
+
+        case SYSREG_ISS(ICC_HPPIR1_EL1): {
+            /* Same selection as IAR1, without acknowledging it. */
+            if (!is_read)
+                break;
+
+            int selected = hv_gic_cpuif_select(s);
+            regs[rt] = (selected >= 0) ? (u64)selected : GIC_SPURIOUS_INTID;
+            break;
+        }
+
+        case SYSREG_ISS(ICC_RPR_EL1):
+            /* Idle priority while nothing is active, otherwise the one value
+             * a single-producer interface can honestly report. */
+            if (is_read)
+                regs[rt] = s->running;
+            break;
+
+        case SYSREG_ISS(ICC_EOIR1_EL1):
+        case SYSREG_ISS(ICC_DIR_EL1): {
+            if (is_read)
+                break;
+
+            u32 intid = regs[rt] & 0xffffff;
+            if (intid < 32 && !probe) {
+                s->active &= ~BIT(intid);
+                s->running = 0xff;
+                gic_cpuif_eoi_count[cpu]++;
+                if (!gic_cpuif_eoi_logged[cpu]) {
+                    gic_cpuif_eoi_logged[cpu] = true;
+                    printf("HV: T8142: guest completed emulated INTID %u on CPU %d\n",
+                           intid, (int)cpu);
+                }
+                /*
+                 * Deliberately does not clear pending.  The GTDT declares both
+                 * timer GSIVs level-triggered, and the guest's own re-arm is
+                 * what drops the level -- hv_update_fiq() stops re-asserting
+                 * once CNTx_CTL.ISTATUS clears.  Dropping it here instead would
+                 * lose a tick whose deadline had already passed again.
+                 */
+                hv_gic_cpuif_sync_vi();
+            }
+            break;
+        }
+
+        case SYSREG_ISS(ICC_SGI1R_EL1):
+            if (!is_read && !probe)
+                hv_gic_cpuif_send_sgi(regs[rt]);
+            break;
+
+        default:
+            return false;
+    }
+
+    return true;
+}
+
+/*
+ * T8142 reports accesses to its absent architectural PMUv3 register bank as
+ * an EL1 undefined instruction instead of producing an MDCR_EL2 sysreg trap.
+ * Mu's exception vector therefore forwards the raw architectural system-
+ * register instruction through one generic HVC.  Decode the instruction here
+ * and feed it into the same EL2 PMU backend used for real ESR_EC_MSR traps.
+ * No PMU policy or Microsoft-image rewriting lives in firmware.
+ */
+/*
+ * `probe` asks only "would we service this instruction", and must not change
+ * anything while asking.  The image scan tests every word in the guest's text
+ * through this path, so a probe that took the write case would push a zero into
+ * emulated state hundreds of times before the guest ran at all.  Probing forces
+ * the read case: it answers the same membership question because that is
+ * decided by the register, not the direction.
+ */
+static bool hv_t8142_sysreg_assist_impl(u32 instruction, u64 input, u64 *output, bool probe)
+{
+    bool is_read;
+
+    switch (instruction & 0xffe00000U) {
+        case 0xd5200000U: /* MRS Xt, system-register */
+            is_read = true;
+            break;
+        case 0xd5000000U: /* MSR system-register, Xt */
+            is_read = false;
+            break;
+        default:
+            return false;
+    }
+
+    u64 reg = (((u64)(instruction >> 19) & 0x3) << ESR_ISS_MSR_OP0_SHIFT) |
+              (((u64)(instruction >> 5) & 0x7) << ESR_ISS_MSR_OP2_SHIFT) |
+              (((u64)(instruction >> 16) & 0x7) << ESR_ISS_MSR_OP1_SHIFT) |
+              (((u64)(instruction >> 12) & 0xf) << ESR_ISS_MSR_CRn_SHIFT) |
+              (((u64)(instruction >> 8) & 0xf) << ESR_ISS_MSR_CRm_SHIFT);
+    u64 rt = instruction & 0x1f;
+    u64 regs[32] = {0};
+
+    if (probe)
+        is_read = true;
+
+    regs[rt] = input;
+    /*
+     * Both absent register files go through here, so the pre-emptive image
+     * scan's "is this something we can service" predicate and the HVC handler
+     * that later services it are the same decision by construction.
+     */
+    if (!hv_handle_t8142_pmu(reg, is_read, rt, regs) &&
+        !hv_handle_t8142_gic_cpuif(reg, is_read, rt, regs, probe))
+        return false;
+
+    if (output)
+        *output = regs[rt];
+    return true;
+}
+
+bool hv_handle_t8142_sysreg_assist(u32 instruction, u64 input, u64 *output)
+{
+    return hv_t8142_sysreg_assist_impl(instruction, input, output, false);
+}
+
+/* Same decoder, asked without consequences -- see hv_t8142_sysreg_assist_impl. */
+static bool hv_t8142_insn_is_absent_reg(u32 instruction)
+{
+    return hv_t8142_sysreg_assist_impl(instruction, 0, NULL, true);
+}
+
+/*
+ * Recover a guest wedged on an access to a system register T8142 does not
+ * implement.
+ *
+ * T8142 has no architectural PMUv3 bank at all -- PMCR_EL0 and friends do not
+ * decode, measured from EL2 where nothing is trapping.  An access from EL1 is
+ * therefore an undefined instruction delivered straight to EL1, and EL2 gets
+ * no say: UNDEF is taken before MDCR_EL2.TPM can classify the access, so the
+ * trap we would need never happens.  The firmware-side assist in Mu's
+ * ArmExceptionLib covers this only while UEFI still owns VBAR_EL1.
+ *
+ * The Windows boot manager installs its own vectors and then runs an ungated
+ * PMUv3 init.  Its undefined-instruction vector captures ELR/SPSR/ESR and
+ * parks on a branch-to-self, which is a silent hang: no console output, no
+ * firmware fault dump, nothing on the panel.
+ *
+ * So recover after the fact.  A guest PC sitting on a branch-to-self is
+ * provably wedged -- that is the gate, and it is exact rather than heuristic.
+ * The faulting access is then emulated with the same backend the HVC path
+ * uses, and the guest's exception entry is unwound: resume at the instruction
+ * after the access, with the PSTATE the guest had before it faulted.
+ *
+ * This is safe here specifically because the vector entry is reached directly
+ * from the exception with no prologue, so it clobbers only x1/x2/x3 while
+ * capturing the fault state; the faulting instruction's destination register
+ * is untouched.  A guest whose handler saved and reused more state than that
+ * could not be resumed this way.
+ */
+/*
+ * AArch64 synchronous "current EL" vector slots.  Which one a fault uses
+ * depends on the stack pointer the guest is running on, i.e. PSTATE.SP: EL1t
+ * (SP_EL0) takes the 0x000 slot, EL1h (SP_ELx) takes 0x200.  This is not
+ * academic here -- the Windows boot manager runs EL1h and the NT kernel runs
+ * EL1t, so a redirect that assumed either one alone would silently do nothing
+ * for the other.
+ */
+#define HV_VECTOR_SYNC_CURRENT_SP0 0x000
+#define HV_VECTOR_SYNC_CURRENT_SPX 0x200
+#define HV_VECTOR_SYNC_SLOT(spsr)                                                                  \
+    (((spsr) & 1) ? HV_VECTOR_SYNC_CURRENT_SPX : HV_VECTOR_SYNC_CURRENT_SP0)
+/*
+ * Distinctive HVC immediate so the trampoline cannot be confused with Mu's
+ * "NTSRG" forwarding calls, which share the SMC/HVC service dispatcher.
+ */
+#define HV_T8142_UNDEF_HVC_IMM  0x4d31
+#define HV_T8142_UNDEF_HVC_INSN (0xd4000002U | (HV_T8142_UNDEF_HVC_IMM << 5))
+
+/*
+ * Every vector we have redirected, not just the most recent one.
+ *
+ * A guest moves between vector tables constantly -- the boot manager calls back
+ * into UEFI boot services, which run under the firmware's own VBAR, so the two
+ * alternate many times a second.  Redirecting only the table in use at the last
+ * observation means the other one is unprotected exactly when the guest returns
+ * to it, which reintroduces the hang it was meant to prevent.  The tables are
+ * independent memory, so simply keep them all redirected.
+ */
+#define HV_T8142_MAX_UNDEF_VECTORS 16
+
+static struct {
+    u64 va;       /* vbar + slot */
+    u32 orig;     /* instruction displaced there, if redirected */
+    bool refused; /* examined and left alone; orig is not meaningful */
+} t8142_undef_vec[HV_T8142_MAX_UNDEF_VECTORS];
+static u32 t8142_undef_vec_count;
+
+/*
+ * Emulate the undefined-instruction fault the guest is currently sitting in.
+ *
+ * Reads the guest's pending fault state via the _EL12 aliases (under E2H the
+ * plain _EL1 names would read m1n1's own registers), emulates the faulting
+ * system-register access with the same backend the HVC path uses, and unwinds
+ * the guest's exception entry so it resumes after the access with the PSTATE
+ * it had before faulting.
+ */
+static bool hv_emulate_t8142_pending_undef(struct exc_info *ctx, u32 *insn_out, u64 *pc_out)
+{
+    if (mrs(ESR_EL12) != 0x02000000) /* EC 0, "unknown reason" == UNDEF */
+        return false;
+
+    u64 fault_pc = mrs(ELR_EL12);
+    u64 insn_pa = hv_translate(fault_pc, false, false, NULL);
+    if (!insn_pa)
+        return false;
+
+    u32 insn = read32(insn_pa);
+    u64 rt = insn & 0x1f;
+    u64 out = 0;
+
+    if (!hv_handle_t8142_sysreg_assist(insn, rt < 31 ? ctx->regs[rt] : 0, &out))
+        return false;
+
+    if (((insn & 0xffe00000U) == 0xd5200000U) && rt < 31) /* MRS Xt, sysreg */
+        ctx->regs[rt] = out;
+
+    ctx->elr = fault_pc + 4;
+    ctx->spsr = mrs(SPSR_EL12);
+
+    if (insn_out)
+        *insn_out = insn;
+    if (pc_out)
+        *pc_out = fault_pc;
+    return true;
+}
+
+/*
+ * Point the guest's undefined-instruction vector at EL2.
+ *
+ * Recovering a wedged guest from the host tick proves the mechanism but runs at
+ * the tick rate: the Windows boot manager's cycle-counter calibration loop
+ * takes three PMCCNTR_EL0 reads per iteration, so at one recovery per tick it
+ * makes no useful progress.  Overwriting the first instruction of the guest's
+ * synchronous vector with an HVC turns every subsequent undefined-instruction
+ * fault into a direct EL2 trap: emulate, return, no parking and no tick
+ * dependency.
+ *
+ * It also removes the register damage the recovery path has to tolerate.  The
+ * guest's vector captures ELR/SPSR/ESR into x1/x2/x3 before halting; trapping
+ * on the vector's first instruction means that capture never runs, so the
+ * guest's registers reach us untouched.
+ */
+/*
+ * Reproduce the instruction our redirect displaced from a vector's first slot.
+ *
+ * Restoring the original and letting the guest re-run its own vector is not
+ * viable: it leaves the vector unredirected until the next tick, and an absent
+ * register touched inside that window reaches a handler with no answer for it.
+ * The NT kernel does not survive that -- it keeps its KPCR in SP_EL1 while
+ * running EL1t and recovers it in the vector's first instruction, so a fault
+ * that slips through leaves x18 holding garbage and every access through it
+ * aborts, recursively.
+ *
+ * So never unpatch: emulate the displaced instruction and continue into the
+ * rest of the guest's own vector. Only instructions handled here may be
+ * displaced in the first place -- see hv_can_displace_vector_insn().
+ *
+ * With `perform` false this only reports whether the instruction is one we can
+ * reproduce, so the same decoder gates patching and performs the replay and
+ * the two can never disagree.
+ */
+static bool hv_replay_vector_insn(struct exc_info *ctx, u64 vec_va, u32 insn, bool perform)
+{
+    u64 rt = insn & 0x1f;
+    u64 val;
+
+    /* B #imm26 -- vector slots commonly just branch to the real handler. */
+    if ((insn & 0xfc000000U) == 0x14000000U) {
+        if (perform) {
+            s64 off = ((s64)((u64)(insn & 0x03ffffffU) << 38)) >> 36;
+            ctx->elr = vec_va + off;
+        }
+        return true;
+    }
+
+    /* MRS Xt, <one of the exception-state registers a vector prologue reads> */
+    switch (insn & ~0x1fU) {
+        case 0xd5384020U: /* ELR_EL1  */
+        case 0xd5384000U: /* SPSR_EL1 */
+        case 0xd5385200U: /* ESR_EL1  */
+        case 0xd5384100U: /* SP_EL1   */
+            break;
+        default:
+            return false;
+    }
+
+    if (!perform) /* validation only; ctx is not available */
+        return true;
+
+    switch (insn & ~0x1fU) {
+        case 0xd5384020U:
+            val = mrs(ELR_EL12);
+            break;
+        case 0xd5384000U:
+            val = mrs(SPSR_EL12);
+            break;
+        case 0xd5385200U:
+            val = mrs(ESR_EL12);
+            break;
+        default: /* SP_EL1: the guest's own, captured on entry */
+            val = ctx->sp[1];
+            break;
+    }
+
+    if (rt < 31)
+        ctx->regs[rt] = val;
+    ctx->elr = vec_va + sizeof(u32);
+    return true;
+}
+
+static bool hv_can_displace_vector_insn(u32 insn)
+{
+    return hv_replay_vector_insn(NULL, 0, insn, false);
+}
+
+/*
+ * Publish an instruction written into guest memory to the guest's fetch path.
+ *
+ * "The word is at the right physical address" and "the guest executes it" are
+ * different claims, and the gap between them is not theoretical here: a
+ * redirect was observed sitting correctly at its physical address, re-read
+ * from EL2 on every tick for eighty seconds, while the guest kept executing
+ * the instruction it had replaced.
+ *
+ * So clean *and invalidate* to the point of coherency rather than only
+ * cleaning to the point of unification.  A clean alone publishes our store but
+ * leaves any copy the guest already holds from loading its image intact, and
+ * that copy is what the fetch returns.  The DSB after the instruction-cache
+ * invalidate is equally required: without it the ISB may retire before the
+ * invalidate has been observed.
+ */
+static void hv_write_guest_insn(u64 pa, u32 insn)
+{
+    write32(pa, insn);
+    sysop("dsb ish");
+    dc_civac(pa);
+    sysop("dsb ish");
+    ic_ialluis();
+    sysop("dsb ish");
+    sysop("isb");
+}
+
+static bool hv_patch_t8142_undef_vector(u64 spsr)
+{
+    u64 vbar = mrs(VBAR_EL12);
+    u64 slot = HV_VECTOR_SYNC_SLOT(spsr);
+
+    if (!vbar)
+        return false;
+
+    u64 va = vbar + slot;
+
+    /* Already decided about this one, either way; do not look at it again. */
+    for (u32 i = 0; i < t8142_undef_vec_count; i++)
+        if (t8142_undef_vec[i].va == va)
+            return !t8142_undef_vec[i].refused;
+
+    if (t8142_undef_vec_count >= HV_T8142_MAX_UNDEF_VECTORS)
+        return false;
+
+    /*
+     * Translate for read, not for write, even though we are about to write.
+     *
+     * A write translation asks whether the *guest* may write the page, which is
+     * the wrong question: a kernel's vector table sits in its read-only text
+     * mapping, so AT S1E1W fails there and the redirect is silently skipped --
+     * indistinguishable, from the log, from the redirect being installed and
+     * not working.  We do not write through the guest's stage-1 mapping at all;
+     * we resolve the address and store to the physical page through EL2's own,
+     * where the guest's permissions do not apply.
+     */
+    u64 pa = hv_translate(va, false, false, NULL);
+    if (!pa) {
+        /*
+         * Not necessarily an error: a guest may publish VBAR_EL1 before the
+         * page is mapped.  Rate-limited because it is retried on every table
+         * switch, and a boot manager alternates tables constantly.
+         */
+        static u64 untranslatable;
+
+        if (untranslatable < 4 || (untranslatable % 4096) == 0)
+            printf("HV: T8142: guest undef vector 0x%lx not translatable (#%ld)\n", va,
+                   untranslatable);
+        untranslatable++;
+        return false;
+    }
+
+    u32 orig = read32(pa);
+    if (orig == HV_T8142_UNDEF_HVC_INSN) /* somehow already ours; nothing to record */
+        return true;
+
+    /*
+     * Only displace an instruction we can reproduce exactly, since the redirect
+     * is permanent and every fault through this vector -- not just the ones we
+     * emulate -- has to continue into the guest's own handler correctly.
+     */
+    if (!hv_can_displace_vector_insn(orig)) {
+        /*
+         * Record the refusal rather than just reporting it.  This runs from the
+         * synchronous-exception path, so a decision that is not remembered is
+         * remade on every trap the guest takes -- a page-table walk, a guest
+         * read and a console write each time.  Firmware's own vector is the
+         * common case and it traps constantly, which is enough to bury the
+         * machine: leaving this uncached cost ~885k identical console lines and
+         * stalled the boot inside UEFI, before the boot manager was ever
+         * reached.  Firmware needs no redirect anyway -- it services these
+         * faults itself through the sysreg assist.
+         */
+        printf("HV: T8142: leaving guest undef vector 0x%lx alone, cannot replay 0x%08x\n", va,
+               orig);
+        t8142_undef_vec[t8142_undef_vec_count].va = va;
+        t8142_undef_vec[t8142_undef_vec_count].refused = true;
+        t8142_undef_vec_count++;
+        return false;
+    }
+
+    hv_write_guest_insn(pa, HV_T8142_UNDEF_HVC_INSN);
+
+    /*
+     * Read the write back.  "Logged as redirected" and "the guest executes our
+     * HVC" are different claims, and conflating them cost a full debugging
+     * cycle: the NT vector was reported redirected, then took 137 faults that
+     * all reached its own handler.  Report the address actually written so a
+     * translation that succeeds but resolves somewhere useless is visible.
+     */
+    u32 back = read32(pa);
+    if (back != HV_T8142_UNDEF_HVC_INSN) {
+        printf("HV: T8142: guest undef vector 0x%lx write did not stick at pa 0x%lx "
+               "(read back 0x%08x)\n",
+               va, pa, back);
+        return false;
+    }
+
+    t8142_undef_vec[t8142_undef_vec_count].va = va;
+    t8142_undef_vec[t8142_undef_vec_count].orig = orig;
+    t8142_undef_vec_count++;
+
+    printf("HV: T8142: guest undef vector 0x%lx (+0x%lx) redirected to EL2 at pa 0x%lx "
+           "(displaced 0x%08x)\n",
+           va, slot, pa, orig);
+    return true;
+}
+
+/*
+ * Re-assert every redirect we believe we own.
+ *
+ * A redirect is a write into guest memory, and the guest can invalidate it
+ * without touching VBAR_EL1: the NT kernel rebuilds its page tables during
+ * early initialization, so the same vector VA can resolve to a different
+ * physical page than the one we patched, and any guest may simply rewrite the
+ * page.  Tracking keyed on the VBAR value alone cannot see either -- it sees an
+ * address it has already handled and skips it, permanently.
+ *
+ * So re-translate and re-check each entry from the host tick.  This is bounded
+ * by the table size, runs at the tick rate rather than per trap, and self-heals
+ * regardless of which of those causes applied.
+ */
+void hv_verify_t8142_undef_vectors(void)
+{
+    if (chip_id != T8142)
+        return;
+
+    for (u32 i = 0; i < t8142_undef_vec_count; i++) {
+        if (t8142_undef_vec[i].refused)
+            continue;
+
+        u64 va = t8142_undef_vec[i].va;
+        u64 pa = hv_translate(va, false, false, NULL);
+        if (!pa)
+            continue; /* not mapped right now; nothing useful to do */
+
+        u32 cur = read32(pa);
+        if (cur == HV_T8142_UNDEF_HVC_INSN) {
+            /*
+             * The redirect is present in memory, which does not prove the
+             * guest fetches it.  Re-publishing costs one broadcast invalidate
+             * per tick and closes the case where the guest is holding a stale
+             * copy of the line -- the exact state observed when a redirect
+             * read back correctly while the guest ignored it.
+             */
+            sysop("dsb ish");
+            dc_civac(pa);
+            sysop("dsb ish");
+            ic_ialluis();
+            sysop("dsb ish");
+            sysop("isb");
+            continue;
+        }
+
+        /*
+         * The redirect is gone.  Whatever is there now is what a fault would
+         * run, so it -- not the instruction we displaced originally -- is what
+         * has to be replayable and recorded.
+         */
+        if (!hv_can_displace_vector_insn(cur)) {
+            printf("HV: T8142: redirect at 0x%lx lost, and 0x%08x cannot be replayed; "
+                   "dropping it\n",
+                   va, cur);
+            t8142_undef_vec[i] = t8142_undef_vec[--t8142_undef_vec_count];
+            i--;
+            continue;
+        }
+
+        hv_write_guest_insn(pa, HV_T8142_UNDEF_HVC_INSN);
+        if (read32(pa) != HV_T8142_UNDEF_HVC_INSN)
+            continue;
+
+        t8142_undef_vec[i].orig = cur;
+        printf("HV: T8142: redirect at 0x%lx reinstated at pa 0x%lx (displaced 0x%08x)\n", va, pa,
+               cur);
+    }
+}
+
+/* Put one guest vector back exactly as it was and stop tracking it. */
+static void hv_unpatch_t8142_undef_vector(u64 va)
+{
+    for (u32 i = 0; i < t8142_undef_vec_count; i++) {
+        if (t8142_undef_vec[i].va != va || t8142_undef_vec[i].refused)
+            continue;
+
+        u64 pa = hv_translate(va, false, true, NULL);
+        if (pa)
+            hv_write_guest_insn(pa, t8142_undef_vec[i].orig);
+
+        t8142_undef_vec[i] = t8142_undef_vec[--t8142_undef_vec_count];
+        return;
+    }
+}
+
+/*
+ * Redirect the offending access itself rather than the vector that catches it.
+ *
+ * Patching the vector is indirect: it depends on the guest's vector being
+ * replaceable, on the displaced instruction being reproducible, and on the
+ * guest actually fetching our write -- and the NT kernel defeated the last of
+ * those, executing its original vector for eighty seconds while the redirect
+ * sat verified at the right physical address.  Replacing the absent-register
+ * access itself removes all three dependencies: there is no exception, no
+ * vector, no displaced prologue to replay, and nothing to unwind.
+ *
+ * The cost is that each site has to fault once to be found, which the tick
+ * recovery already does.  Guests touch a small fixed set of these.
+ */
+#define HV_T8142_MAX_PMU_SITES 1024
+
+static struct {
+    u64 va;   /* guest VA of an absent-register access we replaced */
+    u32 orig; /* the access instruction itself */
+} t8142_pmu_site[HV_T8142_MAX_PMU_SITES];
+static u32 t8142_pmu_site_count;
+
+static bool hv_patch_t8142_pmu_site_quiet(u64 va, u32 insn, bool verbose)
+{
+    for (u32 i = 0; i < t8142_pmu_site_count; i++)
+        if (t8142_pmu_site[i].va == va)
+            return true;
+
+    if (t8142_pmu_site_count >= HV_T8142_MAX_PMU_SITES)
+        return false;
+
+    u64 pa = hv_translate(va, false, false, NULL);
+    if (!pa)
+        return false;
+
+    /* Only replace the exact instruction we decoded; anything else is not ours. */
+    if (read32(pa) != insn)
+        return false;
+
+    hv_write_guest_insn(pa, HV_T8142_UNDEF_HVC_INSN);
+    if (read32(pa) != HV_T8142_UNDEF_HVC_INSN)
+        return false;
+
+    t8142_pmu_site[t8142_pmu_site_count].va = va;
+    t8142_pmu_site[t8142_pmu_site_count].orig = insn;
+    t8142_pmu_site_count++;
+
+    if (verbose)
+        printf("HV: T8142: absent-register site 0x%lx (0x%08x) redirected to EL2 at pa 0x%lx\n", va,
+               insn, pa);
+    return true;
+}
+
+static bool hv_patch_t8142_pmu_site(u64 va, u32 insn)
+{
+    return hv_patch_t8142_pmu_site_quiet(va, insn, true);
+}
+
+/*
+ * Replace every absent-register access in a guest image before any of them runs.
+ *
+ * Discovering these lazily, one fault at a time, cannot work for the NT kernel:
+ * its undefined-instruction path ends in a bugcheck (bl; brk #0xf000; b .), so
+ * the first access to reach it is already fatal.  Recovering the guest from
+ * that park does not help either -- the kernel's own handler has run by then
+ * and overwritten the interrupted registers, so resuming past the faulting
+ * instruction lands in code whose live state is gone.  That is precisely how
+ * the first emulated PMCCNTR_EL0 read was immediately followed by a write
+ * through a destroyed base register.
+ *
+ * The only intervention that survives is one that happens before the first
+ * execution.  Walk back from a known address inside the image to its PE
+ * header, then replace the accesses in its executable sections.  The predicate
+ * is the emulator itself, so a site can never be replaced by something the HVC
+ * handler would then refuse.
+ */
+#define HV_PE_MAX_BACK_PAGES 16384
+#define HV_PE_SECTION_EXECUTE 0x20000000
+
+static bool hv_read_guest32(u64 va, u32 *out)
+{
+    u64 pa = hv_translate(va, false, false, NULL);
+
+    if (!pa)
+        return false;
+    *out = read32(pa);
+    return true;
+}
+
+static bool hv_read_guest64(u64 va, u64 *out)
+{
+    u32 lo, hi;
+
+    if (!hv_read_guest32(va, &lo) || !hv_read_guest32(va + 4, &hi))
+        return false;
+    *out = ((u64)hi << 32) | lo;
+    return true;
+}
+
+static u64 hv_find_guest_pe_base(u64 va)
+{
+    u64 page = va & ~0xfffUL;
+
+    for (u32 i = 0; i < HV_PE_MAX_BACK_PAGES; i++, page -= 0x1000) {
+        u32 mz, lfanew, sig;
+
+        /*
+         * Each iteration is a stage-1 walk plus a guest read, and the miss case
+         * runs all 16384 of them.  That case became reachable once individual
+         * driver images started being scanned on first fault, so pet the
+         * watchdog rather than rely on the walk staying short.
+         */
+        if ((i & 0xff) == 0)
+            hv_wdt_pet();
+
+        if (!hv_read_guest32(page, &mz) || (mz & 0xffff) != 0x5a4d) /* 'MZ' */
+            continue;
+        if (!hv_read_guest32(page + 0x3c, &lfanew) || lfanew < 0x40 || lfanew > 0x1000)
+            continue;
+        if (!hv_read_guest32(page + lfanew, &sig) || sig != 0x00004550) /* 'PE\0\0' */
+            continue;
+        return page;
+    }
+
+    return 0;
+}
+
+/*
+ * Base of the kernel image we scanned, kept so the bugcheck reporter below can
+ * find a global inside it.
+ */
+static u64 t8142_kernel_base;
+
+/*
+ * Decode an AArch64 PC-relative literal load.
+ *
+ * Needed because the scan rewrites instructions in place, and a *data* word
+ * that happens to decode as an absent-register access is indistinguishable
+ * from a real one when read in isolation.  Rewriting such a word does not
+ * redirect anything -- nothing executes it -- it silently replaces a constant
+ * the image will later load with the HVC encoding.
+ *
+ * This was checked offline for ntoskrnl when the scan only covered the kernel:
+ * zero of 535 candidates collided with a literal.  Sweeping 110 images extends
+ * the same rewrite to code that has had no such check, so the check moves here.
+ */
+static bool hv_insn_is_literal_load(u32 insn, u64 pc, u64 *target, u32 *size)
+{
+    u32 bytes;
+
+    switch (insn & 0xff000000) {
+        case 0x18000000: bytes = 4; break;  /* LDR   Wt, label      */
+        case 0x58000000: bytes = 8; break;  /* LDR   Xt, label      */
+        case 0x98000000: bytes = 4; break;  /* LDRSW Xt, label      */
+        case 0x1c000000: bytes = 4; break;  /* LDR   St, label      */
+        case 0x5c000000: bytes = 8; break;  /* LDR   Dt, label      */
+        case 0x9c000000: bytes = 16; break; /* LDR   Qt, label      */
+        default: return false;
+    }
+
+    s32 imm19 = (s32)((insn >> 5) & 0x7ffff);
+    if (imm19 & 0x40000)
+        imm19 |= ~0x7ffff; /* sign extend */
+
+    *target = pc + ((s64)imm19 * 4);
+    *size = bytes;
+    return true;
+}
+
+#define HV_PE_MAX_SECTION_CANDIDATES 1024
+
+static u64 scan_cand_va[HV_PE_MAX_SECTION_CANDIDATES];
+static u32 scan_cand_insn[HV_PE_MAX_SECTION_CANDIDATES];
+static bool scan_cand_is_data[HV_PE_MAX_SECTION_CANDIDATES];
+
+static void hv_scan_guest_image_absent_regs(u64 va_in_image)
+{
+    static u64 scanned[64];
+    static u32 scanned_count;
+
+    u64 base = hv_find_guest_pe_base(va_in_image);
+    if (!base)
+        return;
+
+    /*
+     * The first image scanned is the one the guest's vectors belong to, i.e.
+     * the kernel.  Later calls scan individual driver images, and must not
+     * retarget this: the bugcheck reporter resolves KiBugCheckData relative to
+     * it, and the vector gate uses it to mean "the kernel image is covered".
+     */
+    if (!t8142_kernel_base)
+        t8142_kernel_base = base;
+
+    for (u32 i = 0; i < scanned_count; i++)
+        if (scanned[i] == base)
+            return;
+    if (scanned_count < ARRAY_SIZE(scanned))
+        scanned[scanned_count++] = base;
+
+    u32 lfanew, coff, opt;
+    if (!hv_read_guest32(base + 0x3c, &lfanew))
+        return;
+
+    u64 nt = base + lfanew;
+    if (!hv_read_guest32(nt + 4, &coff) || !hv_read_guest32(nt + 20, &opt))
+        return;
+
+    u32 nsec = (coff >> 16) & 0xffff;
+    u64 sechdr = nt + 24 + (opt & 0xffff);
+    u32 words = 0, patched = 0, literals = 0, overflow = 0, cand_count = 0;
+
+    for (u32 s = 0; s < nsec && s < 64; s++) {
+        u64 h = sechdr + s * 40;
+        u32 vsz, rva, chars;
+
+        if (!hv_read_guest32(h + 8, &vsz) || !hv_read_guest32(h + 12, &rva) ||
+            !hv_read_guest32(h + 36, &chars))
+            continue;
+        if (!(chars & HV_PE_SECTION_EXECUTE) || !vsz)
+            continue;
+
+        u64 v = (base + rva) & ~3UL;
+        u64 end = base + rva + vsz;
+
+        while (v < end) {
+            u64 page_end = (v | 0xfffUL) + 1;
+            if (page_end > end)
+                page_end = end;
+
+            /* Several thousand pages with the guest stopped; do not let the
+             * watchdog conclude the hypervisor has hung. */
+            hv_wdt_pet();
+
+            u64 pa = hv_translate(v, false, false, NULL);
+            if (!pa) {
+                v = page_end;
+                continue;
+            }
+
+            for (; v + 3 < page_end; v += 4, pa += 4) {
+                u32 insn = read32(pa);
+
+                words++;
+                if (!hv_t8142_insn_is_absent_reg(insn))
+                    continue;
+                if (cand_count < HV_PE_MAX_SECTION_CANDIDATES) {
+                    scan_cand_va[cand_count] = v;
+                    scan_cand_insn[cand_count] = insn;
+                    scan_cand_is_data[cand_count] = false;
+                    cand_count++;
+                } else {
+                    overflow++;
+                }
+            }
+            v = page_end;
+        }
+
+        if (!cand_count)
+            continue;
+
+        /*
+         * Second pass, paid only by sections that actually contain candidates
+         * -- which is a handful of images out of the hundred-odd swept.  Any
+         * candidate that some instruction loads as a constant is data, not
+         * code, and must be left alone.
+         */
+        v = (base + rva) & ~3UL;
+        while (v < end) {
+            u64 page_end = (v | 0xfffUL) + 1;
+            if (page_end > end)
+                page_end = end;
+
+            hv_wdt_pet();
+
+            u64 pa = hv_translate(v, false, false, NULL);
+            if (!pa) {
+                v = page_end;
+                continue;
+            }
+
+            for (; v + 3 < page_end; v += 4, pa += 4) {
+                u64 target;
+                u32 bytes;
+
+                if (!hv_insn_is_literal_load(read32(pa), v, &target, &bytes))
+                    continue;
+
+                for (u32 i = 0; i < cand_count; i++) {
+                    if (scan_cand_va[i] >= target &&
+                        scan_cand_va[i] < target + bytes) {
+                        scan_cand_is_data[i] = true;
+                    }
+                }
+            }
+            v = page_end;
+        }
+
+        for (u32 i = 0; i < cand_count; i++) {
+            if (scan_cand_is_data[i]) {
+                literals++;
+                continue;
+            }
+            if (hv_patch_t8142_pmu_site_quiet(scan_cand_va[i],
+                                              scan_cand_insn[i], false))
+                patched++;
+        }
+        cand_count = 0;
+    }
+
+    if (literals || overflow)
+        printf("HV: T8142: image at 0x%lx: %ld candidate(s) left alone as literal data, "
+               "%ld unchecked past the cap\n",
+               base, (u64)literals, (u64)overflow);
+
+    printf("HV: T8142: image at 0x%lx: scanned %ld words, redirected %ld absent-register "
+           "accesses (%ld sites total)\n",
+           base, (u64)words, (u64)patched, (u64)t8142_pmu_site_count);
+}
+
+/*
+ * The guest executed our HVC where an absent-register access used to be.  No
+ * exception was taken, so there is no pending fault state to consult -- the
+ * instruction to emulate is the one we recorded when we replaced it, and
+ * ELR_EL2 already points past it.
+ */
+static bool hv_handle_t8142_pmu_site(struct exc_info *ctx)
+{
+    u64 site = ctx->elr - sizeof(u32);
+
+    for (u32 i = 0; i < t8142_pmu_site_count; i++) {
+        if (t8142_pmu_site[i].va != site)
+            continue;
+
+        u32 insn = t8142_pmu_site[i].orig;
+        u64 rt = insn & 0x1f;
+        u64 out = 0;
+
+        if (!hv_handle_t8142_sysreg_assist(insn, rt < 31 ? ctx->regs[rt] : 0, &out))
+            return false;
+
+        if (((insn & 0xffe00000U) == 0xd5200000U) && rt < 31) /* MRS Xt, sysreg */
+            ctx->regs[rt] = out;
+
+        static u64 site_emulated;
+
+        if (site_emulated < 8 || (site_emulated % 4096) == 0)
+            printf("HV: T8142: site emulated 0x%08x at 0x%lx (#%ld)\n", insn, site, site_emulated);
+        site_emulated++;
+        return true;
+    }
+
+    return false;
+}
+
+/*
+ * Service the redirected vector.  The guest took an undefined-instruction
+ * exception and its vector's first instruction is now our HVC, so the pending
+ * fault state is intact and no guest register has been disturbed.
+ */
+static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
+{
+    if (chip_id != T8142)
+        return false;
+    if ((ctx->esr & 0xffff) != HV_T8142_UNDEF_HVC_IMM)
+        return false;
+
+    /* A replaced access site is unambiguous and needs no fault state. */
+    if (hv_handle_t8142_pmu_site(ctx))
+        return true;
+
+    if (!t8142_undef_vec_count)
+        return false;
+
+    u32 insn = 0;
+    u64 fault_pc = 0;
+
+    if (hv_emulate_t8142_pending_undef(ctx, &insn, &fault_pc)) {
+        /*
+         * Rate-limited: this is the hot path once a guest spins on an absent
+         * register, so log enough to prove it is being serviced and to show
+         * the rate, without drowning the console.
+         */
+        static u64 emulated;
+
+        if (emulated < 8 || (emulated % 4096) == 0)
+            printf("HV: T8142: trampoline emulated 0x%08x at 0x%lx (#%ld)\n", insn, fault_pc,
+                   emulated);
+        emulated++;
+        return true;
+    }
+
+    /*
+     * Not an absent-register fault -- one of the guest's own exceptions
+     * arriving through a vector we redirected.  Reproduce the instruction we
+     * displaced and fall into the rest of the guest's handler, leaving the
+     * redirect in place so the next absent-register access is still caught.
+     *
+     * ELR_EL2 holds the address after our HVC, so the vector being serviced is
+     * the word before it; no need to guess which tracked entry this is.
+     */
+    u64 vec_va = ctx->elr - sizeof(u32);
+    u32 orig = 0;
+
+    for (u32 i = 0; i < t8142_undef_vec_count; i++)
+        if (t8142_undef_vec[i].va == vec_va && !t8142_undef_vec[i].refused)
+            orig = t8142_undef_vec[i].orig;
+
+    if (orig && hv_replay_vector_insn(ctx, vec_va, orig, true))
+        return true;
+
+    /*
+     * Should be unreachable: nothing is displaced unless it can be replayed.
+     * Fail safe by handing the vector back to the guest intact rather than
+     * resuming into a handler that is missing its first instruction.
+     */
+    printf("HV: T8142: trampoline lost vector 0x%lx (orig 0x%08x); restoring\n", vec_va, orig);
+    hv_unpatch_t8142_undef_vector(vec_va);
+    ctx->elr = vec_va;
+    return true;
+}
+
+/*
+ * Report the guest's bugcheck code once it has stopped making progress.
+ *
+ * A bugchecked NT kernel is silent: it writes nothing to the console we have,
+ * and its halt path is an infinite call to a branch-to-self stub, so from EL2
+ * it is indistinguishable from any other wedge.  The stop code is the one piece
+ * of information that says *why*, and the kernel has already written it to
+ * KiBugCheckData before halting -- five words holding the code and its four
+ * parameters.
+ *
+ * The offset is specific to the kernel build under test, recovered from its own
+ * KeBugCheckEx prologue (adrp x8, #0xdbb000 / add x19, x8, #0x9a0 / stp x8, x23,
+ * [x19]).  Wrong-but-mapped on another build, so this stays a diagnostic and
+ * nothing depends on the value.
+ */
+#define HV_NT_KIBUGCHECKDATA_RVA 0xdbb9a0
+
+static void hv_report_t8142_bugcheck(struct exc_info *ctx)
+{
+    static u64 prev_pc;
+    static u32 stuck;
+    static bool reported;
+
+    if (reported || !t8142_kernel_base)
+        return;
+
+    if (ctx->elr != prev_pc) {
+        prev_pc = ctx->elr;
+        stuck = 0;
+        return;
+    }
+    if (++stuck < 3) /* a few ticks at the same PC, not a momentary sample */
+        return;
+
+    u64 pa = hv_translate(t8142_kernel_base + HV_NT_KIBUGCHECKDATA_RVA, false, false, NULL);
+    if (!pa)
+        return;
+
+    u64 code = read64(pa);
+    if (!code) /* halted somewhere that is not a bugcheck */
+        return;
+
+    printf("HV: T8142: guest bugcheck 0x%lx (%lx, %lx, %lx, %lx) at pc 0x%lx (rva 0x%lx)\n", code,
+           read64(pa + 8), read64(pa + 16), read64(pa + 24), read64(pa + 32), ctx->elr,
+           ctx->elr - t8142_kernel_base);
+    reported = true;
+}
+
+bool hv_recover_t8142_sysreg_undef(struct exc_info *ctx)
+{
+    hv_report_t8142_bugcheck(ctx);
+
+    u32 insn = 0;
+    u64 fault_pc = 0;
+
+    if (chip_id != T8142)
+        return false;
+
+    /*
+     * Gate on the guest being demonstrably stuck, not merely on it being
+     * inside an exception: ESR_EL12 still reads the last fault long after a
+     * handler has dealt with it, so acting on that alone would corrupt a
+     * healthy guest.  A PC sitting on a branch-to-self is exact.
+     */
+    u64 pc_pa = hv_translate(ctx->elr, false, false, NULL);
+    if (!pc_pa || read32(pc_pa) != 0x14000000) /* B .   (branch to self) */
+        return false;
+
+    if (!hv_emulate_t8142_pending_undef(ctx, &insn, &fault_pc))
+        return false;
+
+    printf("HV: T8142: recovered guest from undefined sysreg access 0x%08x at 0x%lx\n", insn,
+           fault_pc);
+
+    /*
+     * Replace the access that faulted, so this site never reaches the guest's
+     * vector again.  This is the direct fix; the vector redirect below is the
+     * general one, and on a guest where it does not take effect this is what
+     * makes progress.
+     */
+    hv_patch_t8142_pmu_site(fault_pc, insn);
+
+    /*
+     * Patch the rest of whatever image that site lives in, too.
+     *
+     * The pre-emptive scan only covers the image the guest's vectors belong to,
+     * which for NT is ntoskrnl and nothing else.  A boot driver carrying its own
+     * absent-register access therefore arrives here unpatched, and fixing the
+     * single faulting instruction leaves every other one in that module waiting
+     * to do the same again -- each costing a recovery the guest may not survive.
+     *
+     * Doing it here rather than in the patcher is deliberate: this path only
+     * runs for a site the scan had not already replaced, so the expensive walk
+     * back to the PE header is paid once per module and never on the hot path.
+     * The scanner dedupes by image base, so a repeat is harmless.
+     */
+    if (fault_pc >= 0xffff000000000000UL)
+        hv_scan_guest_image_absent_regs(fault_pc);
+
+    /*
+     * Only reachable when the guest wedged before we had its vector, so take
+     * this chance to redirect it and make the tick-rate path unnecessary from
+     * here on.  Use the PSTATE the guest faulted in, not its current one: the
+     * exception put it on the handler's stack, which may not be the stack the
+     * faulting code was using.
+     */
+    hv_patch_t8142_undef_vector(mrs(SPSR_EL12));
+    return true;
+}
+
+/*
+ * Keep the redirect pointed at whatever vector the guest is currently using.
+ *
+ * A guest that faults in a loop rather than halting never trips the wedge
+ * detector, so waiting for a hang is not enough: the NT kernel installs its own
+ * vectors and then spins on PMCCNTR_EL0, faulting continuously without ever
+ * parking.  Re-evaluating each tick also covers the guest switching tables or
+ * stacks, which happens at every handoff -- firmware to boot manager to kernel.
+ */
+/*
+ * Scan every image the NT kernel has loaded, not just the one its vectors live
+ * in.
+ *
+ * The pre-emptive scan is keyed off VBAR, so it covers ntoskrnl and nothing
+ * else.  A boot driver carrying its own absent-register access is therefore
+ * still live, and on this SoC that is fatal rather than recoverable: measured
+ * as bugcheck 0x1E reporting instruction 0xd53b9d0b -- "mrs x11, PMCCNTR_EL0"
+ * -- at an address far below the ntoskrnl base.  There is no way to intercept
+ * it after the fact, because an absent-register UNDEF is delivered straight to
+ * EL1 and the one place it could have been caught, the guest's own vector,
+ * cannot be touched without causing 0x2B (see hv_track_t8142_undef_vector).
+ *
+ * So enumerate the images instead.  PsLoadedModuleList is an exported symbol
+ * whose RVA is read out of the very ntoskrnl this platform boots, the same way
+ * KiBugCheckData's was -- and reading both from the export directory
+ * reproduced the KiBugCheckData value already in use here, which is what
+ * makes the method trustworthy rather than a guess.
+ *
+ * The RVA is still specific to one kernel build, so it is not taken on faith:
+ * the first entry of that list is always ntoskrnl itself, and the walk is
+ * abandoned unless its DllBase is the kernel base already established
+ * independently.  A different build fails that check and simply gets no module
+ * scanning, rather than having arbitrary guest memory interpreted as a list.
+ */
+#define HV_NT_PSLOADEDMODULELIST_RVA 0xd6a7e0
+#define HV_NT_LDR_DLLBASE            0x30
+#define HV_NT_MAX_MODULES            256
+
+/*
+ * Find the other images the boot loader placed in kernel space, by looking for
+ * them rather than by asking the kernel.
+ *
+ * Asking was tried first and cannot work this early: PsLoadedModuleList reads
+ * as an empty list -- Flink 0 -- at the point the fault happens, because NT
+ * populates it well after HAL initialization.  The module that faults is
+ * already resident and already executing by then, so any list-based scheme is
+ * structurally too late for it.
+ *
+ * Windows images are 64K-aligned in kernel space, so a stride of that size over
+ * the region around the kernel finds every one of them.  Each candidate must
+ * present MZ, a sane e_lfanew and PE\0\0 before it is scanned, and the scanner
+ * only rewrites words inside executable sections, so a stale header left in
+ * memory costs a few reads and changes nothing.  Unmapped probes simply fail to
+ * translate.
+ *
+ * This is deliberately independent of any kernel build: no symbol, no RVA, no
+ * structure layout.  The measured driver sat about 110MB below the kernel base,
+ * hence a radius rather than a scan upward only.
+ */
+#define HV_PE_SWEEP_RADIUS (512UL << 20)
+#define HV_PE_SWEEP_STEP   0x10000UL
+
+static void hv_sweep_guest_images(u64 anchor)
+{
+    u64 lo = (anchor - HV_PE_SWEEP_RADIUS) & ~(HV_PE_SWEEP_STEP - 1);
+    u64 hi = anchor + HV_PE_SWEEP_RADIUS;
+    u32 probes = 0, found = 0;
+
+    for (u64 page = lo; page < hi; page += HV_PE_SWEEP_STEP, probes++) {
+        u32 mz, lfanew, sig;
+
+        if ((probes & 0xff) == 0)
+            hv_wdt_pet();
+
+        if (!hv_read_guest32(page, &mz) || (mz & 0xffff) != 0x5a4d)
+            continue;
+        if (!hv_read_guest32(page + 0x3c, &lfanew) || lfanew < 0x40 || lfanew > 0x1000)
+            continue;
+        if (!hv_read_guest32(page + lfanew, &sig) || sig != 0x00004550)
+            continue;
+
+        found++;
+        hv_scan_guest_image_absent_regs(page);
+    }
+
+    printf("HV: T8142: swept 0x%lx..0x%lx for guest images, found %u\n", lo, hi,
+           found);
+}
+
+static void hv_scan_guest_modules(void)
+{
+    if (chip_id != T8142 || !t8142_kernel_base)
+        return;
+
+    u64 head = t8142_kernel_base + HV_NT_PSLOADEDMODULELIST_RVA;
+    u64 entry;
+    static bool reported;
+
+    if (!hv_read_guest64(head, &entry) || !entry || entry == head) {
+        if (!reported) {
+            reported = true;
+            printf("HV: T8142: module list head 0x%lx unreadable or empty "
+                   "(flink 0x%lx)\n", head, entry);
+        }
+        return;
+    }
+
+    u64 first_base;
+    if (!hv_read_guest64(entry + HV_NT_LDR_DLLBASE, &first_base) ||
+        first_base != t8142_kernel_base) {
+        if (!reported) {
+            reported = true;
+            printf("HV: T8142: module list at 0x%lx rejected: first entry 0x%lx "
+                   "DllBase 0x%lx != kernel 0x%lx\n",
+                   head, entry, first_base, t8142_kernel_base);
+        }
+        return; /* not the list we think it is -- do nothing */
+    }
+
+    if (!reported) {
+        reported = true;
+        printf("HV: T8142: walking guest module list at 0x%lx\n", head);
+    }
+
+    for (u32 i = 0; i < HV_NT_MAX_MODULES && entry && entry != head; i++) {
+        u64 base;
+
+        hv_wdt_pet();
+
+        if (!hv_read_guest64(entry + HV_NT_LDR_DLLBASE, &base))
+            break;
+        if (base >= 0xffff000000000000UL)
+            hv_scan_guest_image_absent_regs(base);
+        if (!hv_read_guest64(entry, &entry)) /* InLoadOrderLinks.Flink */
+            break;
+    }
+}
+
+/*
+ * Report emulated interrupt traffic, but only when it changes.
+ *
+ * The per-CPU one-shot lines answer "did this ever work"; they cannot answer
+ * "is it still working", and that is the question that separates a regression
+ * in this delivery path from the guest waiting on a device m1n1 does not yet
+ * bridge.  A guest spinning on a lock looks identical either way from the
+ * outside.
+ *
+ * Printing only on change keeps a healthy system quiet -- and quiet is itself
+ * the signal, because a clock that has stopped stops moving these counters.
+ */
+/*
+ * Look for a bugcheck without needing the sampled CPU to be the one that took
+ * it.
+ *
+ * hv_report_t8142_bugcheck() requires the tick to land on a core parked at the
+ * same PC three times running.  That was fine while the guest was
+ * single-threaded, and is useless now: with two cores healthy and ticking at
+ * 1kHz, a bugcheck on any of the other seven never satisfies it.  KiBugCheckData
+ * is global, so read it directly instead.
+ */
+void hv_check_t8142_bugcheck(void)
+{
+    static bool reported;
+
+    if (chip_id != T8142 || reported || !t8142_kernel_base)
+        return;
+
+    u64 pa = hv_translate(t8142_kernel_base + HV_NT_KIBUGCHECKDATA_RVA, false,
+                          false, NULL);
+    if (!pa)
+        return;
+
+    u64 code = read64(pa);
+    if (!code)
+        return;
+
+    reported = true;
+    printf("HV: T8142: guest bugcheck 0x%lx (%lx, %lx, %lx, %lx) seen on tick\n",
+           code, read64(pa + 8), read64(pa + 16), read64(pa + 24),
+           read64(pa + 32));
+}
+
+void hv_report_t8142_gic_activity(void)
+{
+    static u32 last_ack[MAX_CPUS];
+    static u32 last_eoi[MAX_CPUS];
+    bool changed = false;
+
+    if (chip_id != T8142)
+        return;
+
+    for (u32 cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (gic_cpuif_ack_count[cpu] != last_ack[cpu] ||
+            gic_cpuif_eoi_count[cpu] != last_eoi[cpu]) {
+            changed = true;
+            break;
+        }
+    }
+
+    if (!changed)
+        return;
+
+    printf("HV: T8142: emulated IRQ traffic (ack/eoi):");
+    for (u32 cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (!gic_cpuif_ack_count[cpu] && !gic_cpuif_eoi_count[cpu])
+            continue;
+        printf(" cpu%d=%u/%u", (int)cpu, gic_cpuif_ack_count[cpu],
+               gic_cpuif_eoi_count[cpu]);
+        /*
+         * A core whose acknowledge count runs one ahead of its completions is
+         * sitting inside a handler it never finished, which also makes it deaf
+         * to everything after -- the active bit blocks further delivery.  Say
+         * which interrupt, because "stuck in the clock" and "stuck in an IPI"
+         * point at completely different faults.
+         */
+        if (gic_cpuif[cpu].active)
+            printf("(act=0x%x)", gic_cpuif[cpu].active);
+        last_ack[cpu] = gic_cpuif_ack_count[cpu];
+        last_eoi[cpu] = gic_cpuif_eoi_count[cpu];
+    }
+    printf("\n");
+}
+
+void hv_scan_t8142_guest_modules(void)
+{
+    hv_scan_guest_modules();
+}
+
+void hv_track_t8142_undef_vector(struct exc_info *ctx)
+{
+    UNUSED(ctx);
+
+    if (chip_id != T8142)
+        return;
+
+    /*
+     * This runs on every synchronous exception from the guest, so the common
+     * case -- the guest is using the same vector table it used last time -- has
+     * to cost a register read and a compare, nothing more.  Anything that walks
+     * page tables or touches guest memory per trap is far too expensive to sit
+     * here; that is a measured statement, not a precaution.
+     */
+    static u64 last_vbar = ~0UL;
+    u64 vbar = mrs(VBAR_EL12);
+
+    if (vbar == last_vbar)
+        return;
+    last_vbar = vbar;
+
+    /*
+     * A kernel-range vector base means the guest is no longer firmware, and
+     * firmware is the only guest that survives discovering these lazily -- it
+     * services the fault itself.  Scan the image the vectors belong to before
+     * it can execute an access we would then have to recover from.  Restricted
+     * to the kernel range deliberately: UEFI and the boot manager already work
+     * through the vector redirect, and this is a much larger intervention.
+     */
+    if (vbar >= 0xffff000000000000UL) {
+        hv_scan_guest_image_absent_regs(vbar);
+
+        /*
+         * If the scan owns this image, leave its vectors alone -- redirecting
+         * them is not merely redundant here, it is destructive.
+         *
+         * NT's table was disassembled to settle this.  Slot +0x000 is the live
+         * synchronous EL1t vector and begins "mrs x18, sp_el0"; that is the
+         * exact word m1n1 displaced, so every synchronous exception the kernel
+         * took was being diverted to EL2 instead of reaching NT's dispatcher.
+         * Slot +0x200 is not a handler at all -- NT never runs at EL1h, so it
+         * hard-wires that slot to "b" its PANIC_STACK_SWITCH path, which is
+         * bugcheck 0x2B, the one observed the moment a virtual IRQ was
+         * delivered.
+         *
+         * Slot +0x000 cannot be kept either, though it was tried: restoring
+         * it alone brought bugcheck 0x2B straight back.  The reason is that
+         * AArch64 sets PSTATE.SP on taking an exception, so NT's vector
+         * prologue runs at EL1h even though the kernel itself runs EL1t.  An
+         * HVC planted there therefore exits to EL2 from EL1h, and any virtual
+         * IRQ asserted across that exit is taken from EL1h -- straight into
+         * +0x280, the same hard-wired branch to PANIC_STACK_SWITCH.  The
+         * correlation is exact over four runs: both slots redirected gives
+         * 0x2B, neither gives 0x1E in an unscanned driver, +0x000 alone gives
+         * 0x2B again.
+         *
+         * Module coverage is therefore not this mechanism's job.  It belongs to
+         * hv_scan_guest_modules(), which enumerates the images the kernel has
+         * loaded and scans them outright -- no interception, and nothing
+         * written to a vector the guest depends on.
+         */
+        if (t8142_kernel_base) {
+            static bool swept;
+
+            if (!swept) {
+                swept = true;
+                hv_sweep_guest_images(t8142_kernel_base);
+            }
+            return;
+        }
+    }
+
+    /*
+     * Redirect both synchronous "current EL" slots, not just the one matching
+     * the guest's PSTATE right now: which slot a future fault uses depends on
+     * the stack mode it faults in, which we cannot know ahead of time.  The NT
+     * kernel runs EL1t and the boot manager EL1h, and either can take the
+     * fault we are here to intercept.
+     */
+    hv_patch_t8142_undef_vector(0); /* EL1t -> +0x000 */
+    hv_patch_t8142_undef_vector(1); /* EL1h -> +0x200 */
+}
+
 static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
 {
     u64 reg = iss & (ESR_ISS_MSR_OP0 | ESR_ISS_MSR_OP2 | ESR_ISS_MSR_OP1 | ESR_ISS_MSR_CRn |
@@ -1825,6 +3808,9 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
     u64 *regs = ctx->regs;
 
     regs[31] = 0;
+
+    if (hv_handle_t8142_pmu(reg, is_read, rt, regs))
+        return true;
 
     switch (reg) {
         SYSREG_PASS(SYS_IMP_APL_CORE_NRG_ACC_DAT);
@@ -2563,7 +4549,30 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         // docs/windows-native-aic.md.
         //
         SYSREG_PASS_DOORBELL(ID_AA64PFR1_EL1)
-        SYSREG_PASS_DOORBELL(ID_AA64DFR0_EL1)
+        //
+        // T8142 reports ID_AA64DFR0_EL1.PMUVer == 0b1111, the architectural
+        // encoding for "IMPLEMENTATION DEFINED performance monitors supported,
+        // PMUv3 NOT supported" (measured on J813: 0x000000f010305f0a).  The
+        // hardware is telling the truth; the danger is that 0b1111 is non-zero.
+        // A guest that tests PMUVer for non-zero rather than for the PMUv3
+        // range concludes PMUv3 exists and issues e.g. MRS Xt, PMCCNTR_EL0 --
+        // a register this core does not implement, so the core raises an EL1
+        // undefined instruction (ESR 0x02000000).  Linux special-cases 0b1111
+        // for exactly this reason; the Windows boot manager does not, and dies.
+        //
+        // EL2 cannot rescue that access.  The register is absent, so UNDEF is
+        // taken to EL1 before MDCR_EL2 can classify it -- there is no EL2 trap
+        // to extend.  The firmware assist in Mu's ArmExceptionLib only works
+        // while UEFI owns VBAR_EL1; once bootmgfw.efi installs its own vectors
+        // the same instruction lands in a handler that cannot emulate it and
+        // the boot hangs silently with no serial output and a blank panel.
+        //
+        // So do not advertise a PMU the guest must not touch: report PMUVer 0,
+        // "not implemented".  This is a truthful description of the PMUv3
+        // interface available to a guest here, and it keeps every Microsoft
+        // image untouched.  The IMP-DEF bank stays private to EL2 either way.
+        //
+        SYSREG_PASS_DOORBELL_CLR(ID_AA64DFR0_EL1, ID_AA64DFR0_PMUVER_MASK)
         SYSREG_PASS_DOORBELL(ID_AA64DFR1_EL1)
         SYSREG_PASS_DOORBELL(ID_AA64ISAR0_EL1)
         SYSREG_PASS_DOORBELL(ID_AA64ISAR1_EL1)
@@ -2777,6 +4786,19 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
 }
 
 static bool hv_handle_smc(struct exc_info *ctx) {
+    if (ctx->regs[0] == HV_SYSREG_ASSIST_CALL_MAGIC && chip_id == T8142) {
+        u64 output = 0;
+        bool handled = hv_handle_t8142_sysreg_assist((u32)ctx->regs[1], ctx->regs[2],
+                                                     &output);
+        if (handled && !t8142_sysreg_assist_logged) {
+            printf("HV: T8142: handled forwarded EL1 sysreg instruction 0x%08x at EL2\n",
+                   (u32)ctx->regs[1]);
+            t8142_sysreg_assist_logged = true;
+        }
+        ctx->regs[0] = handled;
+        ctx->regs[1] = output;
+        return true;
+    }
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     if (ctx->regs[0] == HV_TIMER_REFLECT_CALL_MAGIC &&
         (ctx->regs[1] == 17 || ctx->regs[1] == 18)) {
@@ -3000,6 +5022,17 @@ static void hv_exc_exit(struct exc_info *ctx)
             printf("HV: T8142: repaired truncated Mu SP_EL0 %#lx -> %#lx on CPU %u\n",
                    truncated_sp, ctx->sp[0], smp_id());
         }
+
+        /*
+         * Reaching this repair proves that Mu has installed VBAR_EL1, brought
+         * up its AIC timer path, and supplied a usable firmware stack.  Yield
+         * once so an opt-in host debugger can patch Mu's exception vectors
+         * before PartitionDxe or the Windows loader can wedge silently.
+         */
+        if (!t8142_sysreg_assist_ready_reported) {
+            t8142_sysreg_assist_ready_reported = true;
+            hv_exc_proxy(ctx, START_HV, HV_SYSREG_ASSIST_READY, NULL);
+        }
     }
 #endif
 
@@ -3016,6 +5049,19 @@ void hv_exc_sync(struct exc_info *ctx)
 #endif
     hv_wdt_breadcrumb('S');
     hv_get_context(ctx);
+
+    /*
+     * Keep the absent-register redirect current from here rather than only
+     * from the host tick.  A guest installs its vectors and then touches an
+     * absent register within microseconds -- the NT kernel reads PMCCNTR_EL0
+     * almost immediately after taking over -- so a once-per-second check loses
+     * that race and the first fault reaches a handler with no answer for it,
+     * which is fatal.  Synchronous traps are frequent enough (ID-register
+     * reads, PSCI, our own trampoline) to close the gap; the tick stays as a
+     * backstop for stretches with no traps at all.
+     */
+    hv_track_t8142_undef_vector(ctx);
+
     bool handled = false;
     u32 ec = FIELD_GET(ESR_EC, ctx->esr);
 
@@ -3030,6 +5076,21 @@ void hv_exc_sync(struct exc_info *ctx)
         case ESR_EC_SMC:
             hv_wdt_breadcrumb('s');
             handled = hv_handle_smc(ctx);
+            break;
+        case ESR_EC_HVC:
+            /*
+             * Mu uses an architectural HVC to forward EL1 system-register
+             * instructions that T8142 reports as undefined.  Keep the call
+             * ABI shared with the existing SMC/IMPDEF service dispatcher;
+             * hv_handle_smc() validates the magic before claiming the trap.
+             */
+            hv_wdt_breadcrumb('h');
+            /*
+             * The redirected T8142 undefined-instruction vector arrives here
+             * too; it carries its own immediate so it cannot be mistaken for a
+             * "NTSRG" forwarding call.
+             */
+            handled = hv_handle_t8142_undef_trampoline(ctx) || hv_handle_smc(ctx);
             break;
         case ESR_EC_IMPDEF:
             hv_wdt_breadcrumb('a');
@@ -3053,7 +5114,18 @@ void hv_exc_sync(struct exc_info *ctx)
 
     if (handled) {
         hv_wdt_breadcrumb('#');
-        ctx->elr += 4;
+        /*
+         * Trapped MRS/MSR/IMPDEF instructions leave ELR_EL2 pointing at the
+         * faulting instruction, so those handlers must advance by one A64
+         * instruction. HVC is different: the architecture records the
+         * preferred return address (the instruction after HVC) in ELR_EL2.
+         * Advancing it again skips the caller's first return instruction. In
+         * Mu's ArmHvcLib that instruction restores the saved argument pointer,
+         * so the double advance turned its following store into a write through
+         * stale x9 (observed as FAR 0x02000010 on J813).
+         */
+        if (ec != ESR_EC_HVC)
+            ctx->elr += 4;
         hv_set_elr(ctx->elr);
         /*
          * This return path is invisible to hv_rendezvous(): hv_cpus_in_guest is

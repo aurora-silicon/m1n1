@@ -39,6 +39,8 @@ int smp_cpu_count(void);
 u64 smp_get_release_addr(int cpu, bool from_adt);
 void smp_set_wfe_mode(bool new_mode);
 void smp_send_ipi(int cpu);
+int smp_secondary_prepare(void);
+void smp_secondary_mark_init_complete(int cpu);
 
 static inline int smp_id(void)
 {

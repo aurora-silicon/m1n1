@@ -7,8 +7,44 @@
 #include "gxf.h"
 #include "iodev.h"
 #include "memory.h"
+#include "soc.h"
 #include "uart.h"
 #include "utils.h"
+
+//
+// Acknowledge a latched L2C error, unless doing so would take the machine down.
+//
+// L2C_ERR_STS is write-1-to-clear (gated by L2C_ERR_STS_ENABLE_W1C), so writing
+// back a zero clears nothing and is pointless everywhere.
+//
+// On T8142 (Apple M5) the register reads fine but the WRITE traps, with ESR
+// EC=0 "unknown reason". This runs inside the exception printer, so the trap
+// re-enters the handler, prints the same registers, and traps again: an
+// unbreakable recursive fault that hides the original exception and wedges the
+// proxy.
+//
+// Guarding on `sts != 0` alone is not enough. That was the previous fix, and it
+// held only while every observed L2C_ERR_STS read back as zero. It failed the
+// first time a genuine bus error latched one: STS came up 0x200, the write went
+// through, and the machine died in exactly the recursive loop described above
+// (ESR 0x2000000, faulting insn d51bf813 = msr s3_3_c15_c8_0). What latched
+// that error was never established -- L2C_ERR_ADR pointed at 0x21195c000, which
+// is a pmgr reg tuple nothing had deliberately touched. So skip the write
+// entirely on this SoC rather than trying to predict when STS will be set.
+//
+// The cost is that a real L2C error stays latched on T8142. That is strictly
+// better than losing the fault report and the machine: the value is still
+// printed by the caller, which is the part with diagnostic worth.
+//
+static void l2c_err_sts_ack(u64 sts)
+{
+    if (!sts)
+        return;
+    if (chip_id == T8142)
+        return;
+
+    msr(SYS_IMP_APL_L2C_ERR_STS, sts);
+}
 
 #define EL0_STACK_SIZE 0x4000
 
@@ -280,29 +316,8 @@ void print_regs(u64 *regs, int el12)
     printf("L2C_ERR_STS: 0x%lx\n", sts);
     printf("L2C_ERR_ADR: 0x%lx\n", mrs(SYS_IMP_APL_L2C_ERR_ADR));
     printf("L2C_ERR_INF: 0x%lx\n", mrs(SYS_IMP_APL_L2C_ERR_INF));
-    //
-    // Only acknowledge if there is actually something to acknowledge.
-    //
-    // L2C_ERR_STS is write-1-to-clear (gated by L2C_ERR_STS_ENABLE_W1C), so
-    // writing back a zero clears nothing -- the write was pointless in that case
-    // even on hardware that tolerates it.
-    //
-    // On T8142 (Apple M5) it is worse than pointless: the register reads fine but
-    // the WRITE traps, with ESR EC=0 "unknown reason". Because this is the
-    // exception printer, that turns every single exception into an infinite
-    // recursive fault -- the handler dies partway through reporting, re-enters,
-    // prints the same registers, and dies again. The genuine fault is never
-    // displayed, and the machine resets.
-    //
-    // That masked the real cause of every crash on this SoC. The repeated
-    // identical dumps at this PC were the handler eating itself, not the bug.
-    //
-    // NOTE: if a real L2C error ever does set sts on T8142 we will trap here
-    // again and need a chip_id-specific skip. Every occurrence so far has read
-    // back 0.
-    //
-    if (sts)
-        msr(SYS_IMP_APL_L2C_ERR_STS, sts);
+    // See l2c_err_sts_ack(): skipped entirely on T8142, where the write traps.
+    l2c_err_sts_ack(sts);
 
     if (is_ecore()) {
         printf("E_LSU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_E_LSU_ERR_STS));
@@ -405,20 +420,8 @@ void exc_sync(u64 *regs)
     if (!(exc_guard & GUARD_SILENT))
         print_regs(regs, el12);
 
-    //
-    // Second occurrence of the T8142 L2C_ERR_STS hazard -- the one in
-    // print_regs() was fixed earlier, this one was missed.
-    //
-    // The register is write-1-to-clear, so writing back a zero clears nothing
-    // and the write is pointless anyway. On T8142 (Apple M5) it is worse: the
-    // read is fine but the WRITE traps. Doing it unconditionally here means
-    // every single exception faults again *inside the exception handler*, which
-    // recurses and takes the machine down -- which is why every fault on this
-    // chip ended as a bare "Exception: SYNC" followed by a dead proxy.
-    //
-    u64 l2c_err_sts = mrs(SYS_IMP_APL_L2C_ERR_STS);
-    if (l2c_err_sts)
-        msr(SYS_IMP_APL_L2C_ERR_STS, l2c_err_sts); // Clear the L2C_ERR flag bits
+    // Second occurrence of the T8142 L2C_ERR_STS hazard; see l2c_err_sts_ack().
+    l2c_err_sts_ack(mrs(SYS_IMP_APL_L2C_ERR_STS));
 
     switch (exc_guard & GUARD_TYPE_MASK) {
         case GUARD_SKIP:

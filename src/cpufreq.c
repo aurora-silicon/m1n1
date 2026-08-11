@@ -70,6 +70,7 @@ static u32 pstate_reg_to_pstate(u64 val)
         case T6031:
         case T6034:
         case T8122:
+        case T8142:
             return FIELD_GET(CLUSTER_PSTATE_DESIRED1, val);
         default:
             printf("cpufreq: Chip 0x%x is unsupported\n", chip_id);
@@ -111,6 +112,7 @@ static int set_pstate(const struct cluster_t *cluster, uint32_t pstate)
             case T6031:
             case T6034:
             case T8122:
+            case T8142:
                 val &= ~CLUSTER_PSTATE_DESIRED1;
                 val |= CLUSTER_PSTATE_SET | FIELD_PREP(CLUSTER_PSTATE_DESIRED1, pstate);
                 break;
@@ -208,6 +210,7 @@ int cpufreq_init_cluster(const struct cluster_t *cluster, const struct feat_t *f
         case T6031:
         case T6034:
         case T8122:
+        case T8142:
             /* Unknown */
             write64(cluster->base + 0x440f8, 1);
             break;
@@ -372,6 +375,34 @@ static const struct cluster_t t6030_clusters[] = {
     {},
 };
 
+//
+// T8142 (Apple M5, J813): two clusters, 6 E-cores + 4 P-cores.
+//
+// Bases confirmed on hardware, not assumed: CLUSTER_PSTATE (base + 0x20020)
+// reads 0x400102 at 0x210e20020 and 0x40010a at 0x211e20020. There is no third
+// cluster -- the ADT reports cluster_id 0 and 1 only, and probing a would-be
+// 0x212e00000 faults.
+//
+// The P-States come from the ADT OPP tables on /arm-io/pmgr:
+//
+//   voltage-states1-sram (ECPU, 8 states) : 972, 1152, 1584, 1992, 2352, 2700,
+//                                           2964, 3048 MHz @ 790..980 mV
+//   voltage-states5-sram (PCPU, 19 states): 1308 .. 4464 MHz @ 790..1125 mV
+//
+// default_pstate is deliberately the operating point Apple's own firmware hands
+// the machine over at -- ECPU pstate 2 (1152 MHz) and PCPU pstate 10 (3720 MHz),
+// read back from CLUSTER_PSTATE above. It is not the maximum. This SoC has no
+// MCC support and no cpufreq-driven thermal management in m1n1 yet, and J813 is
+// fanless, so pinning the P-cluster at pstate 19 (4464 MHz, 1125 mV) on the
+// strength of a table read is not something to do blind. Raising these is a
+// one-line change once there is thermal telemetry to justify it.
+//
+static const struct cluster_t t8142_clusters[] = {
+    {"ECPU0", 0x210e00000, false, 1, 2},
+    {"PCPU0", 0x211e00000, true, 1, 10},
+    {},
+};
+
 const struct cluster_t *cpufreq_get_clusters(void)
 {
     switch (chip_id) {
@@ -409,6 +440,8 @@ const struct cluster_t *cpufreq_get_clusters(void)
         case T6030:
         case T8122:
             return t6030_clusters;
+        case T8142:
+            return t8142_clusters;
         case T6031:
         case T6034:
             return t6031_clusters;
@@ -493,6 +526,32 @@ static const struct feat_t t6030_features[] = {
     {},
 };
 
+//
+// T8142 (Apple M5): deliberately empty.
+//
+// Every feature the older tables drive is gated on pmgr_get_feature(), which
+// just reads a same-named u32 property off /arm-io/pmgr. On J813 none of
+// ppt-thrtl, llc-thrtl, amx-thrtl, cpu-apsc or cpu-fixed-freq-pll-relock exist
+// -- all 70 pmgr properties were enumerated and not one of them is a *-thrtl.
+//
+// That is not an omission in the ADT, it is a generational change. T8142 instead
+// carries clpc, clpc-voter-agent-idx, ptd-dvfs-ceil-range, ptd-ranges, pmp with
+// function-pmp_control, perf-domains and energy-counters: peak-power throttling
+// and DVFS moved to the Closed Loop Performance Controller and the PMP.
+//
+// Borrowing t8122_features here would therefore not "enable throttling". Since
+// pmgr_get_feature() returns 0 for every absent name, cpufreq_init_cluster()
+// takes its else branch and *clears* BIT(63) at 0x48400, 0x48408, 0x40270 and
+// 0x40250 -- writing to four registers whose meaning on this SoC has never been
+// established, on the strength of a table inherited from a different chip.
+//
+// Do nothing until CLPC/PMP is understood. See the thermal work: m1n1 has no SMC
+// read path yet, so there is currently no way to observe the result either.
+//
+static const struct feat_t t8142_features[] = {
+    {},
+};
+
 const struct feat_t *cpufreq_get_features(void)
 {
     switch (chip_id) {
@@ -519,6 +578,8 @@ const struct feat_t *cpufreq_get_features(void)
             return t8112_features;
         case T8122:
             return t8122_features;
+        case T8142:
+            return t8142_features;
         case T6020:
         case T6021:
         case T6022:

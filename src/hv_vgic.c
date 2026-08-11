@@ -1571,6 +1571,29 @@ void hv_vgicv3_assign_redist_affinity_value(u16 cpu_num, bool last_cpu) {
 
 }
 
+/*
+ * CPUs that actually reached the spin table, counted exactly the way
+ * hv_vgicv3_init_redist_registers() decides to build a frame for one.
+ *
+ * The redistributor count has to describe the machine, not the ADT.  On T8142
+ * one secondary does not come up, so the ADT's ten CPUs yield nine live ones,
+ * and requiring parity turned that into a reboot before Mu ran a single
+ * instruction -- the panic below, which is what the T8142 "carrier resets the
+ * machine" deferral in hv.c was actually reporting.  Sizing to the live count
+ * keeps the carrier usable on a partially-started machine and returns to ten
+ * frames on its own once every core starts.
+ */
+static u16 hv_vgic_live_cpu_count(void)
+{
+    u16 live = 0;
+
+    for (u16 cpu = 0; cpu < MAX_CPUS; cpu++)
+        if (cpu == (u16)boot_cpu_idx || smp_is_alive(cpu))
+            live++;
+
+    return live;
+}
+
 void hv_vgicv3_init_redist_registers(void) {
     u16 frame = 0;
 
@@ -1598,8 +1621,16 @@ void hv_vgicv3_init_redist_registers(void) {
         //
         frame++;
     }
+    /*
+     * Not fatal.  A frame short of the ADT count means a core did not start,
+     * which is a CPU-bring-up defect to fix in smp.c -- not a reason to reboot
+     * the machine out from under firmware that has not run yet.  The guest
+     * stops walking at the frame whose GICR_TYPER carries Last, so it simply
+     * sees the cores that exist.
+     */
     if (frame != num_cpus)
-        panic("HV vGIC: initialized %u redistributors for %u ADT CPUs\n", frame, num_cpus);
+        printf("HV vGIC: %u redistributors for %u ADT CPUs -- %u core(s) never started\n", frame,
+               num_cpus, num_cpus - frame);
 }
 
 
@@ -1965,7 +1996,17 @@ void hv_vgicv3_init(void)
             dist_base = DIST_BASE_36_BIT;
             redist_base = REDIST_BASE_36_BIT;
             its_base = ITS_BASE_36_BIT;
-            num_cpus = (u16)smp_cpu_count();
+            /*
+             * Live cores, not ADT cores.  One M5 secondary does not currently
+             * start, and every use of num_cpus here -- the redistributor frame
+             * count, which frame carries GICR_TYPER.Last, and the size of the
+             * MMIO hook -- must describe frames that actually exist.  Sizing
+             * from the ADT instead publishes a frame with nothing behind it.
+             */
+            num_cpus = hv_vgic_live_cpu_count();
+            if (num_cpus != (u16)smp_cpu_count())
+                printf("HV vGIC: sizing carrier to %u live CPUs (ADT reports %d)\n", num_cpus,
+                       smp_cpu_count());
             break;
         // case T8010:
         // case T8015:

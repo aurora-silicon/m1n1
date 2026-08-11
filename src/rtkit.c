@@ -150,6 +150,60 @@ struct crashlog_entry {
     u8 payload[];
 };
 
+/* ADT integers are stored as either 4 or 8 bytes depending on the property. */
+static bool adt_getprop_uint(const void *adt_, int node, const char *name, u64 *out)
+{
+    u32 len = 0;
+    const void *val = adt_getprop(adt_, node, name, &len);
+
+    if (!val)
+        return false;
+
+    if (len == sizeof(u32))
+        *out = *(const u32 *)val;
+    else if (len == sizeof(u64))
+        *out = *(const u64 *)val;
+    else
+        return false;
+
+    return true;
+}
+
+/*
+ * An IOP that iBoot already loaded and started keeps its buffers in the
+ * carveout it was given, and asks the AP to bless them by address rather than
+ * requesting an allocation.  The ADT records that carveout on the IOP's RTBuddy
+ * nub child as region-base/region-size -- on J813, /arm-io/smc/iop-smc-nub
+ * declares 0x38de00000 + 0x120000, which is where the already-running SMC's
+ * oslog buffer at 0x38de71000 lives.  Without a window every such grant is
+ * refused and the handshake dies with "outside physical window".
+ *
+ * Adopt the nub's region as the default, so those grants are admitted but stay
+ * bounded to the memory the ADT gave that specific IOP.  Callers that stage
+ * their own region -- mtp_handoff.c -- call rtkit_set_phys_window() after
+ * rtkit_init() and override this.
+ */
+static void rtkit_adopt_nub_carveout(rtkit_dev_t *rtk, int iop_node)
+{
+    u64 base, size;
+
+    /* asc_get_iop_node() hands back the RTBuddy nub itself, not the ASC. */
+    if (iop_node < 0 || !adt_is_compatible(adt, iop_node, "iop-nub,rtbuddy-v2"))
+        return;
+
+    if (!adt_getprop_uint(adt, iop_node, "region-base", &base) ||
+        !adt_getprop_uint(adt, iop_node, "region-size", &size))
+        return;
+
+    if (!size || base > UINT64_MAX - size)
+        return;
+
+    rtk->phys_window_base = base;
+    rtk->phys_window_size = size;
+    rtkit_printf("adopted %s carveout as physical window (%#lx, %#zx)\n",
+                 adt_get_name(adt, iop_node), base, (size_t)size);
+}
+
 rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,
                         iova_domain_t *dart_iovad, sart_dev_t *sart, bool sram)
 {
@@ -189,6 +243,7 @@ rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,
 
     int iop_node = asc_get_iop_node(asc);
     ADT_GETPROP(adt, iop_node, "asc-dram-mask", &rtk->dva_base);
+    rtkit_adopt_nub_carveout(rtk, iop_node);
 
     return rtk;
 
