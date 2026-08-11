@@ -294,6 +294,16 @@ volatile u64 smp_start_fail_mask;
 volatile u64 smp_t8142_relay_addr;
 volatile u32 smp_t8142_relay_word;
 volatile u32 smp_t8142_impl_status[MAX_CPUS][2];
+// Where each core's cpu-impl-reg window lives, and the RVBAR word read out of
+// it before this image touched anything.  Kept because the host cannot obtain
+// either one: reading a stopped core's impl window over the proxy faults, and
+// the reply arrives as console text rather than data.
+volatile u64 smp_t8142_impl_addr[MAX_CPUS];
+volatile u64 smp_t8142_rvbar_pre[MAX_CPUS];
+// Impl status as this image first finds it, before it has released anything.
+// This is the measurement that separates "the candidate wedges cpu0" from
+// "cpu0 was already wedged when the candidate got here".
+volatile u32 smp_t8142_status_pre[MAX_CPUS][2];
 volatile u64 smp_cpu0_wake_attempts;
 volatile u64 smp_cpu_release_base;
 volatile u32 smp_t8142_misc_before[4];
@@ -1002,6 +1012,13 @@ void smp_start_secondaries(void)
             memcpy(cpu_impl_reg, &regs[index], 16);
         }
 
+        if (chip_id == T8142) {
+            smp_t8142_impl_addr[i] = cpu_impl_reg[0];
+            smp_t8142_rvbar_pre[i] = read64(cpu_impl_reg[0]);
+            smp_t8142_status_pre[i][0] = read32(cpu_impl_reg[0] + 0x100);
+            smp_t8142_status_pre[i][1] = read32(cpu_impl_reg[0] + 0x104);
+        }
+
         if (i == boot_cpu_idx) {
             // Check if already locked
             if (FIELD_GET(RVBAR_LOCK, read64(cpu_impl_reg[0])))
@@ -1056,6 +1073,40 @@ void smp_start_secondaries(void)
                 smp_wait_cpu(i);
         }
         smp_finish_cpu_start();
+    }
+
+    if (chip_id == T8142) {
+        // One line per core, printed once, after every start attempt has
+        // settled.  T8142_QUIET_SECONDARY silences the per-core progress
+        // messages because secondaries sharing the console wedged the machine,
+        // so without this the boot CPU reports nothing at all about who came
+        // up -- and the masks it does export lose concurrent updates
+        // (smp_reset_entered[] is the byte array that does not).
+        //
+        // rvbar is the raw cpu-impl-reg word: bit 0 is the lock, bits 47:12 the
+        // vector address.  A core still locked to the *resident* image's vector
+        // after a RAM chainload is the case the relay exists to cover.
+        dc_ivac_range((void *)smp_reset_entered, sizeof(smp_reset_entered));
+        printf("T8142 SMP: prepared 0x%lx started 0x%lx failed 0x%lx (vectors 0x%lx, relay "
+               "0x%lx=0x%08x)\n",
+               t8142_prepared_mask, smp_started_mask, smp_start_fail_mask, (u64)_vectors_start,
+               smp_t8142_relay_addr, smp_t8142_relay_word);
+
+        for (int i = 0; i < MAX_CPUS; i++) {
+            if (!smp_t8142_impl_addr[i])
+                continue;
+
+            u64 rvbar_now = read64(smp_t8142_impl_addr[i]);
+
+            printf("T8142 SMP:  cpu%d impl 0x%lx rvbar %s0x%lx -> %s0x%lx status "
+                   "0x%08x/0x%08x -> 0x%08x/0x%08x entered %d%s\n",
+                   i, smp_t8142_impl_addr[i], (smp_t8142_rvbar_pre[i] & RVBAR_LOCK) ? "L" : "u",
+                   smp_t8142_rvbar_pre[i] & RVBAR_ADDR, (rvbar_now & RVBAR_LOCK) ? "L" : "u",
+                   rvbar_now & RVBAR_ADDR, smp_t8142_status_pre[i][0], smp_t8142_status_pre[i][1],
+                   read32(smp_t8142_impl_addr[i] + 0x100),
+                   read32(smp_t8142_impl_addr[i] + 0x104), smp_reset_entered[i],
+                   i == boot_cpu_idx ? " (boot)" : "");
+        }
     }
 }
 
