@@ -25,6 +25,32 @@ from m1n1 import asm
 
 new_base = u.base
 
+# Every T8142 secondary must reach the candidate cold, because the candidate
+# can only release a cold core.  A core wedged during the handover is
+# unrecoverable and silently costs the guest a CPU -- and when the guest's MADT
+# still advertises it, Windows asks for it, gets a refusal and resets.  That is
+# a long way downstream of the cause, so assert the invariant here instead.
+#
+# Use read32, not readmem: a bulk transfer against this device-memory window
+# faults and desyncs the UART, while single-register reads are fine.
+T8142_CPU_IMPL = [0x210050000 + n * 0x100000 for n in range(6)] + \
+                 [0x211050000 + n * 0x100000 for n in range(4)]
+
+def check_secondaries_cold_before_handover():
+    if u.adt["/chosen"].chip_id != 0x8142:
+        return
+    bad = []
+    for n, base in enumerate(T8142_CPU_IMPL):
+        lo, hi = p.read32(base + 0x100), p.read32(base + 0x104)
+        state = (hi >> 8) & 0xff
+        if state in (0x40, 0x80):  # cold, or the running boot CPU
+            continue
+        bad.append(f"cpu{n} {lo:#010x}/{hi:#010x}")
+    if bad:
+        print("WARNING: T8142 secondaries wedged before handover, the guest "
+              "will be short a CPU: " + "; ".join(bad))
+
+
 if args.raw:
     image = args.payload.read_bytes()
     image += b"\x00\x00\x00\x00"
@@ -94,6 +120,7 @@ if args.xnu:
             if hasattr(nub, "segment_names"):
                 remove_oslog(nub)
 
+
 rvbar = entry & ~0xfff
 if rvbar != u.base:
     print("Setting secondary CPU RVBARs...")
@@ -102,20 +129,29 @@ if rvbar != u.base:
         if cpu.state == "running":
             continue
 
-        # T8142 has asymmetric 6E+4P clusters.  The cluster-1 cpu-impl-reg
-        # window faults when accessed from the installed proxy, while the
-        # replacement m1n1 currently starts only cpu1 and cpu2 (cpu0 is a
-        # known-bad secondary and the remaining cores are capped in smp.c).
-        # Redirect exactly the secondaries that the replacement image will
-        # start; skipping every T8142 RVBAR leaves those cores pointing into
-        # the resident image, while touching cpu7+ raises an SError.
-        if u.adt["/chosen"].chip_id == 0x8142:
-            if args.t8142_rvbar_mode == "skip":
-                print(f"  {cpu.name}: RVBAR write skipped by T8142 policy")
-                continue
-            if args.t8142_rvbar_mode == "auto" and cpu.cpu_id not in (1, 2):
-                print(f"  {cpu.name}: not used by the T8142 chainload SMP set")
-                continue
+        # T8142: never write a secondary RVBAR from the host.
+        #
+        # Measured on J813 by probing every core's impl status around each step
+        # of this script: a single p.write64 to *cpu1's* cpu-impl-reg window
+        # wedges *cpu0*.  It goes from cold (+0x104 bits[15:8] == 0x40) to 0x10,
+        # a third state that is neither cold nor running (0x80), and no later
+        # release, stop or cluster trigger recovers it.  cpu1 itself stays cold.
+        #
+        # These writes are not per-core on this SoC.  Only cpu1 and cpu2 were
+        # ever written, yet afterwards all ten cores read RVBAR locked to the
+        # value written -- including cluster 1, which the loop never touched.
+        #
+        # Skipping them costs nothing.  Each secondary then reaches the
+        # candidate with RVBAR still locked to the resident image's vectors,
+        # which is precisely the case smp.c's t8142_prepare_locked_rvbar_relay()
+        # exists to handle -- and that relay is already proven in the field:
+        # with these writes present, eight of nine secondaries came up through
+        # it and only cpu0, the one they had wedged, did not.
+        #
+        # "all" remains as an escape hatch for bisecting this again.
+        if u.adt["/chosen"].chip_id == 0x8142 and args.t8142_rvbar_mode != "all":
+            print(f"  {cpu.name}: RVBAR write skipped (host writes wedge cpu0 on T8142)")
+            continue
 
         addr, size = cpu.cpu_impl_reg
         print(f"  {cpu.name}: [0x{addr:x}] = 0x{rvbar:x}")
@@ -191,6 +227,7 @@ if args.call:
     print(f"Jumping to stub at 0x{stub.addr:x}")
     p.call(stub.addr, new_base + bootargs_off, image_addr, new_base, image_size, reboot=True)
 else:
+    check_secondaries_cold_before_handover()
     print(f"Reloading into stub at 0x{stub.addr:x}")
     p.reload(stub.addr, new_base + bootargs_off, image_addr, new_base, image_size)
 
