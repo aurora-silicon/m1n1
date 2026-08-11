@@ -21,6 +21,7 @@
 #include "hv.h"
 #include "hv_vgic.h"
 #include "assert.h"
+#include "hv_aic_alias.h"
 #include "cpu_regs.h"
 #include "display.h"
 #include "memory.h"
@@ -416,8 +417,9 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
                     value_ic_enabler |= BIT(i);      
                     irq_num = (32 * reg_num) + i;
 
-                    aic_set_mask(irq_num, false);
-                    vgic_log("HV vGIC DEBUG [Info] [AIC]: unmasking irq %d\n", irq_num);
+                    aic_set_mask(hv_aic_alias_to_physical(irq_num), false);
+                    vgic_log("HV vGIC DEBUG [Info] [AIC]: unmasking irq %d (physical %d)\n",
+                             irq_num, hv_aic_alias_to_physical(irq_num));
                 }
             }
             if(reg_num == 0) {
@@ -455,8 +457,9 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
                     value_ic_enabler &= ~BIT(i);      
                     irq_num = (32 * reg_num) + i;
 
-                    aic_set_mask(irq_num, false);
-                    vgic_log("HV vGIC DEBUG [Info] [AIC]: masking irq %d\n", irq_num);
+                    aic_set_mask(hv_aic_alias_to_physical(irq_num), false);
+                    vgic_log("HV vGIC DEBUG [Info] [AIC]: masking irq %d (physical %d)\n",
+                             irq_num, hv_aic_alias_to_physical(irq_num));
                 }
             }
             if(reg_num == 0) {

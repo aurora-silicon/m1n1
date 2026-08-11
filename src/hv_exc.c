@@ -12,6 +12,7 @@
 #include "hv_vgic.h"
 #include "aic.h"
 #include "aic_regs.h"
+#include "hv_aic_alias.h"
 #include "adt.h"
 
 #define TIME_ACCOUNTING
@@ -5867,7 +5868,10 @@ void hv_exc_irq(struct exc_info *ctx)
                     u64 intd = (lr_val >> ICH_LR_VIRTUAL_SHIFT) & ICH_LR_VIRTUAL_MASK;
                     hv_vgic3_write_lr(lr, 0);
                     if(intd > 31)
-                        aic_set_mask(intd, false);//TODO: check distributor
+                        //TODO: check distributor
+                        //`intd` came out of a list register, so it is a guest
+                        //INTID; aic_set_mask() wants the physical line.
+                        aic_set_mask(hv_aic_alias_to_physical(intd), false);
                 }
             }
         }
@@ -5933,11 +5937,20 @@ void hv_exc_irq(struct exc_info *ctx)
         return;
     }
 
+    /*
+     * Everything below this point is guest-facing: list registers and the vGIC
+     * distributor are indexed by guest INTID, not by AIC line.  Translate the
+     * physical line once here.  This is the identity unless an alias covers it,
+     * so every platform without one is byte-for-byte unchanged; see
+     * hv_aic_alias.h for why J813's MTP line needs one.
+     */
+    u32 guest_irq = hv_aic_alias_to_published(irq);
+
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     if (hv_native_aic_windows_active() && !hv_native_aic_windows_ready()) {
         virq_t pending = {
-            .vintid = irq,
-            .priority = hv_vgic3_get_priority(irq),
+            .vintid = guest_irq,
+            .priority = hv_vgic3_get_priority(guest_irq),
             .active = false,
             .pending = true,
             .hw_status = false,
@@ -5946,6 +5959,7 @@ void hv_exc_irq(struct exc_info *ctx)
         virq_queue_push(&PERCPU(irq_queue), &pending);
         if ((ctx->regs[18] == 0 || !PERCPU(carrier_stack_ready)) &&
             !PERCPU(carrier_stack_defer_logged)) {
+            /* Trace the physical line: this records a hardware event. */
             hv_native_aic_trace_record(HV_NATIVE_AIC_TRACE_CARRIER_DEFER,
                                        irq, ctx->regs[18]);
             PERCPU(carrier_stack_defer_logged) = true;
@@ -5955,18 +5969,18 @@ void hv_exc_irq(struct exc_info *ctx)
 #endif
     if(hv_vgic3_get_free_lr() != -1){
         hv_vgic3_inject_irq(
-            irq,                         //vintid
-            hv_vgic3_get_priority(irq),  //priority
-            false,                       //active
-            true,                        //pending
-            false,                       //hw_status
-            0                            //hw_irq
+            guest_irq,                         //vintid
+            hv_vgic3_get_priority(guest_irq),  //priority
+            false,                             //active
+            true,                              //pending
+            false,                             //hw_status
+            0                                  //hw_irq
         );
     }
     else{
         virq_t pending = {
-            .vintid = irq,
-            .priority = hv_vgic3_get_priority(irq),
+            .vintid = guest_irq,
+            .priority = hv_vgic3_get_priority(guest_irq),
             .active = false,
             .pending = true,
             .hw_status = false,
