@@ -90,6 +90,33 @@ static const display_config_t display_config_m2_pro_max = {
     .dptx_phy = "/arm-io/lpdptx-phy0",
 };
 
+/*
+ * J813 MacBook Air (T8142/M5), internal panel.
+ *
+ * Every path here was read back off the live ADT rather than inferred from an
+ * older machine, because the naming is not the same. The DART and DCP nodes
+ * happen to match the M1 layout -- /arm-io/dcp, dart-dcp, dart-disp0 all exist
+ * -- but the pmgr device does not: T8142 names it DISP_CPU, where every earlier
+ * table says DISP0_CPU0. Falling back to display_config_m1, which is what
+ * happened before this entry existed, therefore resolved three paths correctly
+ * and then looked up a power device that is not there.
+ *
+ * Known risk, not yet settled: /arm-io/dcp is "iop,ascwrap-v6", newer than the
+ * v4-era wrapper m1n1's DCP/RTKit stack was written against, and disp0 reports
+ * "disp0,t8142". Whether dcp_iboot's protocol still applies on this generation
+ * is exactly what enabling this is meant to find out.
+ */
+#if 0 /* not wired up: display_configure() hangs on T8142 -- see display_init() */
+static const display_config_t display_config_m5_internal = {
+    .dcp = "/arm-io/dcp",
+    .dcp_dart = "/arm-io/dart-dcp",
+    .disp_dart = "/arm-io/dart-disp0",
+    .pmgr_dev = "DISP_CPU",
+    .dcp_alias = "dcp",
+    .dcp_index = 0,
+};
+#endif
+
 /* J414s MacBook Pro uses the internal T6020 display pipeline. */
 static const display_config_t display_config_m2_pro_internal = {
     .dcp = "/arm-io/dcp0",
@@ -660,6 +687,38 @@ int display_init(void)
         chip_id != S5L8960X) {
         printf("display: Dummy framebuffer found, initializing display\n");
         return display_configure(NULL);
+        /*
+         * T8142/J813 needs a BGRA handoff here and cannot have one yet.
+         *
+         * iBoot hands the internal panel over as a 30 bpp X2R10G10B10 surface
+         * -- boot args report depth 30bpp, stride 0x2800 for 2560x1664, i.e.
+         * four bytes a pixel holding thirty bits of colour. Mu advertises that
+         * through the GOP as a 10-bit PixelBitMask, and Windows' BasicDisplay
+         * only drives 32-bit BGRA, so it declines the framebuffer and renders
+         * nothing. Measured, not inferred: Windows Setup runs to completion
+         * behind a black panel, seventeen processes deep, setup.exe /
+         * SetupHost.exe / vds.exe all alive. The installer works; it has
+         * nowhere to draw.
+         *
+         * The J414s branch below is the right shape of fix, and calling
+         * display_configure() here was tried. It hangs. Stage B produced no
+         * output at all and USB never re-enumerated -- which looks like a dead
+         * chainload but is not: display_init() runs before USB init, and the
+         * UART is the USB serial, so a hang here swallows the whole stage's
+         * buffered output. Reproduced twice, identically.
+         *
+         * What is already established, so the next attempt need not redo it
+         * (all read off the live ADT):
+         *   /arm-io/dcp, /arm-io/dart-dcp, /arm-io/dart-disp0   all present
+         *   pmgr device is DISP_CPU, not DISP0_CPU0 as every older table says
+         *   /arm-io/dcp is "iop,ascwrap-v6"; disp0 is "disp0,t8142"
+         *   root compatible is J813AP / Mac17,3 -- but adt_is_compatible()
+         *     does NOT match it from the chainloaded stage, so gate on chip_id
+         *
+         * ascwrap-v6 is the prime suspect: m1n1's DCP/RTKit stack targets the
+         * v4-era wrapper. That is the piece to establish before re-enabling
+         * this, and display_config_m5_internal above is already correct for it.
+         */
     } else if (adt_is_compatible(adt, 0, "J414sAP")) {
         /*
          * iBoot leaves the internal panel on a w30r framebuffer.  Convert it

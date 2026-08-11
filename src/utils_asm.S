@@ -172,3 +172,80 @@ _deep_wfi_helper:
     ldp x30, x0, [sp], #16
 
     ret
+
+/*
+ * Waits that do not trust the general-purpose register file to survive them.
+ *
+ * T8142 gives m1n1 no way to select a state-retaining wait mode -- writing
+ * SYS_IMP_APL_CYC_OVRD takes an undefined instruction exception -- so a core can
+ * come back from a wait with the register file cleared.  That is not
+ * hypothetical: it is what destroys the guest's x26 across HalProcessorIdle
+ * (bugcheck 0xA), and m1n1's own C code is exposed to the same thing wherever it
+ * waits, because the compiler keeps live values in x19-x28 across the
+ * instruction.
+ *
+ * Both routines spill the whole callee-saved set to their own frame and reload
+ * it afterwards, so a caller sees an ordinary AAPCS call whatever the hardware
+ * does.  SP and memory do survive -- the Windows idle path's own post-wait
+ * reload of x29/x30 from its stack is what lets it return at all.
+ *
+ * cpu_wfe_stateless() additionally reports the fact: it leaves a canary in x19
+ * across the wait and returns 1 if it did not come back.
+ */
+.globl cpu_wfi_stateless
+.type cpu_wfi_stateless, @function
+cpu_wfi_stateless:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+
+    dsb sy
+    isb
+    wfi
+    isb
+
+    ldp x19, x20, [sp, #16]
+    ldp x21, x22, [sp, #32]
+    ldp x23, x24, [sp, #48]
+    ldp x25, x26, [sp, #64]
+    ldp x27, x28, [sp, #80]
+    ldp x29, x30, [sp], #96
+
+    ret
+
+.globl cpu_wfe_stateless
+.type cpu_wfe_stateless, @function
+cpu_wfe_stateless:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+
+    movz x19, #0x5a5a, lsl #48
+    movk x19, #0xa5a5, lsl #32
+
+    dsb sy
+    isb
+    wfe
+    isb
+
+    movz x1, #0x5a5a, lsl #48
+    movk x1, #0xa5a5, lsl #32
+    cmp x19, x1
+    cset x0, ne
+
+    ldp x19, x20, [sp, #16]
+    ldp x21, x22, [sp, #32]
+    ldp x23, x24, [sp, #48]
+    ldp x25, x26, [sp, #64]
+    ldp x27, x28, [sp, #80]
+    ldp x29, x30, [sp], #96
+
+    ret

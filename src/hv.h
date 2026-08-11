@@ -125,6 +125,7 @@ bool hv_switch_cpu(int cpu);
 void hv_pin_cpu(int cpu);
 u64 hv_host_counter(void);
 void hv_arm_tick(bool secondary);
+void hv_arm_wfi_wake(void);
 bool hv_mask_pending_tick(void);
 void hv_rearm(void);
 void hv_maybe_exit(void);
@@ -134,6 +135,7 @@ bool hv_recover_t8142_sysreg_undef(struct exc_info *ctx);
 void hv_track_t8142_undef_vector(struct exc_info *ctx);
 void hv_verify_t8142_undef_vectors(void);
 void hv_scan_t8142_guest_modules(void);
+void hv_report_t8142_process(struct exc_info *ctx);
 void hv_report_t8142_gic_activity(void);
 void hv_check_t8142_bugcheck(void);
 

@@ -19,6 +19,27 @@
 
 #define HV_TICK_RATE      5000
 #define HV_SLOW_TICK_RATE 1
+/*
+ * How often a CPU parked in the EL2 guest-WFI wait re-checks for work.
+ *
+ * This exists because holding the guest's WFI at EL2 (T8142 has no writable
+ * CYC_OVRD, so the wait cannot be left to the guest) changes what can wake the
+ * core.  At EL1 a *virtual* interrupt ends a WFI; at EL2 it does not, and the
+ * only thing left is a physical one -- which for an idle secondary means its
+ * own tick, at HV_SLOW_TICK_RATE.  One hertz.
+ *
+ * Windows drives its scheduler off a 64 Hz timer, so every timed wait in the
+ * guest was being stretched by up to a second.  Measured: idle cores waking
+ * ~5.5 times a second, and WinPE progressing at 90 syscalls a second when the
+ * same boot had earlier averaged 2200.  It booted, just far too slowly to
+ * finish.
+ *
+ * 1 kHz puts the wakeup floor an order of magnitude below anything Windows asks
+ * for.  The cost is bounded and small: this wait is entered from the `handled`
+ * fast path in hv_exc_sync(), which does not take the big hypervisor lock, so
+ * nine idle cores re-checking at 1 kHz contend with nothing.
+ */
+#define HV_WFI_WAKE_RATE 1000
 
 DECLARE_SPINLOCK(bhl);
 
@@ -29,6 +50,7 @@ extern char _hv_vectors_start[0];
 
 u64 hv_tick_interval;
 u64 hv_secondary_tick_interval;
+u64 hv_wfi_wake_interval;
 
 int hv_pinned_cpu;
 int hv_want_cpu;
@@ -227,6 +249,34 @@ int hv_init(void)
                  HCR_VM);  // Enable stage 2 translation
 #endif
 
+    /*
+     * Hold the guest's WFI at EL2 when the CPU retention policy cannot be set.
+     *
+     * hv_configure_guest_wfi_mode() below is the normal way to keep the
+     * register file across WFI, but it early-returns whenever CYC_OVRD is
+     * absent, and on T8142 that register takes an undefined instruction
+     * exception on write.  A guest that idles on such a core can return from
+     * WFI with its general-purpose registers cleared.
+     *
+     * That is not survivable for Windows.  ntoskrnl's idle path keeps the PRCB
+     * idle-nesting counter address live in x26 across the bare `wfi` inside
+     * HalProcessorIdle() and dereferences it in the very next instruction after
+     * the call returns, so a cleared x26 is a read of address 0 at
+     * DISPATCH_LEVEL -- bugcheck 0xA, reproduced at ntoskrnl RVA 0x2c3d8c on
+     * every J813 boot that gets that far.
+     *
+     * Trapping the instruction moves the wait to EL2, where _hv_entry has
+     * already spilled x0-x30 to the exception frame and _hv_return reloads all
+     * of them.  Whatever the hardware does to the register file is then
+     * invisible to the guest.  Cores that can set the retention policy keep
+     * running WFI natively; this costs them nothing.
+     */
+    if (!cpu_features->cyc_ovrd) {
+        hv_write_hcr(mrs(HCR_EL2) | HCR_TWI);
+        printf("HV: trapping guest WFI (no CYC_OVRD on this CPU, HCR_EL2=0x%lx)\n",
+               mrs(HCR_EL2));
+    }
+
     if (chip_id == T8142) {
         /*
          * T8142 does not provide the older Apple PMC register bank used by
@@ -272,6 +322,7 @@ int hv_init(void)
 
     // Compute tick interval
     hv_tick_interval = mrs(CNTFRQ_EL0) / HV_TICK_RATE;
+    hv_wfi_wake_interval = mrs(CNTFRQ_EL0) / HV_WFI_WAKE_RATE;
 
     printf("HV: Host tick timer: %s\n", chip_id == T8142 ? "CNTHP_EL2" : "CNTP_EL0");
 
@@ -852,6 +903,24 @@ void hv_set_elr(u64 val)
         return msr(ELR_EL2, val);
 }
 
+/*
+ * Bound a guest-WFI wait held at EL2; see HV_WFI_WAKE_RATE.
+ *
+ * Uses the same timer the host tick does, so whichever fires is taken as an
+ * ordinary tick and re-arms the normal schedule on its way out -- there is no
+ * separate state to restore, and an early tick is harmless.
+ */
+void hv_arm_wfi_wake(void)
+{
+    if (chip_id == T8142) {
+        msr(SYS_CNTHP_TVAL_EL2, hv_wfi_wake_interval);
+        msr(SYS_CNTHP_CTL_EL2, CNTx_CTL_ENABLE);
+    } else {
+        msr(CNTP_TVAL_EL0, hv_wfi_wake_interval);
+        msr(CNTP_CTL_EL0, CNTx_CTL_ENABLE);
+    }
+}
+
 void hv_arm_tick(bool secondary)
 {
     u64 interval = secondary ? hv_secondary_tick_interval : hv_tick_interval;
@@ -1002,7 +1071,9 @@ void hv_tick(struct exc_info *ctx)
      */
     hv_verify_t8142_undef_vectors();
     hv_scan_t8142_guest_modules();
+    hv_report_t8142_process(ctx);
     hv_report_t8142_gic_activity();
+    smp_report_wfe_reg_loss();
     hv_check_t8142_bugcheck();
     hv_recover_t8142_sysreg_undef(ctx);
     iodev_handle_events(uartproxy_iodev);

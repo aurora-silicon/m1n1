@@ -2589,11 +2589,47 @@ static bool hv_t8142_insn_is_absent_reg(u32 instruction)
 #define HV_VECTOR_SYNC_SLOT(spsr)                                                                  \
     (((spsr) & 1) ? HV_VECTOR_SYNC_CURRENT_SPX : HV_VECTOR_SYNC_CURRENT_SP0)
 /*
+ * Synchronous exceptions taken *from* EL0, which use a different slot entirely:
+ * the "lower EL, AArch64" quarter of the table.  This is the only vector an
+ * undefined instruction executed by a user-mode process can reach, so it is the
+ * only place EL2 can intercept one -- nothing a process executes can trap to
+ * EL2 directly (HVC is UNDEFINED at EL0), which rules out the instruction-site
+ * replacement used for kernel images.
+ */
+#define HV_VECTOR_SYNC_LOWER_A64 0x400
+/*
  * Distinctive HVC immediate so the trampoline cannot be confused with Mu's
  * "NTSRG" forwarding calls, which share the SMC/HVC service dispatcher.
  */
 #define HV_T8142_UNDEF_HVC_IMM  0x4d31
 #define HV_T8142_UNDEF_HVC_INSN (0xd4000002U | (HV_T8142_UNDEF_HVC_IMM << 5))
+
+/*
+ * Replaced access sites carry their own identity in the HVC immediate.
+ *
+ * Addressing them by location does not survive the guest moving the code.  A
+ * site is recorded by VA and written by PA, and Windows relocates driver text
+ * after load -- import optimisation copies it into pool pages -- so the copy
+ * holds a perfectly good HVC of ours at a VA we never patched and a PA we never
+ * wrote.  Neither key matches, and the old fallback stepped over the
+ * instruction: measured at exactly 8 skipped guest instructions per boot, in
+ * kernel code, the last of them at the line where WinPE stopped making
+ * progress.  The addresses were freshly randomised each boot, which is what
+ * ruled out a second view of a page we had patched.
+ *
+ * Putting the site's table index in the immediate makes the trap
+ * position-independent: wherever the word ends up, it still says which
+ * instruction it replaced.  It also turns the lookup from a scan of ~600
+ * entries into an index, on a path taken thousands of times a boot.
+ *
+ * Indices are stable because the table only ever grows.  The range sits above
+ * HV_T8142_UNDEF_HVC_IMM and does not collide with Mu's forwarding calls, which
+ * are identified by a magic in a register (HV_SYSREG_ASSIST_CALL_MAGIC), not by
+ * their immediate.
+ */
+#define HV_T8142_SITE_HVC_IMM_BASE 0x4e00
+#define HV_T8142_SITE_HVC_INSN(idx)                                                                \
+    (0xd4000002U | ((HV_T8142_SITE_HVC_IMM_BASE + (u32)(idx)) << 5))
 
 /*
  * Every vector we have redirected, not just the most recent one.
@@ -2609,6 +2645,7 @@ static bool hv_t8142_insn_is_absent_reg(u32 instruction)
 
 static struct {
     u64 va;       /* vbar + slot */
+    u64 pa;       /* where the redirect was actually written */
     u32 orig;     /* instruction displaced there, if redirected */
     bool refused; /* examined and left alone; orig is not meaningful */
 } t8142_undef_vec[HV_T8142_MAX_UNDEF_VECTORS];
@@ -2644,6 +2681,14 @@ static bool hv_emulate_t8142_pending_undef(struct exc_info *ctx, u32 *insn_out, 
         ctx->regs[rt] = out;
 
     ctx->elr = fault_pc + 4;
+    /*
+     * Unwinding to the pre-fault PSTATE is what returns an EL0 fault to EL0
+     * rather than into the guest's handler.  It reaches the CPU through
+     * hv_exc_sync()'s write-back, deliberately not from here: hv_translate()
+     * picks AT S12E1R vs S12E0R off SPSR_EL2, and hv_exc_exit() resolves kernel
+     * addresses before it republishes SPSR.  Changing the register early makes
+     * those kernel translations run as EL0 and fail.
+     */
     ctx->spsr = mrs(SPSR_EL12);
 
     if (insn_out)
@@ -2702,12 +2747,32 @@ static bool hv_replay_vector_insn(struct exc_info *ctx, u64 vec_va, u32 insn, bo
         return true;
     }
 
+    /*
+     * SUB SP, SP, #imm12 (unshifted) -- a vector that opens by reserving its
+     * own frame.  NT's lower-EL slots all begin "sub sp, sp, #0x370".
+     *
+     * Which stack that adjusts is not a guess: an exception entry always sets
+     * PSTATE.SP, so the vector runs at EL1h and SP is SP_EL1.  Read it off the
+     * guest's own PSTATE anyway rather than assuming, so this stays correct if
+     * it is ever reached from a mode where it is not.
+     */
+    if ((insn & 0xffc003ffU) == 0xd10003ffU) {
+        if (perform) {
+            u64 imm12 = (insn >> 10) & 0xfff;
+
+            /* Both return paths republish ctx->sp[]; see hv_exc_sync(). */
+            ctx->sp[ctx->spsr & 1] -= imm12;
+            ctx->elr = vec_va + sizeof(u32);
+        }
+        return true;
+    }
+
     /* MRS Xt, <one of the exception-state registers a vector prologue reads> */
     switch (insn & ~0x1fU) {
         case 0xd5384020U: /* ELR_EL1  */
         case 0xd5384000U: /* SPSR_EL1 */
         case 0xd5385200U: /* ESR_EL1  */
-        case 0xd5384100U: /* SP_EL1   */
+        case 0xd5384100U: /* SP_EL0   */
             break;
         default:
             return false;
@@ -2726,8 +2791,22 @@ static bool hv_replay_vector_insn(struct exc_info *ctx, u64 vec_va, u32 insn, bo
         case 0xd5385200U:
             val = mrs(ESR_EL12);
             break;
-        default: /* SP_EL1: the guest's own, captured on entry */
-            val = ctx->sp[1];
+        default:
+            /*
+             * SP_EL0, and it must be sp[0].  This encoding was labelled SP_EL1
+             * here and replayed from sp[1], which is a different register:
+             * 0xd5384100 is op1=0 (SP_EL0), while SP_EL1 is op1=4, 0xd53c4100 --
+             * and EL1 cannot name SP_EL1 with MRS at all.
+             *
+             * The mistake was not cosmetic.  NT's synchronous EL1t vector opens
+             * "mrs x18, sp_el0 / and sp, x18, #~0xf": it recovers the
+             * interrupted kernel stack and immediately installs it.  Replaying
+             * sp[1] handed it SP_EL1 instead, so the kernel resumed on a stack
+             * that was never one, faulted through it recursively and reached
+             * PANIC_STACK_SWITCH.  That is the bugcheck 0x2B which was recorded
+             * against redirecting this slot at all, and it was this line.
+             */
+            val = ctx->sp[0];
             break;
     }
 
@@ -2769,10 +2848,9 @@ static void hv_write_guest_insn(u64 pa, u32 insn)
     sysop("isb");
 }
 
-static bool hv_patch_t8142_undef_vector(u64 spsr)
+static bool hv_patch_t8142_undef_vector(u64 slot)
 {
     u64 vbar = mrs(VBAR_EL12);
-    u64 slot = HV_VECTOR_SYNC_SLOT(spsr);
 
     if (!vbar)
         return false;
@@ -2861,6 +2939,7 @@ static bool hv_patch_t8142_undef_vector(u64 spsr)
     }
 
     t8142_undef_vec[t8142_undef_vec_count].va = va;
+    t8142_undef_vec[t8142_undef_vec_count].pa = pa;
     t8142_undef_vec[t8142_undef_vec_count].orig = orig;
     t8142_undef_vec_count++;
 
@@ -2898,8 +2977,29 @@ void hv_verify_t8142_undef_vectors(void)
         if (!pa)
             continue; /* not mapped right now; nothing useful to do */
 
+        /*
+         * The VA moved to a different page.  Put the page we did patch back the
+         * way we found it before adopting the new one, or our HVC stays in it
+         * forever: the guest recycles that frame into pool or code, executes it,
+         * and arrives here as a trampoline hit with no record -- which the
+         * handler can only answer by skipping whatever instruction was there.
+         * Eight of those per boot were reaching the guest before this.
+         */
+        if (t8142_undef_vec[i].pa && t8142_undef_vec[i].pa != pa) {
+            u64 stale = t8142_undef_vec[i].pa;
+
+            if (read32(stale) == HV_T8142_UNDEF_HVC_INSN) {
+                hv_write_guest_insn(stale, t8142_undef_vec[i].orig);
+                printf("HV: T8142: redirect for 0x%lx moved pa 0x%lx -> 0x%lx, restored "
+                       "0x%08x at the old page\n",
+                       va, stale, pa, t8142_undef_vec[i].orig);
+            }
+            t8142_undef_vec[i].pa = 0;
+        }
+
         u32 cur = read32(pa);
         if (cur == HV_T8142_UNDEF_HVC_INSN) {
+            t8142_undef_vec[i].pa = pa;
             /*
              * The redirect is present in memory, which does not prove the
              * guest fetches it.  Re-publishing costs one broadcast invalidate
@@ -2934,6 +3034,7 @@ void hv_verify_t8142_undef_vectors(void)
         if (read32(pa) != HV_T8142_UNDEF_HVC_INSN)
             continue;
 
+        t8142_undef_vec[i].pa = pa;
         t8142_undef_vec[i].orig = cur;
         printf("HV: T8142: redirect at 0x%lx reinstated at pa 0x%lx (displaced 0x%08x)\n", va, pa,
                cur);
@@ -2956,6 +3057,15 @@ static bool hv_unpatch_t8142_undef_vector(u64 va)
         u64 pa = hv_translate(va, false, true, NULL);
         if (pa)
             hv_write_guest_insn(pa, t8142_undef_vec[i].orig);
+
+        /*
+         * The entry is about to go, so this is the last chance to clean up a
+         * page the VA no longer resolves to.  Leaving our HVC there is what
+         * produces trampoline hits at addresses nothing can account for.
+         */
+        u64 stale = t8142_undef_vec[i].pa;
+        if (stale && stale != pa && read32(stale) == HV_T8142_UNDEF_HVC_INSN)
+            hv_write_guest_insn(stale, t8142_undef_vec[i].orig);
 
         t8142_undef_vec[i] = t8142_undef_vec[--t8142_undef_vec_count];
         return pa != 0;
@@ -2982,6 +3092,7 @@ static bool hv_unpatch_t8142_undef_vector(u64 va)
 
 static struct {
     u64 va;   /* guest VA of an absent-register access we replaced */
+    u64 pa;   /* where the replacement was actually written */
     u32 orig; /* the access instruction itself */
 } t8142_pmu_site[HV_T8142_MAX_PMU_SITES];
 static u32 t8142_pmu_site_count;
@@ -3003,11 +3114,15 @@ static bool hv_patch_t8142_pmu_site_quiet(u64 va, u32 insn, bool verbose)
     if (read32(pa) != insn)
         return false;
 
-    hv_write_guest_insn(pa, HV_T8142_UNDEF_HVC_INSN);
-    if (read32(pa) != HV_T8142_UNDEF_HVC_INSN)
+    /* Encodes the slot it is about to occupy; see HV_T8142_SITE_HVC_INSN. */
+    u32 trap = HV_T8142_SITE_HVC_INSN(t8142_pmu_site_count);
+
+    hv_write_guest_insn(pa, trap);
+    if (read32(pa) != trap)
         return false;
 
     t8142_pmu_site[t8142_pmu_site_count].va = va;
+    t8142_pmu_site[t8142_pmu_site_count].pa = pa;
     t8142_pmu_site[t8142_pmu_site_count].orig = insn;
     t8142_pmu_site_count++;
 
@@ -3021,29 +3136,6 @@ static bool hv_patch_t8142_pmu_site(u64 va, u32 insn)
 {
     return hv_patch_t8142_pmu_site_quiet(va, insn, true);
 }
-
-/*
- * Probe for the open bugcheck 0xA.
- *
- * The fault is x26 == 0 at ntoskrnl RVA 0x2c3d8c, on return from the indirect
- * call four instructions earlier, inside CPU idle accounting.  x26 is
- * callee-saved, holds x20 + 0x89af, and the identical register is dereferenced
- * successfully before the call, so it is destroyed across it.
- *
- * Two things are unknown and one boot with this probe answers both.  Which
- * function the call reaches: it is `blr x15`, so x15 is the answer, and nothing
- * static can tell us because the target comes from [x19 + 0x260].  And whether
- * m1n1 is the writer: the MRS emulation for rewritten absent-register sites
- * assigns ctx->regs[rt] directly, and `out` is 0 for every PMU register this
- * SoC lacks -- which would produce exactly the zero observed.
- *
- * Emulating the branch afterwards is free: the HVC has already advanced ELR to
- * the instruction after the call, which is precisely the link address.
- */
-#define HV_T8142_0XA_BLR_RVA  0x2c3d84
-#define HV_T8142_0XA_BLR_INSN 0xd63f01e0 /* blr x15 */
-
-static u64 t8142_0xa_probe_va;
 
 /*
  * Replace every absent-register access in a guest image before any of them runs.
@@ -3164,7 +3256,21 @@ static bool scan_cand_is_data[HV_PE_MAX_SECTION_CANDIDATES];
 
 static void hv_scan_guest_image_absent_regs(u64 va_in_image)
 {
-    static u64 scanned[64];
+    /*
+     * Every image ever scanned, so the per-tick module walk skips the ones it
+     * has already done.
+     *
+     * This table is not an optimisation, it is what stops the walk becoming the
+     * boot's bottleneck.  A base that does not fit is never recorded, so the
+     * image is rescanned on *every* tick from then on -- a full two-pass
+     * instruction scan of its text plus two console lines, with the guest paused
+     * for all of it.  At 64 entries that started the moment WinPE's 65th driver
+     * loaded: measured at 142 images, so 78 of them rescanned once a second,
+     * ~156 log lines per tick against a UART that cannot carry them.  Windows
+     * stopped loading drivers and idled for 27000 log lines, which read exactly
+     * like a hang and was not one.
+     */
+    static u64 scanned[512];
     static u32 scanned_count;
 
     u64 base = hv_find_guest_pe_base(va_in_image);
@@ -3183,8 +3289,27 @@ static void hv_scan_guest_image_absent_regs(u64 va_in_image)
     for (u32 i = 0; i < scanned_count; i++)
         if (scanned[i] == base)
             return;
-    if (scanned_count < ARRAY_SIZE(scanned))
-        scanned[scanned_count++] = base;
+
+    if (scanned_count >= ARRAY_SIZE(scanned)) {
+        /*
+         * Out of room.  Skip the image rather than scan it, because scanning
+         * one we cannot record means scanning it again on every tick forever,
+         * and that starves the guest far more surely than a missed site hurts
+         * it.  Missing it is survivable now: the redirected +0x000 vector
+         * catches an absent-register access in unscanned code before NT's
+         * handler runs, which is the whole reason it is redirected.
+         */
+        static bool full_logged;
+
+        if (!full_logged) {
+            full_logged = true;
+            printf("HV: T8142: image scan table full at %d images; further images rely on the "
+                   "vector redirect\n",
+                   (int)scanned_count);
+        }
+        return;
+    }
+    scanned[scanned_count++] = base;
 
     u32 lfanew, coff, opt;
     if (!hv_read_guest32(base + 0x3c, &lfanew))
@@ -3321,29 +3446,6 @@ static void hv_scan_guest_image_absent_regs(u64 va_in_image)
     printf("HV: T8142: absent-register sites writing x19-x28: %u of %ld\n", rt_callee_saved,
            (u64)t8142_pmu_site_count);
 
-    /*
-     * Arm the bugcheck 0xA probe once the kernel itself has been swept.  The
-     * RVA is fixed for this build of ntoskrnl and the encoding is checked
-     * before anything is written, so a different kernel simply declines.
-     */
-    if (base == t8142_kernel_base && !t8142_0xa_probe_va) {
-        u64 va = base + HV_T8142_0XA_BLR_RVA;
-        u64 pa = hv_translate(va, false, false, NULL);
-        u32 cur = pa ? read32(pa) : 0;
-
-        if (pa && cur == HV_T8142_0XA_BLR_INSN) {
-            hv_write_guest_insn(pa, HV_T8142_UNDEF_HVC_INSN);
-            if (read32(pa) == HV_T8142_UNDEF_HVC_INSN) {
-                t8142_0xa_probe_va = va;
-                printf("HV: T8142: 0xA probe armed at 0x%lx (pa 0x%lx)\n", va, pa);
-            } else {
-                printf("HV: T8142: 0xA probe: write to pa 0x%lx did not stick\n", pa);
-            }
-        } else {
-            printf("HV: T8142: 0xA probe not armed: va 0x%lx pa 0x%lx insn 0x%08x (want 0x%08x)\n",
-                   va, pa, cur, HV_T8142_0XA_BLR_INSN);
-        }
-    }
 }
 
 /*
@@ -3352,95 +3454,74 @@ static void hv_scan_guest_image_absent_regs(u64 va_in_image)
  * instruction to emulate is the one we recorded when we replaced it, and
  * ELR_EL2 already points past it.
  */
-static bool hv_handle_t8142_pmu_site(struct exc_info *ctx)
+static bool hv_handle_t8142_pmu_site(struct exc_info *ctx, u32 imm)
 {
+    if (imm < HV_T8142_SITE_HVC_IMM_BASE)
+        return false;
+
+    u32 idx = imm - HV_T8142_SITE_HVC_IMM_BASE;
+    if (idx >= t8142_pmu_site_count)
+        return false;
+
     u64 site = ctx->elr - sizeof(u32);
+    u32 insn = t8142_pmu_site[idx].orig;
+    u64 rt = insn & 0x1f;
+    u64 out = 0;
 
-    for (u32 i = 0; i < t8142_pmu_site_count; i++) {
-        if (t8142_pmu_site[i].va != site)
-            continue;
+    if (!hv_handle_t8142_sysreg_assist(insn, rt < 31 ? ctx->regs[rt] : 0, &out))
+        return false;
 
-        u32 insn = t8142_pmu_site[i].orig;
-        u64 rt = insn & 0x1f;
-        u64 out = 0;
+    if (((insn & 0xffe00000U) == 0xd5200000U) && rt < 31) /* MRS Xt, sysreg */
+        ctx->regs[rt] = out;
 
-        if (!hv_handle_t8142_sysreg_assist(insn, rt < 31 ? ctx->regs[rt] : 0, &out))
-            return false;
+    static u64 site_emulated;
+    static u32 callee_saved_emulated;
+    static u64 relocated;
 
-        if (((insn & 0xffe00000U) == 0xd5200000U) && rt < 31) /* MRS Xt, sysreg */
-            ctx->regs[rt] = out;
-
-        static u64 site_emulated;
-        static u32 callee_saved_emulated;
-
-        /*
-         * An MRS into x19-x28 makes m1n1 the writer of a register the ABI says
-         * the callee must preserve.  That is the exact shape of the open
-         * bugcheck 0xA, so print those in full rather than under the throttle
-         * that hid them: the aggregate scan says only 58 of ~581 sites can do
-         * it, and how many of those ever execute is the open question.
-         */
-        if (((insn & 0xffe00000U) == 0xd5200000U) && rt >= 19 && rt <= 28) {
-            if (callee_saved_emulated < 64)
-                printf("HV: T8142: CALLEE-SAVED WRITE x%ld = 0x%lx at 0x%lx (insn 0x%08x)\n", rt,
-                       out, site, insn);
-            callee_saved_emulated++;
-        } else if (site_emulated < 8 || (site_emulated % 4096) == 0) {
-            printf("HV: T8142: site emulated 0x%08x at 0x%lx (#%ld)\n", insn, site, site_emulated);
-        }
-        site_emulated++;
-        return true;
+    /*
+     * Executing somewhere other than where it was planted means the guest moved
+     * the code.  Worth saying once per site-ish rather than never: it used to be
+     * the case that got the instruction skipped.
+     */
+    if (site != t8142_pmu_site[idx].va) {
+        if (relocated < 8 || (relocated % 4096) == 0)
+            printf("HV: T8142: site %d (0x%lx) relocated to 0x%lx, emulated 0x%08x (#%ld)\n",
+                   (int)idx, t8142_pmu_site[idx].va, site, insn, relocated);
+        relocated++;
     }
 
-    return false;
+    /*
+     * An MRS into x19-x28 makes m1n1 the writer of a register the ABI says
+     * the callee must preserve.  That is the exact shape of the old
+     * bugcheck 0xA, so print those in full rather than under the throttle
+     * that hid them: the aggregate scan says only 58 of ~581 sites can do
+     * it, and how many of those ever execute is the open question.
+     */
+    if (((insn & 0xffe00000U) == 0xd5200000U) && rt >= 19 && rt <= 28) {
+        if (callee_saved_emulated < 64)
+            printf("HV: T8142: CALLEE-SAVED WRITE x%ld = 0x%lx at 0x%lx (insn 0x%08x)\n", rt, out,
+                   site, insn);
+        callee_saved_emulated++;
+    } else if (site_emulated < 8 || (site_emulated % 4096) == 0) {
+        printf("HV: T8142: site emulated 0x%08x at 0x%lx (#%ld)\n", insn, site, site_emulated);
+    }
+    site_emulated++;
+    return true;
 }
 
 /*
- * The guest reached the indirect call that bugcheck 0xA returns from.  Report
- * where it is about to go, what x26 looks like on the way in, and whether any
- * instruction we rewrote lives inside the target -- then perform the branch.
+ * Traffic through the lower-EL synchronous vector.
+ *
+ * Redirecting +0x400 catches user-mode absent-register accesses, but it also
+ * puts an EL2 round trip on every syscall and every user page fault, which is
+ * the entire cost of the mechanism.  The two counts are what says whether that
+ * is affordable, so keep them apart: `emul` is work only EL2 can do, `pass` is
+ * pure overhead paid to see it.
  */
-static bool hv_handle_t8142_0xa_probe(struct exc_info *ctx)
-{
-    static u32 hits;
-
-    if (!t8142_0xa_probe_va || (ctx->elr - sizeof(u32)) != t8142_0xa_probe_va)
-        return false;
-
-    u64 callee = ctx->regs[15];
-
-    if (hits < 8) {
-        printf("HV: T8142: 0xA probe #%u: callee=0x%lx (kernel rva 0x%lx) x19=0x%lx x20=0x%lx "
-               "x26=0x%lx\n",
-               hits, callee, callee - t8142_kernel_base, ctx->regs[19], ctx->regs[20],
-               ctx->regs[26]);
-
-        /*
-         * Only the callee's own body is in range here.  A site in something it
-         * calls in turn would still be saved and restored by that function, so
-         * the interesting case is a rewrite in the target itself.
-         */
-        u32 inside = 0;
-        for (u32 i = 0; i < t8142_pmu_site_count; i++) {
-            u64 va = t8142_pmu_site[i].va;
-
-            if (va < callee || va >= callee + 0x4000)
-                continue;
-
-            inside++;
-            printf("HV: T8142: 0xA probe:   site 0x%lx (+0x%lx) insn=0x%08x rt=x%u\n", va,
-                   va - callee, t8142_pmu_site[i].orig, t8142_pmu_site[i].orig & 0x1f);
-        }
-        if (!inside)
-            printf("HV: T8142: 0xA probe:   no rewritten site within 0x4000 of the callee\n");
-    }
-    hits++;
-
-    /* Emulate `blr x15`.  ELR is already the return address the branch links. */
-    ctx->regs[30] = ctx->elr;
-    ctx->elr = callee;
-    return true;
-}
+static u64 el0_sync_pass;
+static u64 el0_sync_emul;
+static u64 el1_sync_pass;
+static u64 el1_sync_emul;
 
 /*
  * Service the redirected vector.  The guest took an undefined-instruction
@@ -3451,22 +3532,26 @@ static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
 {
     if (chip_id != T8142)
         return false;
-    if ((ctx->esr & 0xffff) != HV_T8142_UNDEF_HVC_IMM)
+    u32 imm = ctx->esr & 0xffff;
+
+    /*
+     * A replaced access site names itself in the immediate, so it is
+     * unambiguous, needs no fault state, and works wherever the guest has moved
+     * the code to.
+     */
+    if (imm >= HV_T8142_SITE_HVC_IMM_BASE)
+        return hv_handle_t8142_pmu_site(ctx, imm);
+
+    if (imm != HV_T8142_UNDEF_HVC_IMM)
         return false;
-
-    /* The 0xA probe is a single known address; check it before the site table. */
-    if (hv_handle_t8142_0xa_probe(ctx))
-        return true;
-
-    /* A replaced access site is unambiguous and needs no fault state. */
-    if (hv_handle_t8142_pmu_site(ctx))
-        return true;
 
     if (!t8142_undef_vec_count)
         return false;
 
     u32 insn = 0;
     u64 fault_pc = 0;
+    /* PSTATE.M of the state that faulted; 0b0000 is EL0t, i.e. user mode. */
+    bool from_el0 = (mrs(SPSR_EL12) & 0xf) == 0;
 
     if (hv_emulate_t8142_pending_undef(ctx, &insn, &fault_pc)) {
         /*
@@ -3475,6 +3560,29 @@ static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
          * the rate, without drowning the console.
          */
         static u64 emulated;
+
+        if (from_el0) {
+            el0_sync_emul++;
+            /*
+             * Always log the first few user-mode ones unrated: each is a
+             * process that would otherwise have died on its own startup code,
+             * and the addresses say which image it came out of.
+             */
+            if (el0_sync_emul <= 8)
+                printf("HV: T8142: EL0 emulated 0x%08x at user pc 0x%lx (#%ld)\n", insn, fault_pc,
+                       el0_sync_emul);
+        } else {
+            el1_sync_emul++;
+            /*
+             * An EL1 one means the pre-emptive image scan did not cover this
+             * address -- a module that loaded after the sweep.  Say where, so a
+             * recurring miss can be traced back to an image rather than just
+             * absorbed silently by the vector.
+             */
+            if (el1_sync_emul <= 8)
+                printf("HV: T8142: EL1 emulated 0x%08x at unscanned pc 0x%lx (#%ld)\n", insn,
+                       fault_pc, el1_sync_emul);
+        }
 
         if (emulated < 8 || (emulated % 4096) == 0)
             printf("HV: T8142: trampoline emulated 0x%08x at 0x%lx (#%ld)\n", insn, fault_pc,
@@ -3499,8 +3607,13 @@ static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
         if (t8142_undef_vec[i].va == vec_va && !t8142_undef_vec[i].refused)
             orig = t8142_undef_vec[i].orig;
 
-    if (orig && hv_replay_vector_insn(ctx, vec_va, orig, true))
+    if (orig && hv_replay_vector_insn(ctx, vec_va, orig, true)) {
+        if (from_el0)
+            el0_sync_pass++;
+        else
+            el1_sync_pass++;
         return true;
+    }
 
     /*
      * Documented as unreachable, and it is not.  Measured on J813: 72166 times
@@ -3546,6 +3659,153 @@ static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
  */
 #define HV_NT_KIBUGCHECKDATA_RVA 0xdbb9a0
 
+/*
+ * EPROCESS field offsets for the kernel under test, taken from its own exported
+ * accessors: PsGetProcessId is `ldr x0, [x0, #0x1c0]` and
+ * PsGetProcessImageFileName is `add x0, x0, #0x328`.  Build-specific, and only
+ * ever used to annotate a bugcheck that already happened.
+ */
+#define HV_NT_EPROCESS_PID_OFF    0x1c0
+#define HV_NT_EPROCESS_NAME_OFF   0x328
+#define HV_NT_EPROCESS_STATUS_OFF 0x614 /* PsGetProcessExitStatus: ldr w0, [x0, #0x614] */
+
+/*
+ * Walk from the guest's KPCR to the name of the process currently on the CPU.
+ * Recovered from this kernel's own accessors:
+ *
+ *   KeGetCurrentThread          ldr x0, [x18, #0x988]   KPCR    -> KTHREAD
+ *   PsGetCurrentProcess         ldr x0, [x8,  #0xb0]    KTHREAD -> EPROCESS
+ *   PsGetProcessImageFileName   add x0, x0,   #0x328    EPROCESS-> ImageFileName
+ *
+ * x18 is the KPCR on Windows ARM64, but only while the CPU is in kernel mode --
+ * in user mode it is the TEB, so the caller must check the sampled EL first.
+ */
+#define HV_NT_KPCR_CURRENT_THREAD_OFF 0x988
+#define HV_NT_KTHREAD_PROCESS_OFF     0xb0
+
+/*
+ * Guest WFIs held at EL2 -- see hv_handle_wfx().  A per-CPU count says whether
+ * every core reached the idle loop and how hard it is idling, which is the
+ * difference between "this core is waiting" and "this core is gone".
+ */
+static u64 wfi_trap_count[MAX_CPUS];
+static bool wfi_trap_logged;
+
+static void hv_report_t8142_wfi_traps(void)
+{
+    printf("HV: T8142: guest WFIs held at EL2:");
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (cpu > 0 && !smp_is_alive(cpu))
+            continue;
+        printf(" cpu%d=%ld", cpu, wfi_trap_count[cpu]);
+    }
+    printf("\n");
+}
+
+static void hv_report_t8142_el0_vector(void)
+{
+    if (!el0_sync_pass && !el0_sync_emul && !el1_sync_pass && !el1_sync_emul)
+        return;
+
+    printf("HV: T8142: redirected sync vectors: EL0 %ld emulated / %ld passed, "
+           "EL1 %ld emulated / %ld passed\n",
+           el0_sync_emul, el0_sync_pass, el1_sync_emul, el1_sync_pass);
+}
+
+/*
+ * Bugcheck 0xEF (CRITICAL_PROCESS_DIED) passes the EPROCESS of the process that
+ * died as its first parameter.  Which one it is separates "Windows is broken"
+ * from "one component is missing", so resolve it here rather than leaving a
+ * bare pointer in the log.
+ */
+/*
+ * Name every process seen running, once each.
+ *
+ * A guest that stalls without bugchecking says nothing about how far user mode
+ * actually got, and "WinPE is idle" and "WinPE is idle inside wpeinit" are
+ * completely different problems.  Sampling the current process on the tick and
+ * printing only names not seen before turns the stall into a trace of what ran:
+ * smss, csrss, wininit, winpeshl, wpeinit, setup.  Where the list stops is the
+ * thing that did not finish.
+ */
+static void hv_report_t8142_current_process(struct exc_info *ctx)
+{
+    static char seen[24][16];
+    static u32 seen_count;
+
+    if (chip_id != T8142 || !t8142_kernel_base)
+        return;
+
+    /* x18 is only the KPCR in kernel mode; in user mode it is the TEB. */
+    if ((ctx->spsr & 0xf) == 0)
+        return;
+
+    u64 kpcr = ctx->regs[18];
+    u64 thread, process;
+
+    if (kpcr < 0xffff000000000000UL)
+        return;
+    if (!hv_read_guest64(kpcr + HV_NT_KPCR_CURRENT_THREAD_OFF, &thread) ||
+        thread < 0xffff000000000000UL)
+        return;
+    if (!hv_read_guest64(thread + HV_NT_KTHREAD_PROCESS_OFF, &process) ||
+        process < 0xffff000000000000UL)
+        return;
+
+    u64 pa = hv_translate(process, false, false, NULL);
+    if (!pa)
+        return;
+
+    char name[16] = {0};
+    for (int i = 0; i < 15; i++) {
+        char c = (char)read8(pa + HV_NT_EPROCESS_NAME_OFF + i);
+        if (c < 0x20 || c > 0x7e)
+            break;
+        name[i] = c;
+    }
+    if (!name[0])
+        return;
+
+    for (u32 i = 0; i < seen_count; i++) {
+        u32 j = 0;
+        while (j < 15 && seen[i][j] == name[j] && name[j])
+            j++;
+        if (seen[i][j] == name[j])
+            return; /* already reported */
+    }
+    if (seen_count >= ARRAY_SIZE(seen))
+        return;
+
+    for (u32 j = 0; j < 16; j++)
+        seen[seen_count][j] = name[j];
+    seen_count++;
+
+    printf("HV: T8142: guest process now running: \"%s\" (pid %ld, EPROCESS 0x%lx)\n", name,
+           read64(pa + HV_NT_EPROCESS_PID_OFF), process);
+}
+
+static void hv_report_t8142_dead_process(u64 code, u64 param1)
+{
+    if (code != 0xef || !param1)
+        return;
+
+    u64 pa = hv_translate(param1, false, false, NULL);
+    if (!pa)
+        return;
+
+    char name[16] = {0};
+    for (int i = 0; i < 15; i++) {
+        char c = (char)read8(pa + HV_NT_EPROCESS_NAME_OFF + i);
+        if (c < 0x20 || c > 0x7e)
+            break;
+        name[i] = c;
+    }
+
+    printf("HV: T8142:   dead process: pid %ld \"%s\" exit status 0x%08x (EPROCESS 0x%lx)\n",
+           read64(pa + HV_NT_EPROCESS_PID_OFF), name,
+           read32(pa + HV_NT_EPROCESS_STATUS_OFF), param1);
+}
+
 static void hv_report_t8142_bugcheck(struct exc_info *ctx)
 {
     static u64 prev_pc;
@@ -3574,6 +3834,7 @@ static void hv_report_t8142_bugcheck(struct exc_info *ctx)
     printf("HV: T8142: guest bugcheck 0x%lx (%lx, %lx, %lx, %lx) at pc 0x%lx (rva 0x%lx)\n", code,
            read64(pa + 8), read64(pa + 16), read64(pa + 24), read64(pa + 32), ctx->elr,
            ctx->elr - t8142_kernel_base);
+    hv_report_t8142_dead_process(code, read64(pa + 8));
     reported = true;
 }
 
@@ -3635,7 +3896,7 @@ bool hv_recover_t8142_sysreg_undef(struct exc_info *ctx)
      * exception put it on the handler's stack, which may not be the stack the
      * faulting code was using.
      */
-    hv_patch_t8142_undef_vector(mrs(SPSR_EL12));
+    hv_patch_t8142_undef_vector(HV_VECTOR_SYNC_SLOT(mrs(SPSR_EL12)));
     return true;
 }
 
@@ -3819,6 +4080,9 @@ void hv_check_t8142_bugcheck(void)
     printf("HV: T8142: guest bugcheck 0x%lx (%lx, %lx, %lx, %lx) seen on tick\n",
            code, read64(pa + 8), read64(pa + 16), read64(pa + 24),
            read64(pa + 32));
+    hv_report_t8142_dead_process(code, read64(pa + 8));
+    hv_report_t8142_wfi_traps();
+    hv_report_t8142_el0_vector();
 }
 
 void hv_report_t8142_gic_activity(void)
@@ -3860,11 +4124,38 @@ void hv_report_t8142_gic_activity(void)
         last_eoi[cpu] = gic_cpuif_eoi_count[cpu];
     }
     printf("\n");
+
+    /*
+     * Periodically, the counters that used to appear only on the bugcheck path.
+     *
+     * A guest that stalls without bugchecking reports nothing there -- which is
+     * exactly what WinPE does when it is waiting on something -- so the two
+     * questions that matter during a stall had no answer: is user mode still
+     * making progress, and are the quiet cores quiet by choice?
+     *
+     * The per-CPU WFI counts settle the second one on their own.  A core parked
+     * in the EL2 wait with a *frozen* count is stuck in a single WFI that
+     * nothing is waking; a core whose count keeps climbing is waking, finding
+     * no work, and idling again, which is Windows parking it and not a bug.
+     * Cores 0-5 going silent together while 6-9 stay busy is currently
+     * consistent with both.
+     */
+    static u32 periodic;
+
+    if ((periodic++ % 32) == 0) {
+        hv_report_t8142_wfi_traps();
+        hv_report_t8142_el0_vector();
+    }
 }
 
 void hv_scan_t8142_guest_modules(void)
 {
     hv_scan_guest_modules();
+}
+
+void hv_report_t8142_process(struct exc_info *ctx)
+{
+    hv_report_t8142_current_process(ctx);
 }
 
 void hv_track_t8142_undef_vector(struct exc_info *ctx)
@@ -3900,33 +4191,46 @@ void hv_track_t8142_undef_vector(struct exc_info *ctx)
         hv_scan_guest_image_absent_regs(vbar);
 
         /*
-         * If the scan owns this image, leave its vectors alone -- redirecting
-         * them is not merely redundant here, it is destructive.
+         * The kernel's own current-EL slots stay untouched, but not for the
+         * reason recorded here previously.
          *
-         * NT's table was disassembled to settle this.  Slot +0x000 is the live
-         * synchronous EL1t vector and begins "mrs x18, sp_el0"; that is the
-         * exact word m1n1 displaced, so every synchronous exception the kernel
-         * took was being diverted to EL2 instead of reaching NT's dispatcher.
-         * Slot +0x200 is not a handler at all -- NT never runs at EL1h, so it
-         * hard-wires that slot to "b" its PANIC_STACK_SWITCH path, which is
-         * bugcheck 0x2B, the one observed the moment a virtual IRQ was
-         * delivered.
+         * NT's table was disassembled to settle it.  Slot +0x000 is the live
+         * synchronous EL1t vector and opens "mrs x18, sp_el0 / and sp, x18,
+         * #~0xf" -- it recovers the interrupted kernel stack and installs it.
+         * Redirecting that slot used to produce bugcheck 0x2B, which was
+         * attributed to a virtual IRQ taken from EL1h landing in +0x280's
+         * hard-wired PANIC_STACK_SWITCH branch.  That explanation was wrong:
+         * the replay table listed 0xd5384100 as SP_EL1 when it is SP_EL0, so
+         * m1n1 displaced the mrs and handed x18 the value of SP_EL1.  NT then
+         * ran on a stack that was never one and faulted through it until it
+         * reached PANIC_STACK_SWITCH by itself.  See hv_replay_vector_insn().
          *
-         * Slot +0x000 cannot be kept either, though it was tried: restoring
-         * it alone brought bugcheck 0x2B straight back.  The reason is that
-         * AArch64 sets PSTATE.SP on taking an exception, so NT's vector
-         * prologue runs at EL1h even though the kernel itself runs EL1t.  An
-         * HVC planted there therefore exits to EL2 from EL1h, and any virtual
-         * IRQ asserted across that exit is taken from EL1h -- straight into
-         * +0x280, the same hard-wired branch to PANIC_STACK_SWITCH.  The
-         * correlation is exact over four runs: both slots redirected gives
-         * 0x2B, neither gives 0x1E in an unscanned driver, +0x000 alone gives
-         * 0x2B again.
+         * With that fixed, +0x000 is redirected, because the pre-emptive image
+         * scan cannot be relied on alone: it is a race it sometimes loses.  A
+         * driver that loads after the sweep and reads an absent register before
+         * the next module walk finds it takes the UNDEF for real -- measured as
+         * bugcheck 0x1E with param4 0xd53b9d08, the "mrs x8, pmccntr_el0" word
+         * itself, at an address 0x48 million bytes above the ntoskrnl base,
+         * i.e. in a module the sweep had never seen.
          *
-         * Module coverage is therefore not this mechanism's job.  It belongs to
-         * hv_scan_guest_modules(), which enumerates the images the kernel has
-         * loaded and scans them outright -- no interception, and nothing
-         * written to a vector the guest depends on.
+         * The old objection to lazy discovery does not apply to a redirect.  It
+         * was that NT's undefined-instruction path ends in a bugcheck, so the
+         * first access to reach it is already fatal -- true, but the whole point
+         * of the redirect is that the access never reaches that path: the HVC is
+         * the vector's first instruction, so EL2 sees the fault before any of
+         * NT's handler has run.  The scan stays as the cheaper path for images
+         * it does catch; the vector is what makes coverage total.
+         *
+         * +0x400 is the other half and must be redirected.  It is the slot
+         * every synchronous exception *from EL0* takes, and user-mode absent-
+         * register accesses cannot be reached any other way -- HVC is UNDEFINED
+         * at EL0, so an instruction-site replacement has nothing to replace the
+         * instruction with, and the images are demand-paged from per-process
+         * ASLR bases the module walk does not cover.  Without this, the first
+         * user-mode process dies on its own startup code: smss.exe's single
+         * "mrs x8, pmccntr_el0" (from the /GS cookie init every MSVC ARM64
+         * binary carries) UNDEFs, NT raises STATUS_ILLEGAL_INSTRUCTION, and the
+         * session manager exiting is bugcheck 0xC000021A.
          */
         if (t8142_kernel_base) {
             static bool swept;
@@ -3935,6 +4239,8 @@ void hv_track_t8142_undef_vector(struct exc_info *ctx)
                 swept = true;
                 hv_sweep_guest_images(t8142_kernel_base);
             }
+            hv_patch_t8142_undef_vector(HV_VECTOR_SYNC_CURRENT_SP0);
+            hv_patch_t8142_undef_vector(HV_VECTOR_SYNC_LOWER_A64);
             return;
         }
     }
@@ -3946,8 +4252,8 @@ void hv_track_t8142_undef_vector(struct exc_info *ctx)
      * kernel runs EL1t and the boot manager EL1h, and either can take the
      * fault we are here to intercept.
      */
-    hv_patch_t8142_undef_vector(0); /* EL1t -> +0x000 */
-    hv_patch_t8142_undef_vector(1); /* EL1h -> +0x200 */
+    hv_patch_t8142_undef_vector(HV_VECTOR_SYNC_CURRENT_SP0);
+    hv_patch_t8142_undef_vector(HV_VECTOR_SYNC_CURRENT_SPX);
 }
 
 static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
@@ -5194,6 +5500,52 @@ static void hv_exc_exit(struct exc_info *ctx)
     msr(SP_EL1, ctx->sp[1]);
 }
 
+/*
+ * Perform a guest WFI at EL2.  See the HCR_EL2.TWI comment in hv_init() for why
+ * this CPU cannot be trusted to run the instruction itself: it can return with
+ * the general-purpose register file cleared, and the guest keeps live values in
+ * it across the wait.  Here the whole guest register set is already in the
+ * exception frame and _hv_return reloads it, so the loss cannot reach EL1.
+ */
+static bool hv_handle_wfx(struct exc_info *ctx)
+{
+    /* ISS[1:0] "TI": 0b00 WFI, 0b01 WFE, 0b10 WFIT, 0b11 WFET. */
+    if (FIELD_GET(ESR_ISS, ctx->esr) & 1)
+        return false; // WFE is not trapped (HCR_EL2.TWE is clear) and has no handler here
+
+    wfi_trap_count[smp_id()]++;
+    if (!wfi_trap_logged) {
+        wfi_trap_logged = true;
+        printf("HV: first guest WFI held at EL2 on CPU %u, guest pc 0x%lx\n", smp_id(),
+               ctx->elr);
+    }
+
+    /*
+     * Wait only when there is nothing to return to the guest with.  A pending
+     * virtual interrupt is not a wakeup event for EL2 -- the guest can reach
+     * WFI with interrupts masked and its only pending work injected by m1n1 --
+     * so waiting on one would stall until the next physical tick.
+     */
+    if (mrs(ISR_EL1) == 0 && !(mrs(HCR_EL2) & (HCR_VI | HCR_VF))) {
+        /*
+         * Bound the wait.  A virtual interrupt does not end a WFI executed at
+         * EL2, so without this an idle secondary sleeps until its own tick --
+         * one hertz -- and every timed wait in the guest stretches to match.
+         * See HV_WFI_WAKE_RATE.
+         */
+        hv_arm_wfi_wake();
+        cpu_wfi_stateless();
+    }
+
+    /*
+     * Deliberately no hv_wdt_pet() here.  The watchdog timestamp is global, so
+     * an idling CPU petting it would hide a genuine hang on another one -- and
+     * hv_start_secondary() is already known to stall intermittently on the
+     * first CPU_ON.  The boot CPU's tick keeps the watchdog fed.
+     */
+    return true;
+}
+
 void hv_exc_sync(struct exc_info *ctx)
 {
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
@@ -5221,6 +5573,10 @@ void hv_exc_sync(struct exc_info *ctx)
         case ESR_EC_MSR:
             hv_wdt_breadcrumb('m');
             handled = hv_handle_msr_unlocked(ctx, FIELD_GET(ESR_ISS, ctx->esr));
+            break;
+        case ESR_EC_WFI:
+            hv_wdt_breadcrumb('w');
+            handled = hv_handle_wfx(ctx);
             break;
         //
         // for Blizzard/Avalanche and later - we need to explicitly check for SMC EC to handle SMCs
@@ -5279,6 +5635,30 @@ void hv_exc_sync(struct exc_info *ctx)
         if (ec != ESR_EC_HVC)
             ctx->elr += 4;
         hv_set_elr(ctx->elr);
+        /*
+         * Republish the rest of the return state, not just ELR.
+         *
+         * Guest x0-x30 reach the guest through the exception frame, so a
+         * handler that writes ctx->regs[] works on this path without help.  SP
+         * and SPSR do not: they are written back only by hv_exc_exit(), which
+         * this path exists to skip.  Anything a handler put in ctx->sp[] or
+         * ctx->spsr was therefore dropped on the floor -- silently, and only on
+         * the path taken in the common case.
+         *
+         * That cost two hardware debugging cycles on the T8142 EL0 vector
+         * redirect: replaying NT's "sub sp, sp, #0x370" left the guest 0x370
+         * above its own frame and it ran off the kernel stack into the guard
+         * page (bugcheck 0x50), and unwinding an emulated EL0 fault returned to
+         * user code at EL1h instead of EL0 (bugcheck 0x2B).
+         *
+         * These are the values hv_get_context() read on entry, so for every
+         * handler that does not touch them this is a write-back of what is
+         * already there -- three system-register writes against a trap that
+         * already cost hundreds of cycles.
+         */
+        hv_set_spsr(ctx->spsr);
+        msr(SP_EL0, ctx->sp[0]);
+        msr(SP_EL1, ctx->sp[1]);
         /*
          * This return path is invisible to hv_rendezvous(): hv_cpus_in_guest is
          * cleared only by hv_exc_entry() below, which we are about to skip.  A

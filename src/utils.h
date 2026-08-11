@@ -528,6 +528,13 @@ extern u64 boot_flags, mem_size_actual;
 void cpu_sleep(bool deep) __attribute__((noreturn));
 void deep_wfi(void);
 
+/*
+ * WFI/WFE for cores that may clear the register file while waiting; see
+ * utils_asm.S.  cpu_wfe_stateless() returns 1 if the file was in fact lost.
+ */
+void cpu_wfi_stateless(void);
+u64 cpu_wfe_stateless(void);
+
 bool is_heap(void *addr);
 bool supports_arch_retention(void);
 bool supports_gxf(void);

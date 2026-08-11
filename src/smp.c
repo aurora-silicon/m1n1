@@ -270,6 +270,12 @@ volatile u64 smp_c_entry_mask;
 volatile u64 smp_init_complete_mask;
 volatile u64 smp_spin_entry_mask;
 
+/*
+ * Times each parked secondary came back from its WFE with the register file
+ * cleared.  Reported by smp_report_wfe_reg_loss(); see smp_secondary_entry().
+ */
+volatile u64 smp_wfe_reg_loss[MAX_CPUS];
+
 static bool wfe_mode = false;
 
 static int target_cpu;
@@ -489,7 +495,23 @@ void smp_secondary_entry(void)
     while (1) {
         while (!(target = me->target)) {
             if (wfe_mode || T8142_EVENT_IDLE) {
-                sysop("wfe");
+                /*
+                 * `me` and `index` live in callee-saved registers across this
+                 * wait, and a parked secondary sits here for minutes -- from
+                 * smp_start_secondaries() until the guest's first CPU_ON.  On
+                 * T8142 a wait can clear the register file (that is what
+                 * destroys the guest's x26 across HalProcessorIdle; see the
+                 * HCR_EL2.TWI trap in hv_exc.c), and a core that resumes with
+                 * `me` cleared never increments its flag again.
+                 *
+                 * cpu_wfe_stateless() both closes that hole and measures it.
+                 * So far it has measured zero: WFE has not been observed losing
+                 * the file on this SoC, so this is a guard rather than a known
+                 * bug, and it is *not* the explanation for the intermittent
+                 * hv_start_secondary() hang -- that still reproduces with this
+                 * in place.  See the retry loop in smp_call4().
+                 */
+                smp_wfe_reg_loss[index] += cpu_wfe_stateless();
             } else {
                 deep_wfi();
 
@@ -1191,8 +1213,22 @@ void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
     else
         smp_send_ipi(cpu);
 
-    while (target->flag == flag)
+    /*
+     * Keep signalling while we wait, rather than trusting the single wakeup
+     * above.  A secondary parked here has been in WFE since
+     * smp_start_secondaries(), which on a Windows boot is minutes -- the guest
+     * does not ask for its first CPU_ON until the NT kernel starts its APs --
+     * and one event that fails to land leaves this loop spinning forever with
+     * the target still asleep.  Measured on J813: 5 of the 11 boots that
+     * reached the guest's first CPU_ON hung exactly here, in hv_start_secondary
+     * on cpu0, with no other symptom.  Re-arming costs one instruction per
+     * iteration of a loop that is already spinning.
+     */
+    while (target->flag == flag) {
+        if (wfe_mode)
+            sysop("sev");
         sysop("dmb sy");
+    }
 }
 
 u64 smp_wait(int cpu)
@@ -1206,6 +1242,25 @@ u64 smp_wait(int cpu)
         sysop("dmb sy");
 
     return target->retval;
+}
+
+void smp_report_wfe_reg_loss(void)
+{
+    static u64 last_total;
+    u64 total = 0;
+
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++)
+        total += smp_wfe_reg_loss[cpu];
+
+    if (total == last_total)
+        return;
+    last_total = total;
+
+    printf("SMP: parked-WFE register file lost:");
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++)
+        if (smp_wfe_reg_loss[cpu])
+            printf(" cpu%d=%ld", cpu, smp_wfe_reg_loss[cpu]);
+    printf("\n");
 }
 
 void smp_set_wfe_mode(bool new_mode)
