@@ -39,6 +39,11 @@ int uart_init(void)
     return 0;
 }
 
+void uart_disable(void)
+{
+    uart_base = 0;
+}
+
 void uart_putbyte(u8 c)
 {
     if (!uart_base)

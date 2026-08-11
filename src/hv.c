@@ -6,6 +6,7 @@
 #include "cpu_regs.h"
 #include "display.h"
 #include "gxf.h"
+#include "malloc.h"
 #include "memory.h"
 #include "mtp_handoff.h"
 #include "pcie.h"
@@ -394,12 +395,140 @@ static void hv_set_gxf_vbar(void)
     msr(SYS_IMP_APL_VBAR_GL1, _hv_vectors_start);
 }
 
+/*
+ * Guest framebuffer shadow (J813).
+ *
+ * iBoot hands this panel over as 30bpp X2R10G10B10: still four bytes per pixel,
+ * but ten bits per channel, B at [11:2], G at [21:12], R at [31:22]. Mu reports
+ * that faithfully as a PixelBitMask mode (SimpleFbDxe.c), and Windows'
+ * BasicDisplay drives only 32-bit BGRA -- so it declines the framebuffer and the
+ * installer runs with nowhere to draw.
+ *
+ * m1n1 solves this on J414s inside display_configure(), by asking the DCP to
+ * scan the surface out as BGRA. That path hangs on T8142, whose DCP is
+ * iop,ascwrap-v6 (see the comment in src/display.c), so instead of changing what
+ * the hardware scans out we change what the guest writes into: the guest gets a
+ * real BGRA buffer and we repack it into the scanout from the tick.
+ *
+ * This is the same conversion Mu does in SimpleFbEncodePixel for its own Blt
+ * calls. Mu's copy stops mattering at ExitBootServices, when Windows takes the
+ * framebuffer over and writes it directly.
+ *
+ * The shadow comes from m1n1's heap, which sits in the hole between the guest's
+ * RAM-LOW and RAM-HIGH windows: memory the guest will never allocate, but that
+ * hv_map_hw() can hand it at its own address.
+ */
+static u32 *hv_fb_shadow;
+static u32 *hv_fb_scanout;
+static u32 hv_fb_stride_px;
+static u32 hv_fb_height;
+static u32 hv_fb_cursor;
+
+static void hv_fb_init(struct boot_args *gba)
+{
+    if (chip_id != T8142 || !gba->video.base || !gba->video.height || !gba->video.stride)
+        return;
+
+    /*
+     * Only worth doing when the guest has been told it is looking at BGRA; the
+     * depth override lives in the proxyclient (hv/__init__.py). If that did not
+     * happen, the guest and the scanout already agree and converting would
+     * corrupt a working display.
+     */
+    if ((gba->video.depth & 0xff) != 32)
+        return;
+
+    u64 size = ALIGN_UP(gba->video.stride * gba->video.height, 0x4000);
+
+    hv_fb_shadow = memalign(0x4000, size);
+    if (!hv_fb_shadow) {
+        printf("HV: fb: no room for a %lu byte BGRA shadow; guest keeps the raw scanout\n", size);
+        return;
+    }
+
+    /*
+     * The guest will map this as a framebuffer, which UEFI and Windows means
+     * non-cacheable -- and it arrives here as heap, which is Normal cacheable.
+     * Two aliases of one physical page with mismatched cacheability is
+     * architecturally unpredictable, so match what fb_init() already does for
+     * the real scanout and take m1n1's own view down to Normal-NC.
+     *
+     * Clean and invalidate first: these lines are dirty from the heap's prior
+     * life, and once the mapping is NC a later eviction would land on top of
+     * whatever the guest has written.
+     */
+    dc_civac_range(hv_fb_shadow, size);
+    sysop("dsb sy");
+    mmu_add_mapping((u64)hv_fb_shadow, (u64)hv_fb_shadow, size, MAIR_IDX_NORMAL_NC, PERM_RW);
+
+    memset(hv_fb_shadow, 0, size);
+
+    if (hv_map_hw((u64)hv_fb_shadow, (u64)hv_fb_shadow, size) < 0) {
+        printf("HV: fb: could not map the BGRA shadow into the guest\n");
+        free(hv_fb_shadow);
+        hv_fb_shadow = NULL;
+        return;
+    }
+
+    hv_fb_scanout = (u32 *)gba->video.base;
+    hv_fb_stride_px = gba->video.stride / 4;
+    hv_fb_height = gba->video.height;
+    gba->video.base = (u64)hv_fb_shadow;
+
+    printf("HV: fb: BGRA shadow at %p -> X2R10G10B10 scanout at %p (%ux%u)\n", hv_fb_shadow,
+           hv_fb_scanout, hv_fb_stride_px, hv_fb_height);
+}
+
+/*
+ * Convert `lines` scanlines, continuing from wherever the previous caller
+ * stopped.
+ *
+ * Deliberately not a whole frame. This first ran as one full pass from
+ * hv_tick(), which executes with the big hypervisor lock held -- 17 MB of
+ * non-cached read plus write, once a second, stalling every other core's EL2
+ * entry. Measured cost: guest interrupt throughput fell from bursts of ~120 per
+ * tick to a flat 2-3, and the installer's spinner visibly crawled.
+ *
+ * The callers that matter are cores about to park in WFI, which get here on the
+ * fast path in hv_exc_sync() *without* taking that lock, so the work lands on
+ * cores that were going to idle anyway. hv_tick() still contributes a slice so a
+ * guest that never idles keeps refreshing. The cursor is shared and advanced
+ * atomically, so several cores just take different bands.
+ */
+void hv_fb_convert_slice(u32 lines)
+{
+    if (!hv_fb_shadow)
+        return;
+
+    u32 start = __atomic_fetch_add(&hv_fb_cursor, lines, __ATOMIC_RELAXED) % hv_fb_height;
+    u32 end = start + lines;
+    if (end > hv_fb_height)
+        end = hv_fb_height;
+
+    for (u32 y = start; y < end; y++) {
+        const u32 *src = hv_fb_shadow + (size_t)y * hv_fb_stride_px;
+        u32 *dst = hv_fb_scanout + (size_t)y * hv_fb_stride_px;
+
+        for (u32 x = 0; x < hv_fb_stride_px; x++) {
+            u32 p = src[x];
+            dst[x] = ((p & 0xff) << 2) | (((p >> 8) & 0xff) << 12) | (((p >> 16) & 0xff) << 22);
+        }
+    }
+}
+
 void hv_start(void *entry, u64 regs[4])
 {
     if (boot_cpu_idx == -1) {
         printf("Boot CPU has not been found, can't start hypervisor\n");
         return;
     }
+
+    /*
+     * regs[0] is the guest's boot_args pointer, written by the proxyclient just
+     * before this call and not yet read by anything. Last chance to redirect the
+     * framebuffer before the guest sees it.
+     */
+    hv_fb_init((struct boot_args *)regs[0]);
 
     memset(hv_should_exit, 0, sizeof(hv_should_exit));
     memset(hv_started_cpus, 0, sizeof(hv_started_cpus));
@@ -1053,6 +1182,12 @@ static void hv_sample_guest_pc(struct exc_info *ctx)
 void hv_tick(struct exc_info *ctx)
 {
     hv_wdt_pet();
+    /*
+     * A floor, not the main path: this runs with the big hypervisor lock held,
+     * so it converts only a band. Idle cores parking in WFI do the bulk of the
+     * work, unlocked. See hv_fb_convert_slice().
+     */
+    hv_fb_convert_slice(HV_FB_SLICE_TICK);
 #ifdef ENABLE_GUEST_PC_SAMPLER
     hv_sample_guest_pc(ctx);
 #endif

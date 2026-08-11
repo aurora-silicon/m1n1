@@ -301,6 +301,26 @@ void m1n1_main(void)
     wdt_disable();
 #ifndef BRINGUP
     pmgr_init();
+
+    /*
+     * J813 leaves uart0 clock-gated under the installed USB-proxy path, and
+     * uart_putbyte() has no way to notice: it spins on read32(uart_base +
+     * UTRSTAT) and then writes UTXH. Those accesses fault asynchronously, so
+     * the SError lands on whatever core and EL happens to be executing when it
+     * retires rather than on the printf that caused it -- observed as guest
+     * SErrors at EL1h mid-instruction, and as nested faults inside m1n1's own
+     * exception reporter, always with FAR = uart0 + 0x10 or + 0x20. It killed
+     * roughly two boots in five, each one looking like a different bug.
+     *
+     * uart_init() runs from startup.c long before pmgr exists, so this is the
+     * earliest the gate can be opened. If it cannot be opened, stop driving the
+     * port entirely: the console reaches us over USB either way, and a silent
+     * UART is strictly better than one that corrupts unrelated execution.
+     */
+    if (pmgr_adt_power_enable("/arm-io/uart0") < 0) {
+        uart_disable();
+        printf("uart0 could not be powered; disabling the physical UART\n");
+    }
 #ifdef USE_DEBUG_USB
     tps6598x_enable_debugusb();
 #endif

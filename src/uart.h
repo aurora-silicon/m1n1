@@ -7,6 +7,13 @@
 
 int uart_init(void);
 
+/*
+ * Stop driving the physical UART. Every uart_* entry point is a no-op
+ * afterwards. For callers that discover the port is unusable *after*
+ * uart_init() has already latched its base address; see main.c.
+ */
+void uart_disable(void);
+
 void uart_putbyte(u8 c);
 u8 uart_getbyte(void);
 

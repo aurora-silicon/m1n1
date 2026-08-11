@@ -5533,6 +5533,14 @@ static bool hv_handle_wfx(struct exc_info *ctx)
          * one hertz -- and every timed wait in the guest stretches to match.
          * See HV_WFI_WAKE_RATE.
          */
+        /*
+         * This core is about to go idle and we are not holding the big
+         * hypervisor lock here, which makes it the right place to move the
+         * guest's framebuffer to the panel. Doing it from hv_tick() instead --
+         * a whole frame, under the lock -- cut guest interrupt throughput by
+         * more than an order of magnitude.
+         */
+        hv_fb_convert_slice(HV_FB_SLICE_IDLE);
         hv_arm_wfi_wake();
         cpu_wfi_stateless();
     }

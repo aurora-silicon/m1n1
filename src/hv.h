@@ -126,6 +126,18 @@ void hv_pin_cpu(int cpu);
 u64 hv_host_counter(void);
 void hv_arm_tick(bool secondary);
 void hv_arm_wfi_wake(void);
+
+/*
+ * Scanlines converted per call from the guest's BGRA shadow into the panel's
+ * X2R10G10B10 scanout. Idle cores about to park in WFI do the bulk of it on the
+ * unlocked path, so their slice is small and frequent (they arrive at
+ * HV_WFI_WAKE_RATE); the tick's slice is a floor for a guest that never idles,
+ * and is bounded because hv_tick() holds the big hypervisor lock.
+ */
+#define HV_FB_SLICE_IDLE 8
+#define HV_FB_SLICE_TICK 64
+
+void hv_fb_convert_slice(u32 lines);
 bool hv_mask_pending_tick(void);
 void hv_rearm(void);
 void hv_maybe_exit(void);

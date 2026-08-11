@@ -2646,6 +2646,31 @@ class HV(Reloadable):
         self.tba.devtree = self.adt_base - phys_base + self.tba.virt_base
         self.tba.top_of_kernel_data = guest_base + image_size
 
+        # J813/T8142: iBoot hands the internal panel over as 30bpp X2R10G10B10,
+        # and Mu's SimpleFbDxe publishes exactly that -- a PixelBitMask mode --
+        # when it sees depth 30 (SimpleFbDxe.c:609).  Windows' BasicDisplay only
+        # drives 32-bit BGRA, so it declines the framebuffer and the installer
+        # renders to a panel that never lights up.  Telling the guest the depth
+        # is 32 makes Mu publish PixelBlueGreenRedReserved8BitPerColor instead;
+        # it accepts either (it rejects anything that is not 30 or 32).
+        #
+        # The scanout hardware is still X2R10G10B10, so this override *alone*
+        # yields a visible but colour-shifted image.  That is deliberate as a
+        # first step: it isolates "does Windows draw at all" from "are the
+        # colours right".  hv_fb_convert() in the hypervisor tick is what makes
+        # the colours right, by giving the guest a real BGRA shadow buffer.
+        #
+        # Only the low byte is the depth; FB_DEPTH_FLAG_RETINA (0x10000) lives
+        # above it and must survive.
+        #
+        # Gated on chip_id and not on an environment variable: AuroraDbg runs
+        # boots through a long-lived daemon, and _environment() copies the
+        # *daemon's* os.environ, which is fixed at daemon start.  A variable
+        # exported in the shell that launches `abg` never reaches run_guest.
+        if self.adt["/chosen"].chip_id == 0x8142:
+            self.tba.video.depth = 32 | (self.tba.video.depth & ~0xff)
+            print(f"T8142: guest framebuffer depth set to {self.tba.video.depth:#x} (BGRA GOP)")
+
         if use_xnu_symbols == True:
             self.sym_offset = vmin - guest_base + self.tba.phys_base - self.tba.virt_base
 
