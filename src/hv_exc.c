@@ -5645,6 +5645,19 @@ static bool hv_handle_wfx(struct exc_info *ctx)
     }
 
     /*
+     * Service the MTP IOP's mailbox here: still off the big hypervisor lock,
+     * but deliberately *outside* the "about to go idle" test below.  That
+     * test is skipped whenever a virtual interrupt is pending, which is
+     * exactly the situation where the guest is busy or wedged -- measured on
+     * J813 with a stuck HCR_VI, the idle block stopped running entirely (the
+     * framebuffer fell to the 1 Hz tick's 64 lines/s), and a drain placed
+     * inside it would have starved precisely when the IOP most needed
+     * servicing.  Internally rate-limited, single-servicer, bounded, silent;
+     * hv_tick() keeps a 1 Hz floor.
+     */
+    mtp_handoff_poll();
+
+    /*
      * Wait only when there is nothing to return to the guest with.  A pending
      * virtual interrupt is not a wakeup event for EL2 -- the guest can reach
      * WFI with interrupts masked and its only pending work injected by m1n1 --
@@ -5665,13 +5678,6 @@ static bool hv_handle_wfx(struct exc_info *ctx)
          * more than an order of magnitude.
          */
         hv_fb_convert_slice(HV_FB_SLICE_IDLE);
-        /*
-         * Same reasoning for the MTP IOP's mailbox: it needs servicing for
-         * as long as the guest runs, and this is the slot that costs the
-         * guest nothing.  Internally rate-limited, single-servicer, bounded,
-         * silent; hv_tick() keeps a 1 Hz floor for a guest that never idles.
-         */
-        mtp_handoff_poll();
         hv_arm_wfi_wake();
         cpu_wfi_stateless();
     }
