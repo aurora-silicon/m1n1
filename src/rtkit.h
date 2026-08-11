@@ -67,6 +67,17 @@ bool rtkit_boot_timed(rtkit_dev_t *rtk, u32 timeout_usec);
 bool rtkit_can_recv(rtkit_dev_t *rtk);
 
 int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg);
+/*
+ * Bounded, silent, never-blocking variant of rtkit_recv() for servicing an
+ * IOP's mailbox while a guest owns the machine.  Consumes at most max_msgs
+ * messages (rtkit_recv() drains the whole mailbox per call); requires a free
+ * A2I slot before each consume so the one reply a message can need is sent
+ * without asc_send() entering its 200 ms poll; prints nothing on any path;
+ * latches an IOP crash without walking the crashlog.  App-endpoint messages
+ * are counted and dropped.  Returns messages consumed, or negative once the
+ * IOP has crashed (stop servicing).
+ */
+int rtkit_service_quiet(rtkit_dev_t *rtk, int max_msgs);
 bool rtkit_send(rtkit_dev_t *rtk, const struct rtkit_message *msg);
 
 bool rtkit_map(rtkit_dev_t *rtk, void *phys, size_t sz, u64 *dva);

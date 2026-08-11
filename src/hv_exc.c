@@ -14,6 +14,7 @@
 #include "aic_regs.h"
 #include "hv_aic_alias.h"
 #include "adt.h"
+#include "mtp_handoff.h"
 
 #define TIME_ACCOUNTING
 //
@@ -5645,6 +5646,13 @@ static bool hv_handle_wfx(struct exc_info *ctx)
          * more than an order of magnitude.
          */
         hv_fb_convert_slice(HV_FB_SLICE_IDLE);
+        /*
+         * Same reasoning for the MTP IOP's mailbox: it needs servicing for
+         * as long as the guest runs, and this is the slot that costs the
+         * guest nothing.  Internally rate-limited, single-servicer, bounded,
+         * silent; hv_tick() keeps a 1 Hz floor for a guest that never idles.
+         */
+        mtp_handoff_poll();
         hv_arm_wfi_wake();
         cpu_wfi_stateless();
     }

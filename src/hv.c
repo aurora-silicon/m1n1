@@ -1243,30 +1243,22 @@ void hv_tick(struct exc_info *ctx)
     hv_report_t8142_process(ctx);
     hv_report_t8142_gic_activity();
     /*
-     * DISABLED -- mtp_handoff_poll() is correct in intent but not safe here.
+     * MTP IOP mailbox floor.  The primary servicer is the unlocked WFI-idle
+     * path in hv_exc.c (see hv_handle_wfx); this 1 Hz call only covers a
+     * guest that never idles.  Safe here now: mtp_handoff_poll() is
+     * rate-limited, single-servicer, message-bounded (rtkit_service_quiet,
+     * max 4), silent, and refuses to consume a message it cannot reply to,
+     * so asc_send()'s 200 ms poll can never run under the big lock.
      *
-     * Nothing in the guest owns the MTP IOP's mailbox (MTP.asl publishes no ASC
-     * aperture and AppleMtpHid has no mailbox code), so an unacknowledged RTKit
-     * syslog backlog wedges the IOP and input dies -- see the measurement in
-     * mtp_handoff_poll().  Calling it from here did fix the mailbox: I2A_CONTROL
-     * stayed EMPTY for a whole boot where it had previously latched FULL.
-     *
-     * But Windows then froze at the boot spinner, with the hypervisor still
-     * live and CPU 6 -- the AIC target, and the core that runs this tick --
-     * taking roughly ten times the interrupts of any other core.  Two reasons
-     * this call site is wrong, either of which could be the cause:
-     *
-     *   - hv_tick() runs with the big hypervisor lock held, so anything slow
-     *     here starves every guest CPU; and
-     *   - rtkit_recv() services MSG_BUFFER_REQUEST by allocating from the m1n1
-     *     heap, which after handoff is Windows' own conventional memory.
-     *     Granting the IOP a DMA buffer out of it corrupts the guest.
-     *
-     * The replacement wants to be a narrow acknowledge-only drain: ACK syslog
-     * and oslog, never allocate, never grant a buffer, and preferably run
-     * outside the big lock.
+     * Historical note: an earlier call here used rtkit_recv(), which drains
+     * the whole mailbox per call and can block in asc_send(), and Setup
+     * crawled with CPU 6 taking ~10x the interrupts of any other core.  The
+     * heap-grant fear recorded at the time was already stale -- with
+     * rtkit_set_buffer_pool() installed (mtp_handoff.c), grants come from
+     * the reserved carveout and rtkit_alloc_buffer() has no heap fallback.
      */
-    /* mtp_handoff_poll(); */
+    mtp_handoff_poll();
+    mtp_handoff_report();
     smp_report_wfe_reg_loss();
     hv_check_t8142_bugcheck();
     hv_recover_t8142_sysreg_undef(ctx);

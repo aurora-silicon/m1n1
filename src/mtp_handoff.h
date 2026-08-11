@@ -19,10 +19,21 @@ void mtp_handoff_init(void);
 void mtp_handoff_map_guest_staging(void);
 
 /*
- * Service the IOP's RTKit mailbox.  Call periodically for as long as the guest
- * runs: nothing in Windows owns this mailbox, and an unacknowledged syslog
- * backlog stops the IOP producing HID reports.
+ * Service the IOP's RTKit mailbox.  Call for as long as the guest runs:
+ * nothing in Windows owns this mailbox, and an unacknowledged syslog backlog
+ * stops the IOP producing HID reports.
+ *
+ * Safe from any core with or without the big hypervisor lock: internally
+ * rate-limited, single-servicer, message-bounded, silent, and never blocking
+ * (rtkit_service_quiet).  The primary call site is the unlocked WFI-idle path
+ * in hv_exc.c; hv_tick() provides a 1 Hz floor.
  */
 void mtp_handoff_poll(void);
+
+/*
+ * Print the one-shot notice for an IOP crash detected by mtp_handoff_poll().
+ * Call only where a bounded printf is acceptable (hv_tick, under the lock).
+ */
+void mtp_handoff_report(void);
 
 #endif

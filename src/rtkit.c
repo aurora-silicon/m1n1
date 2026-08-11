@@ -13,10 +13,17 @@
 #include "types.h"
 #include "utils.h"
 
+/*
+ * All module output funnels through here so that quiet servicing can turn it
+ * off in one place: printf at EL2 on T8142 is slow and a known SError source,
+ * and rtkit_service_quiet() runs while a guest owns the machine.
+ */
 #define rtkit_printf(...)                                                                          \
     do {                                                                                           \
-        debug_printf("rtkit(%s): ", rtk->name);                                                    \
-        debug_printf(__VA_ARGS__);                                                                 \
+        if (!rtk->quiet) {                                                                         \
+            debug_printf("rtkit(%s): ", rtk->name);                                                \
+            debug_printf(__VA_ARGS__);                                                             \
+        }                                                                                          \
     } while (0)
 
 #define RTKIT_EP_MGMT     0
@@ -126,6 +133,15 @@ struct rtkit_dev {
     u32 syslog_cnt, syslog_size;
 
     bool crashed;
+
+    /*
+     * Quiet servicing state (rtkit_service_quiet): while set, rtkit_printf
+     * is a no-op and failures are counted instead of reported.
+     */
+    bool quiet;
+    u32 quiet_app_msgs;
+    u32 quiet_handle_fail;
+    u32 quiet_tx_blocked;
 };
 
 struct syslog_log {
@@ -581,6 +597,15 @@ static void rtkit_crashed(rtkit_dev_t *rtk)
     struct crashlog_hdr *hdr = rtk->crashlog_bfr.bfr;
     rtk->crashed = true;
 
+    /*
+     * Under quiet servicing the walk below is forbidden: it printfs once per
+     * entry over IOP-controlled memory, at EL2, while a guest is running, and
+     * advances by an IOP-supplied length.  Latch the crash and leave; the
+     * crashlog can be walked from the proxy shell afterwards.
+     */
+    if (rtk->quiet)
+        return;
+
     rtkit_printf("IOP crashed!\n");
 
     if (hdr->type != 'CLHE') {
@@ -612,118 +637,194 @@ bool rtkit_can_recv(rtkit_dev_t *rtk)
     return asc_can_recv(rtk->asc);
 }
 
+/*
+ * Dispatch one received mailbox message.  Returns 1 for an app-endpoint
+ * message (left in *msg for the caller), 0 when consumed (handled or
+ * dropped), -1 on a handling failure or IOP crash -- rtk->crashed
+ * distinguishes the two.
+ */
+static int rtkit_handle_message(rtkit_dev_t *rtk, struct rtkit_message *msg,
+                                const struct asc_message *asc_msg)
+{
+    bool ok = true;
+
+    if (asc_msg->msg1 >= 0x100) {
+        rtkit_printf("WARNING: received message for invalid endpoint %x >= 0x100\n",
+                     asc_msg->msg1);
+        return 0;
+    }
+
+    msg->msg = asc_msg->msg0;
+    msg->ep = (u8)asc_msg->msg1;
+
+    /* if this is an app message we can just forward it to the caller */
+    if (msg->ep >= 0x20)
+        return 1;
+
+    u32 msgtype = FIELD_GET(MGMT_TYPE, msg->msg);
+    switch (msg->ep) {
+        case RTKIT_EP_MGMT:
+            switch (msgtype) {
+                case MGMT_MSG_IOP_PWR_STATE_ACK:
+                    rtk->iop_power = FIELD_GET(MGMT_PWR_STATE, msg->msg);
+                    break;
+                case MGMT_MSG_AP_PWR_STATE_ACK:
+                    rtk->ap_power = FIELD_GET(MGMT_PWR_STATE, msg->msg);
+                    break;
+                default:
+                    rtkit_printf("unknown management message %x\n", msgtype);
+            }
+            break;
+        case RTKIT_EP_SYSLOG:
+            switch (msgtype) {
+                case MSG_BUFFER_REQUEST:
+                    ok = ok && rtkit_handle_buffer_request(rtk, msg, &rtk->syslog_bfr);
+                    break;
+                case MSG_SYSLOG_INIT:
+                    rtk->syslog_cnt = FIELD_GET(MSG_SYSLOG_INIT_COUNT, msg->msg);
+                    rtk->syslog_size = FIELD_GET(MSG_SYSLOG_INIT_ENTRYSIZE, msg->msg);
+                    break;
+                case MSG_SYSLOG_LOG:
+#ifdef RTKIT_SYSLOG
+                {
+                    u64 index = FIELD_GET(MSG_SYSLOG_LOG_INDEX, msg->msg);
+                    u64 stride = rtk->syslog_size + sizeof(struct syslog_log);
+                    struct syslog_log *log = rtk->syslog_bfr.bfr + stride * index;
+                    rtkit_printf("syslog: [%s]%s", log->context, log->msg);
+                    if (log->msg[strlen(log->msg) - 1] != '\n')
+                        printf("\n");
+                }
+#endif
+                    if (!asc_send(rtk->asc, asc_msg))
+                        rtkit_printf("failed to ack syslog\n");
+                    break;
+                default:
+                    rtkit_printf("unknown syslog message %x\n", msgtype);
+            }
+            break;
+        case RTKIT_EP_CRASHLOG:
+            switch (msgtype) {
+                case MSG_BUFFER_REQUEST:
+                    if (!rtk->crashlog_bfr.bfr) {
+                        ok = ok && rtkit_handle_buffer_request(rtk, msg, &rtk->crashlog_bfr);
+                    } else {
+                        rtkit_crashed(rtk);
+                        return -1;
+                    }
+                    break;
+                default:
+                    rtkit_printf("unknown crashlog message %x\n", msgtype);
+            }
+            break;
+        case RTKIT_EP_IOREPORT:
+            switch (msgtype) {
+                case MSG_BUFFER_REQUEST:
+                    ok = ok && rtkit_handle_buffer_request(rtk, msg, &rtk->ioreport_bfr);
+                    break;
+                /* unknown but must be ACKed */
+                case 0x8:
+                case 0xc:
+                    if (!rtkit_send(rtk, msg))
+                        rtkit_printf("unable to ACK unknown ioreport message\n");
+                    break;
+                default:
+                    rtkit_printf("unknown ioreport message %x\n", msgtype);
+            }
+            break;
+        case RTKIT_EP_OSLOG:
+            switch (FIELD_GET(OSLOG_TYPE, msg->msg)) {
+                case OSLOG_TYPE_BUFFER_REQUEST:
+                    ok = ok && rtkit_handle_oslog_request(rtk, msg);
+                    break;
+                default:
+                    rtkit_printf("unknown oslog message %lx\n", msg->msg);
+            }
+            break;
+        default:
+            rtkit_printf("message to unknown system endpoint 0x%02x: %lx\n", msg->ep, msg->msg);
+    }
+
+    if (!ok) {
+        rtkit_printf("failed to handle system message 0x%02x: %lx\n", msg->ep, msg->msg);
+        return -1;
+    }
+
+    return 0;
+}
+
 int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg)
 {
     struct asc_message asc_msg;
-    bool ok = true;
 
     if (rtk->crashed)
         return -1;
 
     while (asc_recv(rtk->asc, &asc_msg)) {
-        if (asc_msg.msg1 >= 0x100) {
-            rtkit_printf("WARNING: received message for invalid endpoint %x >= 0x100\n",
-                         asc_msg.msg1);
-            continue;
-        }
-
-        msg->msg = asc_msg.msg0;
-        msg->ep = (u8)asc_msg.msg1;
-
-        /* if this is an app message we can just forward it to the caller */
-        if (msg->ep >= 0x20)
-            return 1;
-
-        u32 msgtype = FIELD_GET(MGMT_TYPE, msg->msg);
-        switch (msg->ep) {
-            case RTKIT_EP_MGMT:
-                switch (msgtype) {
-                    case MGMT_MSG_IOP_PWR_STATE_ACK:
-                        rtk->iop_power = FIELD_GET(MGMT_PWR_STATE, msg->msg);
-                        break;
-                    case MGMT_MSG_AP_PWR_STATE_ACK:
-                        rtk->ap_power = FIELD_GET(MGMT_PWR_STATE, msg->msg);
-                        break;
-                    default:
-                        rtkit_printf("unknown management message %x\n", msgtype);
-                }
-                break;
-            case RTKIT_EP_SYSLOG:
-                switch (msgtype) {
-                    case MSG_BUFFER_REQUEST:
-                        ok = ok && rtkit_handle_buffer_request(rtk, msg, &rtk->syslog_bfr);
-                        break;
-                    case MSG_SYSLOG_INIT:
-                        rtk->syslog_cnt = FIELD_GET(MSG_SYSLOG_INIT_COUNT, msg->msg);
-                        rtk->syslog_size = FIELD_GET(MSG_SYSLOG_INIT_ENTRYSIZE, msg->msg);
-                        break;
-                    case MSG_SYSLOG_LOG:
-#ifdef RTKIT_SYSLOG
-                    {
-                        u64 index = FIELD_GET(MSG_SYSLOG_LOG_INDEX, msg->msg);
-                        u64 stride = rtk->syslog_size + sizeof(struct syslog_log);
-                        struct syslog_log *log = rtk->syslog_bfr.bfr + stride * index;
-                        rtkit_printf("syslog: [%s]%s", log->context, log->msg);
-                        if (log->msg[strlen(log->msg) - 1] != '\n')
-                            printf("\n");
-                    }
-#endif
-                        if (!asc_send(rtk->asc, &asc_msg))
-                            rtkit_printf("failed to ack syslog\n");
-                        break;
-                    default:
-                        rtkit_printf("unknown syslog message %x\n", msgtype);
-                }
-                break;
-            case RTKIT_EP_CRASHLOG:
-                switch (msgtype) {
-                    case MSG_BUFFER_REQUEST:
-                        if (!rtk->crashlog_bfr.bfr) {
-                            ok = ok && rtkit_handle_buffer_request(rtk, msg, &rtk->crashlog_bfr);
-                        } else {
-                            rtkit_crashed(rtk);
-                            return -1;
-                        }
-                        break;
-                    default:
-                        rtkit_printf("unknown crashlog message %x\n", msgtype);
-                }
-                break;
-            case RTKIT_EP_IOREPORT:
-                switch (msgtype) {
-                    case MSG_BUFFER_REQUEST:
-                        ok = ok && rtkit_handle_buffer_request(rtk, msg, &rtk->ioreport_bfr);
-                        break;
-                    /* unknown but must be ACKed */
-                    case 0x8:
-                    case 0xc:
-                        if (!rtkit_send(rtk, msg))
-                            rtkit_printf("unable to ACK unknown ioreport message\n");
-                        break;
-                    default:
-                        rtkit_printf("unknown ioreport message %x\n", msgtype);
-                }
-                break;
-            case RTKIT_EP_OSLOG:
-                switch (FIELD_GET(OSLOG_TYPE, msg->msg)) {
-                    case OSLOG_TYPE_BUFFER_REQUEST:
-                        ok = ok && rtkit_handle_oslog_request(rtk, msg);
-                        break;
-                    default:
-                        rtkit_printf("unknown oslog message %lx\n", msg->msg);
-                }
-                break;
-            default:
-                rtkit_printf("message to unknown system endpoint 0x%02x: %lx\n", msg->ep, msg->msg);
-        }
-
-        if (!ok) {
-            rtkit_printf("failed to handle system message 0x%02x: %lx\n", msg->ep, msg->msg);
-            return -1;
-        }
+        int ret = rtkit_handle_message(rtk, msg, &asc_msg);
+        if (ret)
+            return ret;
     }
 
     return 0;
+}
+
+int rtkit_service_quiet(rtkit_dev_t *rtk, int max_msgs)
+{
+    int n = 0;
+
+    if (!rtk || rtk->crashed)
+        return -1;
+
+    rtk->quiet = true;
+
+    while (n < max_msgs) {
+        struct asc_message asc_msg;
+        struct rtkit_message msg;
+
+        if (!asc_can_recv(rtk->asc))
+            break;
+
+        /*
+         * Consuming is irreversible and any message needs at most one reply
+         * (syslog ack, buffer grant, ioreport echo), so require a free A2I
+         * slot before touching the FIFO.  With one guaranteed, asc_send()'s
+         * poll32 sees the condition already met and returns immediately --
+         * only the AP fills A2I, so the slot cannot vanish underneath us.
+         * Without one, leave the message queued for a later pass.
+         */
+        if (!asc_can_send(rtk->asc)) {
+            rtk->quiet_tx_blocked++;
+            break;
+        }
+
+        if (!asc_recv(rtk->asc, &asc_msg))
+            break;
+        n++;
+
+        int ret = rtkit_handle_message(rtk, &msg, &asc_msg);
+        if (ret > 0) {
+            /*
+             * App-endpoint message with no consumer attached: nothing in a
+             * running guest ever calls rtkit_recv() for this device, so
+             * count it and move on rather than stalling the drain.
+             */
+            rtk->quiet_app_msgs++;
+        } else if (ret < 0) {
+            if (rtk->crashed) {
+                rtk->quiet = false;
+                return -1;
+            }
+            /*
+             * A failed grant or handler is not fatal to servicing: the IOP
+             * either re-requests or stalls in a way the transport-side
+             * telemetry will show.  Count it and keep the mailbox moving.
+             */
+            rtk->quiet_handle_fail++;
+        }
+    }
+
+    rtk->quiet = false;
+    return n;
 }
 
 bool rtkit_start_ep(rtkit_dev_t *rtk, u8 ep)

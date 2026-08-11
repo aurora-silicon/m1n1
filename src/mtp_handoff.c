@@ -187,8 +187,10 @@ static const struct mtp_platform *mtp_platform;
 
 /*
  * Multitouch firmware staging window, in lockstep with the fourth _CRS
- * memory resource in the Windows MTP SSDT (integration/hardware/m2-pro/
- * project-mu/MTP.asl) and with the Mu MemoryInitPeiLib reservation overlay.
+ * memory resource in the Windows MTP SSDT (mu/Platform/MacBookAir2026Pkg/
+ * AcpiTables/MTP.asl; the J414s original it was ported from lives in
+ * MacBookProEarly2023Pkg) and with the Mu MemoryInitPeiLib reservation
+ * overlay.
  * AppleMtpHid writes the firmware payload at the CPU physical address and
  * sends the bus address in command 0x95, so the mapping must be established
  * here and must survive into Windows.  The bus address sits above the IOP
@@ -561,7 +563,7 @@ fail:
 }
 
 /*
- * Keep servicing the MTP IOP's RTKit mailbox for as long as the guest runs.
+ * Service the MTP IOP's RTKit mailbox for as long as the guest runs.
  *
  * Handing the DockChannel to Windows does not hand over the mailbox: MTP.asl
  * publishes no ASC aperture and AppleMtpHid contains no mailbox code at all, so
@@ -576,40 +578,65 @@ fail:
  * Draining the mailbox by hand emptied it but did not restart the IOP, because
  * what it waits for is the acknowledgement, not the space.
  *
- * rtkit_recv() already does all of this: it acknowledges syslog, answers
- * management and buffer requests, and returns 1 only for an app-endpoint
- * message.  The missing piece was never the logic, only that nobody called it.
+ * The first attempt called rtkit_recv() from hv_tick() under the big
+ * hypervisor lock, and Setup crawled.  That call was wrong three ways, none
+ * of them frequency: rtkit_recv() drains the entire mailbox per call (the
+ * old budget bounded calls, not messages), its replies go through asc_send()
+ * which spins up to 200 ms when A2I is full, and a crashed IOP walks the
+ * crashlog with a printf per entry -- all under the lock every other core
+ * needs to exit the guest.
  *
- * Runs from hv_tick() under the big hypervisor lock, so it is deliberately
- * bounded: drain a few messages per tick and leave the rest for the next one.
- * Nothing here writes to the console -- a printf at EL2 on this machine is both
- * slow and a known SError source.
+ * rtkit_service_quiet() exists for exactly this call site: message-bounded,
+ * silent on every path, and it refuses to consume anything it could not
+ * immediately reply to.  The primary caller is the WFI-idle path in
+ * hv_exc.c, which runs without the big lock (same slot as the framebuffer
+ * slice work, and for the same reason); hv_tick() calls it too as a 1 Hz
+ * floor for the case where no core ever idles.  The busy flag keeps
+ * concurrently idling cores from stacking up on the ASC MMIO, and the
+ * interval keeps the cost of a WFI trap at one counter read.
  */
-static u32 mtp_handoff_app_messages;
+static u32 mtp_handoff_poll_interval;
+static u64 mtp_handoff_poll_next;
+static u32 mtp_handoff_poll_busy;
+static bool mtp_handoff_crash_pending;
 
 void mtp_handoff_poll(void)
 {
-    unsigned int budget = 8;
-
     if (!mtp_handoff.ready || !mtp_handoff.rtkit)
         return;
 
-    while (budget-- && rtkit_can_recv(mtp_handoff.rtkit)) {
-        struct rtkit_message msg;
-        int ret = rtkit_recv(mtp_handoff.rtkit, &msg);
+    if (__atomic_exchange_n(&mtp_handoff_poll_busy, 1, __ATOMIC_ACQUIRE))
+        return;
 
-        if (ret < 0) {
+    if (!mtp_handoff_poll_interval)
+        mtp_handoff_poll_interval = mrs(CNTFRQ_EL0) / 100; /* 10 ms */
+
+    u64 now = hv_host_counter();
+    if (now >= mtp_handoff_poll_next) {
+        mtp_handoff_poll_next = now + mtp_handoff_poll_interval;
+
+        if (rtkit_can_recv(mtp_handoff.rtkit) &&
+            rtkit_service_quiet(mtp_handoff.rtkit, 4) < 0) {
             /*
-             * A crashed or wedged endpoint must not be polled forever: stop
-             * touching it and let the rest of the system carry on.
+             * Crashed IOP: stop touching it for good.  The notice is
+             * printed by mtp_handoff_report() from the tick, where the big
+             * lock is already held and one bounded printf is acceptable.
              */
             mtp_handoff.ready = false;
-            return;
+            mtp_handoff_crash_pending = true;
         }
-
-        if (ret > 0)
-            mtp_handoff_app_messages++;
     }
+
+    __atomic_store_n(&mtp_handoff_poll_busy, 0, __ATOMIC_RELEASE);
+}
+
+void mtp_handoff_report(void)
+{
+    if (!mtp_handoff_crash_pending)
+        return;
+
+    mtp_handoff_crash_pending = false;
+    printf("mtp-handoff: MTP IOP crashed; mailbox service stopped\n");
 }
 
 void mtp_handoff_map_guest_staging(void)
@@ -661,6 +688,10 @@ void mtp_handoff_map_guest_staging(void)
 }
 
 void mtp_handoff_poll(void)
+{
+}
+
+void mtp_handoff_report(void)
 {
 }
 
