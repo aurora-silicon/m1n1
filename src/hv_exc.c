@@ -98,9 +98,29 @@ static bool t8142_sysreg_assist_ready_reported;
 #define HV_SYSREG_ASSIST_CALL_MAGIC 0x4e54535247ULL /* "NTSRG" */
 #define HV_TIMER_REFLECT_CALL_REPOST_P 0x100
 #define HV_TIMER_REFLECT_CALL_REPOST_V 0x101
+/*
+ * The AIC3 handover.  AIC2 announces "Windows owns the controller now" by
+ * writing CONFIG |= ENABLE, which hv_aic.c watches for; AIC3 has no global
+ * CONFIG register at all, so the HAL extension says so explicitly instead.
+ */
+#define HV_TIMER_REFLECT_CALL_CONTROLLER_READY 0x102
+/*
+ * Step reporting from the HAL extension, step code in x2.
+ *
+ * Its gNtasiTrace[] can only be read by walking the loaded-module list to find
+ * the image, and that list does not exist during HAL init phase 0 -- exactly
+ * where a failure to register lands.  Measured on J813: a boot that bugchecked
+ * 0x5C there reported the extension "is not loaded", which was the reader
+ * failing on an empty list rather than a fact about the extension.  This needs
+ * no symbols and works at any stage.
+ */
+#define HV_TIMER_REFLECT_CALL_PROGRESS 0x103
 #define HV_TIMER_REFLECT_REPOST_STALE 0
 #define HV_TIMER_REFLECT_REPOSTED 1
 #define HV_TIMER_REFLECT_REPOST_ALREADY_UNREAD 2
+#define HV_TIMER_REFLECT_READY_IGNORED 0
+#define HV_TIMER_REFLECT_READY_ACCEPTED 1
+#define HV_TIMER_REFLECT_READY_ALREADY 2
 #define HV_TIMER_CTL_ENABLE      BIT(0)
 #define HV_TIMER_CTL_IMASK       BIT(1)
 /* Standard GIC PPIs published by the Windows startup-carrier GTDT. */
@@ -5394,6 +5414,29 @@ static bool hv_handle_smc(struct exc_info *ctx) {
             ctx->regs[1] == HV_TIMER_REFLECT_CALL_REPOST_P);
         return true;
     }
+    if (ctx->regs[0] == HV_TIMER_REFLECT_CALL_MAGIC &&
+        ctx->regs[1] == HV_TIMER_REFLECT_CALL_PROGRESS) {
+        printf("HV: ntasi-step: %ld (CPU %d, phase active=%d ready=%d)\n",
+               ctx->regs[2], smp_id(), hv_native_aic_windows_active(),
+               hv_native_aic_windows_ready());
+        ctx->regs[0] = 0;
+        return true;
+    }
+    if (ctx->regs[0] == HV_TIMER_REFLECT_CALL_MAGIC &&
+        ctx->regs[1] == HV_TIMER_REFLECT_CALL_CONTROLLER_READY) {
+        /*
+         * Only meaningful once Mu has handed off at ExitBootServices; before
+         * that windows_aic_phase is false and this is reported as ignored
+         * rather than silently accepted.
+         */
+        if (hv_native_aic_windows_controller_ready("HAL extension SMC"))
+            ctx->regs[0] = HV_TIMER_REFLECT_READY_ACCEPTED;
+        else if (hv_native_aic_windows_ready())
+            ctx->regs[0] = HV_TIMER_REFLECT_READY_ALREADY;
+        else
+            ctx->regs[0] = HV_TIMER_REFLECT_READY_IGNORED;
+        return true;
+    }
 #endif
     printf("PSCI SMC DEBUG: handling PSCI request 0x%lx\n", ctx->regs[0]);
     bool handled_smc = hv_handle_psci_smc(ctx);
@@ -5678,6 +5721,9 @@ static bool hv_handle_wfx(struct exc_info *ctx)
          * more than an order of magnitude.
          */
         hv_fb_convert_slice(HV_FB_SLICE_IDLE);
+        /* Unlocked idle path, same as the slice above: this is where most of
+         * the change detection actually happens, because an idle guest exits
+         * here constantly and a busy one does not need watching as closely. */
         hv_arm_wfi_wake();
         cpu_wfi_stateless();
     }

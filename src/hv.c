@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "hv.h"
+#include "fb_capture.h"
 #include "hv_tpm.h"
 #include "assert.h"
 #include "cpu_regs.h"
@@ -477,6 +478,12 @@ static void hv_fb_init(struct boot_args *gba)
     hv_fb_height = gba->video.height;
     gba->video.base = (u64)hv_fb_shadow;
 
+    /* Tell the change detector where the guest's pixels are. Done HERE, at the
+     * announcement, so the two can never disagree about the address -- it is
+     * re-allocated per guest and moved between two consecutive J813 boots. */
+    fb_capture_set_shadow((u64)hv_fb_shadow, gba->video.width, gba->video.height,
+                          gba->video.stride);
+
     printf("HV: fb: BGRA shadow at %p -> X2R10G10B10 scanout at %p (%ux%u)\n", hv_fb_shadow,
            hv_fb_scanout, hv_fb_stride_px, hv_fb_height);
 }
@@ -602,11 +609,17 @@ void hv_start(void *entry, u64 regs[4])
      */
     mtp_handoff_map_guest_staging();
 
-    /* Host MMIO mappings are complete before hv_start(), so these hooks persist. */
-    if (chip_id == T8142)
-        printf("HV: T8142: deferring native-AIC transition hooks during Mu/NVMe bring-up\n");
-    else
-        hv_native_aic_transition_init();
+    /*
+     * Host MMIO mappings are complete before hv_start(), so these hooks persist.
+     *
+     * T8142 used to skip this and defer the hooks "during Mu/NVMe bring-up",
+     * because there was no CSRT and therefore no way for Windows to drive the
+     * AIC itself -- installing the hooks would have handed interrupts to an
+     * EL1 that could not service them.  T8142FamilyPkg now publishes a real
+     * AIC3 CSRT and the HAL extension binds to it, so the reason is gone and
+     * this SoC takes the same path as every other one.
+     */
+    hv_native_aic_transition_init();
 #endif
 
     //
@@ -1221,6 +1234,8 @@ void hv_tick(struct exc_info *ctx)
      * work, unlocked. See hv_fb_convert_slice().
      */
     hv_fb_convert_slice(HV_FB_SLICE_TICK);
+    /* Same budget rationale as the slice above: bounded work on an exit that
+     * was happening anyway. One tile row is 40 tiles of 64x64 on this panel. */
     hv_fb_report();
 #ifdef ENABLE_GUEST_PC_SAMPLER
     hv_sample_guest_pc(ctx);

@@ -21,6 +21,7 @@ static bool mu_aic_ready;
 static bool mu_timer_ready;
 static bool windows_aic_phase;
 static bool windows_aic_enabled;
+static bool windows_ready_claimed;
 
 #define HV_NATIVE_AIC_TRACE_DEPTH 64
 
@@ -228,27 +229,17 @@ void hv_native_aic_timer_ready(void)
         hv_native_aic_windows_active())
         return;
 
-    if (!__atomic_load_n(&mu_aic_ready, __ATOMIC_ACQUIRE)) {
-        /*
-         * J813/T8142 deliberately leaves the CONFIG/EVENT transition hooks
-         * unmapped during Mu and NVMe bring-up.  Consequently we cannot learn
-         * that AppleAicDxe enabled AIC2 from handle_native_aic_transition().
-         * The final TimerDxe CTL write is nevertheless a safe place to sample
-         * the real, non-destructive CONFIG register: the timer callback has
-         * already been registered and CONFIG.ENABLE proves the native AIC
-         * handler is live.  Initialize only the Mu timer-reflection state here;
-         * do not install the deferred Windows transition hooks.
-         */
-        if (chip_id != T8142 ||
-            !(read32(aic->base + AIC2_GLOBAL_CONFIG) &
-              AIC2_GLOBAL_CONFIG_ENABLE))
-            return;
-
-        hv_timer_reflect_init();
-        __atomic_store_n(&native_aic_active, true, __ATOMIC_RELEASE);
-        __atomic_store_n(&mu_aic_ready, true, __ATOMIC_RELEASE);
-        printf("HV: T8142: observed live Mu AIC2 CONFIG without transition hooks\n");
-    }
+    /*
+     * mu_aic_ready is latched by handle_native_aic_transition() when AppleAicDxe
+     * writes CONFIG.  Until that has happened there is nothing to reflect.
+     *
+     * T8142 used to compensate here by polling the real CONFIG register,
+     * because its transition hooks were deliberately not installed and the
+     * write could not be observed.  The hooks are installed now, so the poll
+     * would only pre-empt the real phase machine with a less informed guess.
+     */
+    if (!__atomic_load_n(&mu_aic_ready, __ATOMIC_ACQUIRE))
+        return;
 
     /*
      * TimerDxe registers its callback before enabling the architectural timer.
@@ -324,13 +315,58 @@ static bool handle_native_aic_transition(struct exc_info *ctx, u64 addr, u64 *va
                smp_id());
     } else if (config_write && (*val & AIC2_GLOBAL_CONFIG_ENABLE) &&
                hv_native_aic_windows_active()) {
-        hv_carrier_retire_active_sgis();
-        __atomic_store_n(&windows_aic_enabled, true, __ATOMIC_RELEASE);
-        hv_native_aic_enter_cpu();
-        hv_timer_reflect_enable();
-        printf("HV: windows-native-aic: Windows enabled AIC2 CONFIG on CPU %d\n",
-               smp_id());
+        hv_native_aic_windows_controller_ready("AIC2 CONFIG enable");
     }
+    return true;
+}
+
+/*
+ * The AIC2 path above learns that Windows has taken the controller by watching
+ * for CONFIG |= ENABLE.  AIC3 has no such register: aic3_layout.c never sets
+ * has_global_config, so AppleAicInitializeIoUnit skips that write entirely and
+ * the branch is *structurally* unreachable -- not racy, not late.
+ *
+ * Measured on J813: the extension reached NTASI_STEP_IOUNIT_OK with all eleven
+ * HAL callbacks installed and ten local units up, while m1n1 was still printing
+ * "holding timer bridge until Windows enables AIC2".  Windows therefore never
+ * received a timer tick and HAL init failed with bugcheck 0x5C (0x110, _, 0x19,
+ * 0xC0000001).
+ *
+ * So take the handover from the extension directly, over the private SMC
+ * channel it already uses for timer reposts.  This is strictly better evidence
+ * than the CONFIG write ever was: a CONFIG write only says "the controller is
+ * powered on", whereas this is issued by the native controller itself, once its
+ * callbacks are installed and its line states replayed.
+ *
+ * The CONFIG branch is deliberately left in place -- AIC2 targets (J414s) keep
+ * their existing trigger and simply find the work already done here.  Whichever
+ * arrives first wins; the loser is a no-op.
+ */
+bool hv_native_aic_windows_controller_ready(const char *source)
+{
+    bool expected = false;
+
+    if (!__atomic_load_n(&native_aic_active, __ATOMIC_ACQUIRE) ||
+        !hv_native_aic_windows_active())
+        return false;
+
+    /*
+     * Claim separately from publishing.  The ordering below is the CONFIG
+     * branch's ordering exactly, and it matters: hv_native_aic_enter_cpu()
+     * decides between the startup carrier and full passthrough by reading
+     * windows_aic_enabled, so the flag must be set before it runs and the SGI
+     * retirement must happen before that.
+     */
+    if (!__atomic_compare_exchange_n(&windows_ready_claimed, &expected, true,
+                                     false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return false;
+
+    hv_carrier_retire_active_sgis();
+    __atomic_store_n(&windows_aic_enabled, true, __ATOMIC_RELEASE);
+    hv_native_aic_enter_cpu();
+    hv_timer_reflect_enable();
+    printf("HV: windows-native-aic: Windows controller ready (%s) on CPU %d\n",
+           source, smp_id());
     return true;
 }
 
@@ -344,6 +380,7 @@ void hv_native_aic_transition_init(void)
     __atomic_store_n(&mu_timer_ready, false, __ATOMIC_RELEASE);
     __atomic_store_n(&windows_aic_phase, false, __ATOMIC_RELEASE);
     __atomic_store_n(&windows_aic_enabled, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&windows_ready_claimed, false, __ATOMIC_RELEASE);
     /*
      * Install after the host has completed its broad MMIO mappings (hv_start,
      * not hv_init), otherwise pt_update overwrites these hooks.  CONFIG lives

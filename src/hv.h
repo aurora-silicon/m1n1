@@ -208,6 +208,14 @@ bool hv_native_aic_windows_ready(void);
 bool hv_native_aic_mu_timer_active(void);
 void hv_native_aic_timer_ready(void);
 void hv_native_aic_enter_cpu(void);
+/*
+ * One-shot, idempotent handover: Windows' native AIC controller is installed
+ * and may now own interrupt delivery.  Two things can report it -- an AIC2
+ * CONFIG enable write, or the HAL extension's explicit SMC (AIC3 has no global
+ * CONFIG register, so there is no write to watch).  Returns true for the caller
+ * that actually performed the transition.
+ */
+bool hv_native_aic_windows_controller_ready(const char *source);
 
 /*
  * Keep the mechanics of changing HCR.FMO/IMO/VI in one place. The helper
