@@ -686,12 +686,39 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
             register_handled = true;
         }
         else if ( (register_handled == false) && (relative_addr >= GIC_DIST_IPRIORITYR0) && (relative_addr <= GIC_DIST_IPRIORITYR254) ) {
-            u32 reg_num;
-            reg_num = (relative_addr - GIC_DIST_IPRIORITYR0) / 4;
-            distributor->gicd_interrupt_priority_regs[reg_num] = *val;
-            vgic_log("HV vGIC DEBUG [INFO] [Distributor]: interrupt priority register %d = 0x%llx\n", reg_num, *val);
+            //
+            // GICD_IPRIORITYR is a byte array: byte N is the priority of INTID N,
+            // and a guest may program a single interrupt with one strb.  Rounding
+            // the address down to a word and storing the whole access as a u32 --
+            // which is what this did -- writes the value to the wrong INTID and
+            // zeroes its three neighbours.
+            //
+            // Measured on J813: Windows programs the MTP SPI with priority 0x40 at
+            // GICD_IPRIORITYR+995, i.e. word 248 byte 3.  The value landed on INTID
+            // 992 and INTID 995 kept 0.  Zero is the *highest* priority the GIC
+            // defines, so when a core acknowledged 995 the CPU interface's running
+            // priority became 0 and hv_gic_cpuif_select()'s `prio >= s->running`
+            // test then rejected every other interrupt -- including the SGI used
+            // for processor rendezvous (priority 0x10) and the core's own timer.
+            // Windows waited 300 s for a core that could no longer answer and
+            // bugchecked 0x1DB, then asked PSCI for SYSTEM_RESET.
+            //
+            // The redistributor path already honoured the sub-word offset; this is
+            // the same handling, and additionally honours the access width so a
+            // halfword or doubleword write updates exactly the bytes it covers.
+            //
+            u32 first_intid = (u32)(relative_addr - GIC_DIST_IPRIORITYR0);
+            u32 nbytes = 1u << width;
+            u8 *prio = (u8 *)distributor->gicd_interrupt_priority_regs;
+
+            for (u32 i = 0; i < nbytes; i++) {
+                if ((first_intid + i) >= sizeof(distributor->gicd_interrupt_priority_regs))
+                    break;
+                prio[first_intid + i] = (u8)(*val >> (8 * i));
+            }
+            vgic_log("HV vGIC DEBUG [INFO] [Distributor]: interrupt priority INTID %d..%d = 0x%llx\n",
+                     first_intid, first_intid + nbytes - 1, *val);
             register_handled = true;
-            //unimplemented_reg_accessed = true;
         }
         else if ( (register_handled == false) && (relative_addr >= GIC_DIST_ITARGETSR0) && (relative_addr <= GIC_DIST_ITARGETSR254) ) {
             //
@@ -848,10 +875,23 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
             register_handled = true;
         }
         else if ( (register_handled == false) && (relative_addr >= GIC_DIST_IPRIORITYR0) && (relative_addr <= GIC_DIST_IPRIORITYR254) ) {
-            u32 reg_num;
-            reg_num = (relative_addr - GIC_DIST_IPRIORITYR0) / 4;
-            *val = distributor->gicd_interrupt_priority_regs[reg_num];
-            vgic_log("HV vGIC DEBUG [INFO] [Distributor]: interrupt priority register %d = 0x%llx\n", reg_num, *val);
+            //
+            // Byte-addressable, and read back exactly the way it is written --
+            // see the write path for why the sub-word offset is load-bearing.
+            //
+            u32 first_intid = (u32)(relative_addr - GIC_DIST_IPRIORITYR0);
+            u32 nbytes = 1u << width;
+            const u8 *prio = (const u8 *)distributor->gicd_interrupt_priority_regs;
+            u64 out = 0;
+
+            for (u32 i = 0; i < nbytes; i++) {
+                if ((first_intid + i) >= sizeof(distributor->gicd_interrupt_priority_regs))
+                    break;
+                out |= (u64)prio[first_intid + i] << (8 * i);
+            }
+            *val = out;
+            vgic_log("HV vGIC DEBUG [INFO] [Distributor]: interrupt priority INTID %d..%d = 0x%llx\n",
+                     first_intid, first_intid + nbytes - 1, *val);
             register_handled = true;
         }
         else if ( (register_handled == false) && (relative_addr >= GIC_DIST_ITARGETSR0) && (relative_addr <= GIC_DIST_ITARGETSR254) ) {
