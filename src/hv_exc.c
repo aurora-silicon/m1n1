@@ -115,6 +115,7 @@ static bool t8142_sysreg_assist_ready_reported;
  * no symbols and works at any stage.
  */
 #define HV_TIMER_REFLECT_CALL_PROGRESS 0x103
+#define NTASI_STEP_LOCAL_UNIT_READY 35
 #define HV_TIMER_REFLECT_REPOST_STALE 0
 #define HV_TIMER_REFLECT_REPOSTED 1
 #define HV_TIMER_REFLECT_REPOST_ALREADY_UNREAD 2
@@ -123,9 +124,15 @@ static bool t8142_sysreg_assist_ready_reported;
 #define HV_TIMER_REFLECT_READY_ALREADY 2
 #define HV_TIMER_CTL_ENABLE      BIT(0)
 #define HV_TIMER_CTL_IMASK       BIT(1)
-/* Standard GIC PPIs published by the Windows startup-carrier GTDT. */
-#define HV_GIC_TIMER_P_INTID     30
-#define HV_GIC_TIMER_V_INTID     27
+/*
+ * Timer IDs published by the T8142 Mu GTDT.  Apple delivers the underlying
+ * sources as per-CPU FIQs, so these GSIVs are firmware-chosen compatibility
+ * numbers rather than the conventional Arm GIC PPIs 30/27.  They must stay in
+ * lockstep with T8142FamilyPkg.dsc.inc or Windows will acknowledge a line with
+ * no clock ISR attached.
+ */
+#define HV_GIC_TIMER_P_INTID     17
+#define HV_GIC_TIMER_V_INTID     18
 
 /*
  * Windows ARM64 uses KPCR+0x24d8 (KPRCB.PanicStackBase) for synchronous
@@ -255,6 +262,27 @@ static u32 native_irq_rearm_entry_epoch[MAX_CPUS];
 static u32 native_irq_rearm_start_time[MAX_CPUS];
 static u32 native_irq_rearm_still_asserted_count[MAX_CPUS];
 static u32 native_irq_rearm_release_count[MAX_CPUS];
+/*
+ * AIC3 announces local-unit readiness before InitializeIoUnit. Keep the last
+ * progress marker per CPU so the otherwise-identical CONTROLLER_READY SMCs can
+ * be separated without changing the already-deployed v5 HAL extension:
+ *
+ *   step 35 + CONTROLLER_READY  -> keep the startup carrier
+ *   step 23 + CONTROLLER_READY  -> InitializeIoUnit is live; retire carrier
+ *
+ * These stay outside hv_pcpu_data, whose 0x800-byte layout is a debugger ABI.
+ */
+static u32 native_aic_last_progress[MAX_CPUS];
+static bool native_aic_local_unit_ready[MAX_CPUS];
+
+static bool hv_native_aic_carrier_local_ready(void)
+{
+    u32 cpu = smp_id();
+
+    return cpu < MAX_CPUS && native_aic_local_unit_ready[cpu] &&
+           hv_native_aic_windows_active() &&
+           !hv_native_aic_windows_ready();
+}
 static u32 native_irq_rearm_capture_count[MAX_CPUS];
 static u32 native_irq_rearm_empty_capture_count[MAX_CPUS];
 static u32 native_irq_rearm_replay_count[MAX_CPUS];
@@ -528,6 +556,9 @@ static bool hv_sgi_queue_pop(virq_t *pending)
 void hv_timer_reflect_init(void)
 {
     memset(native_aic_timer_diag, 0, sizeof(native_aic_timer_diag));
+    memset(native_aic_last_progress, 0, sizeof(native_aic_last_progress));
+    memset(native_aic_local_unit_ready, 0,
+           sizeof(native_aic_local_unit_ready));
     for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
         PERCPU_N(cpu, ipi_queued) = 0;
         PERCPU_N(cpu, ipi_pending) = 0;
@@ -889,6 +920,53 @@ static void hv_native_aic_progress_deferred_irq(void)
                             native_irq_entry_epoch[cpu]);
 }
 
+/*
+ * Guest EVENT reads, i.e. "Windows' interrupt handler actually ran".  The one
+ * number that separates "the timer bridge is delivering" from "EL2 is posting
+ * doorbells nobody collects"; see hv_native_aic_delivery_report().
+ */
+static u32 native_event_read_count[MAX_CPUS];
+
+/*
+ * One line per second once Windows owns the AIC, answering the only question
+ * that matters after the handover: does an interrupt actually reach the guest?
+ *
+ * fiq   - the Apple timer FIQ arrived at EL2 and was coalesced
+ * evrd  - the guest read the AIC EVENT aperture, i.e. its ISR ran
+ * IMO/VI - what EL2 is asking for right now
+ * gI    - guest PSTATE.I at the last trap; a guest spinning with interrupts
+ *         masked cannot take VI no matter how correct the routing is, which is
+ *         the difference between "not delivered" and "not delivarable".
+ */
+void hv_native_aic_delivery_report(void)
+{
+    u32 fiq = 0, evrd = 0, unread = 0;
+    u64 hcr = mrs(HCR_EL2);
+    u64 spsr = mrs(SPSR_EL2);
+
+    if (!hv_native_aic_windows_ready())
+        return;
+
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        fiq += PERCPU_N(cpu, timer_p_fiq_count) + PERCPU_N(cpu, timer_v_fiq_count);
+        evrd += native_event_read_count[cpu];
+        unread += PERCPU_N(cpu, timer_p_event_unread) ||
+                  PERCPU_N(cpu, timer_v_event_unread);
+    }
+
+    /*
+     * Keep reporting IGRPEN1 as phase evidence, not as a controller-owner
+     * verdict. J813 proved that Windows can clear it and still acknowledge the
+     * transition clock through ICC_IAR1_EL1 until InitializeIoUnit installs the
+     * native EVENT callback.
+     */
+    printf("HV: native-aic: fiq=%u evrd=%u unread=%u IMO=%d VI=%d gI=%d gEL=%d "
+           "igrpen1=%d elr=0x%lx\n",
+           fiq, evrd, unread, !!(hcr & HCR_IMO), !!(hcr & HCR_VI),
+           !!(spsr & BIT(7)), (int)((spsr >> 2) & 3),
+           !!hv_vgic3_get_igrpen1(), (unsigned long)mrs(ELR_EL2));
+}
+
 static void hv_native_aic_doorbell_sync(void)
 {
     bool pending;
@@ -1243,7 +1321,8 @@ static bool hv_carrier_irq_pending(void)
 {
 #if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
     if (!hv_native_aic_windows_active() || hv_native_aic_windows_ready() ||
-        !hv_vgic3_get_igrpen1() ||
+        (!hv_vgic3_get_igrpen1() &&
+         !hv_native_aic_carrier_local_ready()) ||
         (!PERCPU(carrier_stack_ready) && !PERCPU(carrier_delivery_proven)))
         return false;
 
@@ -1262,9 +1341,17 @@ static bool hv_carrier_irq_pending(void)
 
     u8 pmr = (mrs(ICH_VMCR_EL2) >> 24) & 0xff;
     virq_t selected = {.priority = 0xff};
-    if (hv_carrier_select_pending(&selected) != HV_CARRIER_QUEUE_NONE &&
-        selected.priority < pmr)
-        return true;
+    if (hv_carrier_select_pending(&selected) != HV_CARRIER_QUEUE_NONE) {
+        /*
+         * After AIC3 LocalUnit is ready, Windows deliberately parks the GIC
+         * PMR at zero but continues acknowledging the compatibility clock via
+         * ICC_IAR1_EL1 until IoUnit installs the native EVENT callback. HCR.VI
+         * bypasses VMCR priority in hardware; allow that bypass only inside
+         * the measured step-35 transition window.
+         */
+        if (hv_native_aic_carrier_local_ready() || selected.priority < pmr)
+            return true;
+    }
 #endif
     return false;
 }
@@ -1351,18 +1438,34 @@ static void hv_update_fiq(struct exc_info *ctx)
             /* Keep the reflected source masked until EVENT or rearm. */
             vm_tmr_fiq_clr( VM_TMR_FIQ_ENA_ENA_V);
         }
-    } else if (hv_native_aic_windows_active()) {
+    } else if (hv_native_aic_windows_active() && !hv_gic_cpuif_active()) {
         /*
-         * Windows calibrates its architectural clock before the AIC HAL
-         * extension enables CONFIG.  During that narrow window, reflect the
-         * architected GTDT timer PPIs 30/27 through empty startup-carrier LRs. A timer write
-         * and ICC_IGRPEN1=1 are both required, so stale Mu state cannot create
-         * an IRQ storm.  This path disappears when CONFIG switches to AIC2.
+         * Windows calibrates its architectural clock before InitializeIoUnit.
+         * Prefer the already-live emulated GIC CPU interface below when Group
+         * 1 is enabled: it owns the guest's PMR/IAR/EOI state and is the path
+         * that carried the clock before the AIC3 HAL extension became active.
+         * This fallback is only for a core that never brought that interface
+         * up. Step 35 is the measured, narrow override for that interval;
+         * stack readiness, PMR, and the single-active-token rule are still
+         * enforced below.
          */
         PERCPU(timer_p_event_unread) = false;
         PERCPU(timer_v_event_unread) = false;
 
-        if (!PERCPU(carrier_timer_ready) || !hv_vgic3_get_igrpen1() ||
+        /*
+         * J813's exception hardening uses x18 as scratch at every trapped
+         * timer write, so that write cannot establish carrier readiness. Once
+         * LocalUnit has completed and the independent KPCR/exception-stack
+         * validator succeeds, the BSP has the stronger proof we actually
+         * need. Keep it latched until the IoUnit handoff.
+         */
+        if (hv_native_aic_carrier_local_ready() &&
+            smp_id() == boot_cpu_idx && PERCPU(carrier_stack_ready))
+            PERCPU(carrier_timer_ready) = true;
+
+        if (!PERCPU(carrier_timer_ready) ||
+            (!hv_vgic3_get_igrpen1() &&
+             !hv_native_aic_carrier_local_ready()) ||
             ctx == NULL || ctx->regs[18] == 0) {
             vm_tmr_fiq_clr(
                     VM_TMR_FIQ_ENA_ENA_P | VM_TMR_FIQ_ENA_ENA_V);
@@ -1631,6 +1734,8 @@ bool hv_native_aic_event_read(u64 raw_event, u64 *event)
     if (!hv_native_aic_windows_ready() || event == NULL)
         return false;
 
+    native_event_read_count[smp_id()]++;
+
     if (raw_event != 0 && !reserved) {
         HV_NATIVE_AIC_HOT_TRACE(HV_NATIVE_AIC_TRACE_EVENT_REAL, raw_event,
                                 native_irq_rearm_deferred[smp_id()]);
@@ -1765,7 +1870,15 @@ static void hv_timer_reflect_guest_rearm(bool physical, bool control_write, u64 
          * online through the carrier; local timer delivery begins only after
          * the native AIC handoff.
          */
-        PERCPU(carrier_timer_ready) = guest_cpu_ready && smp_id() == boot_cpu_idx;
+        /*
+         * Readiness is a one-way proof until the native handoff. Windows may
+         * use x18 as scratch on a later trapped timer write; clearing an
+         * already-proven BSP here removes the only clock source before IoUnit.
+         * hv_windows_update_carrier_readiness() still validates the live x18,
+         * KPCR and exception stacks before each actual carrier delivery.
+         */
+        PERCPU(carrier_timer_ready) |=
+            guest_cpu_ready && smp_id() == boot_cpu_idx;
         PERCPU(timer_p_event_unread) = false;
         PERCPU(timer_v_event_unread) = false;
         if (physical) {
@@ -2358,6 +2471,115 @@ static void hv_gic_cpuif_timer_pend(bool physical)
                                       : HV_VGIC_TIMER_V_INTID);
 }
 
+/*
+ * Route the short native-AIC startup compatibility window through one CPU-
+ * interface owner, regardless of how the guest access reached EL2.
+ *
+ * On T8142 the architectural ICC_* register file is absent at EL1.  The image
+ * scanner therefore replaces those accesses with indexed HVC sites before the
+ * guest executes them.  Those HVCs normally feed the standalone emulated-GIC
+ * CPU interface below.  During the native-AIC startup window, however, HCR.VI
+ * is driven from the carrier queues and their IAR/EOI state must be consumed by
+ * that same owner.  Letting a rewritten ICC_IAR1_EL1 read fall through to the
+ * standalone model returns 0x3ff even while the carrier has a pending timer;
+ * the guest takes the IRQ, sees it as spurious, and never reaches IoUnit.
+ *
+ * The ordinary trapped-MSR path uses this helper too.  That keeps direct
+ * TALL1 traps and pre-rewritten HVC sites semantically identical instead of
+ * leaving two subtly different copies of the carrier protocol.
+ */
+static bool hv_handle_native_aic_carrier_cpuif(u64 reg, bool is_read, u64 rt,
+                                                u64 regs[32], bool probe)
+{
+#if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
+    if (probe || !hv_native_aic_windows_active() ||
+        hv_native_aic_windows_ready())
+        return false;
+
+    /*
+     * Do not split one architectural CPU interface between two state
+     * machines. Once the standalone T8142 model has seen Group 1 enabled, it
+     * already owns PMR, IAR, EOI, and HCR.VI. The J813 step-35 trace proved
+     * that diverting only IAR/EOI to this carrier delivered INTID 18 once but
+     * never observed its completion, ending in HAL_INITIALIZATION_FAILED.
+     *
+     * Always let the Group-1 access itself reach the standalone model so the
+     * first enable establishes that ownership. Keep the software carrier only
+     * as a fallback for a core that never brought up the compatibility GIC.
+     */
+    u64 cpu = smp_id();
+    if (reg == SYSREG_ISS(ICC_IGRPEN1_EL1) ||
+        (cpu < MAX_CPUS && gic_cpuif_brought_up[cpu]))
+        return false;
+
+    switch (reg) {
+        case SYSREG_ISS(ICC_PMR_EL1):
+            if (is_read)
+                regs[rt] = PERCPU(vgic_pmr);
+            else
+                PERCPU(vgic_pmr) = regs[rt];
+            return true;
+
+        case SYSREG_ISS(ICC_IAR1_EL1):
+            if (is_read) {
+                if (!PERCPU(carrier_stack_ready) &&
+                    !PERCPU(carrier_delivery_proven)) {
+                    regs[rt] = 0x3ff;
+                } else {
+                    regs[rt] = hv_carrier_do_iar1();
+                }
+                if (regs[rt] != 0x3ff) {
+                    u32 count = ++PERCPU(carrier_iar_count);
+                    if (count <= 8)
+                        hv_native_aic_trace_record(
+                            HV_NATIVE_AIC_TRACE_CARRIER_IAR,
+                            regs[rt] | ((u64)count << 32), regs[18]);
+                }
+            }
+            return true;
+
+        case SYSREG_ISS(ICC_IGRPEN1_EL1):
+            if (is_read)
+                regs[rt] = hv_vgic3_get_igrpen1();
+            else
+                hv_vgic3_set_igrpen1(regs[rt]);
+            hv_native_aic_trace_record(HV_NATIVE_AIC_TRACE_CARRIER_SYSREG,
+                                       is_read ? 0 : BIT(32), regs[rt]);
+            return true;
+
+        case SYSREG_ISS(ICC_BPR1_EL1):
+            if (is_read)
+                regs[rt] = 0;
+            hv_native_aic_trace_record(HV_NATIVE_AIC_TRACE_CARRIER_SYSREG,
+                                       1 | (is_read ? 0 : BIT(32)), regs[rt]);
+            return true;
+
+        case SYSREG_ISS(ICC_EOIR1_EL1):
+            if (is_read) {
+                regs[rt] = 0;
+            } else {
+                hv_carrier_do_eoir1(regs[rt] & ICH_LR_VIRTUAL_MASK);
+                u32 count = ++PERCPU(carrier_eoi_count);
+                if (count <= 8)
+                    hv_native_aic_trace_record(
+                        HV_NATIVE_AIC_TRACE_CARRIER_EOI,
+                        regs[rt] & ICH_LR_VIRTUAL_MASK, count);
+            }
+            return true;
+
+        default:
+            return false;
+    }
+#else
+    (void)reg;
+    (void)is_read;
+    (void)rt;
+    (void)regs;
+    (void)probe;
+    return false;
+#endif
+}
+
 static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32],
                                       bool probe)
 {
@@ -2367,6 +2589,9 @@ static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
     u64 cpu = smp_id();
     if (cpu >= MAX_CPUS)
         return false;
+
+    if (hv_handle_native_aic_carrier_cpuif(reg, is_read, rt, regs, probe))
+        return true;
 
     struct hv_gic_cpuif *s = &gic_cpuif[cpu];
 
@@ -2387,41 +2612,44 @@ static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
         case SYSREG_ISS(ICC_PMR_EL1):
             if (is_read) {
                 regs[rt] = s->pmr;
-            } else {
+            } else if (!probe) {
                 s->pmr = regs[rt] & 0xff;
                 /* Lowering IRQL unmasks: re-evaluate before returning. */
-                if (!probe)
-                    hv_gic_cpuif_sync_vi();
+                hv_gic_cpuif_sync_vi();
             }
             break;
 
         case SYSREG_ISS(ICC_BPR1_EL1):
             if (is_read)
                 regs[rt] = s->bpr1;
-            else
+            else if (!probe)
                 s->bpr1 = regs[rt] & 0x7;
             break;
 
         case SYSREG_ISS(ICC_IGRPEN0_EL1):
             if (is_read)
                 regs[rt] = s->igrpen0;
-            else
+            else if (!probe)
                 s->igrpen0 = regs[rt] & 1;
             break;
 
         case SYSREG_ISS(ICC_IGRPEN1_EL1):
             if (is_read) {
                 regs[rt] = s->igrpen1;
-            } else {
+            } else if (!probe) {
                 u64 was = s->igrpen1;
                 s->igrpen1 = regs[rt] & 1;
+#ifdef ENABLE_VGIC_MODULE
+                /* Keep transition diagnostics and fallback gates coherent. */
+                hv_vgic3_set_igrpen1(s->igrpen1);
+#endif
                 /*
                  * Only the first enable is treated as bring-up.  An OS may
                  * toggle Group 1 around a critical section, and re-running the
                  * reset below on such a toggle would discard an interrupt the
                  * guest had already acknowledged but not yet completed.
                  */
-                if (!probe && s->igrpen1 && !was && !gic_cpuif_brought_up[cpu]) {
+                if (s->igrpen1 && !was && !gic_cpuif_brought_up[cpu]) {
                     gic_cpuif_brought_up[cpu] = true;
                     /*
                      * The OS is initializing this CPU interface.  Anything
@@ -2486,7 +2714,7 @@ static bool hv_handle_t8142_gic_cpuif(u64 reg, bool is_read, u64 rt, u64 regs[32
                  * INTIDs, and the emulated distributor does not implement them.
                  */
                 regs[rt] = (4UL << 8);
-            } else {
+            } else if (!probe) {
                 s->ctlr = regs[rt];
             }
             break;
@@ -4211,6 +4439,29 @@ void hv_check_t8142_bugcheck(void)
     printf("HV: T8142: guest bugcheck 0x%lx (%lx, %lx, %lx, %lx) seen on tick\n",
            code, read64(pa + 8), read64(pa + 16), read64(pa + 24),
            read64(pa + 32));
+#if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
+    if (hv_native_aic_windows_active()) {
+        u32 cpu = smp_id();
+        u64 hcr = mrs(HCR_EL2);
+        u8 pmr = (mrs(ICH_VMCR_EL2) >> 24) & 0xff;
+        virq_t pending = {.vintid = 0x3ff, .priority = 0xff};
+        enum hv_carrier_queue queue = hv_carrier_select_pending(&pending);
+
+        printf("HV: native-aic: carrier-gate cpu=%u local=%d timer=%d "
+               "stack=%d proven=%d active=%d igrpen1=%d pmr=0x%x "
+               "queue=%d intid=%u prio=0x%x fiq=%lu/%lu refl=%d/%d "
+               "VI=%d\n",
+               cpu, native_aic_local_unit_ready[cpu],
+               PERCPU(carrier_timer_ready), PERCPU(carrier_stack_ready),
+               PERCPU(carrier_delivery_proven), PERCPU(carrier_irq_active),
+               !!hv_vgic3_get_igrpen1(), pmr, queue, pending.vintid,
+               pending.priority, (unsigned long)PERCPU(timer_p_fiq_count),
+               (unsigned long)PERCPU(timer_v_fiq_count),
+               PERCPU(timer_p_reflection_pending),
+               PERCPU(timer_v_reflection_pending), !!(hcr & HCR_VI));
+        hv_native_aic_trace_dump();
+    }
+#endif
     hv_report_t8142_dead_process(code, read64(pa + 8));
     hv_report_t8142_wfi_traps();
     hv_report_t8142_el0_vector();
@@ -4402,6 +4653,17 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
     if (hv_handle_t8142_pmu(reg, is_read, rt, regs))
         return true;
 
+    /*
+     * Direct TALL1 traps and pre-rewritten HVC sites must reach the same
+     * T8142 CPU-interface owner. Otherwise a direct EOIR can complete a
+     * different state machine from the IAR that supplied its INTID.
+     */
+    if (hv_handle_t8142_gic_cpuif(reg, is_read, rt, regs, false))
+        return true;
+
+    if (hv_handle_native_aic_carrier_cpuif(reg, is_read, rt, regs, false))
+        return true;
+
     switch (reg) {
         SYSREG_PASS(SYS_IMP_APL_CORE_NRG_ACC_DAT);
         SYSREG_PASS(SYS_IMP_APL_CORE_SRM_NRG_ACC_DAT);
@@ -4589,7 +4851,15 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         case SYSREG_ISS(ICC_IAR1_EL1):
             if(is_read) {
                 if (hv_native_aic_windows_active() &&
-                    !hv_native_aic_windows_ready() && regs[18] == 0) {
+                    !hv_native_aic_windows_ready() &&
+                    !PERCPU(carrier_stack_ready) &&
+                    !PERCPU(carrier_delivery_proven)) {
+                    /*
+                     * Before the BSP's KPCR and exception stacks are proven,
+                     * fail closed. After that proof, x18 is not a valid gate:
+                     * Windows' hardened vector saves and clears it before the
+                     * trapped ICC_IAR1_EL1 read, then restores it on return.
+                     */
                     regs[rt] = 0x3ff;
                 } else {
                     regs[rt] = hv_carrier_do_iar1();
@@ -5416,6 +5686,14 @@ static bool hv_handle_smc(struct exc_info *ctx) {
     }
     if (ctx->regs[0] == HV_TIMER_REFLECT_CALL_MAGIC &&
         ctx->regs[1] == HV_TIMER_REFLECT_CALL_PROGRESS) {
+        u32 cpu = smp_id();
+        u32 step = (u32)ctx->regs[2];
+
+        if (cpu < MAX_CPUS) {
+            native_aic_last_progress[cpu] = step;
+            if (step == NTASI_STEP_LOCAL_UNIT_READY)
+                native_aic_local_unit_ready[cpu] = true;
+        }
         printf("HV: ntasi-step: %ld (CPU %d, phase active=%d ready=%d)\n",
                ctx->regs[2], smp_id(), hv_native_aic_windows_active(),
                hv_native_aic_windows_ready());
@@ -5424,11 +5702,26 @@ static bool hv_handle_smc(struct exc_info *ctx) {
     }
     if (ctx->regs[0] == HV_TIMER_REFLECT_CALL_MAGIC &&
         ctx->regs[1] == HV_TIMER_REFLECT_CALL_CONTROLLER_READY) {
+        u32 cpu = smp_id();
+
         /*
          * Only meaningful once Mu has handed off at ExitBootServices; before
          * that windows_aic_phase is false and this is reported as ignored
          * rather than silently accepted.
          */
+        if (cpu < MAX_CPUS && !hv_native_aic_windows_ready() &&
+            native_aic_local_unit_ready[cpu] &&
+            native_aic_last_progress[cpu] == NTASI_STEP_LOCAL_UNIT_READY) {
+            /*
+             * The v5 AIC3 HAL emits this same leaf at two readiness boundaries.
+             * At step 35 Windows still calls ICC_IAR1_EL1; moving the timer to
+             * native EVENT here creates a permanent spurious-IAR interrupt
+             * loop. A later call, after step 23 (IOUNIT_ENTER), falls through
+             * and performs the real one-shot handoff.
+             */
+            ctx->regs[0] = HV_TIMER_REFLECT_READY_ACCEPTED;
+            return true;
+        }
         if (hv_native_aic_windows_controller_ready("HAL extension SMC"))
             ctx->regs[0] = HV_TIMER_REFLECT_READY_ACCEPTED;
         else if (hv_native_aic_windows_ready())

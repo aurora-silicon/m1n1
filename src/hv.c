@@ -547,6 +547,10 @@ void hv_fb_report(void)
     u32 lines = __atomic_exchange_n(&hv_fb_lines, 0, __ATOMIC_RELAXED);
     printf("HV: fb: %u lines/s = %u.%02u fps\n", lines, lines / hv_fb_height,
            (lines * 100 / hv_fb_height) % 100);
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    /* Same 1 Hz budget; silent until Windows owns the AIC. */
+    hv_native_aic_delivery_report();
+#endif
 }
 
 void hv_start(void *entry, u64 regs[4])

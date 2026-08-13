@@ -319,6 +319,16 @@ typedef enum {
      */
     P_GPU_INITDATA_FILL = 0x1800,
 
+    /* Framebuffer change detection (src/fb_capture.c). Returns the address
+     * of the descriptor so the host can read geometry, the frame sequence
+     * and the dirty bitmap without hunting for a static symbol. */
+    P_FB_CAPTURE_DESC = 0x1900,
+    /* Run one bounded scan pass on demand. The HV drives the scanner from its
+     * own exit paths while a guest runs; with no guest nothing exits, so the
+     * host needs a way to advance it -- otherwise the dirty path is only
+     * reachable by booting something, which is a poor place to leave it. */
+    P_FB_CAPTURE_SCAN = 0x1901,
+
     // Bulk host<->guest channel; keep in sync with proxyclient/m1n1/hv/xfer.py
     P_HV_MAP_XFER = 0x1700,
 } ProxyOp;

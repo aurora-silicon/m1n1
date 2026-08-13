@@ -2,6 +2,7 @@
 
 #include "build_cfg.h"
 #include "proxy.h"
+#include "fb_capture.h"
 #include "acio.h"
 #include "atcphy.h"
 #include "cpufreq.h"
@@ -916,6 +917,13 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = media_handoff_init((u32)request->args[0]);
             break;
 
+        case P_FB_CAPTURE_DESC:
+            reply->retval = (u64)fb_capture_descriptor();
+            break;
+        case P_FB_CAPTURE_SCAN:
+            fb_capture_scan_now(request->args[0] ? request->args[0] : 1);
+            reply->retval = fb_capture_descriptor()->seq;
+            break;
         case P_GPU_INITDATA_FILL:
             reply->retval = gpu_handoff_init(request->args[0], request->args[1]);
             break;

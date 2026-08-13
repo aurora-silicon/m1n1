@@ -838,6 +838,8 @@ class M1N1Proxy(Reloadable):
 
     # AGX preboot initdata handoff; keep in sync with src/proxy.h
     P_GPU_INITDATA_FILL = 0x1800
+    P_FB_CAPTURE_DESC = 0x1900
+    P_FB_CAPTURE_SCAN = 0x1901
 
     def __init__(self, iface, debug=False):
         self.debug = debug
@@ -1150,6 +1152,18 @@ class M1N1Proxy(Reloadable):
     def mmu_init_secondary(self, cpu):
         self.request(self.P_MMU_INIT_SECONDARY, cpu)
 
+
+    def fb_capture_desc(self):
+        """Address of m1n1's framebuffer change descriptor (struct
+        fb_capture_desc). Read it to learn geometry, the frame sequence and
+        which tiles changed, instead of transferring a whole 16 MiB frame."""
+        return self.request(self.P_FB_CAPTURE_DESC)
+
+    def fb_capture_scan(self, tile_rows=1):
+        """Advance the change detector by `tile_rows` rows of tiles and return
+        the new sequence. Only needed when no guest is running: the HV drives
+        the scanner itself from its exit paths."""
+        return self.request(self.P_FB_CAPTURE_SCAN, tile_rows)
 
     def xzdec(self, inbuf, insize, outbuf=0, outsize=0):
         return self.request(self.P_XZDEC, inbuf, insize, outbuf,

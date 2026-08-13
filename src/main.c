@@ -11,6 +11,7 @@
 #include "display.h"
 #include "exception.h"
 #include "fb.h"
+#include "fb_capture.h"
 #include "firmware.h"
 #include "gxf.h"
 #include "heapblock.h"
@@ -294,6 +295,9 @@ void m1n1_main(void)
      * on -- but by then we have the early log, which is the entire purpose.
      */
     fb_init(!is_mac);
+    /* Describe the scanout immediately: the change detector must work with
+     * no guest at all -- m1n1 console, Mu, or between boots. */
+    fb_capture_init();
     fb_set_active(true);
 #endif
     aic_init();
@@ -332,6 +336,9 @@ void m1n1_main(void)
 #ifndef EARLY_FB_CONSOLE
     // On idevice we need to always clear, because otherwise it looks scuffed on white devices
     fb_init(!is_mac);
+    /* Describe the scanout immediately: the change detector must work with
+     * no guest at all -- m1n1 console, Mu, or between boots. */
+    fb_capture_init();
     fb_display_logo();
 #ifdef FB_SILENT_MODE
     fb_set_active(!cur_boot_args.video.display);

@@ -216,6 +216,7 @@ void hv_native_aic_enter_cpu(void);
  * that actually performed the transition.
  */
 bool hv_native_aic_windows_controller_ready(const char *source);
+void hv_native_aic_delivery_report(void);
 
 /*
  * Keep the mechanics of changing HCR.FMO/IMO/VI in one place. The helper

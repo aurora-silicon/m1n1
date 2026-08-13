@@ -164,7 +164,7 @@ OBJECTS := \
 	gpu_handoff.o gpu_handoff_abi.o \
 	gxf.o gxf_asm.o \
 	heapblock.o \
-	hv.o hv_vm.o hv_exc.o hv_vuart.o hv_wdt.o hv_asm.o hv_aic.o hv_aic_alias.o hv_virtio.o hv_tpm.o hv_xfer.o hv_psci.o hv_vgic.o \
+	hv.o hv_vm.o hv_exc.o hv_vuart.o hv_wdt.o hv_asm.o hv_aic.o hv_aic_alias.o hv_virtio.o hv_tpm.o hv_xfer.o fb_capture.o hv_psci.o hv_vgic.o \
 	i2c.o \
 	iodev.o \
 	iova.o \

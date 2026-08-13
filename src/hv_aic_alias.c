@@ -27,9 +27,20 @@ struct hv_aic_alias {
  * m1n1's own reserved timer software IRQs sit at aic->nr_irq - 2 * MAX_CPUS,
  * i.e. the very top of AIC space, so they cannot collide with a low published
  * number either.
+ *
+ * ans is the internal NVMe storage controller, and the same problem: its line
+ * is `interrupts`[`nvme-interrupt-idx`] = interrupts[4] = 1155, also above the
+ * arbiter's ceiling.  996 was picked by the same walk, re-run on this machine
+ * for the ans work: 443 distinct lines appear in ADT `interrupts` properties,
+ * 249 of them inside [32,1024), and 1155 is claimed by /arm-io/ans alone.  Of
+ * the 980..999 block only 984 is taken, so 996 is free and sits next to the
+ * mtp alias where both stay reviewable.  scratchpad adt_free_gsiv.py re-runs
+ * the check; it is RAM-only, because a stray MMIO read latches an L2C error on
+ * this SoC.
  */
 static const struct hv_aic_alias hv_aic_aliases_t8142[] = {
     {995, 1277}, /* dockchannel-mtp: keyboard + trackpad */
+    {996, 1155}, /* ans: internal NVMe storage */
 };
 
 static const struct hv_aic_alias *hv_aic_alias_table(u32 *count)
