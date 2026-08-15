@@ -38,9 +38,27 @@ struct hv_aic_alias {
  * the check; it is RAM-only, because a stray MMIO read latches an L2C error on
  * this SoC.
  */
+/*
+ * usb-drd0 is the LEFT Type-C port (atc-phy0 port-number 1; the proxy's own
+ * cable is usb-drd1 / port-number 2, whose ADT nodes m1n1 removes from the
+ * guest).  m1n1 already releases this controller to the guest in USB2 host
+ * mode every boot -- "USB0: releasing controller for guest" -- so the only
+ * thing missing for Windows is a devnode it can bind, and a GSIV it accepts.
+ *
+ * Its ADT `interrupts` is <1511 1512 1513 1514 1489>; 1511 is index 0, the
+ * DWC3/xHCI controller interrupt, matching the single 777 that T8103's DSDT
+ * published for the same node.  All five are above the arbiter's ceiling.
+ *
+ * 997 is free by the same ADT walk that picked 995 and 996: of 980..999 only
+ * 984 is claimed, and no live physical line is 997 -- which has to be checked
+ * rather than assumed, because injection is otherwise the identity and a
+ * published number that is also a real line would deliver some other device's
+ * interrupts under this INTID.
+ */
 static const struct hv_aic_alias hv_aic_aliases_t8142[] = {
     {995, 1277}, /* dockchannel-mtp: keyboard + trackpad */
     {996, 1155}, /* ans: internal NVMe storage */
+    {997, 1511}, /* usb-drd0: left Type-C port, xHCI host */
 };
 
 static const struct hv_aic_alias *hv_aic_alias_table(u32 *count)
