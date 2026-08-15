@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "usb.h"
+#include "ace3.h"
 #include "adt.h"
 #include "atcphy.h"
 #include "dart.h"
@@ -16,6 +17,12 @@
 #include "usb_dwc3_regs.h"
 #include "utils.h"
 #include "vsprintf.h"
+
+/*
+ * M3+ machines hang their USB-PD controllers off this SPMI bus instead of i2c.
+ * Its presence is what selects usb_spmi_init() over usb_init_i2c().
+ */
+#define USB_SPMI_HPM_BUS "/arm-io/nub-spmi-a0"
 
 struct usb_drd_regs {
     uintptr_t drd_regs;
@@ -397,6 +404,22 @@ void usb_spmi_init(void)
     for (int idx = 0; idx < USB_IODEV_COUNT; ++idx)
         usb_phy_bringup(idx); /* Fails on missing devices, just continue */
 
+    /*
+     * Tell every ACE3 the system is powered on.  Without this the controllers
+     * sit at SYSTEM_POWER_STATE 0x07 -- never initialised -- and while they
+     * will happily accept power (so a charger or a phone acting as a source
+     * still attaches), they refuse to source VBUS.  A port that never sources
+     * never presents Rp, so no ordinary USB device is detected at all: measured
+     * on J813, a known-good keyboard produced no plug event and no interrupt
+     * until SSPS(S0) landed, after which the port came up Source/DFP with a
+     * USB3 data connection.
+     *
+     * Best-effort by design: this must never turn a working PHY bring-up into a
+     * failed one, so ace3_power_on_ports() logs and continues past any port it
+     * cannot reach.
+     */
+    ace3_power_on_ports(USB_SPMI_HPM_BUS);
+
     usb_is_initialized = true;
 }
 
@@ -462,7 +485,7 @@ void usb_init(void)
      * M3/M4 models do not use i2c, but instead SPMI with a new controller.
      * We can get USB going for now by just bringing up the phys.
      */
-    if (adt_path_offset(adt, "/arm-io/nub-spmi-a0/hpm0") > 0) {
+    if (adt_path_offset(adt, USB_SPMI_HPM_BUS "/hpm0") > 0) {
         usb_spmi_init();
         return;
     }

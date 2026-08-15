@@ -137,6 +137,7 @@ DCP_OBJECTS := $(patsubst %,dcp/%, \
 	system_ep.o)
 
 OBJECTS := \
+	ace3.o \
 	adt.o \
 	afk.o \
 	aic.o \
