@@ -51,7 +51,7 @@ class WindowsUnifiedContractTests(unittest.TestCase):
         builder = (ROOT / "tools/build-j414s-windows-unified.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn('AURORA_BRANCHES = ("main", "M5-Dev")', builder)
+        self.assertIn('AURORA_BRANCHES = ("main", "j813")', builder)
         self.assertIn("ALLOWED_BRANCHES = AURORA_BRANCHES", builder)
         self.assertIn('"j813": "aurora.j813.m1n1-unified.v1"', builder)
         self.assertIn('"j414s": "ntasi.j414s.m1n1-unified.v1"', builder)
