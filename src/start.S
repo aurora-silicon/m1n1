@@ -2,6 +2,10 @@
 
 #include "soc.h"
 
+#if defined(J873_DIAGNOSTIC) && defined(TARGET)
+#error J873_DIAGNOSTIC must not enable pre-identity early UART writes with TARGET
+#endif
+
 #define UTRSTAT 0x010
 #define UTXH 0x020
 
@@ -171,7 +175,9 @@ _start:
     bl debug_putc
     mov w0, '\n'
     bl debug_putc
+#ifndef J873_DIAGNOSTIC
     bl pan_fixup
+#endif
 
     mrs x8, CurrentEL
     cmp x8, #0xc
@@ -183,6 +189,10 @@ _start:
     b .
 
 start_el3:
+#ifdef J873_DIAGNOSTIC
+    /* The Mac entry ABI is EL1/EL2. Do not attempt an unverified EL3 transition. */
+    b .
+#endif
     bl exception_initialize
     adrp x8, _stack_bot_el3
     mov sp, x8

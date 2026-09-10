@@ -22,6 +22,7 @@
 #define T8132 0x8132
 #define T8140 0x8140
 #define T8142 0x8142
+#define T8152 0x8152
 #define T6000 0x6000
 #define T6001 0x6001
 #define T6002 0x6002
@@ -64,6 +65,9 @@
 #elif TARGET == T8142
 /* /arm-io/uart0 on the M5 J704/J813 ADT. */
 #define EARLY_UART_BASE 0x3a5200000
+#elif TARGET == T8152
+/* J873g 26A428 ADT: /arm-io/uart0, after bus-range translation. */
+#define EARLY_UART_BASE 0x331200000
 #elif TARGET == T7000 || TARGET == T7001 || TARGET == S8000 || TARGET == S8001 ||                  \
     TARGET == S8003 || TARGET == T8010 || TARGET == T8011
 #if TARGET == T7000 && defined(TARGET_BOARD) && TARGET_BOARD == 0x34 // Apple TV HD

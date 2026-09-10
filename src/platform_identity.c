@@ -22,6 +22,11 @@ static const char j813_root_target_type[] = "J813";
 static const char j813_model[] = "Mac17,3";
 static const char j813_compatible[] = "J813AP\0Mac17,3\0AppleARM";
 
+/* 26A428 J873g ADT and root BuildManifest agree on these identifiers. */
+static const char j873g_root_target_type[] = "J873g";
+static const char j873g_model[] = "Mac18,5";
+static const char j873g_compatible[] = "J873gAP\0Mac18,5\0AppleARM";
+
 static bool property_equals(const void *property, u32 property_len, const void *expected,
                             size_t expected_len)
 {
@@ -60,6 +65,20 @@ bool platform_identity_matches_j813(const struct platform_identity *identity)
                            sizeof(j813_compatible));
 }
 
+bool platform_identity_matches_j873g(const struct platform_identity *identity)
+{
+    if (!identity)
+        return false;
+
+    return identity->chip_id == T8152 && identity->board_id == 0x24 &&
+           property_equals(identity->root_target_type, identity->root_target_type_len,
+                           j873g_root_target_type, sizeof(j873g_root_target_type)) &&
+           property_equals(identity->model, identity->model_len, j873g_model,
+                           sizeof(j873g_model)) &&
+           property_equals(identity->compatible, identity->compatible_len, j873g_compatible,
+                           sizeof(j873g_compatible));
+}
+
 #ifndef PLATFORM_IDENTITY_HOST_TEST
 static void platform_identity_read(struct platform_identity *identity)
 {
@@ -95,5 +114,13 @@ bool platform_is_j813(void)
 
     platform_identity_read(&identity);
     return platform_identity_matches_j813(&identity);
+}
+
+bool platform_is_j873g(void)
+{
+    struct platform_identity identity = {};
+
+    platform_identity_read(&identity);
+    return platform_identity_matches_j873g(&identity);
 }
 #endif

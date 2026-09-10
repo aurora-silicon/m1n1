@@ -459,6 +459,11 @@ def parse_prop(node, path, node_name, name, v, is_template=False):
         else:
             return None, v
 
+    elif name == "service-gates":
+        if len(v) % 4:
+            raise ValueError("service-gates must contain 32-bit service IDs")
+        t = Array(len(v) // 4, Int32ul)
+
     elif name == "interrupts":
         # parse "interrupts" as Array of Int32ul, wrong for nodes whose
         # "interrupt-parent" has "interrupt-cells" = 2
@@ -825,23 +830,52 @@ class ADTNode:
         self[name] = node
         return node
 
+    @property
+    def pmgr_u8id(self):
+        return self._pmgr_u8id
+
     def pmgr_init(self):
-        self.pmgr_u8id = (self["/arm-io/pmgr"].devices[0].id1 != self["/arm-io/pmgr"].devices[1].id1)
-        self._pmgr_use_group_and_offset = not "ps-regs" in self["/arm-io/pmgr"]._properties
+        # Loading an ADT must not require a PMGR1 register model. T8152 has a
+        # pmgr2,arch parent and a separate pmgr2,t8152 child. Preserve their
+        # properties for inspection without treating PMGR2 services as PMGR1
+        # device records or silently falling back to legacy register offsets.
+        # Metadata must stay private: public assignments become serialized ADT
+        # properties through __setattr__, corrupting an otherwise exact rebuild.
+        self._pmgr_u8id = None
+        self._pmgr_use_group_and_offset = None
+        try:
+            pmgr = self["/arm-io/pmgr"]
+        except KeyError:
+            return
+        if any(c.startswith("pmgr2,") for c in getattr(pmgr, "compatible", [])):
+            return
+        devices = getattr(pmgr, "devices", [])
+        if len(devices) < 2:
+            return
+        if not ("ps-regs" in pmgr._properties or "ps-groups" in pmgr._properties):
+            return
+        self._pmgr_u8id = devices[0].id1 != devices[1].id1
+        self._pmgr_use_group_and_offset = "ps-regs" not in pmgr._properties
 
     def pmgr_dev_get_id(self, dev):
+        if self.pmgr_u8id is None:
+            raise NotImplementedError("PMGR1 device helpers are unavailable for this ADT")
         if self.pmgr_u8id:
             return dev.id1
         else:
             return dev.id2
 
     def pmgr_dev_get_parents(self, dev):
+        if self.pmgr_u8id is None:
+            raise NotImplementedError("PMGR1 device helpers are unavailable for this ADT")
         if self.pmgr_u8id:
             return dev.parents_un.u8id.parents 
         else:
             return dev.parents_un.u16id.parents 
 
     def pmgr_dev_get_block(self, dev):
+        if self._pmgr_use_group_and_offset is None:
+            raise NotImplementedError("PMGR1 register helpers are unavailable for this ADT")
         if self._pmgr_use_group_and_offset:
             reg = self["/arm-io/pmgr"].ps_groups[dev.group].reg
         else:
@@ -849,6 +883,8 @@ class ADTNode:
         return self["/arm-io/pmgr"].get_reg(reg)
 
     def pmgr_dev_get_offset(self, dev):
+        if self._pmgr_use_group_and_offset is None:
+            raise NotImplementedError("PMGR1 register helpers are unavailable for this ADT")
         if self._pmgr_use_group_and_offset:
             return dev.offset
         else:

@@ -5,6 +5,7 @@
 #include "dockchannel_uart.h"
 #include "exception.h"
 #include "firmware.h"
+#include "platform_identity.h"
 #include "smp.h"
 #include "string.h"
 #include "types.h"
@@ -160,6 +161,56 @@ void dump_boot_args(struct boot_args *ba)
 }
 
 extern void get_device_info(void);
+
+#ifdef J873_DIAGNOSTIC
+/* Opt-in first-entry recorder. Keep this before all normal platform init.
+ * UART is the only device accessed, and only after a complete identity check.
+ * The assembly entry, iBoot ABI and UART clock state still require hardware proof.
+ */
+static __attribute__((noreturn)) void j873_diagnostic(void)
+{
+    int chosen = adt_path_offset(adt, "/chosen");
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "chip-id", &chip_id) != sizeof(chip_id) ||
+        ADT_GETPROP(adt, chosen, "board-id", &board_id) != sizeof(board_id) ||
+        !platform_is_j873g())
+        goto halt;
+
+    if (uart_init() < 0)
+        goto halt;
+
+    uart_puts("J873g M6 diagnostic v1: experimental first entry");
+    uart_printf("chip=%x board=%x EL=%lu MIDR=%016lx MPIDR=%016lx\n", chip_id, board_id,
+                mrs(CurrentEL) >> 2, mrs(MIDR_EL1), mrs(MPIDR_EL1));
+    uart_printf("CNTFRQ=%lu MMFR0=%016lx ISAR0=%016lx PFR0=%016lx\n", mrs(CNTFRQ_EL0),
+                mrs(ID_AA64MMFR0_EL1), mrs(ID_AA64ISAR0_EL1), mrs(ID_AA64PFR0_EL1));
+    uart_printf("bootargs rev=%u ver=%u phys=%016lx virt=%016lx mem=%016lx\n",
+                cur_boot_args.revision, cur_boot_args.version, cur_boot_args.phys_base,
+                cur_boot_args.virt_base, cur_boot_args.mem_size);
+    uart_printf("ADT=%p size=%x video=%016lx %lux%lu stride=%lu\n", adt,
+                cur_boot_args.devtree_size, cur_boot_args.video.base,
+                cur_boot_args.video.width, cur_boot_args.video.height, cur_boot_args.video.stride);
+    int cpus = adt_path_offset(adt, "/cpus");
+    if (cpus >= 0) {
+        int remaining = adt_get_child_count(adt, cpus);
+        int cpu = remaining > 0 ? adt_first_child_offset(adt, cpus) : -1;
+        while (remaining-- > 0 && cpu >= 0) {
+            u32 len = 0;
+            const char *state = adt_getprop(adt, cpu, "state", &len);
+            u32 cpu_id = ~0;
+            ADT_GETPROP(adt, cpu, "cpu-id", &cpu_id);
+            uart_printf("ADT cpu-id=%u state=%.*s\n", cpu_id, (int)len, state ? state : "");
+            /* The last CPU can also be the last node in a synthetic ADT. */
+            if (remaining > 0)
+                cpu = adt_next_sibling_offset(adt, cpu);
+        }
+    }
+    uart_puts("J873_DIAGNOSTIC_COMPLETE: halting before normal initialization");
+halt:
+    while (1)
+        sysop("wfe");
+}
+#endif
+
 void _start_c(void *boot_args, void *base)
 {
     UNUSED(base);
@@ -171,6 +222,10 @@ void _start_c(void *boot_args, void *base)
 
     adt =
         (void *)(((u64)cur_boot_args.devtree) - cur_boot_args.virt_base + cur_boot_args.phys_base);
+
+#ifdef J873_DIAGNOSTIC
+    j873_diagnostic();
+#endif
 
 #ifndef BRINGUP
     int node = adt_path_offset(adt, "/cpus");
