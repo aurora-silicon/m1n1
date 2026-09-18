@@ -676,6 +676,44 @@ void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova)
     return dart_translate_internal(dart, iova, 1);
 }
 
+int dart_visit_locked_t8110(uintptr_t base, u8 sid, u64 dram_base, u64 dram_size,
+                           int (*visit)(u64 iova, u64 physical, void *opaque), void *opaque)
+{
+    u64 dram_end = dram_base + dram_size;
+    u32 ttbr = read32(base + DART_T8110_TTBR_OFF + 4 * sid);
+    if (!visit || dram_size < SZ_16K || dram_end <= dram_base ||
+        !(read32(base + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR) ||
+        (read32(base + DART_T8110_TCR_OFF + 4 * sid) &
+         ~(DART_T8110_TCR_REMAP | DART_T8110_TCR_BYPASS_DAPF)) !=
+            DART_T8110_TCR_TRANSLATE_ENABLE ||
+        !(ttbr & DART_T8110_TTBR_VALID))
+        return -1;
+
+    u64 root = (u64)FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT;
+    if (root < dram_base || root > dram_end - SZ_16K)
+        return -1;
+    const volatile u64 *l1 = (const volatile u64 *)root;
+    for (u32 i = 0; i < SZ_16K / sizeof(u64); i++) {
+        u64 pte = l1[i];
+        if (!(pte & DART_PTE_VALID))
+            continue;
+        u64 table = FIELD_GET(DART_T6000_PTE_OFFSET, pte) << DART_PTE_OFFSET_SHIFT;
+        if (table < dram_base || table > dram_end - SZ_16K)
+            return -1;
+        const volatile u64 *l2 = (const volatile u64 *)table;
+        for (u32 j = 0; j < SZ_16K / sizeof(u64); j++) {
+            pte = l2[j];
+            if (!(pte & DART_PTE_VALID))
+                continue;
+            u64 physical = FIELD_GET(DART_T6000_PTE_OFFSET, pte) << DART_PTE_OFFSET_SHIFT;
+            int ret = visit(((u64)i << 25) | ((u64)j << 14), physical, opaque);
+            if (ret)
+                return ret;
+        }
+    }
+    return 0;
+}
+
 u64 dart_search(dart_dev_t *dart, void *paddr)
 {
     for (int ttbr = 0; ttbr < dart->params->ttbr_count; ++ttbr) {

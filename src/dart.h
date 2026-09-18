@@ -32,4 +32,8 @@ u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len);
 void dart_shutdown(dart_dev_t *dart);
 u64 dart_vm_base(dart_dev_t *dart);
 
+/* Inspect an inherited, locked, two-level T8110-format stream without writes. */
+int dart_visit_locked_t8110(uintptr_t base, u8 sid, u64 dram_base, u64 dram_size,
+                           int (*visit)(u64 iova, u64 physical, void *opaque), void *opaque);
+
 #endif
