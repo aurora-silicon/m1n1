@@ -50,6 +50,7 @@ static char *uboot_config[MAX_UBOOT_CONFIGS][2];
 extern const char *const m1n1_version;
 
 int dt_set_gpu(void *dt);
+int dt_set_display_m3_external(void *dt);
 
 #define DT_ALIGN 16384
 
@@ -2122,7 +2123,10 @@ static int dt_set_display(void)
     int ret = 0;
 
     if (!fdt_node_check_compatible(dt, 0, "apple,t6030")) {
-        return dt_set_j514s_dcp_handoff();
+        ret = dt_set_j514s_dcp_handoff();
+        if (ret)
+            return ret;
+        return dt_set_display_m3_external(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t8103")) {
         ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
                                            disp_reserved_regions_t8103,
