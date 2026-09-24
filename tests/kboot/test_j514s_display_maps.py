@@ -9,8 +9,18 @@ for name in ('dt_device_set_reserved_mem', 'dt_get_or_add_reserved_mem',
              'dt_device_add_mem_region', 'dt_get_iommu_node', 'dt_reserve_asc_firmware'):
     start = source.index('static int '+name+'(')
     functions.append(source[start:source.index('\n}', start)+2])
-start = source.index('struct j514s_display_maps {')
-functions.append(source[start:source.index('/* Publish the inherited J514S', start)])
+start = source.index('struct m3_dcp_board {')
+functions.append(source[start:source.index('struct m3_dcp_adt {', start)])
+functions.append(r'''
+static int dt_set_j514s_display_maps(const struct adt_segment_ranges *s, u32 count,
+                                     u64 base, u64 size) {
+    struct m3_display_maps maps[2];
+    (void)m3_dcp_board_j613;
+    if (m3_walk_display_maps(&m3_dcp_board_j514s, s, count, base, size, maps))
+        return -1;
+    return dt_set_m3_display_maps(&m3_dcp_board_j514s, s, count, maps);
+}
+''')
 harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -22,6 +32,7 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint8_t u8;
 #define T6030 0x8132
+#define T8122 0x8122
 #define SZ_16K 0x4000ULL
 #define ALIGN_UP(x,a) (((x)+(a)-1)&~((a)-1))
 #define bail(...) do { return -1; } while (0)

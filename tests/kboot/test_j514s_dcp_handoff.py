@@ -7,17 +7,20 @@ import tempfile
 
 def test_handoff():
     source = (Path(__file__).resolve().parents[2] / "src/kboot.c").read_text()
-    start = source.index("static int dt_set_j514s_dcp_handoff(void)")
-    end = source.index("static int dt_set_display(void)", start)
+    board = source[source.index("struct m3_dcp_board {"):source.index("struct m3_display_maps {")]
+    start = source.index("struct m3_dcp_adt {")
+    end = source.index("/*\n * iBoot leaves the T8122", start)
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 typedef uint64_t u64;
 typedef uint32_t u32;
 #define T6030 0x8132
+#define T8122 0x8122
 #define SZ_16K 0x4000ULL
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define bail(...) do { return -1; } while (0)
@@ -51,14 +54,21 @@ static int fdt_setprop_string(void *p, int n, const char *k, const char *v) {
     mutations++; return 0;
 }
 static const void *fdt_getprop(void *p, int n, const char *name, int *length) { return NULL; }
-static int dt_set_j514s_display_maps(const struct adt_segment_ranges *s, u32 count,
-                                    u64 base, u64 size) { return -1; }
+struct m3_display_maps { int unused; };
+static int m3_walk_display_maps(const struct m3_dcp_board *b,
+                                const struct adt_segment_ranges *s, u32 count,
+                                u64 base, u64 size, struct m3_display_maps *m) { return -1; }
+static int dt_set_m3_display_maps(const struct m3_dcp_board *b,
+                                  const struct adt_segment_ranges *s, u32 count,
+                                  const struct m3_display_maps *m) { return -1; }
+static int dt_transaction(int (*fn)(void *), void *arg) { return fn(arg); }
 static int dt_set_dcp_firmware(const char *s) { mutations++; return 0; }
 static int dt_reserve_asc_firmware(const char *a, const char *b,
                                  const char *c, bool remap, u64 base) {
     assert(remap && !base); mutations++; return 0;
 }
 '''
+    harness = harness.replace("static void *dt, *adt;", board + "static void *dt, *adt;")
     harness += source[start:end]
     harness += r'''
 static void reset(void) {
@@ -69,6 +79,10 @@ static void reset(void) {
         .phys = 0x103e187c000ULL, .remap = 0x10006394000ULL, .size = 0x325000
     };
     mutations = 0;
+}
+static int dt_set_j514s_dcp_handoff(void) {
+    (void)m3_dcp_board_j613;
+    return dt_set_m3_dcp_handoff(&m3_dcp_board_j514s);
 }
 static void rejected(void) {
     assert(dt_set_j514s_dcp_handoff() < 0);

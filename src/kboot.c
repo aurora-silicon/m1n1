@@ -1796,11 +1796,11 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
         int mem_node =
             dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, seg->phys, seg_size);
         if (mem_node < 0)
-            return ret;
+            return mem_node;
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
         /* The OS log has a physical host address, not a DART translation. */
-        if (chip_id == T6030 && !strcmp(fdt_path, "dcp") && seg->unk == 0xa)
+        if ((chip_id == T6030 || chip_id == T8122) && !strcmp(fdt_path, "dcp") && seg->unk == 0xa)
             ret = fdt_setprop_empty(dt, mem_node, "apple,dcp-os-log");
         else
             ret = dt_device_set_reserved_mem(mem_node, node_name, dev_phandle, iova, seg_size);
@@ -1937,15 +1937,90 @@ static struct disp_mapping disp_reserved_regions_t602x[] = {
     {"region-id-157", "region157", true, true, false},
 };
 
-struct j514s_display_maps {
-    const struct adt_segment_ranges *segments;
-    u32 count;
-    u64 bytes[32];
+/* Run fn on a copy of the FDT and commit the copy only if fn succeeds. */
+static int dt_transaction(int (*fn)(void *), void *arg)
+{
+    int size = fdt_totalsize(dt), ret = -1;
+    void *orig = dt, *copy = malloc(size);
+    if (copy && !fdt_open_into(orig, copy, size)) {
+        dt = copy;
+        ret = fn(arg);
+        dt = orig;
+        if (!ret)
+            memcpy(orig, copy, size);
+    }
+    free(copy);
+    return ret;
+}
+
+/*
+ * Native M3 internal-display handoff. iBoot leaves DCP running from preloaded
+ * firmware and the disp0 DART locked with live scanout/PIODMA mappings. Every
+ * board-specific value is in this table; J514S values are unchanged.
+ */
+struct m3_dcp_board {
+    const char *name;
+    u32 chip;
+    const char *machine, *soc, *dcp_compatible, *display_compatible;
+    const char *native_piodma, *native_scanout, *inherited_mappings;
+    const char *qualified_uuid; /* firmware whose PIODMA/scanout handoff is known */
+    u64 disp0_dart;
+    /* Exact SID0/SID4 region counts. Zero means not yet qualified on hardware:
+     * require at least one region per stream and every scanout segment covered.
+     */
+    u32 regions[2];
+    /* J514S refuses to boot an inconsistent handoff. J613 keeps the original
+     * DT and falls back to unlinked segment reservations instead.
+     */
+    bool fatal;
 };
 
-static int j514s_display_page(u64 iova, u64 physical, void *opaque)
+static const struct m3_dcp_board m3_dcp_board_j514s = {
+    .name = "J514S",
+    .chip = T6030,
+    .machine = "apple,j514s",
+    .soc = "apple,t6030",
+    .dcp_compatible = "apple,t6030-dcp",
+    .display_compatible = "apple,t6030-display-diagnostics",
+    .native_piodma = "apple,j514s-native-piodma",
+    .native_scanout = "apple,j514s-native-scanout",
+    .inherited_mappings = "apple,j514s-inherited-mappings",
+    .qualified_uuid = "DDF38191-93B3-324A-BC8F-643006F5AC82",
+    .disp0_dart = 0x28d304000,
+    .regions = {3, 1},
+    .fatal = true,
+};
+
+/* Values from the live J613 ADT (os-fw 14.7): /arm-io/dart-disp0 is at arm-io
+ * 0x7d304000 (+0x210000000), mapper-disp0 SID0, mapper-disp0-piodma SID4.
+ */
+static const struct m3_dcp_board m3_dcp_board_j613 = {
+    .name = "J613",
+    .chip = T8122,
+    .machine = "apple,j613",
+    .soc = "apple,t8122",
+    .dcp_compatible = "apple,t8122-dcp",
+    .display_compatible = "apple,t8122-display-diagnostics",
+    .native_piodma = "apple,j613-native-piodma",
+    .native_scanout = "apple,j613-native-scanout",
+    .inherited_mappings = "apple,j613-inherited-mappings",
+    .qualified_uuid = "90F849E1-B422-367E-B389-50246F8DEC47",
+    .disp0_dart = 0x28d304000,
+    .regions = {0, 0},
+    .fatal = false,
+};
+
+#define M3_DCP_MAX_SEGMENTS 32
+
+struct m3_display_maps {
+    const struct adt_segment_ranges *segments;
+    u32 count;
+    u64 bytes[M3_DCP_MAX_SEGMENTS];
+};
+
+static int m3_display_page(u64 iova, u64 physical, void *opaque)
 {
-    struct j514s_display_maps *maps = opaque;
+    struct m3_display_maps *maps = opaque;
     for (u32 i = 0; i < maps->count; i++) {
         const struct adt_segment_ranges *seg = &maps->segments[i];
         u64 start = seg->remap & ((1ULL << 36) - 1);
@@ -1960,32 +2035,58 @@ static int j514s_display_page(u64 iova, u64 physical, void *opaque)
     return -1; /* Never drop an inherited mapping that we cannot describe. */
 }
 
-static int dt_set_j514s_display_maps(const struct adt_segment_ranges *segments, u32 count,
-                                    u64 dram_start, u64 dram_size)
+/* Read-only: walk the locked SID0/SID4 tables and check them against the ADT. */
+static int m3_walk_display_maps(const struct m3_dcp_board *board,
+                                const struct adt_segment_ranges *segments, u32 count,
+                                u64 dram_start, u64 dram_size, struct m3_display_maps maps[2])
 {
-    const char *aliases[] = {"disp0", "disp0_piodma"};
     const u8 streams[] = {0, 4};
-    struct j514s_display_maps maps[2] = {
-        {.segments = segments, .count = count}, {.segments = segments, .count = count},
-    };
-    u32 phandles[2];
+    int ret = 0;
 
-    /* Exact J514S register block; reading tables must not enable/reset streams. */
     for (u32 n = 0; n < 2; n++) {
-        if (dart_visit_locked_t8110(0x28d304000, streams[n], dram_start, dram_size,
-                                    j514s_display_page, &maps[n]))
+        maps[n] = (struct m3_display_maps){.segments = segments, .count = count};
+        /* Exact register block; reading tables must not enable/reset streams. */
+        if (dart_visit_locked_t8110(board->disp0_dart, streams[n], dram_start, dram_size,
+                                    m3_display_page, &maps[n])) {
+            printf("FDT: %s DISP0 SID%u has a mapping outside the ADT scanout segments\n",
+                   board->name, streams[n]);
             return -1;
-        u32 regions = 0;
+        }
+        u32 regions = 0, mask = 0;
         for (u32 i = 0; i < count; i++) {
             if (!maps[n].bytes[i])
                 continue;
-            if (maps[n].bytes[i] != ALIGN_UP((u64)segments[i].size, SZ_16K))
-                return -1;
+            if (maps[n].bytes[i] != ALIGN_UP((u64)segments[i].size, SZ_16K)) {
+                printf("FDT: %s DISP0 SID%u maps segment %u partially (0x%lx bytes)\n", board->name,
+                       streams[n], i, maps[n].bytes[i]);
+                ret = -1;
+            }
             regions++;
+            mask |= 1U << i;
         }
-        if (regions != (n == 0 ? 3 : 1))
-            return -1;
+        printf("FDT: %s DISP0 SID%u maps %u segment(s), mask 0x%x\n", board->name, streams[n],
+               regions, mask);
+        if (board->regions[n] ? regions != board->regions[n] : !regions)
+            ret = -1;
     }
+    if (!board->regions[0]) {
+        for (u32 i = 0; i < count; i++) {
+            if (segments[i].unk == 2 && !maps[0].bytes[i] && !maps[1].bytes[i]) {
+                printf("FDT: %s scanout segment %u is not mapped by SID0 or SID4\n", board->name,
+                       i);
+                ret = -1;
+            }
+        }
+    }
+    return ret;
+}
+
+static int dt_set_m3_display_maps(const struct m3_dcp_board *board,
+                                  const struct adt_segment_ranges *segments, u32 count,
+                                  const struct m3_display_maps maps[2])
+{
+    const char *aliases[] = {"disp0", "disp0_piodma"};
+    u32 phandles[2];
 
     /* Publish only after every inherited PTE passed the physical/IOVA check. */
     for (u32 n = 0; n < 2; n++) {
@@ -2024,43 +2125,44 @@ static int dt_set_j514s_display_maps(const struct adt_segment_ranges *segments, 
     if (dart < 0 || fdt_setprop_string(dt, dart, "status", "okay"))
         return -1;
     piodma = fdt_path_offset(dt, "disp0_piodma");
-    if (fdt_setprop_empty(dt, piodma, "apple,j514s-inherited-mappings"))
+    if (fdt_setprop_empty(dt, piodma, board->inherited_mappings))
         return -1;
     if (fdt_setprop_string(dt, piodma, "status", "okay"))
         return -1;
-    printf("FDT: J514S DISP0 SID0/SID4 mappings preserved; PIODMA enabled\n");
+    printf("FDT: %s DISP0 SID0/SID4 mappings preserved; PIODMA enabled\n", board->name);
     int dcp = fdt_path_offset(dt, "dcp");
-    if (dcp >= 0 && fdt_getprop(dt, dcp, "apple,j514s-native-scanout", NULL)) {
+    if (dcp >= 0 && fdt_getprop(dt, dcp, board->native_scanout, NULL)) {
         int display = fdt_path_offset(dt, "disp0");
-        if (display < 0 ||
-            fdt_node_check_compatible(dt, display, "apple,t6030-display-diagnostics"))
+        if (display < 0 || fdt_node_check_compatible(dt, display, board->display_compatible))
             return -1;
-        if (fdt_setprop_empty(dt, display, "apple,j514s-inherited-mappings") ||
+        if (fdt_setprop_empty(dt, display, board->inherited_mappings) ||
             fdt_setprop_string(dt, display, "status", "okay"))
             return -1;
-        printf("FDT: J514S native scanout diagnostic enabled with preserved SID0 mappings\n");
+        printf("FDT: %s native scanout diagnostic enabled with preserved SID0 mappings\n",
+               board->name);
     }
     return 0;
 }
 
-/* Publish the inherited J514S firmware mapping without starting a display driver. */
-static int dt_set_j514s_dcp_handoff(void)
-{
-    int dcp_node = fdt_path_offset(dt, "dcp");
-    if (dcp_node < 0)
-        return 0; /* Older DT with simple-framebuffer only. */
-    if (chip_id != T6030 || fdt_node_check_compatible(dt, 0, "apple,j514s") ||
-        fdt_node_check_compatible(dt, dcp_node, "apple,t6030-dcp"))
-        bail("FDT: unsupported native DCP handoff target\n");
+struct m3_dcp_adt {
+    const struct adt_segment_ranges *segments;
+    u32 count;
+    u64 dram_start, dram_size;
+    const char *uuid;
+};
 
+/* Validate the complete ADT description before anything touches the FDT. */
+static int m3_dcp_read_adt(const struct m3_dcp_board *board, struct m3_dcp_adt *out)
+{
     int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
     if (nub < 0)
-        bail("ADT: missing J514S DCP firmware metadata\n");
+        bail("ADT: missing %s DCP firmware metadata\n", board->name);
 
     u32 len;
     const struct adt_segment_ranges *segments = adt_getprop(adt, nub, "segment-ranges", &len);
-    if (!segments || !len || len % sizeof(*segments) || len / sizeof(*segments) > 32)
-        bail("ADT: invalid J514S DCP firmware segment list\n");
+    if (!segments || !len || len % sizeof(*segments) ||
+        len / sizeof(*segments) > M3_DCP_MAX_SEGMENTS)
+        bail("ADT: invalid %s DCP firmware segment list\n", board->name);
     u32 count = len / sizeof(*segments);
 
     /* Firmware carveouts are outside the OS-usable boot-args interval. */
@@ -2068,27 +2170,58 @@ static int dt_set_j514s_dcp_handoff(void)
     u64 dram_start, dram_size;
     if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_start) < 0 ||
         ADT_GETPROP(adt, chosen, "dram-size", &dram_size) < 0)
-        bail("ADT: missing J514S physical DRAM bounds\n");
+        bail("ADT: missing %s physical DRAM bounds\n", board->name);
     u64 dram_end = dram_start + dram_size;
     if (!dram_size || dram_end <= dram_start)
-        bail("ADT: invalid J514S DRAM bounds\n");
+        bail("ADT: invalid %s DRAM bounds\n", board->name);
 
-    /* Validate the entire list before mutating the FDT. Use remap addresses:
-     * CPU-image offsets are not the addresses in the inherited DCP DART.
+    /* Use remap addresses: CPU-image offsets are not the addresses in the
+     * inherited DCP DART.
      */
-    for (unsigned i = 0; i < len / sizeof(*segments); i++) {
+    for (u32 i = 0; i < count; i++) {
         u64 size = ALIGN_UP((u64)segments[i].size, SZ_16K);
         if (!size || (segments[i].phys | segments[i].remap) & (SZ_16K - 1) ||
             segments[i].phys < dram_start || segments[i].phys + size < segments[i].phys ||
             segments[i].phys + size > dram_end || segments[i].remap + size < segments[i].remap)
-            bail("ADT: invalid J514S DCP firmware segment %u\n", i);
+            bail("ADT: invalid %s DCP firmware segment %u\n", board->name, i);
     }
 
     const char *uuid = adt_getprop(adt, nub, "uuid", &len);
     if (!uuid || len != 37 || uuid[len - 1])
-        bail("ADT: invalid J514S DCP firmware UUID\n");
-    if (fdt_setprop_string(dt, dcp_node, "apple,firmware-uuid", uuid))
-        bail("FDT: cannot publish J514S DCP firmware UUID\n");
+        bail("ADT: invalid %s DCP firmware UUID\n", board->name);
+
+    *out = (struct m3_dcp_adt){segments, count, dram_start, dram_size, uuid};
+    return 0;
+}
+
+struct m3_display_publish {
+    const struct m3_dcp_board *board;
+    const struct m3_dcp_adt *fw;
+    const struct m3_display_maps *maps;
+};
+
+static int m3_publish_display_maps(void *arg)
+{
+    const struct m3_display_publish *p = arg;
+    return dt_set_m3_display_maps(p->board, p->fw->segments, p->fw->count, p->maps);
+}
+
+/* Publish the inherited firmware mapping without starting a display driver. */
+static int dt_set_m3_dcp_handoff(const struct m3_dcp_board *board)
+{
+    int dcp_node = fdt_path_offset(dt, "dcp");
+    if (dcp_node < 0)
+        return 0; /* Older DT with simple-framebuffer only. */
+    if (chip_id != board->chip || fdt_node_check_compatible(dt, 0, board->machine) ||
+        fdt_node_check_compatible(dt, dcp_node, board->dcp_compatible))
+        bail("FDT: unsupported native DCP handoff target\n");
+
+    struct m3_dcp_adt fw;
+    if (m3_dcp_read_adt(board, &fw))
+        return -1;
+
+    if (fdt_setprop_string(dt, dcp_node, "apple,firmware-uuid", fw.uuid))
+        bail("FDT: cannot publish %s DCP firmware UUID\n", board->name);
 
     int ret = dt_set_dcp_firmware("dcp");
     if (ret)
@@ -2098,13 +2231,94 @@ static int dt_set_j514s_dcp_handoff(void)
         return ret;
 
     dcp_node = fdt_path_offset(dt, "dcp");
-    if (fdt_getprop(dt, dcp_node, "apple,j514s-native-piodma", NULL)) {
-        if (strcmp(uuid, "DDF38191-93B3-324A-BC8F-643006F5AC82") ||
-            dt_set_j514s_display_maps(segments, count, dram_start, dram_size))
-            printf("FDT: J514S PIODMA handoff unqualified; retaining disabled device\n");
+    bool piodma = fdt_getprop(dt, dcp_node, board->native_piodma, NULL);
+    /* Boards whose stream layout is not yet qualified always report the
+     * read-only walk, so the DT opt-in can be qualified from a boot log.
+     */
+    if (piodma || !board->regions[0]) {
+        struct m3_display_maps maps[2];
+        int walked =
+            m3_walk_display_maps(board, fw.segments, fw.count, fw.dram_start, fw.dram_size, maps);
+        struct m3_display_publish publish = {board, &fw, maps};
+        /* All or nothing: never leave half-linked disp0/PIODMA mappings. */
+        if (piodma && (strcmp(fw.uuid, board->qualified_uuid) || walked ||
+                       dt_transaction(m3_publish_display_maps, &publish)))
+            printf("FDT: %s PIODMA handoff unqualified; retaining disabled device\n", board->name);
     }
 
-    printf("FDT: J514S DCP firmware mappings published; display device status unchanged\n");
+    printf("FDT: %s DCP firmware mappings published; display device status unchanged\n",
+           board->name);
+    return 0;
+}
+
+/*
+ * iBoot leaves the T8122 DCP running, and its __OS_LOG segment lies inside RAM
+ * that is otherwise handed to the OS. Whatever else happens, reserve every
+ * segment so the OS cannot allocate pages the running DCP still writes to.
+ * Used when the DT has no DCP node or the linked handoff was rejected.
+ */
+static void dt_reserve_m3_dcp_segments(const struct m3_dcp_board *board)
+{
+    int node = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
+    u32 len = 0;
+    const struct adt_segment_ranges *seg =
+        node < 0 ? NULL : adt_getprop(adt, node, "segment-ranges", &len);
+    if (!seg || !len || len % sizeof(*seg)) {
+        printf("ADT: %s has no usable DCP segment-ranges\n", board->name);
+        return;
+    }
+
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        u64 phys = seg[i].phys;
+        u64 size = ALIGN_UP((u64)seg[i].size, SZ_16K);
+        char name[64];
+
+        if (!phys || !size || phys & (SZ_16K - 1)) {
+            printf("ADT: %s DCP segment %u at 0x%lx is unusable, skipped\n", board->name, i, phys);
+            continue;
+        }
+        snprintf(name, sizeof(name), "asc-firmware@%lx", phys);
+        if (dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, phys, size) < 0) {
+            printf("FDT: failed to reserve %s DCP segment %u at 0x%lx\n", board->name, i, phys);
+            continue;
+        }
+        printf("FDT: reserved %s DCP segment %u at 0x%lx size 0x%lx (unlinked)\n", board->name, i,
+               phys, size);
+    }
+}
+
+static int m3_dcp_handoff(void *board)
+{
+    return dt_set_m3_dcp_handoff(board);
+}
+
+/* Never fails the boot: a rejected handoff leaves the original DT untouched. */
+static int dt_set_t8122_display(void)
+{
+    const struct m3_dcp_board *board = &m3_dcp_board_j613;
+    int dcp = fdt_path_offset(dt, "dcp");
+
+    if (dcp >= 0) {
+        /* The handoff mutates the global FDT through the shared reserved-memory
+         * helpers; commit it whole or not at all.
+         */
+        if (!dt_transaction(m3_dcp_handoff, (void *)board))
+            return 0;
+        printf("FDT: %s DCP handoff rejected; original DT retained\n", board->name);
+    } else {
+        printf("FDT: %s DT has no DCP node; reserving firmware segments only\n", board->name);
+    }
+
+    dt_reserve_m3_dcp_segments(board);
+
+    /* Read-only report of the inherited scanout/PIODMA streams, so the DT
+     * opt-in can be qualified from the boot log of this same m1n1.
+     */
+    struct m3_dcp_adt fw;
+    struct m3_display_maps maps[2];
+    if (!m3_dcp_read_adt(board, &fw) && chip_id == board->chip &&
+        m3_walk_display_maps(board, fw.segments, fw.count, fw.dram_start, fw.dram_size, maps))
+        printf("FDT: %s inherited display mappings do not qualify\n", board->name);
     return 0;
 }
 
@@ -2123,10 +2337,12 @@ static int dt_set_display(void)
     int ret = 0;
 
     if (!fdt_node_check_compatible(dt, 0, "apple,t6030")) {
-        ret = dt_set_j514s_dcp_handoff();
+        ret = dt_set_m3_dcp_handoff(&m3_dcp_board_j514s);
         if (ret)
             return ret;
         return dt_set_display_m3_external(dt);
+    } else if (!fdt_node_check_compatible(dt, 0, "apple,t8122")) {
+        return dt_set_t8122_display();
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t8103")) {
         ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
                                            disp_reserved_regions_t8103,
