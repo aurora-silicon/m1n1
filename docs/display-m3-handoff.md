@@ -49,3 +49,37 @@ Differences from J514S, because J613 is not yet qualified on hardware:
 Host validation: `tests/kboot/test_j613_dcp_handoff.py` (real libfdt and the
 production kboot code; `J613_ADT` / `J613_DCP_DTSI` select a saved ADT and the
 real board dtsi). Not yet run on hardware.
+
+# T8122 GPU firmware handoff
+
+`dt_set_gpu()` hands T8122 to `dt_set_gpu_t8122()` in `kboot_gpu.c` instead
+of reporting an unsupported chip. iBoot preloads the GFX ASC firmware and
+leaves its UAT tables in RAM, and nothing else reserved that memory on T8122.
+Every T8122 boot now reserves, `no-map`, the four `/arm-io/sgx` regions
+(`gpu-region`, `gfx-shared-region`, `gfx-handoff`, `gfx-shared-l2-region`)
+in the `uat-ttbs`, `uat-pagetables`, `uat-handoff` and `uat-pagetables-l2`
+nodes (filling the DT's placeholders, or creating them), and the
+`/arm-io/gfx-asc` `__TEXT`/`__DATA` segments as `asc-firmware@<phys>`.
+
+When the ADT is consistent (gfx-asc and iop-gfx-nub `segment-ranges` equal,
+`__TEXT;__DATA`, `pre-loaded` 1, phys == remap, 16K-aligned, flags 1/0,
+`__TEXT` at VA 0xfffffc0000000000 with `__DATA` right after it, all six ranges
+disjoint and inside DRAM), nothing else in `/reserved-memory` or
+`/memreserve/` overlaps them, and the DT has an `apple,agx-t8122` node (the
+`gpu` alias, or the only such node), the handoff links the six regions as
+`ttbs pagetables handoff shared-l2 fw-text fw-data` (other `memory-region`
+entries are kept) and sets `apple,m3-handoff-version = <1>`,
+`apple,firmware-segment-vas` (two u64) and `apple,firmware-segment-flags`.
+That is the ABI of the M3 runtime (drm/asahi `m3_board.rs`) and of
+`make-gpu-overlay.py`. It is committed as a whole FDT copy or not at all.
+
+The GPU node is set to `disabled` unless the root is `apple,j613` and the
+node has `apple,j613-native-gpu`, in which case it is set to `okay`. If the
+handoff is refused, the node is set to `disabled` and every usable range is
+still reserved, unlinked, one transaction per range. Ranges that are already
+covered, or that partially overlap another reservation, are logged and
+skipped. This never fails the boot.
+
+Host validation: `tests/kboot/test_t8122_gpu_handoff.py` (real libfdt and
+the production code; `J613_ADT` / `J613_GPU_DTSI` select a saved ADT and a
+real dtsi). Not yet run on hardware.
