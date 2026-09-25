@@ -25,30 +25,43 @@ GPU handoff work remains in the working tree and build, outside this commit.
 # J613 internal display handoff
 
 J613 (MacBook Air 13" M3, T8122) shares the J514S internal handoff through a
-per-board table in `kboot.c`. The DT ABI is the same with a `j613` prefix:
-`apple,firmware-uuid` and `memory-region` links to every `iop-dcp-nub`
-segment on the `dcp` alias, `apple,dcp-os-log` on the `__OS_LOG` segment
-(remap == phys), and, only when the DT opts in with `apple,j613-native-piodma`
-(and `apple,j613-native-scanout`), `apple,j613-inherited-mappings` on
-`disp0_piodma` (and `disp0`). Firmware UUID 90F849E1-B422-367E-B389-50246F8DEC47
-(os-fw 14.7) is the only one allowed to publish inherited scanout mappings.
-The disp0 DART block (0x28d304000, SID0 scanout, SID4 PIODMA) matches J514S.
+per-board table in `kboot.c`, but publishes the ABI of the in-tree drm/apple
+14.x IOMFB path (J613 board record) and its display gate, described by the
+kernel's `t8122-j613-dcp.dtsi`:
 
-Differences from J514S, because J613 is not yet qualified on hardware:
-- The SID0/SID4 split of the four scanout segments is unknown. Instead of the
-  exact J514S 3/1 counts, each stream must map at least one segment, every
-  scanout segment must be mapped by one of them, and every inherited page must
-  still match its ADT segment. The read-only walk result is always logged
-  (`DISP0 SIDn maps ... mask`), even without the opt-in, to qualify the split.
-- A rejected handoff never fails the boot. The handoff and the PIODMA/scanout
-  publication each run on a copy of the FDT and are committed whole or not at
-  all. On rejection, or with a DT that has no `dcp` alias, every DCP segment is
-  still reserved `no-map` (unlinked), because the running DCP writes its
-  `__OS_LOG` inside RAM otherwise given to the OS.
+- always, on the `dcp` alias: `apple,firmware-uuid` (ADT `iop-dcp-nub`
+  uuid), `apple,firmware-version`, `apple,firmware-compat` (<14 7 0> for
+  os-fw 14.7) and a `no-map` `memory-region` per `iop-dcp-nub` segment with
+  `iommu-addresses = <&dcp remap size>`, or `apple,dcp-os-log` on `__OS_LOG`
+  (remap == phys). `apple,notch-height` comes from `dt_set_fb()`.
+- only if the DT has the `apple,t8122-display-subsystem` node (`disp0`
+  alias; the kernel's `apple_t8122_display.enable=1` is the real opt-in):
+  a `framebuffer` `memory-region` (ADT `/vram`, no-map, compatible
+  `framebuffer`, no DART tuple) first on the display subsystem, the SID0
+  segments linked to it and the SID4 segment to the `piodma` child, all named,
+  and then `apple,t8122-handoff = <1>` on the DCP, the display subsystem and
+  PIODMA, last. No `status` is changed: the display gate enables the nodes.
+
+The display part is published, as one FDT transaction, only if the firmware
+UUID is 90F849E1-B422-367E-B389-50246F8DEC47; the read-only walk of the
+locked disp0 DART (0x28d304000) finds every inherited page inside its ADT
+segment at the ADT physical address, SID0 mapping exactly segments 4 and 6
+(0x50), SID4 exactly segment 5 (0x20), and no stream the 16 MB segment 3
+(0x08, linked to the DCP only); `apple,firmware-compat` is 14.7.0 and
+`apple,notch-height` 64; the display subsystem and PIODMA are streams 0 and 4
+of that DART, PIODMA is the DCP's available `piodma` child, and the DCP,
+display subsystem and disp0 DART are still disabled with no memory-region;
+and the boot framebuffer lies inside `/vram`. Otherwise no marker is set and
+the kernel does not take the display over. The walk is always logged.
+
+A rejected DCP handoff never fails the boot: the original DT is kept and
+every DCP segment is still reserved `no-map` (unlinked), because the running
+DCP writes its `__OS_LOG` inside RAM otherwise given to the OS.
 
 Host validation: `tests/kboot/test_j613_dcp_handoff.py` (real libfdt and the
-production kboot code; `J613_ADT` / `J613_DCP_DTSI` select a saved ADT and the
-real board dtsi). Not yet run on hardware.
+production kboot code; `J613_ADT` selects a saved ADT, `J613_DCP_DTSI` the
+kernel's dtsi and `J613_DTB` a complete t8122-j613.dtb). Not yet run on
+hardware.
 
 # T8122 GPU firmware handoff
 

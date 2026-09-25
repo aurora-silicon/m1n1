@@ -1962,13 +1962,22 @@ struct m3_dcp_board {
     const char *name;
     u32 chip;
     const char *machine, *soc, *dcp_compatible, *display_compatible;
+    /* J514S diagnostic ABI, opted into by DT properties; NULL for J613. */
     const char *native_piodma, *native_scanout, *inherited_mappings;
+    /* J613: drm/apple's display gate ABI. The display subsystem node's
+     * compatible is the opt-in, the nodes' status stays with the kernel, and
+     * this marker is set = <1> on the DCP, display and PIODMA nodes last.
+     */
+    const char *handoff;
     const char *qualified_uuid; /* firmware whose PIODMA/scanout handoff is known */
     u64 disp0_dart;
-    /* Exact SID0/SID4 region counts. Zero means not yet qualified on hardware:
-     * require at least one region per stream and every scanout segment covered.
-     */
+    /* Exact SID0/SID4 region counts (J514S). */
     u32 regions[2];
+    /* Exact SID0/SID4 segment masks and the scanout segments mapped by
+     * neither stream, where measured (J613). Used instead of the counts.
+     */
+    u32 masks[2], unmapped;
+    u32 notch_height; /* rows m1n1 hides from the boot framebuffer */
     /* J514S refuses to boot an inconsistent handoff. J613 keeps the original
      * DT and falls back to unlinked segment reservations instead.
      */
@@ -1993,6 +2002,7 @@ static const struct m3_dcp_board m3_dcp_board_j514s = {
 
 /* Values from the live J613 ADT (os-fw 14.7): /arm-io/dart-disp0 is at arm-io
  * 0x7d304000 (+0x210000000), mapper-disp0 SID0, mapper-disp0-piodma SID4.
+ * The DT contract is the kernel's t8122-j613-dcp.dtsi.
  */
 static const struct m3_dcp_board m3_dcp_board_j613 = {
     .name = "J613",
@@ -2000,13 +2010,16 @@ static const struct m3_dcp_board m3_dcp_board_j613 = {
     .machine = "apple,j613",
     .soc = "apple,t8122",
     .dcp_compatible = "apple,t8122-dcp",
-    .display_compatible = "apple,t8122-display-diagnostics",
-    .native_piodma = "apple,j613-native-piodma",
-    .native_scanout = "apple,j613-native-scanout",
-    .inherited_mappings = "apple,j613-inherited-mappings",
+    .display_compatible = "apple,t8122-display-subsystem",
+    .handoff = "apple,t8122-handoff",
     .qualified_uuid = "90F849E1-B422-367E-B389-50246F8DEC47",
     .disp0_dart = 0x28d304000,
-    .regions = {0, 0},
+    /* Measured: SID0 maps segments 4 and 6, SID4 segment 5. Segment 3
+     * (16 MB) is mapped by neither; it stays linked to the DCP only.
+     */
+    .masks = {0x50, 0x20},
+    .unmapped = 1U << 3,
+    .notch_height = 64, /* 2560x1664 panel, 2560x1600 boot framebuffer */
     .fatal = false,
 };
 
@@ -2066,16 +2079,23 @@ static int m3_walk_display_maps(const struct m3_dcp_board *board,
         }
         printf("FDT: %s DISP0 SID%u maps %u segment(s), mask 0x%x\n", board->name, streams[n],
                regions, mask);
-        if (board->regions[n] ? regions != board->regions[n] : !regions)
+        if (board->masks[n] ? mask != board->masks[n] : regions != board->regions[n]) {
+            if (board->masks[n])
+                printf("FDT: %s DISP0 SID%u mask is not the measured 0x%x\n", board->name,
+                       streams[n], board->masks[n]);
             ret = -1;
+        }
     }
-    if (!board->regions[0]) {
-        for (u32 i = 0; i < count; i++) {
-            if (segments[i].unk == 2 && !maps[0].bytes[i] && !maps[1].bytes[i]) {
-                printf("FDT: %s scanout segment %u is not mapped by SID0 or SID4\n", board->name,
-                       i);
-                ret = -1;
-            }
+    if (board->masks[0]) {
+        /* Scanout segments neither stream maps must be exactly the declared ones. */
+        u32 unmapped = 0;
+        for (u32 i = 0; i < count; i++)
+            if (segments[i].unk == 2 && !maps[0].bytes[i] && !maps[1].bytes[i])
+                unmapped |= 1U << i;
+        if (unmapped != board->unmapped) {
+            printf("FDT: %s scanout segments mapped by neither stream 0x%x, expected 0x%x\n",
+                   board->name, unmapped, board->unmapped);
+            ret = -1;
         }
     }
     return ret;
@@ -2116,10 +2136,14 @@ static int dt_set_m3_display_maps(const struct m3_dcp_board *board,
                 return -1;
         }
         for (u32 n = 0; n < 2; n++) {
-            if (maps[n].bytes[i] && dt_device_add_mem_region(aliases[n], phandle, NULL))
+            if (maps[n].bytes[i] &&
+                dt_device_add_mem_region(aliases[n], phandle, board->handoff ? name : NULL))
                 return -1;
         }
     }
+    /* The display gate enables the DARTs and the display itself. */
+    if (board->handoff)
+        return 0;
     int piodma = fdt_path_offset(dt, "disp0_piodma");
     int dart = dt_get_iommu_node(piodma, 0);
     if (dart < 0 || fdt_setprop_string(dt, dart, "status", "okay"))
@@ -2231,18 +2255,15 @@ static int dt_set_m3_dcp_handoff(const struct m3_dcp_board *board)
         return ret;
 
     dcp_node = fdt_path_offset(dt, "dcp");
-    bool piodma = fdt_getprop(dt, dcp_node, board->native_piodma, NULL);
-    /* Boards whose stream layout is not yet qualified always report the
-     * read-only walk, so the DT opt-in can be qualified from a boot log.
-     */
-    if (piodma || !board->regions[0]) {
+    bool piodma = board->native_piodma && fdt_getprop(dt, dcp_node, board->native_piodma, NULL);
+    if (piodma) {
         struct m3_display_maps maps[2];
         int walked =
             m3_walk_display_maps(board, fw.segments, fw.count, fw.dram_start, fw.dram_size, maps);
         struct m3_display_publish publish = {board, &fw, maps};
         /* All or nothing: never leave half-linked disp0/PIODMA mappings. */
-        if (piodma && (strcmp(fw.uuid, board->qualified_uuid) || walked ||
-                       dt_transaction(m3_publish_display_maps, &publish)))
+        if (strcmp(fw.uuid, board->qualified_uuid) || walked ||
+            dt_transaction(m3_publish_display_maps, &publish))
             printf("FDT: %s PIODMA handoff unqualified; retaining disabled device\n", board->name);
     }
 
@@ -2287,9 +2308,162 @@ static void dt_reserve_m3_dcp_segments(const struct m3_dcp_board *board)
     }
 }
 
-static int m3_dcp_handoff(void *board)
+/* The single <phandle stream> entry of @node's iommus, if it names @dart_base. */
+static int m3_iommu_stream(int node, u64 dart_base, u32 stream)
 {
-    return dt_set_m3_dcp_handoff(board);
+    int len;
+    const fdt32_t *iommus = node < 0 ? NULL : fdt_getprop(dt, node, "iommus", &len);
+    if (!iommus || len != 8 || fdt32_ld(iommus + 1) != stream)
+        return -1;
+    int dart = fdt_node_offset_by_phandle(dt, fdt32_ld(iommus));
+    const fdt64_t *reg = dart < 0 ? NULL : fdt_getprop(dt, dart, "reg", &len);
+    if (!reg || len < 16 || fdt64_ld(reg) != dart_base)
+        return -1;
+    return dart;
+}
+
+static bool m3_status_disabled(int node)
+{
+    const char *status = node < 0 ? NULL : fdt_getprop(dt, node, "status", NULL);
+    return status && !strcmp(status, "disabled");
+}
+
+/* The DT shape and the DCP properties drm/apple's J613 path reads. */
+static int m3_check_display_contract(const struct m3_dcp_board *board)
+{
+    int dcp = fdt_path_offset(dt, "dcp");
+    int display = fdt_path_offset(dt, "disp0");
+    int piodma = fdt_path_offset(dt, "disp0_piodma");
+    int len;
+
+    /* The kernel finds PIODMA as the DCP's "piodma" child. */
+    if (dcp < 0 || piodma < 0 || fdt_subnode_offset(dt, dcp, "piodma") != piodma)
+        bail("FDT: %s disp0_piodma is not the DCP's piodma child\n", board->name);
+    int dart = m3_iommu_stream(display, board->disp0_dart, 0);
+    if (dart < 0 || m3_iommu_stream(piodma, board->disp0_dart, 4) != dart)
+        bail("FDT: %s display/PIODMA are not DISP0 DART streams 0/4 at 0x%lx\n", board->name,
+             board->disp0_dart);
+    /* The kernel's display gate enables these itself and refuses enabled ones. */
+    if (!m3_status_disabled(dcp) || !m3_status_disabled(display) || !m3_status_disabled(dart))
+        bail("FDT: %s DCP, display or DISP0 DART is not disabled\n", board->name);
+    /* ... but creates PIODMA only if it is available. */
+    const char *status = fdt_getprop(dt, piodma, "status", NULL);
+    if (status && strcmp(status, "okay"))
+        bail("FDT: %s PIODMA is not available\n", board->name);
+    if (fdt_getprop(dt, display, "memory-region", NULL) ||
+        fdt_getprop(dt, piodma, "memory-region", NULL))
+        bail("FDT: %s display/PIODMA already have memory regions\n", board->name);
+
+    const char *uuid = fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
+    if (!uuid || strcmp(uuid, board->qualified_uuid))
+        bail("FDT: %s DCP firmware UUID is not the qualified one\n", board->name);
+    /* dcp.c prints the cells as "%d.%d.%d" and requires "14.7.0". */
+    const fdt32_t *compat = fdt_getprop(dt, dcp, "apple,firmware-compat", &len);
+    if (!compat || len != 12 || fdt32_ld(compat) != 14 || fdt32_ld(compat + 1) != 7 ||
+        fdt32_ld(compat + 2) != 0)
+        bail("FDT: %s DCP firmware-compat is not 14.7.0\n", board->name);
+    const fdt32_t *notch = fdt_getprop(dt, dcp, "apple,notch-height", &len);
+    if (!notch || len != 4 || fdt32_ld(notch) != board->notch_height)
+        bail("FDT: %s DCP notch-height is not %u\n", board->name, board->notch_height);
+    return 0;
+}
+
+/*
+ * appledrm takes the boot framebuffer's range from the display subsystem's
+ * "framebuffer" memory-region, to remove simpledrm. The locked SID0 table maps
+ * no /vram page (the walk refuses any page outside the DCP segments), so the
+ * region has no iommu-addresses. Linked first, so its name index is its
+ * memory-region index.
+ */
+static int m3_publish_framebuffer(const struct m3_dcp_board *board, u64 dram_start, u64 dram_size)
+{
+    int path[8];
+    u64 base, size;
+    if (adt_path_offset_trace(adt, "/vram", path) < 0 ||
+        adt_get_reg(adt, path, "reg", 0, &base, &size))
+        bail("ADT: %s has no /vram\n", board->name);
+    if (!size || (base | size) & (SZ_16K - 1) || base < dram_start || base + size < base ||
+        base + size > dram_start + dram_size)
+        bail("ADT: invalid %s /vram 0x%lx+0x%lx\n", board->name, base, size);
+
+    int fb = fdt_path_offset(dt, "/chosen/framebuffer");
+    int len;
+    const fdt64_t *reg = fb < 0 ? NULL : fdt_getprop(dt, fb, "reg", &len);
+    if (!reg || len != 16 || fdt64_ld(reg) < base || fdt64_ld(reg + 1) > size ||
+        fdt64_ld(reg) - base > size - fdt64_ld(reg + 1))
+        bail("FDT: %s boot framebuffer is not inside /vram\n", board->name);
+
+    char name[64];
+    snprintf(name, sizeof(name), "framebuffer@%lx", base);
+    int node = dt_get_or_add_reserved_mem(name, "framebuffer", true, base, size);
+    if (node < 0)
+        return -1;
+    return dt_device_add_mem_region("disp0", fdt_get_phandle(dt, node), "framebuffer");
+}
+
+static int m3_publish_t8122_display(void *arg)
+{
+    const struct m3_display_publish *p = arg;
+    const struct m3_dcp_board *board = p->board;
+    const char *aliases[] = {"dcp", "disp0", "disp0_piodma"};
+
+    if (m3_check_display_contract(board) ||
+        m3_publish_framebuffer(board, p->fw->dram_start, p->fw->dram_size) ||
+        dt_set_m3_display_maps(board, p->fw->segments, p->fw->count, p->maps))
+        return -1;
+    /* Last: the markers are the kernel's proof that all of the above holds. */
+    for (u32 i = 0; i < ARRAY_SIZE(aliases); i++) {
+        int node = fdt_path_offset(dt, aliases[i]);
+        if (node < 0 || fdt_setprop_u32(dt, node, board->handoff, 1))
+            bail("FDT: cannot set %s on %s\n", board->handoff, aliases[i]);
+    }
+    return 0;
+}
+
+/*
+ * Offer the display to the kernel's display gate: only for a DT with the
+ * board's display subsystem, qualified firmware and exactly the measured
+ * DISP0 streams. All or nothing; a refusal leaves the DCP ABI without markers,
+ * which the kernel treats as no handoff.
+ */
+static void dt_set_m3_display_handoff(const struct m3_dcp_board *board)
+{
+    struct m3_dcp_adt fw;
+    struct m3_display_maps maps[2];
+
+    if (m3_dcp_read_adt(board, &fw))
+        return;
+    /* Read-only; always logged so the masks can be checked from a boot log. */
+    int walked =
+        m3_walk_display_maps(board, fw.segments, fw.count, fw.dram_start, fw.dram_size, maps);
+
+    int display = fdt_path_offset(dt, "disp0");
+    if (display < 0 || fdt_node_check_compatible(dt, display, board->display_compatible)) {
+        printf("FDT: %s DT has no %s; display handoff not offered\n", board->name,
+               board->display_compatible);
+        return;
+    }
+    if (strcmp(fw.uuid, board->qualified_uuid))
+        printf("FDT: %s DCP firmware %s is not the qualified %s\n", board->name, fw.uuid,
+               board->qualified_uuid);
+    struct m3_display_publish publish = {board, &fw, maps};
+    if (strcmp(fw.uuid, board->qualified_uuid) || walked ||
+        dt_transaction(m3_publish_t8122_display, &publish)) {
+        printf("FDT: %s display handoff refused; %s not set\n", board->name, board->handoff);
+        return;
+    }
+    printf("FDT: %s display handoff published (%s); nodes left disabled for the kernel\n",
+           board->name, board->handoff);
+}
+
+static int m3_dcp_handoff(void *arg)
+{
+    const struct m3_dcp_board *board = arg;
+    if (dt_set_m3_dcp_handoff(board))
+        return -1;
+    if (board->handoff)
+        dt_set_m3_display_handoff(board);
+    return 0;
 }
 
 /* Never fails the boot: a rejected handoff leaves the original DT untouched. */
