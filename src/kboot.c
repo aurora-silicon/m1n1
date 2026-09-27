@@ -313,6 +313,21 @@ static int dt_set_chosen(void)
     if (fdt_setprop(dt, node, "asahi,m1n1-stage2-version", m1n1_version, strlen(m1n1_version) + 1))
         bail("FDT: couldn't set asahi,m1n1-stage2-version\n");
 
+    /*
+     * On M2 (T8112, T602x) and later SoCs, iBoot establishes hardware warm
+     * registration of the Secure Enclave (SEP) and Touch ID sensor before
+     * handoff. Querying the SEP ASC mailbox in m1n1 desynchronizes this
+     * state, causing the SEP firmware to refuse subsequent biometric commands.
+     * M1 SoCs (T8103, T600x) rely on cold boot and do not have this restriction.
+     */
+    bool sep_warm_active = (chip_id != T8103 && chip_id != T6000 &&
+                            chip_id != T6001 && chip_id != T6002);
+
+    if (sep_warm_active) {
+        printf("SEP: Preserving iBoot warm registration; seeding RNG from ADT\n");
+        return dt_set_rng_seed_adt(node);
+    }
+
     if (dt_set_rng_seed_sep(node))
         return dt_set_rng_seed_adt(node);
 
