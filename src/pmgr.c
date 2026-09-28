@@ -65,6 +65,13 @@ static u32 pmgr_devices_len = 0;
 
 static bool pmgr_u8id = false;
 static bool pmgr_use_group_and_offset = false;
+static bool pmgr_protected_addr(uintptr_t addr);
+
+static bool pmgr_protected_device(const struct pmgr_device *device)
+{
+    return chip_id == T8140 && (!strncmp(device->name, "DISP_CPU", sizeof(device->name)) ||
+                                !strncmp(device->name, "DISPEXT0_CPU", sizeof(device->name)));
+}
 
 static uintptr_t pmgr_get_psreg(u8 idx)
 {
@@ -89,6 +96,12 @@ int pmgr_set_mode(uintptr_t addr, u8 target_mode)
 {
     if (!addr)
         return -1;
+    if (pmgr_protected_addr(addr)) {
+        if (FIELD_GET(PMGR_PS_ACTUAL, read32(addr)) == target_mode)
+            return 0;
+        printf("pmgr: refusing protected display CPU power transition at 0x%lx\n", addr);
+        return -1;
+    }
     mask32(addr, PMGR_AUTO_ENABLE | PMGR_WAS_CLKGATED | PMGR_WAS_PWRGATED | PMGR_PS_TARGET,
            FIELD_PREP(PMGR_PS_TARGET, target_mode));
     if (poll32(addr, PMGR_PS_ACTUAL, FIELD_PREP(PMGR_PS_ACTUAL, target_mode), PMGR_POLL_TIMEOUT) <
@@ -143,6 +156,21 @@ static uintptr_t pmgr_device_get_addr(u8 die, const struct pmgr_device *device)
         addr += (device->addr_offset << 3);
 
     return addr;
+}
+
+static bool pmgr_protected_addr(uintptr_t addr)
+{
+    if (chip_id != T8140 || !pmgr_devices)
+        return false;
+    for (size_t i = 0; i < pmgr_devices_len; i++) {
+        if (!pmgr_protected_device(&pmgr_devices[i]))
+            continue;
+        for (u8 die = 0; die < pmgr_dies; die++) {
+            if (pmgr_device_get_addr(die, &pmgr_devices[i]) == addr)
+                return true;
+        }
+    }
+    return false;
 }
 
 static void pmgr_adt_get_parents(const struct pmgr_device *device, u16 parent[2])
@@ -347,6 +375,8 @@ int pmgr_adt_power_disable_index(const char *path, u32 index)
 
 static int pmgr_reset_device(int die, const struct pmgr_device *dev)
 {
+    if (pmgr_protected_device(dev))
+        return -1;
     if (die < 0 || die >= pmgr_dies) {
         printf("pmgr: invalid die id %d for device %s\n", die, dev->name);
         return -1;
@@ -524,6 +554,9 @@ int pmgr_init(void)
             if ((device->flags & PMGR_FLAG_VIRTUAL))
                 continue;
 
+            if (pmgr_protected_device(device))
+                continue;
+
             uintptr_t addr = pmgr_device_get_addr(die, device);
             if (!addr)
                 return -1;
@@ -543,6 +576,9 @@ int pmgr_init(void)
                         }
 
                         if ((pdevice->flags & PMGR_FLAG_VIRTUAL))
+                            continue;
+
+                        if (pmgr_protected_device(pdevice))
                             continue;
 
                         addr = pmgr_device_get_addr(die, pdevice);
