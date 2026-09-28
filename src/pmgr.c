@@ -19,6 +19,7 @@
 #define PMGR_POLL_TIMEOUT 10000
 
 #define PMGR_FLAG_VIRTUAL 0x10
+#define PMGR_MAX_PARENT_DEPTH 32
 
 struct pmgr_device {
     u8 flags;
@@ -67,7 +68,7 @@ static bool pmgr_use_group_and_offset = false;
 
 static uintptr_t pmgr_get_psreg(u8 idx)
 {
-    if (idx * 12 >= pmgr_ps_regs_len) {
+    if (((u32)idx + 1) * 12 > pmgr_ps_regs_len) {
         printf("pmgr: Index %d is out of bounds for ps-regs\n", idx);
         return 0;
     }
@@ -86,6 +87,8 @@ static uintptr_t pmgr_get_psreg(u8 idx)
 
 int pmgr_set_mode(uintptr_t addr, u8 target_mode)
 {
+    if (!addr)
+        return -1;
     mask32(addr, PMGR_AUTO_ENABLE | PMGR_WAS_CLKGATED | PMGR_WAS_PWRGATED | PMGR_PS_TARGET,
            FIELD_PREP(PMGR_PS_TARGET, target_mode));
     if (poll32(addr, PMGR_PS_ACTUAL, FIELD_PREP(PMGR_PS_ACTUAL, target_mode), PMGR_POLL_TIMEOUT) <
@@ -122,6 +125,8 @@ static int pmgr_find_device(u16 id, const struct pmgr_device **device)
 
 static uintptr_t pmgr_device_get_addr(u8 die, const struct pmgr_device *device)
 {
+    if (die >= pmgr_dies)
+        return 0;
     uintptr_t addr;
     if (pmgr_use_group_and_offset)
         addr = pmgr_get_psreg(device->group_and_offset.group);
@@ -151,14 +156,58 @@ static void pmgr_adt_get_parents(const struct pmgr_device *device, u16 parent[2]
     }
 }
 
-static int pmgr_set_mode_recursive(u8 die, u16 id, u8 target_mode, bool recurse)
+static int pmgr_validate_parents(u16 id, u16 *ancestors, size_t depth)
+{
+    const struct pmgr_device *device;
+    u16 parents[2];
+
+    if (depth >= PMGR_MAX_PARENT_DEPTH || pmgr_find_device(id, &device))
+        return -1;
+    for (size_t i = 0; i < depth; i++) {
+        if (ancestors[i] == id)
+            return -1;
+    }
+    ancestors[depth] = id;
+    pmgr_adt_get_parents(device, parents);
+    for (size_t i = 0; i < ARRAY_SIZE(parents); i++) {
+        if (parents[i] && pmgr_validate_parents(parents[i], ancestors, depth + 1))
+            return -1;
+    }
+    return 0;
+}
+
+static int pmgr_validate_topology(void)
+{
+    for (size_t i = 0; i < pmgr_devices_len; i++) {
+        const struct pmgr_device *device = &pmgr_devices[i];
+        u16 id = pmgr_adt_get_id(device);
+        u16 ancestors[PMGR_MAX_PARENT_DEPTH];
+
+        if (!id || pmgr_validate_parents(id, ancestors, 0))
+            return -1;
+        for (size_t j = 0; j < i; j++) {
+            if (pmgr_adt_get_id(&pmgr_devices[j]) == id)
+                return -1;
+        }
+        if (!(device->flags & PMGR_FLAG_VIRTUAL)) {
+            for (u8 die = 0; die < pmgr_dies; die++) {
+                if (!pmgr_device_get_addr(die, device))
+                    return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int pmgr_set_mode_recursive_inner(u8 die, u16 id, u8 target_mode, bool recurse,
+                                         unsigned int depth)
 {
     if (!pmgr_initialized) {
         printf("pmgr: pmgr_set_mode_recursive() called before successful pmgr_init()\n");
         return -1;
     }
 
-    if (id == 0)
+    if (id == 0 || die >= pmgr_dies || depth >= PMGR_MAX_PARENT_DEPTH)
         return -1;
 
     const struct pmgr_device *device;
@@ -179,7 +228,8 @@ static int pmgr_set_mode_recursive(u8 die, u16 id, u8 target_mode, bool recurse)
             u16 parents[2];
             pmgr_adt_get_parents(device, parents);
             if (parents[i]) {
-                int ret = pmgr_set_mode_recursive(die, parents[i], target_mode, true);
+                int ret =
+                    pmgr_set_mode_recursive_inner(die, parents[i], target_mode, true, depth + 1);
                 if (ret < 0)
                     return ret;
             }
@@ -194,6 +244,11 @@ static int pmgr_set_mode_recursive(u8 die, u16 id, u8 target_mode, bool recurse)
     }
 
     return 0;
+}
+
+static int pmgr_set_mode_recursive(u8 die, u16 id, u8 target_mode, bool recurse)
+{
+    return pmgr_set_mode_recursive_inner(die, id, target_mode, recurse, 0);
 }
 
 int pmgr_power_enable(u32 id)
@@ -219,7 +274,7 @@ static int pmgr_adt_find_devices(const char *path, const u32 **devices, u32 *n_d
     }
 
     *devices = adt_getprop(adt, node_offset, "clock-gates", n_devices);
-    if (*devices == NULL || *n_devices == 0) {
+    if (*devices == NULL || *n_devices == 0 || (*n_devices & 3)) {
         printf("pmgr: Error getting %s clock-gates.\n", path);
         return -1;
     }
@@ -292,12 +347,14 @@ int pmgr_adt_power_disable_index(const char *path, u32 index)
 
 static int pmgr_reset_device(int die, const struct pmgr_device *dev)
 {
-    if (die < 0 || die > 16) {
+    if (die < 0 || die >= pmgr_dies) {
         printf("pmgr: invalid die id %d for device %s\n", die, dev->name);
         return -1;
     }
 
     uintptr_t addr = pmgr_device_get_addr(die, dev);
+    if (!addr)
+        return -1;
 
     u32 reg = read32(addr);
     if (FIELD_GET(PMGR_PS_ACTUAL, reg) != PMGR_PS_ACTIVE) {
@@ -361,6 +418,8 @@ int pmgr_reset(int die, const char *name)
 
 int pmgr_power_on(int die, const char *name)
 {
+    if (die < 0 || die >= pmgr_dies)
+        return -1;
     const struct pmgr_device *dev = NULL;
 
     for (unsigned int i = 0; i < pmgr_devices_len; ++i) {
@@ -399,6 +458,15 @@ int pmgr_adt_path_offset_trace(const void *adt_ptr, int *path)
 
 int pmgr_init(void)
 {
+    pmgr_initialized = 0;
+    pmgr_name = pmgr_name_t8103;
+    pmgr_ps_regs = NULL;
+    pmgr_ps_regs_len = 0;
+    pmgr_devices = NULL;
+    pmgr_devices_len = 0;
+    pmgr_u8id = false;
+    pmgr_use_group_and_offset = false;
+
     int node = adt_path_offset(adt, "/arm-io");
     if (node < 0) {
         printf("pmgr: Error getting /arm-io node\n");
@@ -406,13 +474,14 @@ int pmgr_init(void)
     }
     if (ADT_GETPROP(adt, node, "die-count", &pmgr_dies) < 0)
         pmgr_dies = 1;
+    if (pmgr_dies < 1 || pmgr_dies > 16)
+        return -1;
 
     pmgr_offset = pmgr_adt_path_offset_trace(adt, pmgr_path);
     if (pmgr_offset < 0) {
         printf("pmgr: Error getting %s node\n", pmgr_name);
         return -1;
     }
-
     pmgr_ps_regs = adt_getprop(adt, pmgr_offset, "ps-regs", &pmgr_ps_regs_len);
     if (pmgr_ps_regs == NULL || pmgr_ps_regs_len == 0) {
         pmgr_use_group_and_offset = true;
@@ -422,6 +491,8 @@ int pmgr_init(void)
             return -1;
         }
     }
+    if (pmgr_ps_regs_len % 12)
+        return -1;
 
     pmgr_devices = adt_getprop(adt, pmgr_offset, "devices", &pmgr_devices_len);
     if (pmgr_devices == NULL || pmgr_devices_len == 0) {
@@ -429,15 +500,22 @@ int pmgr_init(void)
         return -1;
     }
 
-    pmgr_devices_len /= sizeof(*pmgr_devices);
-    pmgr_initialized = 1;
+    if (pmgr_devices_len % sizeof(*pmgr_devices))
+        return -1;
 
-    printf("pmgr: Cleaning up device states...\n");
+    pmgr_devices_len /= sizeof(*pmgr_devices);
 
     // detect whether u8 or u16 PMGR IDs are used by comparing the IDs of the
     // first 2 devices
     if (pmgr_devices_len >= 2)
         pmgr_u8id = pmgr_devices[0].id1 != pmgr_devices[1].id1;
+
+    if (pmgr_validate_topology()) {
+        printf("pmgr: Invalid ADT power-state topology\n");
+        return -1;
+    }
+
+    printf("pmgr: Cleaning up device states...\n");
 
     for (u8 die = 0; die < pmgr_dies; ++die) {
         for (size_t i = 0; i < pmgr_devices_len; ++i) {
@@ -448,7 +526,7 @@ int pmgr_init(void)
 
             uintptr_t addr = pmgr_device_get_addr(die, device);
             if (!addr)
-                continue;
+                return -1;
 
             u32 reg = read32(addr);
 
@@ -461,7 +539,7 @@ int pmgr_init(void)
                         if (pmgr_find_device(parent[j], &pdevice)) {
                             printf("pmgr: Failed to find parent #%d for %s\n", parent[j],
                                    device->name);
-                            continue;
+                            return -1;
                         }
 
                         if ((pdevice->flags & PMGR_FLAG_VIRTUAL))
@@ -469,7 +547,7 @@ int pmgr_init(void)
 
                         addr = pmgr_device_get_addr(die, pdevice);
                         if (!addr)
-                            continue;
+                            return -1;
 
                         reg = read32(addr);
 
@@ -477,7 +555,8 @@ int pmgr_init(void)
                             FIELD_GET(PMGR_PS_TARGET, reg) != PMGR_PS_ACTIVE) {
                             printf("pmgr: Enabling %d.%s, parent of active device %s\n", die,
                                    pdevice->name, device->name);
-                            pmgr_set_mode(addr, PMGR_PS_ACTIVE);
+                            if (pmgr_set_mode(addr, PMGR_PS_ACTIVE))
+                                return -1;
                         }
                     }
                 }
@@ -485,6 +564,7 @@ int pmgr_init(void)
         }
     }
 
+    pmgr_initialized = 1;
     printf("pmgr: initialized, %d devices on %u dies found.\n", pmgr_devices_len, pmgr_dies);
 
     return 0;
