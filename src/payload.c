@@ -370,12 +370,15 @@ int payload_run(void)
 
         if (kboot_boot(kernel))
             goto boot_failed;
+        if (boot_spec)
+            nvme_keep_running_for_linux = true;
         return 0;
 
     boot_failed:
         if (boot_spec) {
             next_stage.entry = NULL;
             kboot_set_initrd(NULL, 0);
+            nvme_keep_running_for_linux = false;
             nvme_shutdown();
         }
         return -1;

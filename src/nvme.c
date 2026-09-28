@@ -130,6 +130,7 @@ static enum {
 
 static bool nvme_initialized = false;
 bool nvme_adopt_live_session = false;
+bool nvme_keep_running_for_linux = false;
 static u8 nvme_die;
 
 static asc_dev_t *nvme_asc = NULL;
@@ -603,6 +604,22 @@ bool nvme_shutdown(void)
 {
     if (!nvme_initialized) {
         // nvme_ensure_shutdown();
+        return true;
+    }
+
+    if (nvme_type == NVME_T8132 && nvme_keep_running_for_linux) {
+        u32 cc = read32(nvme_base + NVME_CC);
+        u32 csts = read32(nvme_base + NVME_CSTS);
+        u32 boot_status = read32(nvme_base + NVME_BOOT_STATUS);
+        if (!nvme_asc || !asc_cpu_running(nvme_asc) || boot_status != NVME_BOOT_STATUS_OK ||
+            !(cc & NVME_CC_EN) || !(csts & NVME_CSTS_RDY) || (csts & NVME_CSTS_CFS)) {
+            printf("nvme: refusing Linux handoff: CC=0x%x CSTS=0x%x BOOT_STATUS=0x%x\n", cc, csts,
+                   boot_status);
+            return false;
+        }
+        nvme_adopt_live_session = true;
+        nvme_initialized = false;
+        printf("nvme: leaving controller and RTKit running for Linux adoption\n");
         return true;
     }
 
