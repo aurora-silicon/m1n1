@@ -19,7 +19,9 @@
 #include "string.h"
 #include "types.h"
 #include "usb_cdc.h"
+#include "usb_cdc_bulk.h"
 #include "usb_cdc_ss_desc.h"
+#include "usb_cdc_ss_regs.h"
 #include "usb_dwc3_regs.h"
 #include "usb_types.h"
 #include "utils.h"
@@ -58,13 +60,18 @@
 
 #define DWC3_SCRATCHPAD_SIZE SZ_16K
 #define TRB_BUFFER_SIZE      SZ_16K
-#define XFER_BUFFER_SIZE     (SZ_16K * MAX_ENDPOINTS * 2)
-#define PAD_BUFFER_SIZE      SZ_16K
-
-#define TRBS_PER_EP              (TRB_BUFFER_SIZE / (MAX_ENDPOINTS * sizeof(struct dwc3_trb)))
+#ifdef J700_CDC_PROXY
+#define XFER_BUFFER_BYTES_PER_EP CDC_BULK_CHAIN_BYTES
+#define XFER_SIZE                CDC_BULK_CHAIN_BYTES
+#define XFER_BUFFER_SIZE         (XFER_BUFFER_BYTES_PER_EP * MAX_ENDPOINTS)
+#else
+#define XFER_BUFFER_SIZE         (SZ_16K * MAX_ENDPOINTS * 2)
 #define XFER_BUFFER_BYTES_PER_EP (XFER_BUFFER_SIZE / MAX_ENDPOINTS)
+#define XFER_SIZE                SZ_16K
+#endif
+#define PAD_BUFFER_SIZE SZ_16K
 
-#define XFER_SIZE SZ_16K
+#define TRBS_PER_EP (TRB_BUFFER_SIZE / (MAX_ENDPOINTS * sizeof(struct dwc3_trb)))
 
 #define SCRATCHPAD_IOVA   0xbeef0000
 #define EVENT_BUFFER_IOVA 0xdead0000
@@ -130,6 +137,9 @@ typedef struct dwc3_dev {
         bool zlp_pending;
         bool stalled;
         u8 resource_index;
+        u8 trb_count;
+        u8 completed_trbs;
+        u32 transfer_length;
 
         void *xfer_buffer;
         uintptr_t xfer_buffer_iova;
@@ -442,6 +452,10 @@ static int usb_dwc3_ep_configure(dwc3_dev_t *dev, u8 ep, u8 type, u32 max_packet
 
     param1 =
         DWC3_DEPCFG_XFER_COMPLETE_EN | DWC3_DEPCFG_XFER_NOT_READY_EN | DWC3_DEPCFG_EP_NUMBER(ep);
+#ifdef J700_CDC_PROXY
+    if (type == DWC3_DEPCMD_TYPE_BULK)
+        param1 |= DWC3_DEPCFG_XFER_IN_PROGRESS_EN;
+#endif
 
     if (usb_dwc3_ep_command(dev, ep, DWC3_DEPCMD_SETEPCONFIG, param0, param1, 0)) {
         usb_debug_printf("cannot issue DWC3_DEPCMD_SETEPCONFIG for EP %d.\n", ep);
@@ -634,6 +648,9 @@ static void usb_dwc3_close_pipe(dwc3_dev_t *dev, int pipe)
         dev->endpoints[ep].xfer_in_progress = false;
         dev->endpoints[ep].resource_index = 0;
         dev->endpoints[ep].zlp_pending = false;
+        dev->endpoints[ep].trb_count = 0;
+        dev->endpoints[ep].completed_trbs = 0;
+        dev->endpoints[ep].transfer_length = 0;
     }
 }
 
@@ -1068,13 +1085,48 @@ ringbuffer_t *usb_dwc3_cdc_get_ringbuffer(dwc3_dev_t *dev, u8 endpoint_number)
     }
 }
 
+static int usb_dwc3_start_bulk_transfer(dwc3_dev_t *dev, u8 ep, u32 length)
+{
+#ifdef J700_CDC_PROXY
+    u32 segments[CDC_BULK_MAX_TRBS];
+    size_t count = usb_cdc_bulk_plan(length, segments, ARRAY_SIZE(segments));
+    if (!count || count > TRBS_PER_EP)
+        return -1;
+
+    u32 offset = 0;
+    for (size_t i = 0; i < count; i++) {
+        struct dwc3_trb *trb = &dev->endpoints[ep].trb[i];
+        uintptr_t buffer = dev->endpoints[ep].xfer_buffer_iova + offset;
+        trb->bpl = buffer;
+        trb->bph = buffer >> 32;
+        trb->size = DWC3_TRB_SIZE_LENGTH(segments[i]);
+        bool out = ep == USB_LEP_CDC_BULK_OUT || ep == USB_LEP_CDC_BULK_OUT_2;
+        trb->ctrl = DWC3_TRB_CTRL_HWO | DWC3_TRB_CTRL_ISP_IMI | DWC3_TRBCTL_NORMAL |
+                    (out ? DWC3_TRB_CTRL_CSP | DWC3_TRB_CTRL_IOC : 0) |
+                    (i + 1 == count ? DWC3_TRB_CTRL_LST | DWC3_TRB_CTRL_IOC : DWC3_TRB_CTRL_CHN);
+        offset += segments[i];
+    }
+    dev->endpoints[ep].trb_count = count;
+#else
+    struct dwc3_trb *trb;
+    usb_dwc3_init_trb(dev, ep, &trb);
+    trb->ctrl |= DWC3_TRBCTL_NORMAL;
+    trb->size = DWC3_TRB_SIZE_LENGTH(length);
+    dev->endpoints[ep].trb_count = 1;
+#endif
+    dev->endpoints[ep].transfer_length = length;
+    dev->endpoints[ep].completed_trbs = 0;
+    if (usb_dwc3_ep_start_transfer(dev, ep, dev->endpoints[ep].trb_iova)) {
+        dev->endpoints[ep].trb_count = 0;
+        return -1;
+    }
+    return 0;
+}
+
 static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number)
 {
     if (!usb_dwc3_trb_available(dev, endpoint_number))
         return;
-    struct dwc3_trb *trb;
-    uintptr_t trb_iova;
-
     if (dev->endpoints[endpoint_number].xfer_in_progress)
         return;
 
@@ -1089,21 +1141,16 @@ static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number
     if (ringbuffer_get_free(host2device) < XFER_SIZE)
         return;
 
+#ifndef J700_CDC_PROXY
     memset(dev->endpoints[endpoint_number].xfer_buffer, 0xaa, XFER_SIZE);
-    trb_iova = usb_dwc3_init_trb(dev, endpoint_number, &trb);
-    trb->ctrl |= DWC3_TRBCTL_NORMAL;
-    trb->size = DWC3_TRB_SIZE_LENGTH(XFER_SIZE);
-
-    usb_dwc3_ep_start_transfer(dev, endpoint_number, trb_iova);
+#endif
+    usb_dwc3_start_bulk_transfer(dev, endpoint_number, XFER_SIZE);
 }
 
 static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
 {
     if (!usb_dwc3_trb_available(dev, endpoint_number))
         return;
-    struct dwc3_trb *trb;
-    uintptr_t trb_iova;
-
     if (dev->endpoints[endpoint_number].xfer_in_progress)
         return;
 
@@ -1122,29 +1169,45 @@ static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
     if (!len && !dev->endpoints[endpoint_number].zlp_pending)
         return;
 
-    trb_iova = usb_dwc3_init_trb(dev, endpoint_number, &trb);
-    trb->ctrl |= DWC3_TRBCTL_NORMAL;
-    trb->size = DWC3_TRB_SIZE_LENGTH(len);
-
-    if (usb_dwc3_ep_start_transfer(dev, endpoint_number, trb_iova)) {
+    if (usb_dwc3_start_bulk_transfer(dev, endpoint_number, len)) {
         device2host->read = previous_read;
         return;
     }
     dev->endpoints[endpoint_number].zlp_pending = len && (len % CDC_BULK_PACKET_SIZE) == 0;
 }
 
-static void usb_dwc3_cdc_handle_bulk_out_xfer_done(dwc3_dev_t *dev,
-                                                   const struct dwc3_event_depevt event)
+static bool usb_dwc3_cdc_copy_bulk_out_progress(dwc3_dev_t *dev, u8 ep)
 {
-    ringbuffer_t *host2device = usb_dwc3_cdc_get_ringbuffer(dev, event.endpoint_number);
+    ringbuffer_t *host2device = usb_dwc3_cdc_get_ringbuffer(dev, ep);
     if (!host2device)
-        return;
-    size_t len = min(XFER_SIZE, ringbuffer_get_free(host2device));
-    u32 remaining = dev->endpoints[event.endpoint_number].trb->size & DWC3_TRB_SIZE_MASK;
-    if (remaining > len)
-        return;
-    ringbuffer_write(dev->endpoints[event.endpoint_number].xfer_buffer,
-                     len - remaining, host2device);
+        return false;
+    dma_rmb();
+    /* A short OUT packet can leave a gap before the next chained TRB. */
+    for (unsigned i = dev->endpoints[ep].completed_trbs; i < dev->endpoints[ep].trb_count; i++) {
+        struct dwc3_trb *trb = &dev->endpoints[ep].trb[i];
+        u32 expected = min((u32)CDC_BULK_TRB_BYTES,
+                           dev->endpoints[ep].transfer_length - i * CDC_BULK_TRB_BYTES);
+        u32 remaining = trb->size & DWC3_TRB_SIZE_MASK;
+        int actual =
+            usb_cdc_bulk_retired_bytes(expected, remaining, DWC3_TRB_SIZE_TRBSTS(trb->size),
+                                       !!(trb->ctrl & DWC3_TRB_CTRL_HWO));
+        if (actual == -1)
+            break;
+        if (actual < 0) {
+            usb_debug_printf("bad bulk completion on EP %u, TRB %u\n", ep, i);
+            usb_dwc3_close_pipe(dev, ep == USB_LEP_CDC_BULK_OUT ? 0 : 1);
+            return false;
+        }
+        const u8 *source = (const u8 *)dev->endpoints[ep].xfer_buffer + i * CDC_BULK_TRB_BYTES;
+        size_t bytes = actual;
+        if (bytes > ringbuffer_get_free(host2device) ||
+            ringbuffer_write(source, bytes, host2device) != bytes) {
+            usb_dwc3_close_pipe(dev, ep == USB_LEP_CDC_BULK_OUT ? 0 : 1);
+            return false;
+        }
+        dev->endpoints[ep].completed_trbs = i + 1;
+    }
+    return true;
 }
 
 static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_depevt event)
@@ -1154,9 +1217,33 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
     if (event.endpoint_event == DWC3_DEPEVT_EPCMDCMPLT)
         return;
 
+    if (event.endpoint_event == DWC3_DEPEVT_XFERINPROGRESS) {
+        u8 ep = event.endpoint_number;
+        if (!dev->endpoints[ep].xfer_in_progress)
+            return;
+        if (event.status & DEPEVT_STATUS_BUSERR) {
+            if (ep == USB_LEP_CDC_BULK_OUT || ep == USB_LEP_CDC_BULK_IN)
+                usb_dwc3_close_pipe(dev, 0);
+            else if (ep == USB_LEP_CDC_BULK_OUT_2 || ep == USB_LEP_CDC_BULK_IN_2)
+                usb_dwc3_close_pipe(dev, 1);
+            return;
+        }
+        if (ep == USB_LEP_CDC_BULK_OUT || ep == USB_LEP_CDC_BULK_OUT_2)
+            usb_dwc3_cdc_copy_bulk_out_progress(dev, ep);
+        return;
+    }
+
     if (event.endpoint_event == DWC3_DEPEVT_XFERCOMPLETE) {
         if (!dev->endpoints[event.endpoint_number].xfer_in_progress)
             return;
+        if (event.status & DEPEVT_STATUS_BUSERR) {
+            u8 ep = event.endpoint_number;
+            if (ep == USB_LEP_CDC_BULK_OUT || ep == USB_LEP_CDC_BULK_IN)
+                usb_dwc3_close_pipe(dev, 0);
+            else if (ep == USB_LEP_CDC_BULK_OUT_2 || ep == USB_LEP_CDC_BULK_IN_2)
+                usb_dwc3_close_pipe(dev, 1);
+            return;
+        }
         dev->endpoints[event.endpoint_number].xfer_in_progress = false;
         dev->endpoints[event.endpoint_number].resource_index = 0;
 
@@ -1169,10 +1256,12 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
                 return;
             case USB_LEP_CDC_BULK_IN: // [[fallthrough]]
             case USB_LEP_CDC_BULK_IN_2:
-                return;
+                return usb_dwc3_cdc_start_bulk_in_xfer(dev, event.endpoint_number);
             case USB_LEP_CDC_BULK_OUT: // [[fallthrough]]
             case USB_LEP_CDC_BULK_OUT_2:
-                return usb_dwc3_cdc_handle_bulk_out_xfer_done(dev, event);
+                if (usb_dwc3_cdc_copy_bulk_out_progress(dev, event.endpoint_number))
+                    return usb_dwc3_cdc_start_bulk_out_xfer(dev, event.endpoint_number);
+                return;
         }
     } else if (event.endpoint_event == DWC3_DEPEVT_XFERNOTREADY) {
         /*
@@ -1198,9 +1287,11 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
         }
     }
 
-    usb_debug_printf("unhandled EP %02x event: %s (0x%02x) (%d)\n", event.endpoint_number,
-                     depvt_names[event.endpoint_event], event.endpoint_event,
-                     dev->endpoints[event.endpoint_number].xfer_in_progress);
+    const char *name = event.endpoint_event < ARRAY_SIZE(depvt_names)
+                           ? depvt_names[event.endpoint_event]
+                           : "Unknown";
+    usb_debug_printf("unhandled EP %02x event: %s (0x%02x) (%d)\n", event.endpoint_number, name,
+                     event.endpoint_event, dev->endpoints[event.endpoint_number].xfer_in_progress);
     usb_dwc3_ep_set_stall(dev, event.endpoint_number, 1);
 }
 
@@ -1219,6 +1310,9 @@ static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev, bool rearm_setup)
         dev->endpoints[i].xfer_in_progress = false;
         dev->endpoints[i].resource_index = 0;
         dev->endpoints[i].zlp_pending = false;
+        dev->endpoints[i].trb_count = 0;
+        dev->endpoints[i].completed_trbs = 0;
+        dev->endpoints[i].transfer_length = 0;
         memset(dev->endpoints[i].xfer_buffer, 0, XFER_BUFFER_BYTES_PER_EP);
         memset(dev->endpoints[i].trb, 0, TRBS_PER_EP * sizeof(struct dwc3_trb));
         if (dev->endpoints[i].stalled)
@@ -1270,7 +1364,8 @@ static void usb_dwc3_handle_event_connect_done(dwc3_dev_t *dev)
 
 static void usb_dwc3_handle_event_dev(dwc3_dev_t *dev, const struct dwc3_event_devt event)
 {
-    usb_debug_printf("device event: %s (0x%02x)\n", devt_names[event.type], event.type);
+    const char *name = event.type < ARRAY_SIZE(devt_names) ? devt_names[event.type] : "Unknown";
+    usb_debug_printf("device event: %s (0x%02x)\n", name, event.type);
     switch (event.type) {
         case DWC3_DEVT_USBRST:
         case DWC3_DEVT_DISCONN:
@@ -1280,8 +1375,7 @@ static void usb_dwc3_handle_event_dev(dwc3_dev_t *dev, const struct dwc3_event_d
             usb_dwc3_handle_event_connect_done(dev);
             break;
         default:
-            usb_debug_printf("unhandled device event: %s (0x%02x)\n", devt_names[event.type],
-                             event.type);
+            usb_debug_printf("unhandled device event: %s (0x%02x)\n", name, event.type);
     }
 }
 
@@ -1324,8 +1418,23 @@ void usb_dwc3_handle_events(dwc3_dev_t *dev)
     write32(dev->regs + DWC3_GEVNTCOUNT(0), count);
     (void)read32(dev->regs + DWC3_GEVNTCOUNT(0));
     dma_rmb();
+
+#ifdef J700_CDC_PROXY
+    /* Service control and reset events before bulk completions in this batch. */
+    for (u32 i = 0; i < n_events; i++) {
+        if (!dev->failed &&
+            (pending[i].type.is_devspec || pending[i].depevt.endpoint_number <= USB_LEP_CTRL_IN))
+            usb_dwc3_handle_event(dev, pending[i]);
+    }
+    for (u32 i = 0; i < n_events; i++) {
+        if (!dev->failed && !pending[i].type.is_devspec &&
+            pending[i].depevt.endpoint_number > USB_LEP_CTRL_IN)
+            usb_dwc3_handle_event(dev, pending[i]);
+    }
+#else
     for (u32 i = 0; i < n_events && !dev->failed; i++)
         usb_dwc3_handle_event(dev, pending[i]);
+#endif
 }
 
 dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
@@ -1423,6 +1532,16 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
 #ifdef J700_CDC_PROXY
     clear32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_SUSPHY);
     clear32(dev->regs + DWC3_GUSB3PIPECTL(0), DWC3_GUSB3PIPECTL_SUSPHY);
+
+    int nump =
+        usb_cdc_nump(read32(dev->regs + DWC3_GHWPARAMS0), read32(dev->regs + DWC3_GHWPARAMS7));
+    if (nump < 1) {
+        usb_debug_printf("invalid DWC3 receive RAM parameters\n");
+        goto error;
+    }
+    clear32(dev->regs + DWC3_GRXTHRCFG, CDC_GRXTHRCFG_PKTCNTSEL);
+    mask32(dev->regs + DWC3_DCFG, CDC_DCFG_NUMP_MASK, CDC_DCFG_NUMP(nump));
+    usb_debug_printf("NUMP=%d\n", nump);
 #endif
 
     /* disable unused features */
