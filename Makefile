@@ -143,6 +143,7 @@ HV_OBJECTS := $(patsubst %,hv/%, \
 	hv_wdt.o)
 
 OBJECTS := \
+	boot_storage.o \
 	adt.o \
 	afk.o \
 	aic.o \
