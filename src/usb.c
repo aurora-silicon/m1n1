@@ -306,8 +306,9 @@ static int hpm_idx(char *hpm_path)
     return idx;
 }
 
-static bool usb_init_match(char *hpm_path, void *)
+static bool usb_init_match(char *hpm_path, void *unused)
 {
+    (void)unused;
     int idx = hpm_idx(hpm_path);
     if (idx < FIRST_USB_IODEV)
         return false;
@@ -316,8 +317,9 @@ static bool usb_init_match(char *hpm_path, void *)
     return true;
 }
 
-static int usb_init_one(char *hpm_path, tps6598x_dev_t *tps, void *)
+static int usb_init_one(char *hpm_path, tps6598x_dev_t *tps, void *unused)
 {
+    (void)unused;
     int idx = hpm_idx(hpm_path);
 
     if (tps6598x_powerup(tps) < 0)
@@ -372,8 +374,9 @@ static bool usb_hpm_restore_irqs_match(char *hpm_path, void *state)
     return true;
 }
 
-static int usb_hpm_restore_irqs_one(char *hpm_path, tps6598x_dev_t *tps, void *)
+static int usb_hpm_restore_irqs_one(char *hpm_path, tps6598x_dev_t *tps, void *unused)
 {
+    (void)unused;
     int idx = hpm_idx(hpm_path);
 
     if (tps6598x_restore_irqs(tps, &tps6598x_irq_state[idx]))
@@ -442,16 +445,21 @@ void usb_iodev_vuart_setup(iodev_id_t iodev)
     iodev_usb_vuart.opaque = iodev_get_opaque(iodev);
 }
 
-int usb_cdc_link_start(void)
+int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
 {
 #ifndef J700_CDC_PROXY
+    (void)set_step;
+    (void)force_swapped;
     return -1;
 #else
     if (chip_id != T8140 || iodev_get_usage(IODEV_USB0))
         return -1;
+    set_step(3);
+    usb_cdc_atc_force_swapped(force_swapped);
     if (usb_phy_bringup(0))
         return -1;
 
+    set_step(4);
     dwc3_dev_t *dwc = usb_iodev_bringup(0);
     if (!dwc)
         return -1;
@@ -467,6 +475,7 @@ int usb_cdc_link_start(void)
     spin_init(&device->lock);
     iodev_register_device(IODEV_USB0, device);
 
+    set_step(5);
     if (usb_cdc_atc_switch_pipe()) {
         iodev_unregister_device(IODEV_USB0);
         usb_dwc3_shutdown(dwc);

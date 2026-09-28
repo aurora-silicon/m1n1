@@ -505,8 +505,9 @@ int tps6598x_foreach_hpm(hpm_match_t *match, hpm_action_t *action, void *data)
     return matched;
 }
 
-static int tps6598x_enable_debugusb_one(char *hpm_path, tps6598x_dev_t *tps, void *)
+static int tps6598x_enable_debugusb_one(char *hpm_path, tps6598x_dev_t *tps, void *unused)
 {
+    (void)unused;
     printf("tps6598x: enable debugusb for %s\n", hpm_path);
 
     if (tps6598x_powerup(tps) < 0) {
@@ -520,8 +521,9 @@ static int tps6598x_enable_debugusb_one(char *hpm_path, tps6598x_dev_t *tps, voi
     return HPM_ACTION_STOP; // stop iterating
 }
 
-static bool tps6598x_is_dfu(char *hpm_path, void *)
+static bool tps6598x_is_dfu(char *hpm_path, void *unused)
 {
+    (void)unused;
     size_t len = strlen(hpm_path);
     if (len < 4)
         return false;

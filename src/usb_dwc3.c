@@ -18,6 +18,7 @@
 #include "ringbuffer.h"
 #include "string.h"
 #include "types.h"
+#include "usb_cdc.h"
 #include "usb_cdc_ss_desc.h"
 #include "usb_dwc3_regs.h"
 #include "usb_types.h"
@@ -147,6 +148,10 @@ typedef struct dwc3_dev {
         /* USB ACM CDC serial */
         u8 cdc_line_coding[7];
     } pipe[CDC_ACM_PIPE_MAX];
+
+#ifdef J700_CDC_PROXY
+    bool primary_dtr_pending;
+#endif
 
 } dwc3_dev_t;
 
@@ -608,6 +613,10 @@ static void usb_dwc3_fail_session(dwc3_dev_t *dev)
 static void usb_dwc3_close_pipe(dwc3_dev_t *dev, int pipe)
 {
     dev->pipe[pipe].ready = false;
+#ifdef J700_CDC_PROXY
+    if (pipe == CDC_ACM_PIPE_0)
+        dev->primary_dtr_pending = false;
+#endif
     dev->pipe[pipe].host2device->read = dev->pipe[pipe].host2device->write;
     dev->pipe[pipe].device2host->read = dev->pipe[pipe].device2host->write;
 
@@ -904,11 +913,19 @@ static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_pac
             if (setup->raw.wValue & 1) { // DTR
                 usb_debug_printf("ACM device opened\n");
                 dev->pipe[pipe].ready = true;
+                if (pipe == CDC_ACM_PIPE_0) {
+#ifdef J700_CDC_PROXY
+                    dev->primary_dtr_pending = true;
+#endif
+                }
             } else {
                 usb_debug_printf("ACM device closed\n");
             }
             if (usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN)) {
                 dev->pipe[pipe].ready = false;
+#ifdef J700_CDC_PROXY
+                dev->primary_dtr_pending = false;
+#endif
                 dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
             } else {
                 dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE;
@@ -954,8 +971,15 @@ static void usb_dwc3_ep0_handle_xfer_done(dwc3_dev_t *dev, const struct dwc3_eve
             usb_dwc3_ep0_handle_setup(dev);
             break;
 
-        case USB_DWC3_EP0_STATE_DATA_RECV_STATUS_DONE:
         case USB_DWC3_EP0_STATE_DATA_SEND_STATUS_DONE:
+#ifdef J700_CDC_PROXY
+            if (dev->primary_dtr_pending) {
+                dev->primary_dtr_pending = false;
+                usb_cdc_primary_opened();
+            }
+#endif
+            /* fall through */
+        case USB_DWC3_EP0_STATE_DATA_RECV_STATUS_DONE:
             dev->ep0_state = usb_dwc3_start_setup_phase(dev) ? USB_DWC3_EP0_STATE_IDLE
                                                              : USB_DWC3_EP0_STATE_SETUP_HANDLE;
             break;
@@ -1203,6 +1227,9 @@ static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev, bool rearm_setup)
         dev->pipe[i].host2device->read = dev->pipe[i].host2device->write;
         dev->pipe[i].device2host->read = dev->pipe[i].device2host->write;
     }
+#ifdef J700_CDC_PROXY
+    dev->primary_dtr_pending = false;
+#endif
     dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
 
     /* set device address back to zero */
@@ -1220,13 +1247,18 @@ static void usb_dwc3_handle_event_connect_done(dwc3_dev_t *dev)
 
 #ifdef J700_CDC_PROXY
     if (speed != DWC3_DSTS_SUPERSPEED) {
+        usb_debug_printf("CDC Gen1 link mode mismatch: DSTS=%x\n", speed);
+        clear32(dev->regs + DWC3_DCTL, DWC3_DCTL_RUN_STOP);
+        usb_cdc_link_failed();
+        return;
+    }
 #else
     if (speed != DWC3_DSTS_HIGHSPEED) {
-#endif
         usb_debug_printf(
             "WARNING: we only support high speed right now but %02x was requested in DSTS\n",
             speed);
     }
+#endif
 
     if (!dev->endpoints[USB_LEP_CTRL_OUT].xfer_in_progress &&
         !dev->endpoints[USB_LEP_CTRL_IN].xfer_in_progress && !usb_dwc3_start_setup_phase(dev))

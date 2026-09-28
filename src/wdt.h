@@ -5,5 +5,6 @@
 
 void wdt_disable(void);
 void wdt_reboot(void);
+int wdt_arm_seconds(unsigned seconds);
 
 #endif

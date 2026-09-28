@@ -103,6 +103,20 @@ endif
 CFG += J700_CDC_PROXY USE_DEBUG_USB
 endif
 
+ifeq ($(J700_CDC_NO_WATCHDOG),1)
+ifneq ($(J700_CDC_PROXY),1)
+$(error J700_CDC_NO_WATCHDOG requires J700_CDC_PROXY=1)
+endif
+CFG += J700_CDC_NO_WATCHDOG
+endif
+
+ifeq ($(J700_CDC_AUTOSTART),1)
+ifneq ($(J700_CDC_PROXY),1)
+$(error J700_CDC_AUTOSTART requires J700_CDC_PROXY=1)
+endif
+CFG += J700_CDC_AUTOSTART
+endif
+
 ifeq ($(T8140_KIS_PROXY),1)
 ifneq ($(CHAINLOADING),1)
 $(error T8140_KIS_PROXY requires CHAINLOADING=1)
@@ -221,7 +235,7 @@ OBJECTS := \
 	tps6598x.o tps6598x_command_core.o \
 	uart.o \
 	uartproxy.o \
-	usb.o usb_dwc3.o usb_cdc_atc.o usb_cdc_ss_desc.o \
+	usb.o usb_dwc3.o usb_cdc.o usb_cdc_atc.o usb_cdc_ss_desc.o usb_cdc_state.o \
 	utils.o utils_asm.o \
 	vsprintf.o \
 	wdt.o \

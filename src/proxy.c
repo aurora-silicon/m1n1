@@ -27,6 +27,7 @@
 #include "uart.h"
 #include "uartproxy.h"
 #include "usb.h"
+#include "usb_cdc.h"
 #include "utils.h"
 #include "xnuboot.h"
 
@@ -479,6 +480,15 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 
         case P_USB_IODEV_VUART_SETUP:
             usb_iodev_vuart_setup(request->args[0]);
+            break;
+
+        case P_CDC_SCHEDULE:
+            if (request->args[0] > 15000 || request->args[1] || request->args[2] > 7 ||
+                usb_cdc_schedule(request->args[0], request->args[1], request->args[2]))
+                reply->status = S_ERROR;
+            break;
+        case P_CDC_STATUS:
+            reply->retval = usb_cdc_status();
             break;
 
         case P_TUNABLES_APPLY_GLOBAL:

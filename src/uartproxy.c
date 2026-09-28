@@ -7,6 +7,7 @@
 #include "proxy.h"
 #include "string.h"
 #include "types.h"
+#include "usb_cdc.h"
 #include "utils.h"
 
 #define REQ_SIZE 64
@@ -182,12 +183,15 @@ int uartproxy_run(struct uartproxy_msg_start *start)
     }
 
     while (running) {
+        usb_cdc_poll();
         if (!start) {
             // A bounded host window may already have consumed the sync word.
             if (use_presynced) {
                 use_presynced = false;
             } else
                 for (iodev = 0; iodev < IODEV_MAX;) {
+                    if (iodev == 0)
+                        usb_cdc_poll();
                     u8 b;
                     if ((iodev_get_usage(iodev) & USAGE_UARTPROXY)) {
                         iodev_handle_events(iodev);

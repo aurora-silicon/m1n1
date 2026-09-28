@@ -28,6 +28,7 @@
 #include "uart.h"
 #include "uartproxy.h"
 #include "usb.h"
+#include "usb_cdc.h"
 #include "utils.h"
 #include "wdt.h"
 #include "xnuboot.h"
@@ -137,10 +138,12 @@ void run_actions(void)
 
     printf("Checking for payloads...\n");
 
+#ifndef J700_CDC_PROXY
     if (payload_run() == 0) {
         printf("Valid payload found\n");
         return;
     }
+#endif
     fb_set_active(true);
 
     printf("No valid payload found\n");
@@ -153,6 +156,11 @@ void run_actions(void)
 #endif
 
     printf("Running proxy...\n");
+
+#ifdef J700_CDC_AUTOSTART
+    if (usb_cdc_schedule(1000, 0, BIT(1) | BIT(2)))
+        panic("CDC autostart scheduling failed\n");
+#endif
 
     uartproxy_run(NULL);
 }
@@ -182,6 +190,13 @@ void m1n1_main(void)
     smp_init();
 #endif
     wdt_disable();
+#ifdef J700_CDC_PROXY
+    if (usb_cdc_arm_watchdog()) {
+        wdt_reboot();
+        panic("CDC watchdog could not be armed\n");
+    }
+    printf("J700 CDC flavour: DebugUSB until scheduled Gen1 transition\n");
+#endif
 #ifndef BRINGUP
     if (pmgr_init() && chip_id == T8140)
         panic("T8140 PMGR initialization failed\n");

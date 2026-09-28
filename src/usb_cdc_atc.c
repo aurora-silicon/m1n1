@@ -142,6 +142,8 @@ int usb_cdc_atc_power_on(uintptr_t pipehandler)
             return -1;
     }
 
+    if (force_swapped)
+        set32(core + ATC_MISC, BIT(2));
     unsigned lane = !!(read32(core + ATC_MISC) & BIT(2));
     active_lane = lane;
     for (size_t i = 0; i < ARRAY_SIZE(lane_groups[0]); i++) {
