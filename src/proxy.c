@@ -35,6 +35,8 @@
 void *rust_read_gigalocker(size_t *);
 void rust_free_gigalocker(void *, size_t);
 
+_Static_assert(sizeof(struct midr_part_features) == 20, "proxy CPU features ABI changed");
+
 int proxy_process(ProxyRequest *request, ProxyReply *reply)
 {
     enum exc_guard_t guard_save = exc_guard;

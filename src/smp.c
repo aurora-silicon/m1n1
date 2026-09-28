@@ -512,7 +512,7 @@ int smp_start_secondaries(void)
     if (!smp_initialized)
         return -1;
 
-    if (chip_id == T8140)
+    if (cpu_features->unsafe_wfi)
         smp_set_wfe_mode(true);
 
     bool failed = false;
@@ -646,8 +646,8 @@ u64 smp_wait(int cpu)
 
 void smp_set_wfe_mode(bool new_mode)
 {
-    if (chip_id == T8140 && !new_mode) {
-        printf("SMP: T8140 secondaries must remain in WFE mode\n");
+    if (cpu_features->unsafe_wfi && !new_mode) {
+        printf("SMP: this CPU family requires WFE mode\n");
         return;
     }
     wfe_mode = new_mode;
