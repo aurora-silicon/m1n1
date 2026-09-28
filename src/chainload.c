@@ -97,8 +97,11 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     // Copy chainload stub
     void *stub = new_image + image_size;
     memcpy(stub, _chainload_stub_start, stub_size);
-    dc_cvau_range(stub, stub_size);
+    dc_cvac_range(stub, stub_size);
+    sysop("dsb sy");
     ic_ivau_range(stub, stub_size);
+    sysop("dsb sy");
+    sysop("isb");
 
     // Set up next stage
     next_stage.entry = stub;
