@@ -570,15 +570,14 @@ void smp_send_ipi(int cpu)
     }
 }
 
-void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
+int smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 {
-    if (cpu >= MAX_CPUS)
-        return;
+    if (cpu < 0 || cpu >= MAX_CPUS || cpu == boot_cpu_idx || !func)
+        return -1;
 
     struct spin_table *target = &spin_table[cpu];
-
-    if (cpu == boot_cpu_idx)
-        return;
+    if (!target->flag || target->target)
+        return -1;
 
     u64 flag = target->flag;
     target->args[0] = arg0;
@@ -594,21 +593,41 @@ void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
     else
         smp_send_ipi(cpu);
 
-    while (target->flag == flag)
+    u64 started = get_ticks();
+    while (target->flag == flag) {
         sysop("dmb sy");
+        if (ticks_to_msecs(get_ticks() - started) >= 1000) {
+            printf("SMP: CPU %d did not acknowledge call\n", cpu);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int smp_wait_timed(int cpu, u64 *retval, u32 timeout_ms)
+{
+    if (cpu < 0 || cpu >= MAX_CPUS || !retval || !spin_table[cpu].flag)
+        return -1;
+
+    struct spin_table *target = &spin_table[cpu];
+    u64 started = get_ticks();
+    while (target->target) {
+        sysop("dmb sy");
+        if (ticks_to_msecs(get_ticks() - started) >= timeout_ms) {
+            printf("SMP: CPU %d call did not complete\n", cpu);
+            return -1;
+        }
+    }
+
+    *retval = target->retval;
+    return 0;
 }
 
 u64 smp_wait(int cpu)
 {
-    if (cpu >= MAX_CPUS)
-        return 0;
-
-    struct spin_table *target = &spin_table[cpu];
-
-    while (target->target)
-        sysop("dmb sy");
-
-    return target->retval;
+    u64 retval = 0;
+    smp_wait_timed(cpu, &retval, 300000);
+    return retval;
 }
 
 void smp_set_wfe_mode(bool new_mode)
@@ -629,7 +648,7 @@ void smp_set_wfe_mode(bool new_mode)
 
 bool smp_is_alive(int cpu)
 {
-    if (cpu >= MAX_CPUS)
+    if (cpu < 0 || cpu >= MAX_CPUS)
         return false;
 
     return spin_table[cpu].flag;
@@ -637,7 +656,7 @@ bool smp_is_alive(int cpu)
 
 uint64_t smp_get_mpidr(int cpu)
 {
-    if (cpu >= MAX_CPUS)
+    if (cpu < 0 || cpu >= MAX_CPUS)
         return 0;
 
     return spin_table[cpu].mpidr;
@@ -645,10 +664,10 @@ uint64_t smp_get_mpidr(int cpu)
 
 u64 smp_get_release_addr(int cpu)
 {
-    struct spin_table *target = &spin_table[cpu];
-
-    if (cpu >= MAX_CPUS)
+    if (cpu < 0 || cpu >= MAX_CPUS)
         return 0;
+
+    struct spin_table *target = &spin_table[cpu];
 
     target->args[0] = 0;
     target->args[1] = 0;
