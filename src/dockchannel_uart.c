@@ -31,9 +31,14 @@ int dockchannel_uart_init(void)
         return -1;
     }
 
-    uart_base += DOCKCHANNEL_UART_CHANNEL * 0x10000;
+    int channel = DOCKCHANNEL_UART_CHANNEL;
+    int chosen = adt_path_offset(adt, "/chosen");
+    u32 chip;
+    if (chosen >= 0 && ADT_GETPROP(adt, chosen, "chip-id", &chip) >= 0 && chip == T8140)
+        channel = 0;
+    uart_base += channel * 0x10000;
 
-    printf("Initialized dockchannel UART at 0x%lx\n", uart_base);
+    printf("Initialized dockchannel UART channel %d at 0x%lx\n", channel, uart_base);
 
     return 0;
 }
