@@ -842,7 +842,7 @@ static int dt_set_mac_addresses(void)
         snprintf(propname, sizeof(propname), "mac-address-%s", mac_address_devices[i].alias);
 
         uint8_t addr[6];
-        if (ADT_GETPROP_ARRAY(adt, anode, propname, addr) < 0)
+        if (ADT_GETPROP_ARRAY(adt, anode, propname, addr) != sizeof(addr))
             continue;
 
         if (mac_address_devices[i].swap) {
@@ -861,7 +861,14 @@ static int dt_set_mac_addresses(void)
         if (node < 0)
             continue;
 
-        fdt_setprop(dt, node, mac_address_devices[i].fdt_property, addr, sizeof(addr));
+        if (fdt_setprop(dt, node, mac_address_devices[i].fdt_property, addr, sizeof(addr)))
+            bail("FDT: could not set %s MAC address\n", mac_address_devices[i].alias);
+
+        if (chip_id == T8140 && !strcmp(mac_address_devices[i].alias, "wifi0")) {
+            int chosen = fdt_path_offset(dt, "/chosen");
+            if (chosen < 0 || fdt_setprop(dt, chosen, "asahi,wifi-mac-address", addr, sizeof(addr)))
+                bail("FDT: could not set deferred Wi-Fi MAC address\n");
+        }
     }
 
     return 0;
@@ -883,6 +890,10 @@ static int dt_set_bluetooth_cal(int anode, int node, const char *adt_name, const
 
 static int dt_set_bluetooth(void)
 {
+    /* J700's Bluetooth function is part of its PCIe MediaTek radio. */
+    if (chip_id == T8140)
+        return 0;
+
     int ret;
     int anode = adt_path_offset(adt, "/arm-io/bluetooth");
 
@@ -1059,10 +1070,6 @@ static int dt_set_wifi(void)
         return 0;
     }
 
-    uint8_t info[16];
-    if (ADT_GETPROP_ARRAY(adt, anode, "wifi-antenna-sku-info", info) < 0)
-        bail("ADT: Failed to get wifi-antenna-sku-info\n");
-
     const char *path = fdt_get_alias(dt, "wifi0");
     if (path == NULL)
         return 0;
@@ -1070,6 +1077,14 @@ static int dt_set_wifi(void)
     int node = fdt_path_offset(dt, path);
     if (node < 0)
         return 0;
+
+    /* The J700 endpoint is MediaTek, not a Broadcom device. */
+    if (chip_id == T8140)
+        return 0;
+
+    uint8_t info[16];
+    if (ADT_GETPROP_ARRAY(adt, anode, "wifi-antenna-sku-info", info) < 0)
+        bail("ADT: Failed to get wifi-antenna-sku-info\n");
 
     char antenna[8];
     memcpy(antenna, &info[8], sizeof(antenna));
