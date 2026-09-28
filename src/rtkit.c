@@ -330,7 +330,6 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
 
     if (!asc_send(rtk->asc, &reply)) {
         rtkit_printf("unable to send buffer reply\n");
-        rtkit_free_buffer(rtk, bfr);
         goto error;
     }
 
