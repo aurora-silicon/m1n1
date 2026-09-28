@@ -219,6 +219,44 @@ enum SPRR_val_t {
 
 static u64 *mmu_pt_L0;
 
+static void mmu_publish_translation(void)
+{
+    sysop("dsb ishst");
+    sysop("tlbi vmalle1is");
+    sysop("dsb ish");
+    sysop("isb");
+}
+
+static void mmu_write_descriptor(u64 *entry, u64 value, u64 from)
+{
+    u64 old = *entry;
+
+    if (old == value)
+        return;
+    if (!mmu_active()) {
+        *entry = value;
+        return;
+    }
+
+    u64 daif = mrs(DAIF);
+    msr(DAIF, daif | 0x3c0);
+
+    /* Keep the table writable if its identity mapping is the block being broken. */
+    u64 *write_entry = entry;
+    if (!(from & (REGION_RWX_EL0 | REGION_RW_EL0 | REGION_RX_EL1)))
+        write_entry = (u64 *)((u64)entry | REGION_RW_EL0);
+
+    if (old & PTE_VALID) {
+        *write_entry = 0;
+        mmu_publish_translation();
+    } else {
+        sysop("dsb ishst");
+    }
+    *write_entry = value;
+    mmu_publish_translation();
+    msr(DAIF, daif);
+}
+
 static u64 *mmu_pt_get_l1(u64 from)
 {
     u64 l0idx = from >> VADDR_L0_OFFSET_BITS;
@@ -233,7 +271,7 @@ static u64 *mmu_pt_get_l1(u64 from)
     memset64(l1, 0, ENTRIES_PER_L1_TABLE * sizeof(u64));
 
     l0d = ((u64)l1) | FIELD_PREP(PTE_TYPE, PTE_TABLE) | PTE_VALID;
-    mmu_pt_L0[l0idx] = l0d;
+    mmu_write_descriptor(&mmu_pt_L0[l0idx], l0d, from);
     return l1;
 }
 
@@ -280,7 +318,7 @@ static u64 *mmu_pt_get_l2(u64 from)
     }
 
     l1d = ((u64)l2) | FIELD_PREP(PTE_TYPE, PTE_TABLE) | PTE_VALID;
-    l1[l1idx] = l1d;
+    mmu_write_descriptor(&l1[l1idx], l1d, from);
     return l2;
 }
 
@@ -327,7 +365,7 @@ static u64 *mmu_pt_get_l3(u64 from)
     }
 
     l2d = ((u64)l3) | FIELD_PREP(PTE_TYPE, PTE_TABLE) | PTE_VALID;
-    l2[l2idx] = l2d;
+    mmu_write_descriptor(&l2[l2idx], l2d, from);
     return l3;
 }
 
@@ -343,7 +381,7 @@ static void mmu_pt_map_l3(u64 from, u64 to, u64 size)
         u64 idx = (from >> VADDR_L3_OFFSET_BITS) & MASK(VADDR_L3_INDEX_BITS);
         u64 *l3 = mmu_pt_get_l3(from);
 
-        l3[idx] = to;
+        mmu_write_descriptor(&l3[idx], to, from);
         from += BIT(VADDR_L3_OFFSET_BITS);
         to += BIT(VADDR_L3_OFFSET_BITS);
     }
@@ -371,7 +409,7 @@ int mmu_map(u64 from, u64 to, u64 size)
     }
 
     // 16K does not support L1 blocks without FEAT_LPA2
-    if (!is_16k() && chip_id != T8140) {
+    if (!mmu_active() && !is_16k() && chip_id != T8140) {
         // Map L2 until L1-aligned or reached end of mapping
         u64 boundary_l1 = ALIGN_UP(from, MASK(VADDR_L1_OFFSET_BITS));
         chunk = min(ALIGN_DOWN(size, MASK(VADDR_L1_OFFSET_BITS)), boundary_l1 - from);
@@ -394,7 +432,7 @@ int mmu_map(u64 from, u64 to, u64 size)
 
     // L2 mappings
     chunk = ALIGN_DOWN(size, MASK(VADDR_L2_OFFSET_BITS));
-    if (chunk && (to & VADDR_L2_ALIGN_MASK) == 0) {
+    if (!mmu_active() && chunk && (to & VADDR_L2_ALIGN_MASK) == 0) {
         u64 ro_start, ro_end;
         bool split_ro = (to & PTE_VALID) && memory_fw_ro_range(&ro_start, &ro_end) > 0;
         u64 block_size = BIT(VADDR_L2_OFFSET_BITS);
@@ -657,6 +695,8 @@ void mmu_init(void)
     if (supports_pan())
         msr(PAN, 0);
 
+    sysop("dmb sy");
+
     // RES1 bits
     u64 sctlr = SCTLR_LSMAOE | SCTLR_nTLSMD | SCTLR_TSCXT | SCTLR_ITD;
     // Configure translation
@@ -676,6 +716,8 @@ static void mmu_secondary_setup(void)
     // Enable EL0 memory access by EL1
     if (supports_pan())
         msr(PAN, 0);
+
+    sysop("dmb sy");
 
     // RES1 bits
     u64 sctlr = SCTLR_LSMAOE | SCTLR_nTLSMD | SCTLR_TSCXT | SCTLR_ITD;
