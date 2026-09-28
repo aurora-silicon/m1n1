@@ -243,16 +243,19 @@ bool rtkit_unmap(rtkit_dev_t *rtk, u64 dva, size_t sz)
 
 bool rtkit_alloc_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz)
 {
-    bfr->bfr = memalign(SZ_16K, sz);
+    if (!sz || sz > (size_t)-1 - (SZ_16K - 1))
+        return false;
+
+    size_t alloc_sz = ALIGN_UP(sz, SZ_16K);
+    bfr->bfr = memalign(SZ_16K, alloc_sz);
     if (!bfr->bfr) {
         rtkit_printf("unable to allocate %zu buffer\n", sz);
         return false;
     }
 
-    sz = ALIGN_UP(sz, 16384);
-
-    bfr->sz = sz;
-    if (!rtkit_map(rtk, bfr->bfr, sz, &bfr->dva))
+    memset(bfr->bfr, 0, alloc_sz);
+    bfr->sz = alloc_sz;
+    if (!rtkit_map(rtk, bfr->bfr, alloc_sz, &bfr->dva))
         goto error;
 
     return true;
