@@ -843,6 +843,9 @@ int pcie_init(void)
 {
     bool success = false;
 
+    if (chip_id == T8140)
+        return 0;
+
     if (pcie_initialized)
         return 0;
 
@@ -859,6 +862,9 @@ int pcie_init(void)
 
 int pcie_shutdown(void)
 {
+    if (chip_id == T8140)
+        return 0;
+
     if (!pcie_initialized)
         return 0;
 
