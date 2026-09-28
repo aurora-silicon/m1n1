@@ -723,6 +723,43 @@ u64 dart_search(dart_dev_t *dart, void *paddr)
     return DART_PTR_ERR;
 }
 
+u64 dart_search_range(dart_dev_t *dart, u64 paddr, size_t len)
+{
+    if (!len || (paddr & (SZ_16K - 1)) || paddr > UINT64_MAX - len || len > SIZE_MAX - (SZ_16K - 1))
+        return DART_PTR_ERR;
+
+    size_t pages = ALIGN_UP(len, SZ_16K) / SZ_16K;
+    for (int ttbr = 0; ttbr < dart->params->ttbr_count; ttbr++) {
+        if (!dart->l1[ttbr])
+            continue;
+        for (u32 l1 = 0; l1 < 2048; l1++) {
+            if (!(dart->l1[ttbr][l1] & DART_PTE_VALID))
+                continue;
+            u64 *l2 = (u64 *)(FIELD_GET(dart->params->offset_mask, dart->l1[ttbr][l1])
+                              << DART_PTE_OFFSET_SHIFT);
+            for (u32 page = 0; page < 2048; page++) {
+                if (!(l2[page] & DART_PTE_VALID))
+                    continue;
+                u64 first = FIELD_GET(dart->params->offset_mask, l2[page]) << DART_PTE_OFFSET_SHIFT;
+                if (first != paddr)
+                    continue;
+                u64 iova = ((u64)ttbr << 36) | ((u64)l1 << 25) | ((u64)page << 14);
+                bool contiguous = true;
+                for (size_t n = 1; n < pages; n++) {
+                    if (n > (UINT64_MAX - iova) / SZ_16K ||
+                        (u64)dart_translate_silent(dart, iova + n * SZ_16K) != paddr + n * SZ_16K) {
+                        contiguous = false;
+                        break;
+                    }
+                }
+                if (contiguous)
+                    return iova;
+            }
+        }
+    }
+    return DART_PTR_ERR;
+}
+
 u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len)
 {
     if (len % SZ_16K)

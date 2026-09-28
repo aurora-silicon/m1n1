@@ -1568,18 +1568,11 @@ static dart_dev_t *dt_init_dart_by_node(int node, u32 num)
 
 static u64 dart_get_mapping(dart_dev_t *dart, const char *path, u64 paddr, size_t size)
 {
-    u64 iova = dart_search(dart, (void *)paddr);
+    u64 iova = dart_search_range(dart, paddr, size);
     if (DART_IS_ERR(iova)) {
-        printf("ADT: %s paddr: 0x%lx is not mapped\n", path, paddr);
+        printf("ADT: %s paddr: 0x%lx is not contiguously mapped\n", path, paddr);
         return iova;
     }
-
-    u64 pend = (u64)dart_translate(dart, iova + size - 1);
-    if (pend != (paddr + size - 1)) {
-        printf("ADT: %s is not continuously mapped: 0x%lx\n", path, pend);
-        return DART_PTR_ERR;
-    }
-
     return iova;
 }
 
