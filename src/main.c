@@ -73,6 +73,18 @@ void run_actions(void)
 {
     bool usb_up = false;
 
+#ifdef T8140_PROXY_WINDOW_MS
+    if (chip_id == T8140 && T8140_PROXY_WINDOW_MS > 0) {
+        if (uartproxy_wait_dockchannel(T8140_PROXY_WINDOW_MS)) {
+            printf("Stage 1: host request received\n");
+            fb_set_active(true);
+            uartproxy_run_presynced(IODEV_DOCKCHANNEL_UART);
+            return;
+        }
+        printf("Stage 1: no host during proxy window\n");
+    }
+#endif
+
 #ifndef BRINGUP
 #ifdef EARLY_PROXY_TIMEOUT
     int node = adt_path_offset(adt, "/chosen/asmb");

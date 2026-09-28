@@ -90,6 +90,7 @@ ifeq ($(T8140_KIS_PROXY),1)
 ifneq ($(CHAINLOADING),1)
 $(error T8140_KIS_PROXY requires CHAINLOADING=1)
 endif
+
 ifeq ($(T8140_CDC_PROXY),1)
 $(error T8140_KIS_PROXY and T8140_CDC_PROXY are mutually exclusive)
 endif
@@ -301,6 +302,8 @@ build-tag src/../build/build_tag.h &:
 build-cfg src/../build/build_cfg.h &:
 	$(QUIET)mkdir -p build
 	$(QUIET)for i in $(CFG); do echo "#define $$i"; done > build/build_cfg.tmp
+	$(QUIET)if [ -n "$(T8140_PROXY_WINDOW_MS)" ]; then \
+		echo "#define T8140_PROXY_WINDOW_MS $(T8140_PROXY_WINDOW_MS)" >> build/build_cfg.tmp; fi
 	$(QUIET)cmp -s build/build_cfg.h build/build_cfg.tmp 2>/dev/null || \
 	( mv -f build/build_cfg.tmp build/build_cfg.h && echo "  CFG   build/build_cfg.h" )
 
