@@ -3015,7 +3015,10 @@ int kboot_boot(void *kernel)
     tunables_apply_static();
     clk_init();
 
-    usb_init();
+    if (chip_id == T8140)
+        printf("kboot: normal USB init skipped on T8140\n");
+    else
+        usb_init();
     ret = pcie_init();
     if (ret && chip_id == T8140) {
         printf("kboot: refusing T8140 handoff after PCIe failure\n");

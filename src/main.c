@@ -83,7 +83,7 @@ void run_actions(void)
         printf("Boot policy: sip0 = %ld\n", lp_sip0);
     }
 
-    if (!cur_boot_args.video.display && lp_sip0 == 127) {
+    if (chip_id != T8140 && !cur_boot_args.video.display && lp_sip0 == 127) {
         printf("Bringing up USB for early debug...\n");
 
         usb_init();
@@ -128,7 +128,7 @@ void run_actions(void)
     printf("No valid payload found\n");
 
 #ifndef BRINGUP
-    if (!usb_up) {
+    if (!usb_up && chip_id != T8140) {
         usb_init();
         usb_iodev_init();
     }
