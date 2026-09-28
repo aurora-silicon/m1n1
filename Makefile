@@ -86,6 +86,16 @@ CFG += CHAINLOADING
 CARGO_FLAGS += --features chainload
 endif
 
+ifeq ($(T8140_KIS_PROXY),1)
+ifneq ($(CHAINLOADING),1)
+$(error T8140_KIS_PROXY requires CHAINLOADING=1)
+endif
+ifeq ($(T8140_CDC_PROXY),1)
+$(error T8140_KIS_PROXY and T8140_CDC_PROXY are mutually exclusive)
+endif
+CFG += T8140_KIS_PROXY USE_DEBUG_USB
+endif
+
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
 	-z nocopyreloc --gc-sections -pie

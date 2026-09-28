@@ -144,6 +144,9 @@ void m1n1_main(void)
     printf("\n\nm1n1 %s\n", m1n1_version);
     printf("Copyright The Asahi Linux Contributors\n");
     printf("Licensed under the MIT license\n\n");
+#ifdef T8140_KIS_PROXY
+    printf("KIS carrier: retaining inherited DebugUSB\n");
+#endif
 
     printf("Running in EL%lu\n\n", mrs(CurrentEL) >> 2);
 
