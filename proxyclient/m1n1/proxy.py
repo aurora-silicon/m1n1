@@ -646,6 +646,8 @@ class M1N1Proxy(Reloadable):
     P_IODEV_WRITE = 0x904
     P_IODEV_WHOAMI = 0x905
     P_USB_IODEV_VUART_SETUP = 0x906
+    P_CDC_SCHEDULE = 0x907
+    P_CDC_STATUS = 0x908
 
     P_TUNABLES_APPLY_GLOBAL = 0xa00
     P_TUNABLES_APPLY_LOCAL = 0xa01
@@ -1114,6 +1116,10 @@ class M1N1Proxy(Reloadable):
         return IODEV(self.request(self.P_IODEV_WHOAMI))
     def usb_iodev_vuart_setup(self, iodev):
         return self.request(self.P_USB_IODEV_VUART_SETUP, iodev)
+    def cdc_schedule(self, delay_ms=1000, flags=0x6):
+        return self.request(self.P_CDC_SCHEDULE, delay_ms, 0, flags)
+    def cdc_status(self):
+        return self.request(self.P_CDC_STATUS)
 
     def tunables_apply_global(self, path, prop):
         return self.request(self.P_TUNABLES_APPLY_GLOBAL, path, prop)
