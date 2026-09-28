@@ -120,6 +120,21 @@ ssize_t iodev_write_nonblocking(iodev_id_t id, const void *buf, size_t length)
     return ret;
 }
 
+ssize_t iodev_write_atomic(iodev_id_t id, const void *buf, size_t length)
+{
+    if (!iodevs[id] || !iodevs[id]->ops->write)
+        return -1;
+
+    if (mmu_active())
+        spin_lock(&iodevs[id]->lock);
+    ssize_t ret = iodevs[id]->ops->write_atomic
+                      ? iodevs[id]->ops->write_atomic(iodevs[id]->opaque, buf, length)
+                      : iodevs[id]->ops->write(iodevs[id]->opaque, buf, length);
+    if (mmu_active())
+        spin_unlock(&iodevs[id]->lock);
+    return ret;
+}
+
 ssize_t iodev_queue(iodev_id_t id, const void *buf, size_t length)
 {
     if (!iodevs[id] || !iodevs[id]->ops->queue)

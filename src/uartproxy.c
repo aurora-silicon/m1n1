@@ -138,7 +138,7 @@ int uartproxy_run(struct uartproxy_msg_start *start)
         // Startup notification only goes out via UART and Dockchannel UART
         reply.checksum = checksum(&reply, REPLY_SIZE - 4);
         iodev_write(IODEV_UART, &reply, REPLY_SIZE);
-        iodev_write(IODEV_DOCKCHANNEL_UART, &reply, REPLY_SIZE);
+        iodev_write_atomic(IODEV_DOCKCHANNEL_UART, &reply, REPLY_SIZE);
     } else {
         // Exceptions / hooks keep the current iodev
         iodev = uartproxy_iodev;
