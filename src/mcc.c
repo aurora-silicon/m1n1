@@ -235,6 +235,41 @@ int mcc_unmap_carveouts(void)
     // region-id-2 and region-id-4 on a booted macos, in the /chosen/carveout-memory-map DT node.
     // This can be used along with dumping the mcc reg space to find the correct start/end/enable
     // above.
+    if (!mcc_regs[0].tz || !mcc_regs[0].tz->count) {
+        static const char *const names[] = {"region-id-4", "region-id-2"};
+        int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
+
+        if (node < 0)
+            return -1;
+        if (mem_size_actual > UINT64_MAX - ram_base)
+            return -1;
+        for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+            u32 len;
+            const u64 *range = adt_getprop(adt, node, names[i], &len);
+            u64 start, size;
+
+            if (!range || len != 2 * sizeof(u64))
+                return -1;
+            memcpy(&start, range, sizeof(start));
+            memcpy(&size, range + 1, sizeof(size));
+            if (!size || start < ram_base || start > UINT64_MAX - size ||
+                start + size > ram_base + mem_size_actual ||
+                ((start | size) & (get_page_size() - 1)) ||
+                mcc_carveout_count >= ARRAY_SIZE(mcc_carveouts) - 1)
+                return -1;
+
+            printf("MMU: Unmapping %s at 0x%lx..0x%lx\n", names[i], start, start + size);
+            mmu_rm_mapping(start, size);
+            mmu_rm_mapping(start | REGION_RWX_EL0, size);
+            mmu_rm_mapping(start | REGION_RW_EL0, size);
+            mmu_rm_mapping(start | REGION_RX_EL1, size);
+            mcc_carveouts[mcc_carveout_count].base = start;
+            mcc_carveouts[mcc_carveout_count].size = size;
+            mcc_carveout_count++;
+        }
+        return 0;
+    }
+
     for (u32 i = 0; i < mcc_regs[0].tz->count; i++) {
         uint64_t off = mcc_regs[0].tz->stride * i;
         uint64_t start = plane_read32(0, 0, mcc_regs[0].tz->start + off);
