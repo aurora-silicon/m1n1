@@ -371,7 +371,7 @@ int mmu_map(u64 from, u64 to, u64 size)
     }
 
     // 16K does not support L1 blocks without FEAT_LPA2
-    if (!is_16k()) {
+    if (!is_16k() && chip_id != T8140) {
         // Map L2 until L1-aligned or reached end of mapping
         u64 boundary_l1 = ALIGN_UP(from, MASK(VADDR_L1_OFFSET_BITS));
         chunk = min(ALIGN_DOWN(size, MASK(VADDR_L1_OFFSET_BITS)), boundary_l1 - from);
@@ -395,7 +395,23 @@ int mmu_map(u64 from, u64 to, u64 size)
     // L2 mappings
     chunk = ALIGN_DOWN(size, MASK(VADDR_L2_OFFSET_BITS));
     if (chunk && (to & VADDR_L2_ALIGN_MASK) == 0) {
-        mmu_pt_map_l2(from, to, chunk);
+        u64 ro_start, ro_end;
+        bool split_ro = (to & PTE_VALID) && memory_fw_ro_range(&ro_start, &ro_end) > 0;
+        u64 block_size = BIT(VADDR_L2_OFFSET_BITS);
+
+        if (!split_ro) {
+            mmu_pt_map_l2(from, to, chunk);
+        } else {
+            for (u64 offset = 0; offset < chunk; offset += block_size) {
+                u64 target = (to + offset) & PTE_TARGET_MASK;
+                if (target < ro_end && target + block_size > ro_start) {
+                    printf("MMU: splitting firmware RO block at 0x%lx\n", target);
+                    mmu_pt_map_l3(from + offset, to + offset, block_size);
+                } else {
+                    mmu_pt_map_l2(from + offset, to + offset, block_size);
+                }
+            }
+        }
         from += chunk;
         to += chunk;
         size -= chunk;
