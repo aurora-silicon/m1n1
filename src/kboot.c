@@ -253,6 +253,52 @@ static int dt_set_fb(void)
     return 0;
 }
 
+static bool dt_bootarg_space(char c)
+{
+    return c == ' ' || c == '\t' || c == '\n';
+}
+
+static int dt_set_t8140_wfx_args(int node)
+{
+    static const char token[] = "arm64.nowfxt";
+    int len = 0;
+    const char *args = fdt_getprop(dt, node, "bootargs", &len);
+    size_t size = 0;
+
+    if (args) {
+        if (len <= 0 || !memchr(args, 0, len))
+            bail("FDT: bootargs is not NUL-terminated\n");
+        size = strnlen(args, len);
+        for (size_t i = 0; i < size;) {
+            while (i < size && dt_bootarg_space(args[i]))
+                i++;
+            size_t start = i;
+            while (i < size && !dt_bootarg_space(args[i]))
+                i++;
+            if (i - start == sizeof(token) - 1 && !memcmp(args + start, token, sizeof(token) - 1))
+                return 0;
+        }
+        while (size && dt_bootarg_space(args[size - 1]))
+            size--;
+    }
+
+    if (size > SIZE_MAX - sizeof(token) - 1)
+        return -1;
+    char *updated = malloc(size + sizeof(token) + (size != 0));
+    if (!updated)
+        return -1;
+    if (size)
+        memcpy(updated, args, size);
+    if (size)
+        updated[size] = ' ';
+    memcpy(updated + size + (size != 0), token, sizeof(token));
+    int ret = fdt_setprop_string(dt, node, "bootargs", updated);
+    free(updated);
+    if (ret)
+        bail("FDT: couldn't set T8140 bootargs\n");
+    return 0;
+}
+
 static int dt_set_chosen(void)
 {
 
@@ -270,6 +316,9 @@ static int dt_set_chosen(void)
             bail("FDT: couldn't set chosen.%s property\n", name);
         printf("FDT: %s = '%s'\n", name, value);
     }
+
+    if (chip_id == T8140 && dt_set_t8140_wfx_args(node))
+        return -1;
 
     if (initrd_start && initrd_size) {
         if (fdt_setprop_u64(dt, node, "linux,initrd-start", (u64)initrd_start))
