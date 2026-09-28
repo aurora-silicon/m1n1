@@ -32,6 +32,8 @@ pub struct NVMEStorage {
     offset: u64,
     extent_sectors: Option<u64>,
     read_budget: Option<u64>,
+    bytes_budget: Option<u64>,
+    op_budget: Option<u64>,
     cached_lba: [Option<u64>; 2],
     cache: [Box<SectorBuffer>; 2],
     last_used: usize,
@@ -46,6 +48,8 @@ impl NVMEStorage {
             offset,
             extent_sectors: None,
             read_budget: None,
+            bytes_budget: None,
+            op_budget: None,
             cached_lba: [None, None],
             cache: [alloc_sector_buf(), alloc_sector_buf()],
             last_used: 0,
@@ -67,7 +71,19 @@ impl NVMEStorage {
 
     pub fn with_read_budget(mut self, sectors: u64) -> Self {
         self.read_budget = Some(sectors);
+        self.bytes_budget = Some(sectors.saturating_mul(SECTOR_SIZE as u64));
+        self.op_budget = Some((1 << 20) - 1);
         self
+    }
+
+    fn charge_op(&mut self) -> Result<(), Error> {
+        if let Some(left) = self.op_budget.as_mut() {
+            if *left == 0 {
+                return Err(());
+            }
+            *left -= 1;
+        }
+        Ok(())
     }
 
     fn charge(&mut self, sectors: usize) -> Result<(), Error> {
@@ -114,6 +130,13 @@ impl fatfs::IoBase for NVMEStorage {
 
 impl fatfs::Read for NVMEStorage {
     fn read(&mut self, mut buf: &mut [u8]) -> Result<usize, Self::Error> {
+        self.charge_op()?;
+        if let Some(left) = self.bytes_budget.as_mut() {
+            if *left < buf.len() as u64 {
+                return Err(());
+            }
+            *left -= buf.len() as u64;
+        }
         let mut read = 0;
         while !buf.is_empty() {
             let relative_lba = self.pos / SECTOR_SIZE as u64;
@@ -180,6 +203,7 @@ impl fatfs::Write for NVMEStorage {
 
 impl fatfs::Seek for NVMEStorage {
     fn seek(&mut self, from: SeekFrom) -> Result<u64, Self::Error> {
+        self.charge_op()?;
         self.pos = match from {
             SeekFrom::Start(n) => n,
             SeekFrom::End(_n) => return Err(()),
