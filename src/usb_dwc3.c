@@ -1130,7 +1130,7 @@ static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
         device2host->read = previous_read;
         return;
     }
-    dev->endpoints[endpoint_number].zlp_pending = (len % CDC_BULK_PACKET_SIZE) == 0;
+    dev->endpoints[endpoint_number].zlp_pending = len && (len % CDC_BULK_PACKET_SIZE) == 0;
 }
 
 static void usb_dwc3_cdc_handle_bulk_out_xfer_done(dwc3_dev_t *dev,
@@ -1140,8 +1140,11 @@ static void usb_dwc3_cdc_handle_bulk_out_xfer_done(dwc3_dev_t *dev,
     if (!host2device)
         return;
     size_t len = min(XFER_SIZE, ringbuffer_get_free(host2device));
+    u32 remaining = dev->endpoints[event.endpoint_number].trb->size & DWC3_TRB_SIZE_MASK;
+    if (remaining > len)
+        return;
     ringbuffer_write(dev->endpoints[event.endpoint_number].xfer_buffer,
-                     len - dev->endpoints[event.endpoint_number].trb->size, host2device);
+                     len - remaining, host2device);
 }
 
 static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_depevt event)
