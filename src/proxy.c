@@ -283,6 +283,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_IC_IVAU:
             ic_ivau_range((void *)request->args[0], request->args[1]);
+            sysop("dsb sy");
+            sysop("isb");
             break;
         case P_DC_IVAC:
             dc_ivac_range((void *)request->args[0], request->args[1]);
@@ -301,6 +303,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_DC_CVAC:
             dc_cvac_range((void *)request->args[0], request->args[1]);
+            sysop("dsb sy");
             break;
         case P_DC_CVAU:
             dc_cvau_range((void *)request->args[0], request->args[1]);
