@@ -93,7 +93,7 @@ static struct kernel_header *boot_prepare_image(const void *data, size_t file_si
 
 static int boot_check_dtb(const void *data, size_t size)
 {
-    if (fdt_check_full(data, size) || fdt_totalsize(data) != (int)size)
+    if (size > UINT32_MAX || fdt_check_full(data, size) || (size_t)fdt_totalsize(data) != size)
         return -1;
 
     u32 target_len;
@@ -163,7 +163,7 @@ int boot_storage_load(const char *spec, struct kernel_header **kernel, void **fd
 
     if (boot_check_dtb(files[1], sizes[1]))
         goto fail;
-    if (!((sizes[2] >= 2 && ((u8 *)files[2])[0] == 0x1f && ((u8 *)files[2])[1] == 0x8b) ||
+    if (!((sizes[2] >= 18 && ((u8 *)files[2])[0] == 0x1f && ((u8 *)files[2])[1] == 0x8b) ||
           (sizes[2] >= 6 && (!memcmp(files[2], "070701", 6) || !memcmp(files[2], "070702", 6)))))
         goto fail;
 
