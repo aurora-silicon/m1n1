@@ -260,25 +260,28 @@ bool rtkit_alloc_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz)
     if (!rtkit_map(rtk, bfr->bfr, alloc_sz, &bfr->dva))
         goto error;
 
+    bfr->owned = true;
     return true;
 
 error:
     free(bfr->bfr);
-    bfr->bfr = NULL;
+    memset(bfr, 0, sizeof(*bfr));
     return false;
 }
 
 bool rtkit_free_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr)
 {
-    if (!bfr->bfr || !is_heap(bfr->bfr))
+    if (!bfr->bfr || !bfr->owned) {
+        memset(bfr, 0, sizeof(*bfr));
         return true;
+    }
 
     if (!rtkit_unmap(rtk, bfr->dva, bfr->sz))
         return false;
 
     free(bfr->bfr);
-
-    return false;
+    memset(bfr, 0, sizeof(*bfr));
+    return true;
 }
 
 static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *msg,
