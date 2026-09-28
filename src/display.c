@@ -639,6 +639,12 @@ int display_init(void)
     else
         printf("display: Display is internal\n");
 
+    if (chip_id == T8140 && !display_is_external) {
+        printf("display: Display is already initialized (%ldx%ld)\n", cur_boot_args.video.width,
+               cur_boot_args.video.height);
+        return 0;
+    }
+
     if ((cur_boot_args.video.width == 640 && cur_boot_args.video.height == 1136) &&
         chip_id != S5L8960X) {
         printf("display: Dummy framebuffer found, initializing display\n");
