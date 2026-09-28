@@ -10,11 +10,16 @@ def test_firmware_iboot_range_bounds(tmp_path):
     start = source.index("bool firmware_iboot_in_range(")
     end = source.index("// Note: semi-open range", start)
     comparator = source[start:end]
+    header = (repo / "src/firmware.h").read_text()
+    version_count = next(line for line in header.splitlines()
+                         if line.startswith("#define IBOOT_VER_COMP "))
 
     harness = """
 #include <assert.h>
-#include "firmware.h"
-""" + comparator + """
+#include <stdbool.h>
+#include <stdint.h>
+typedef uint32_t u32;
+""" + version_count + "\n" + comparator + """
 int main(void)
 {
     u32 lo[IBOOT_VER_COMP] = {1, 2, 3, 4, 5};
