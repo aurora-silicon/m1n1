@@ -171,12 +171,13 @@ static void *load_kernel(void *p, size_t size)
 
 #ifdef CHAINLOADING
 static size_t chosen_cnt = 1;
-static char *chosen[MAX_CHOSEN_VARS] = {
+/* The extra slot carries nvme.adopt without reducing the chosen-variable limit. */
+static char *chosen[MAX_CHOSEN_VARS + 1] = {
     "chosen.asahi,m1n1-stage1-version=" BUILD_TAG,
 };
 #else
 static size_t chosen_cnt = 0;
-static char *chosen[MAX_CHOSEN_VARS];
+static char *chosen[MAX_CHOSEN_VARS + 1];
 #endif
 
 static bool enable_tso = false;
