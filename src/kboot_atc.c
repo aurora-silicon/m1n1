@@ -146,6 +146,32 @@ static const struct adt_tunable_info atc_tunables_t8122[] = {
     {"tunable_LN1_TX_SHM_CIO_DFLT", "apple,tunable-lane1-cio", 0x14000, 0x1000, true},
 };
 
+static const struct adt_tunable_info atc_tunables_t8130[] = {
+    {"tunable_ATC0AXI2AF", "apple,tunable-axi2af", 0, 0x8000, true},
+    {"tunable_USB2PHY_REG_DFLT", "apple,tunable-usb2phy-reg-dflt", 0, 0x4000, true},
+    {"tunable_ATC_FABRIC", "apple,tunable-common-b", 0x44000, 0x4000, true},
+    {"tunable_CIO3PLL_CORE", "apple,tunable-common-b", 0x2a00, 0x200, true},
+    {"tunable_CIO3PLL_TOP", "apple,tunable-common-b", 0x2800, 0x200, true},
+    {"tunable_ACIOPHY_LANE_USBC0", "apple,tunable-common-b", 0x5000, 0x1000, true},
+    {"tunable_ACIOPHY_PLL_TOP", "apple,tunable-common-b", 0x1000, 0x4000, true},
+    {"tunable_ACIOPHY_TOP", "apple,tunable-common-b", 0, 0x4000, true},
+    {"tunable_AUSCMN_DIG", "apple,tunable-common-b", 0x800, 0x200, true},
+    {"tunable_AUSPLL_CORE", "apple,tunable-common-b", 0x2200, 0x4000, true},
+    {"tunable_AUX_TOP", "apple,tunable-common-b", 0x16000, 0x4000, true},
+    {"tunable_AUSCMN_SHM", "apple,tunable-common-b", 0xa00, 0x200, true},
+    {"tunable_CLKMON_CFG", "apple,tunable-common-b", 0x2600, 0x100, false},
+    {"tunable_LN0_RX_TOP_USB_DFLT", "apple,tunable-lane0-usb", 0x9000, 0x1000, true},
+    {"tunable_LN0_RX_EQ_USB_EQA", "apple,tunable-lane0-usb", 0xa000, 0x1000, true},
+    {"tunable_LN0_RX_SHM_USB_DFLT", "apple,tunable-lane0-usb", 0xb000, 0x1000, true},
+    {"tunable_LN0_TX_TOP_USB_DFLT", "apple,tunable-lane0-usb", 0xc000, 0x1000, true},
+    {"tunable_LN0_TX_SHM_USB_DFLT", "apple,tunable-lane0-usb", 0xd000, 0x1000, true},
+    {"tunable_LN1_RX_TOP_USB_DFLT", "apple,tunable-lane1-usb", 0x10000, 0x1000, true},
+    {"tunable_LN1_RX_EQ_USB_EQA", "apple,tunable-lane1-usb", 0x11000, 0x1000, true},
+    {"tunable_LN1_RX_SHM_USB_DFLT", "apple,tunable-lane1-usb", 0x12000, 0x1000, true},
+    {"tunable_LN1_TX_TOP_USB_DFLT", "apple,tunable-lane1-usb", 0x13000, 0x1000, true},
+    {"tunable_LN1_TX_SHM_USB_DFLT", "apple,tunable-lane1-usb", 0x14000, 0x1000, true},
+};
+
 static const struct atc_fuse_info atc_fuses_t8103_port0[] = {
     {0x23d2bc434, 9, 6, CIO3PLL_DCO_NCTRL, CIO3PLL_DCO_COARSEBIN_EFUSE0},
     {0x23d2bc434, 15, 6, CIO3PLL_DCO_NCTRL, CIO3PLL_DCO_COARSEBIN_EFUSE1},
@@ -282,6 +308,7 @@ static const struct atc_fuse_info atc_fuses_t8112_port1[] = {
 // strings in ADT atc-phy nodes.
 static const struct atc_fuse_hw atc_fuses[] = {
     {"atc-phy,t8132", -1, NULL, 0},
+    {"atc-phy,t8130", -1, NULL, 0},
     {"atc-phy,t8122", -1, NULL, 0},
     {"atc-phy,t6020", -1, NULL, 0},
     {"atc-phy,t8112", 0, atc_fuses_t8112_port0, ARRAY_SIZE(atc_fuses_t8112_port0)},
@@ -453,8 +480,11 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
         goto cleanup;
     }
 
-    if (adt_is_compatible_at(adt, adt_node, "atc-phy,t8122", 0) ||
-        adt_is_compatible_at(adt, adt_node, "atc-phy,t8132", 0)) {
+    if (adt_is_compatible_at(adt, adt_node, "atc-phy,t8130", 0)) {
+        tunables = atc_tunables_t8130;
+        tunable_count = ARRAY_SIZE(atc_tunables_t8130);
+    } else if (adt_is_compatible_at(adt, adt_node, "atc-phy,t8122", 0) ||
+               adt_is_compatible_at(adt, adt_node, "atc-phy,t8132", 0)) {
         tunables = &atc_tunables_t8122[0];
         tunable_count = sizeof(atc_tunables_t8122) / sizeof(*atc_tunables_t8122);
     } else {
@@ -522,6 +552,10 @@ cleanup:
      */
     for (size_t i = 0; i < sizeof(atc_tunables) / sizeof(*atc_tunables); ++i)
         fdt_delprop(dt, fdt_node, atc_tunables[i].fdt_name);
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8122); i++)
+        fdt_delprop(dt, fdt_node, atc_tunables_t8122[i].fdt_name);
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8130); i++)
+        fdt_delprop(dt, fdt_node, atc_tunables_t8130[i].fdt_name);
     fdt_delprop(dt, fdt_node, "apple,tunable-common-a");
     fdt_delprop(dt, fdt_node, "apple,tunable-common");
 
