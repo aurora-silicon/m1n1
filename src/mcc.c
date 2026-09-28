@@ -603,8 +603,9 @@ static int mcc_init_t8140(int node, int *path)
     mcc_count = count;
     for (int i = 0; i < mcc_count; i++) {
         u64 base, size;
-        if (reg_idx > INT32_MAX - i || adt_get_reg(adt, path, "reg", reg_idx + i, &base, &size) ||
-            !base || (planes - 1) > (UINT64_MAX - 4) / stride || (planes - 1) * stride + 4 > size)
+        if (reg_idx > (u32)(INT32_MAX - i) ||
+            adt_get_reg(adt, path, "reg", reg_idx + i, &base, &size) || !base ||
+            (planes - 1) > (UINT64_MAX - 4) / stride || (planes - 1) * stride + 4 > size)
             return -1;
         mcc_regs[i].plane_base = base;
         mcc_regs[i].plane_stride = stride;
