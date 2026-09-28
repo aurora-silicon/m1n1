@@ -20,7 +20,8 @@ The packaging tool requires identical source commits and tags, clean buildbox
 inputs, `RELEASE`, `CHAINLOADING`, `T8140_KIS_PROXY`, `USE_DEBUG_USB` and
 no custom logo define or `LOGO=` build variable, one Stage 1 config marker, and
 `STACKBOT` as each image's final eight bytes. It ships each binary with the raw
-ELF from the same buildbox output folder, source/build metadata, licences and
+ELF from the same buildbox output folder, source/build metadata, licences,
+`fatfs/PROVENANCE.md` with the pinned revision and local changes, and
 `SHA256SUMS`. The image uses the upstream m1n1 boot logo.
 
 ## Fill the installed Stage 1

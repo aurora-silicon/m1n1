@@ -60,6 +60,7 @@ def main() -> None:
     shutil.copytree(REPO / "3rdparty_licenses", args.output / "3rdparty_licenses")
     (args.output / "fatfs").mkdir()
     shutil.copy2(REPO / "rust/fatfs/LICENSE.txt", args.output / "fatfs/LICENSE.txt")
+    shutil.copy2(REPO / "rust/fatfs/PROVENANCE.md", args.output / "fatfs/PROVENANCE.md")
     shutil.copy2(REPO / "docs/j700-release.md", args.output / "ESP-AND-INSTALL.md")
 
     (args.output / "SOURCE-AND-BUILDS.txt").write_text(
