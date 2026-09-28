@@ -144,11 +144,27 @@ static ssize_t dockchannel_uart_iodev_write(void *opaque, const void *buf, size_
     return len;
 }
 
+static ssize_t dockchannel_uart_iodev_write_nonblocking(void *opaque, const void *buf, size_t len)
+{
+    UNUSED(opaque);
+
+    if (!uart_base)
+        return 0;
+
+    size_t count = min(len, (size_t)read32(uart_base + DATA_TX_FREE));
+    const u8 *p = buf;
+    for (size_t i = 0; i < count; i++)
+        write32(uart_base + DATA_TX8, p[i]);
+
+    return count;
+}
+
 static struct iodev_ops iodev_dockchannel_uart_ops = {
     .can_read = dockchannel_uart_iodev_can_read,
     .can_write = dockchannel_uart_iodev_can_write,
     .read = dockchannel_uart_iodev_read,
     .write = dockchannel_uart_iodev_write,
+    .write_nonblocking = dockchannel_uart_iodev_write_nonblocking,
 };
 
 struct iodev iodev_dockchannel_uart = {
