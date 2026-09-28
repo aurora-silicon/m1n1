@@ -11,6 +11,7 @@
 #include "display.h"
 #include "exception.h"
 #include "firmware.h"
+#include "heapblock.h"
 #include "iodev.h"
 #include "isp.h"
 #include "kboot_atc.h"
@@ -2852,8 +2853,33 @@ int kboot_prepare_dt(void *fdt)
     if (fdt_add_mem_rsv(dt, (u64)dt, dt_bufsize))
         bail("FDT: couldn't add reservation for the devtree\n");
 
-    if (fdt_add_mem_rsv(dt, (u64)_base, ((u64)_end) - ((u64)_base)))
-        bail("FDT: couldn't add reservation for m1n1\n");
+    u64 image_end = (u64)_end;
+    if (chip_id == T8140) {
+        u64 ram_end, inherited = cur_boot_args.top_of_kernel_data;
+        u64 high_water = heapblock_high_water();
+
+        if (!cur_boot_args.mem_size ||
+            cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size)
+            bail("FDT: invalid inherited RAM extent\n");
+        ram_end = cur_boot_args.phys_base + cur_boot_args.mem_size;
+        image_end = max(image_end, inherited);
+        if ((u64)_base < cur_boot_args.phys_base || image_end < (u64)_base || image_end > ram_end ||
+            high_water > ram_end)
+            bail("FDT: invalid T8140 retained memory extent\n");
+
+        u64 heap_top = max(inherited, high_water);
+        if (heap_top > (u64)_end) {
+            if (heap_top > UINT64_MAX - (SZ_16K - 1))
+                bail("FDT: retained heap extent overflows\n");
+            u64 heap_start = ALIGN_DOWN((u64)_end, SZ_16K);
+            u64 heap_end = ALIGN_UP(heap_top, SZ_16K);
+            if (heap_end > ram_end || fdt_add_mem_rsv(dt, heap_start, heap_end - heap_start))
+                bail("FDT: couldn't reserve retained heap\n");
+            printf("FDT: retained heap [0x%lx, 0x%lx)\n", heap_start, heap_end);
+        }
+    }
+    if (fdt_add_mem_rsv(dt, (u64)_base, image_end - (u64)_base))
+        bail("FDT: couldn't add reservation for m1n1 and inherited high-water\n");
 
     if (chip_id == T8140) {
         u64 ro_start, ro_end;
