@@ -146,6 +146,7 @@ struct mcc_regs {
     u32 cache_status_mask;
     u32 cache_status_val;
     u32 cache_disable;
+    bool has_cache_control;
 
     struct tz_regs *tz;
 };
@@ -198,6 +199,10 @@ int mcc_enable_cache(void)
     /* The 6030 memory controller supports setting a waymask, but the desktop chips do not appear to
        use it */
     for (int mcc = 0; mcc < mcc_count; mcc++) {
+        if (!mcc_regs[mcc].has_cache_control) {
+            printf("MCC: cache control is firmware-owned on MCC %d; leaving it enabled\n", mcc);
+            continue;
+        }
         for (int plane = 0; plane < mcc_regs[mcc].plane_count; plane++) {
             plane_write32(mcc, plane, PLANE_CACHE_ENABLE, mcc_regs[mcc].cache_enable_val);
             if (plane_poll32(mcc, plane, PLANE_CACHE_STATUS, mcc_regs[mcc].cache_status_mask,
@@ -297,6 +302,7 @@ int mcc_init_t8103(int node, int *path, bool t8112)
     mcc_regs[0].cache_status_mask = T8103_CACHE_STATUS_MASK;
     mcc_regs[0].cache_status_val = T8103_CACHE_STATUS_VAL;
     mcc_regs[0].cache_disable = t8112 ? T8112_CACHE_DISABLE : 0;
+    mcc_regs[0].has_cache_control = true;
     mcc_regs[0].tz = &t8103_tz_regs;
 
     printf("MCC: Initialized T8103 MCC (%d channels)\n", val);
@@ -347,6 +353,7 @@ int mcc_init_t6000(int node, int *path, bool t602x)
         mcc_regs[i].cache_status_mask = T6000_CACHE_STATUS_MASK;
         mcc_regs[i].cache_status_val = T6000_CACHE_STATUS_VAL;
         mcc_regs[i].cache_disable = 0;
+        mcc_regs[i].has_cache_control = true;
 
         mcc_regs[i].tz = t602x ? &t602x_tz_regs : &t8103_tz_regs;
     }
@@ -383,6 +390,7 @@ int mcc_init_t6031(int *path, u32 reg_offset, u32 plane_count, u32 dcs_count)
         mcc_regs[i].cache_status_mask = T6031_CACHE_STATUS_MASK;
         mcc_regs[i].cache_status_val = T6031_CACHE_STATUS_VAL;
         mcc_regs[i].cache_disable = 0;
+        mcc_regs[i].has_cache_control = true;
 
         mcc_regs[i].tz = &t6031_tz_regs;
     }
@@ -415,6 +423,7 @@ int mcc_init_t8122(int *path, u32 reg_offset, u32 plane_count, u32 dcs_count,
         mcc_regs[i].cache_status_mask = T8122_CACHE_STATUS_MASK;
         mcc_regs[i].cache_status_val = T8122_CACHE_STATUS_VAL;
         mcc_regs[i].cache_disable = 0;
+        mcc_regs[i].has_cache_control = true;
 
         mcc_regs[i].tz = tz_regs;
     }
@@ -567,6 +576,7 @@ static int mcc_init_t8140(int node, int *path)
         mcc_regs[i].plane_count = planes;
         mcc_regs[i].dcs_count = channels;
         mcc_regs[i].tz = NULL;
+        mcc_regs[i].has_cache_control = false;
     }
 
     printf("MCC: Initialized T8140 MCCs (%d instances, %d planes, %d channels)\n", mcc_count,
