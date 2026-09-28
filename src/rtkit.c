@@ -227,8 +227,10 @@ bool rtkit_map(rtkit_dev_t *rtk, void *phys, size_t sz, u64 *dva)
 bool rtkit_unmap(rtkit_dev_t *rtk, u64 dva, size_t sz)
 {
     if (rtk->sart) {
-        if (!sart_remove_allowed_region(rtk->sart, (void *)dva, sz))
+        if (!sart_remove_allowed_region(rtk->sart, (void *)dva, sz)) {
             rtkit_printf("sart_remove_allowed_region failed (size 0x%lx)\n", sz);
+            return false;
+        }
         return true;
     } else if (rtk->dart) {
         dva &= ~rtk->dva_base;
