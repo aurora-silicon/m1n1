@@ -60,6 +60,8 @@ static tps6598x_dev_t *tps6598x_init(const char *adt_node, const char *addr_prop
 tps6598x_dev_t *tps6598x_init_i2c(const char *adt_node, i2c_dev_t *i2c)
 {
     tps6598x_dev_t *dev = tps6598x_init(adt_node, "hpm-iic-addr");
+    if (!dev)
+        return NULL;
     dev->i2c = i2c;
     return dev;
 }
@@ -67,13 +69,21 @@ tps6598x_dev_t *tps6598x_init_i2c(const char *adt_node, i2c_dev_t *i2c)
 tps6598x_dev_t *tps6598x_init_spmi(const char *adt_node, spmi_dev_t *spmi)
 {
     tps6598x_dev_t *dev = tps6598x_init(adt_node, "reg");
+    if (!dev || !spmi) {
+        free(dev);
+        return NULL;
+    }
     dev->spmi = spmi;
 
     if (spmi_send_wakeup(dev->spmi, dev->addr) < 0)
-        return NULL;
+        goto err_free;
     mdelay(10);
 
     return dev;
+
+err_free:
+    free(dev);
+    return NULL;
 }
 
 void tps6598x_shutdown(tps6598x_dev_t *dev)
@@ -89,7 +99,7 @@ static int tps6598x_spmi_select_reg(tps6598x_dev_t *dev, const u8 reg)
     if (spmi_reg0_write(dev->spmi, dev->addr, reg) < 0)
         return -1;
 
-    while (val != reg) {
+    for (int i = 0; i < 1000 && val != reg; i++) {
         if (spmi_ext_read(dev->spmi, dev->addr, TPS_SPMI_REG_SELECT, &val, 1) < 0)
             return -1;
         if (val == reg)
@@ -97,6 +107,10 @@ static int tps6598x_spmi_select_reg(tps6598x_dev_t *dev, const u8 reg)
         if (val != (reg | TPS_SPMI_REG_SELECT_TRIG)) // Selection in progress
             return -1;
         mdelay(1);
+    }
+    if (val != reg) {
+        printf("tps6598x: timed out selecting SPMI register 0x%x\n", reg);
+        return -1;
     }
     return 0;
 }
@@ -145,14 +159,21 @@ int tps6598x_command(tps6598x_dev_t *dev, const char *cmd, const u8 *data_in, si
         return -1;
 
     u32 cmd_status;
-    do {
+    for (int i = 0; i < 10000; i++) {
         if (tps6598x_read_reg(dev, TPS_REG_CMD1, (u8 *)&cmd_status, 4) < 0)
             return -1;
-        if (cmd_status == TPS_CMD_INVALID)
+        if (cmd_status == TPS_CMD_INVALID) {
+            printf("tps6598x: command %.4s rejected\n", cmd);
             return -1;
+        }
+        if (!cmd_status)
+            goto complete;
         udelay(100);
-    } while (cmd_status != 0);
+    }
+    printf("tps6598x: command %.4s timed out\n", cmd);
+    return -1;
 
+complete:
     if (len_out) {
         if (tps6598x_read_reg(dev, TPS_REG_DATA1, data_out, len_out) != (ssize_t)len_out)
             return -1;
@@ -261,7 +282,8 @@ int tps6598x_powerup(tps6598x_dev_t *dev)
         return 0;
 
     const u8 data = 0;
-    tps6598x_command(dev, "SSPS", &data, 1, NULL, 0);
+    if (tps6598x_command(dev, "SSPS", &data, 1, NULL, 0))
+        return -1;
 
     if (tps6598x_read_reg(dev, TPS_REG_POWER_STATE, &power_state, 1) < 0)
         return -1;
@@ -293,7 +315,8 @@ int tps6598x_enter_kis(tps6598x_dev_t *dev)
 
     // check status and soft reset if it fails
     if (tps6598x_cmd_status(dev, "LOCK")) {
-        tps6598x_command(dev, "Gaid", NULL, 0, NULL, 0);
+        if (tps6598x_command(dev, "Gaid", NULL, 0, NULL, 0))
+            return -1;
         mdelay(20);
     }
 
@@ -311,7 +334,7 @@ int tps6598x_enter_kis(tps6598x_dev_t *dev)
     }
 
     ret = tps6598x_read_reg(dev, TPS_REG_MODE, (u8 *)&mode, 4);
-    if (mode != TPS_MODE_DBMA) {
+    if (ret != 4 || mode != TPS_MODE_DBMA) {
         printf("tps6598x_enter_kis: Failed to enter DBMa mode, mode=0x%08x\n", mode);
         return -1;
     }
@@ -323,8 +346,9 @@ int tps6598x_enter_kis(tps6598x_dev_t *dev)
     }
 
     en = 0;
-    tps6598x_command(dev, "DBMa", &en, 1, NULL, 0);
-    tps6598x_command(dev, "LOCK", key_null, 4, NULL, 0);
+    if (tps6598x_command(dev, "DBMa", &en, 1, NULL, 0) ||
+        tps6598x_command(dev, "LOCK", key_null, 4, NULL, 0))
+        return -1;
 
     return ret;
 }
