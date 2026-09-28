@@ -32,6 +32,7 @@
 #include "xnuboot.h"
 
 #include "libfdt/libfdt.h"
+#include "tinf/tinf.h"
 
 #define MAX_CHOSEN_PARAMS 16
 #define MAX_UBOOT_CONFIGS 4
@@ -2006,6 +2007,109 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
     return 0;
 }
 
+static int dt_set_ave(void)
+{
+    if (chip_id != T8140)
+        return 0;
+
+    const char *path = "/soc/video-codec@285100000";
+    int node = fdt_path_offset(dt, path);
+    if (node < 0)
+        return 0;
+
+    const char *reason = "invalid ADT firmware segments";
+    int anode = adt_path_offset(adt, "/arm-io/ave");
+    if (anode < 0) {
+        reason = "ADT node absent";
+        goto disable;
+    }
+
+    u32 preloaded;
+    if (ADT_GETPROP(adt, anode, "pre-loaded", &preloaded) != sizeof(preloaded) || preloaded != 1) {
+        reason = "firmware not preloaded";
+        goto disable;
+    }
+
+    u32 seg_len, names_len;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, anode, "segment-ranges", &seg_len);
+    const char *names = adt_getprop(adt, anode, "segment-names", &names_len);
+    if (!seg || !names || !seg_len || seg_len % sizeof(*seg) || seg_len > 4 * sizeof(*seg) ||
+        !names_len)
+        goto disable;
+
+    int dram_node = adt_path_offset(adt, "/chosen");
+    u64 dram_base;
+    if (dram_node < 0 || ADT_GETPROP(adt, dram_node, "dram-base", &dram_base) != sizeof(dram_base))
+        goto disable;
+    if (dram_base > cur_boot_args.phys_base)
+        goto disable;
+
+    size_t count = seg_len / sizeof(*seg);
+    char normalized[4][16] = {{0}};
+    u64 phys_end[4], remap_end[4];
+    size_t pos = 0;
+    for (size_t i = 0; i < count; i++) {
+        while (pos < names_len && names[pos] == '_')
+            pos++;
+        size_t n = 0;
+        while (pos < names_len && names[pos] != ';' && names[pos]) {
+            char c = names[pos++];
+            if (c >= 'A' && c <= 'Z')
+                c += 'a' - 'A';
+            if (n == 15 || !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
+                goto disable;
+            normalized[i][n++] = c;
+        }
+        if (!n || (i + 1 < count && (pos >= names_len || names[pos++] != ';')))
+            goto disable;
+        for (size_t j = 0; j < i; j++)
+            if (!strcmp(normalized[i], normalized[j]))
+                goto disable;
+
+        u64 span = ALIGN_UP((u64)seg[i].size, SZ_16K);
+        if (!seg[i].size || !seg[i].remap || (seg[i].phys & (SZ_16K - 1)) ||
+            (seg[i].remap & (SZ_16K - 1)) || seg[i].phys > UINT64_MAX - span ||
+            seg[i].remap > UINT64_MAX - span || seg[i].phys < dram_base ||
+            seg[i].phys + span > cur_boot_args.phys_base)
+            goto disable;
+        phys_end[i] = seg[i].phys + span;
+        remap_end[i] = seg[i].remap + span;
+        for (size_t j = 0; j < i; j++)
+            if ((seg[i].phys < phys_end[j] && seg[j].phys < phys_end[i]) ||
+                (seg[i].remap < remap_end[j] && seg[j].remap < remap_end[i]))
+                goto disable;
+    }
+    if (pos < names_len && (names[pos] != 0 || pos + 1 != names_len))
+        goto disable;
+
+    u32 crcs[4];
+    for (size_t i = 0; i < count; i++)
+        crcs[i] = tinf_crc32((void *)seg[i].phys, seg[i].size);
+
+    if (dt_reserve_asc_firmware("/arm-io/ave", NULL, path, true, 0)) {
+        reason = "firmware reservation failed";
+        goto disable;
+    }
+    for (size_t i = 0; i < count; i++) {
+        char prop[48], value[9];
+        snprintf(prop, sizeof(prop), "aurora,ave-%s-crc32", normalized[i]);
+        snprintf(value, sizeof(value), "%08x", crcs[i]);
+        int chosen = fdt_path_offset(dt, "/chosen");
+        if (chosen < 0 || fdt_setprop_string(dt, chosen, prop, value)) {
+            reason = "CRC export failed";
+            goto disable;
+        }
+    }
+    return 0;
+
+disable:
+    node = fdt_path_offset(dt, path);
+    if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
+        return -1;
+    printf("FDT: AVE disabled: %s\n", reason);
+    return 0;
+}
+
 static const char dcpext_aliases[][8] = {
     "dcpext",  "dcpext0", "dcpext1", "dcpext2", "dcpext3",
     "dcpext4", "dcpext5", "dcpext6", "dcpext7",
@@ -3066,6 +3170,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_acio_tunables())
         return -1;
     if (dt_set_pcie_tunables())
+        return -1;
+    if (dt_set_ave())
         return -1;
     if (dt_set_display())
         return -1;
