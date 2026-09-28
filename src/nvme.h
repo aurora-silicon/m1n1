@@ -6,6 +6,7 @@
 #include "types.h"
 
 bool nvme_init(void);
+extern bool nvme_adopt_live_session;
 void nvme_shutdown(void);
 
 bool nvme_flush(u32 nsid);

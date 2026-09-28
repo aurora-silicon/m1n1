@@ -28,6 +28,7 @@
 #define NVME_CSTS_SHST_BUSY   1
 #define NVME_CSTS_SHST_DONE   2
 #define NVME_CSTS_RDY         BIT(0)
+#define NVME_CSTS_CFS         BIT(1)
 
 #define NVME_AQA 0x24
 #define NVME_ASQ 0x28
@@ -128,6 +129,7 @@ static enum {
 } nvme_type;
 
 static bool nvme_initialized = false;
+bool nvme_adopt_live_session = false;
 static u8 nvme_die;
 
 static asc_dev_t *nvme_asc = NULL;
@@ -178,6 +180,8 @@ static void free_queue(struct nvme_queue *q)
 
 static void nvme_poll_syslog(void)
 {
+    if (!nvme_rtkit)
+        return;
     struct rtkit_message msg;
     rtkit_recv(nvme_rtkit, &msg);
 }
@@ -317,6 +321,7 @@ bool nvme_init(void)
     memset(&adminq, 0, sizeof(adminq));
     memset(&ioq, 0, sizeof(ioq));
 
+    bool adopting = false;
     int adt_path[8];
     int node = adt_path_offset_trace(adt, "/arm-io/ans", adt_path);
     if (node < 0) {
@@ -386,6 +391,23 @@ bool nvme_init(void)
     if (!nvme_asc)
         goto out_ioq;
 
+    if (nvme_type == NVME_T8132) {
+        bool running = asc_cpu_running(nvme_asc);
+        adopting = nvme_adopt_live_session || running;
+        if (adopting) {
+            u32 boot_status = read32(nvme_base + NVME_BOOT_STATUS);
+            u32 csts = read32(nvme_base + NVME_CSTS);
+            if (!running || boot_status != NVME_BOOT_STATUS_OK || (csts & NVME_CSTS_CFS)) {
+                printf("nvme: cannot adopt ANS: RUN=%d BOOT_STATUS=0x%x CSTS=0x%x\n", running,
+                       boot_status, csts);
+                goto out_asc;
+            }
+            nvme_adopt_live_session = true;
+            printf("nvme: adopting the live post-M4 ANS session\n");
+            goto setup_controller;
+        }
+    }
+
     nvme_sart = sart_init("/arm-io/sart-ans");
     if (!nvme_sart)
         goto out_asc;
@@ -402,6 +424,7 @@ bool nvme_init(void)
         goto out_shutdown;
     }
 
+setup_controller:
     /* setup controller and NVMMU for linear submission queue */
     set32(nvme_base + NVME_LINEAR_SQ_CTRL, NVME_LINEAR_SQ_CTRL_EN);
     write32(nvme_base + NVME_MAX_PEND_CMDS_CTRL,
@@ -472,6 +495,8 @@ out_disable_ctrl:
     nvme_ctrl_disable();
     nvme_poll_syslog();
 out_shutdown:
+    if (adopting)
+        goto out_asc;
     rtkit_sleep(nvme_rtkit);
     // Some machines call this ANS, some ANS2...
     pmgr_reset(nvme_die, "ANS");
