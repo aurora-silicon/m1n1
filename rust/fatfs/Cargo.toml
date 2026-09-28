@@ -23,6 +23,7 @@ std = []
 lfn = []
 # Use dynamic allocation. When used without std please enable core_io/collections
 alloc = []
+explicit-fat32 = []
 # Full Unicode support. Disabling it reduces code size by avoiding Unicode-aware character case conversion
 unicode = []
 # Enable only error-level logging

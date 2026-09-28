@@ -389,7 +389,7 @@ impl<IO: Read + Write + Seek, TP, OCC> FileSystem<IO, TP, OCC> {
         let root_dir_sectors = bpb.root_dir_sectors();
         let first_data_sector = bpb.first_data_sector();
         let total_clusters = bpb.total_clusters();
-        let fat_type = FatType::from_clusters(total_clusters);
+        let fat_type = bpb.fat_type();
 
         // read FSInfo sector if this is FAT32
         let mut fs_info = if fat_type == FatType::Fat32 {

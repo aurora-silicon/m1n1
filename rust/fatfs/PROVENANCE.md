@@ -6,4 +6,7 @@
 - Files: upstream `src/*.rs`, `Cargo.toml`, `LICENSE.txt`, and `README.md`.
 - Excluded: examples, tests, fixtures, scripts, CI files, changelog and repository metadata.
 
-Local code changes after the import are listed here as separate commits.
+Local code changes after the import:
+
+1. `explicit-fat32` feature: use the BPB's zero 16-bit sectors-per-FAT field to select FAT32 even
+   on a small volume, while retaining the remaining BPB validation. Enabled only by m1n1.

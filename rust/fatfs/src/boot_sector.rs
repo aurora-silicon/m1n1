@@ -277,7 +277,7 @@ impl BiosParameterBlock {
     fn validate_total_clusters<E: IoError>(&self) -> Result<(), Error<E>> {
         let is_fat32 = self.is_fat32();
         let total_clusters = self.total_clusters();
-        let fat_type = FatType::from_clusters(total_clusters);
+        let fat_type = self.fat_type();
         if is_fat32 != (fat_type == FatType::Fat32) {
             error!("Invalid BPB: result of FAT32 determination from total number of clusters and sectors_per_fat_16 field differs");
             return Err(Error::CorruptedFileSystem);
@@ -337,6 +337,14 @@ impl BiosParameterBlock {
         // because it must be non-zero on FAT12/FAT16,
         // this provides a simple way to detect FAT32
         self.sectors_per_fat_16 == 0
+    }
+
+    pub(crate) fn fat_type(&self) -> FatType {
+        #[cfg(feature = "explicit-fat32")]
+        if self.is_fat32() {
+            return FatType::Fat32;
+        }
+        FatType::from_clusters(self.total_clusters())
     }
 
     pub(crate) fn sectors_per_fat(&self) -> u32 {
