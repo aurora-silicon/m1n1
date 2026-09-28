@@ -3007,13 +3007,26 @@ int kboot_prepare_dt(void *fdt)
 
 int kboot_boot(void *kernel)
 {
-    mcc_enable_cache();
+    int ret = mcc_enable_cache();
+    if (ret && chip_id == T8140) {
+        printf("kboot: refusing T8140 handoff after MCC cache failure\n");
+        return -1;
+    }
     tunables_apply_static();
     clk_init();
 
     usb_init();
-    pcie_init();
-    dapf_init_all();
+    ret = pcie_init();
+    if (ret && chip_id == T8140) {
+        printf("kboot: refusing T8140 handoff after PCIe failure\n");
+        return -1;
+    }
+    ret = dapf_init_all();
+    if (ret < 0 && chip_id == T8140) {
+        printf("kboot: refusing T8140 handoff after DAPF failure\n");
+        pcie_shutdown();
+        return -1;
+    }
 
     printf("Setting SMP mode to WFE...\n");
     smp_set_wfe_mode(true);

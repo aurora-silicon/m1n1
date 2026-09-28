@@ -154,14 +154,16 @@ void m1n1_main(void)
 #ifndef BRINGUP
     if (supports_gxf())
         gxf_init();
-    mcc_init();
+    if (mcc_init() && chip_id == T8140)
+        panic("T8140 MCC initialization failed\n");
     mmu_init();
     aic_init();
     smp_init();
 #endif
     wdt_disable();
 #ifndef BRINGUP
-    pmgr_init();
+    if (pmgr_init() && chip_id == T8140)
+        panic("T8140 PMGR initialization failed\n");
 #ifdef USE_DEBUG_USB
     tps6598x_enable_debugusb();
 #endif
