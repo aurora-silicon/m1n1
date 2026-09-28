@@ -17,6 +17,7 @@
 #include "mcc.h"
 #include "memory.h"
 #include "nvme.h"
+#include "payload.h"
 #include "pcie.h"
 #include "pmgr.h"
 #include "smp.h"
@@ -432,6 +433,11 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_KBOOT_SET_UBOOT:
             reply->retval = kboot_set_uboot((void *)request->args[0], (void *)request->args[1]);
+            break;
+        case P_KBOOT_BOOT_STORAGE:
+            if (payload_boot_storage((const char *)request->args[0]) == 0)
+                return 1;
+            reply->status = S_ERROR;
             break;
 
         case P_PMGR_POWER_ENABLE:

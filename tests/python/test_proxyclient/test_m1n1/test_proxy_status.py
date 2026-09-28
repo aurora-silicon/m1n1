@@ -8,6 +8,7 @@ from proxyclient.m1n1.proxy import M1N1Proxy, ProxyRemoteError
 
 
 def test_remote_operation_failure_is_distinct_from_unknown_opcode():
+    assert M1N1Proxy.P_KBOOT_BOOT_STORAGE == 0x705
     class Interface:
         def proxyreq(self, request, **_kwargs):
             opcode = struct.unpack_from("<Q", request)[0]
