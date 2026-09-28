@@ -21,7 +21,7 @@ struct fw_version_info system_firmware;
 
 const struct fw_version_info fw_versions[NUM_FW_VERSIONS] = {
     // clang-format off
-    [V_UNKNOWN]  = {V_UNKNOWN,  "unknown",     {0},            1, "unknown"},
+    [V_UNKNOWN]  = {V_UNKNOWN,  "unknown",     {0, 0, 0},      3, "unknown"},
     [V11_0B1]    = {V11_0B1,    "11.0 beta",   {10, 98, 1},    3, "iBoot-6603.110.6.3"},
     [V11_0B3]    = {V11_0B3,    "11.0 beta3",  {10, 98, 3},    3, "iBoot-6671.0.0.0.6"},
     [V11_0B4]    = {V11_0B4,    "11.0 beta4",  {10, 98, 4},    3, "iBoot-6723.0.0.141.6"},
@@ -235,7 +235,7 @@ void firmware_parse_version(const char *s, u32 *out)
 static void detect_firmware(struct fw_version_info *info, const char *ver)
 {
     for (size_t i = 0; i < ARRAY_SIZE(fw_versions); i++) {
-        if (!strcmp(fw_versions[i].iboot, ver)) {
+        if (fw_versions[i].iboot && !strcmp(fw_versions[i].iboot, ver)) {
             *info = fw_versions[i];
             return;
         }
