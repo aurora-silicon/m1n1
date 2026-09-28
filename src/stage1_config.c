@@ -1,10 +1,15 @@
 /* SPDX-License-Identifier: MIT */
 
+#include "../build/build_cfg.h"
+
 #include "stage1_config.h"
+#include "assert.h"
 #include "string.h"
 #include "utils.h"
 
 #include "tinf/tinf.h"
+
+#ifdef CHAINLOADING
 
 struct stage1_config_block {
     char magic[16];
@@ -14,6 +19,7 @@ struct stage1_config_block {
     char stage2_path[192];
     u32 crc32;
 };
+static_assert(sizeof(struct stage1_config_block) == 260, "Stage 1 config block layout changed");
 
 static struct stage1_config_block config __attribute__((section(".data.stage1_config"), used)) = {
     .magic = "AURORA-S1-CFG01",
@@ -104,3 +110,22 @@ const char *stage1_config_target(void)
     snprintf(target, sizeof(target), "%s;%s", config.esp_uuid, config.stage2_path);
     return target;
 }
+
+#else
+
+u32 stage1_config_window_ms(void)
+{
+    return 0;
+}
+
+const char *stage1_config_esp_uuid(void)
+{
+    return NULL;
+}
+
+const char *stage1_config_target(void)
+{
+    return NULL;
+}
+
+#endif
