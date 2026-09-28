@@ -308,30 +308,54 @@ bool nvme_init(void)
         return true;
     }
 
+    nvme_base = 0;
+    nvmmu_base = 0;
+    nvme_die = 0;
+    nvme_asc = NULL;
+    nvme_rtkit = NULL;
+    nvme_sart = NULL;
+    memset(&adminq, 0, sizeof(adminq));
+    memset(&ioq, 0, sizeof(ioq));
+
     int adt_path[8];
     int node = adt_path_offset_trace(adt, "/arm-io/ans", adt_path);
     if (node < 0) {
         printf("nvme: Error getting NVMe node /arm-io/ans\n");
-        return NULL;
+        goto out_reset;
     }
 
-    if (adt_get_property(adt, node, "nvme-secure-bar"))
+    u32 secure_len;
+    const void *secure_bar = adt_getprop(adt, node, "nvme-secure-bar", &secure_len);
+    if (secure_bar) {
+        if (secure_len || !adt_is_compatible(adt, node, "iop,ascwrap-v6")) {
+            printf("nvme: invalid split secure BAR descriptor\n");
+            goto out_reset;
+        }
         // M4+ generations have the nvme-secure-bar property and 10+ regs.
         // They use reg[3] for NVMMU registers and reg[9] for NVMe registers,
         // and require extra writes to set up the IO queues.
         nvme_type = NVME_T8132;
-    else
+    } else {
         // M1-M3 generations use reg[3] for both NVMMU and NVMe registers.
         nvme_type = NVME_T8103;
+    }
 
-    if (adt_get_reg(adt, adt_path, "reg", 3, &nvmmu_base, NULL) < 0) {
+    u64 nvmmu_size, nvme_size;
+    if (adt_get_reg(adt, adt_path, "reg", 3, &nvmmu_base, &nvmmu_size) < 0 || !nvmmu_base) {
         printf("nvme: Error getting NVMMU base address.\n");
-        return NULL;
+        goto out_reset;
     }
     if (nvme_type == NVME_T8132) {
-        if (adt_get_reg(adt, adt_path, "reg", 9, &nvme_base, NULL) < 0) {
+        if (adt_get_reg(adt, adt_path, "reg", 9, &nvme_base, &nvme_size) < 0 || !nvme_base) {
             printf("nvme: Error getting NVMe base address.\n");
-            return NULL;
+            goto out_reset;
+        }
+        if (nvmmu_size < NVMMU_TCB_STAT + sizeof(u32) ||
+            nvme_size < NVME_BOOT_STATUS + sizeof(u32) || nvmmu_base > UINT64_MAX - nvmmu_size ||
+            nvme_base > UINT64_MAX - nvme_size ||
+            (nvmmu_base < nvme_base + nvme_size && nvme_base < nvmmu_base + nvmmu_size)) {
+            printf("nvme: invalid split BAR geometry\n");
+            goto out_reset;
         }
     } else {
         nvme_base = nvmmu_base;
@@ -348,7 +372,7 @@ bool nvme_init(void)
 
     if (!alloc_queue(&adminq)) {
         printf("nvme: Error allocating admin queue\n");
-        return NULL;
+        goto out_reset;
     }
     if (!alloc_queue(&ioq)) {
         printf("nvme: Error allocating admin queue\n");
@@ -462,6 +486,15 @@ out_ioq:
     free_queue(&ioq);
 out_adminq:
     free_queue(&adminq);
+out_reset:
+    memset(&adminq, 0, sizeof(adminq));
+    memset(&ioq, 0, sizeof(ioq));
+    nvme_asc = NULL;
+    nvme_rtkit = NULL;
+    nvme_sart = NULL;
+    nvme_base = 0;
+    nvmmu_base = 0;
+    nvme_die = 0;
     return false;
 }
 
