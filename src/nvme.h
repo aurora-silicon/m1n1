@@ -12,5 +12,6 @@ bool nvme_has_live_post_m4_session(void);
 
 bool nvme_flush(u32 nsid);
 bool nvme_read(u32 nsid, u64 lba, void *buffer);
+bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count);
 
 #endif

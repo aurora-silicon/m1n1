@@ -140,6 +140,11 @@ static u64 nvme_base;
 static u64 nvmmu_base;
 
 static struct nvme_queue adminq, ioq;
+static bool nvme_cmd_timed_out;
+static bool nvme_multi_enabled = true;
+static bool nvme_multi_verified;
+static u64 *nvme_prp_list;
+static u8 *nvme_verify_bounce;
 
 static bool alloc_queue(struct nvme_queue *q)
 {
@@ -223,11 +228,13 @@ static bool nvme_ctrl_shutdown(void)
 static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u64 *result)
 {
     bool found = false;
+    bool completed = false;
     u64 timeout;
     u8 tag = 0;
     struct nvme_command *queue_cmd = &q->cmds[tag];
     struct apple_nvmmu_tcb *tcb = &q->tcbs[tag];
 
+    nvme_cmd_timed_out = false;
     memcpy(queue_cmd, cmd, sizeof(*cmd));
     queue_cmd->tag = tag;
 
@@ -264,6 +271,7 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
         memcpy(&cqe, &q->cqes[q->cq_head], sizeof(cqe));
         if ((cqe.status & 1) != q->cq_phase)
             continue;
+        completed = true;
 
         if (cqe.tag == tag) {
             found = true;
@@ -292,6 +300,7 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
     }
 
     if (!found) {
+        nvme_cmd_timed_out = !completed;
         printf("nvme: could not find command completion in CQ\n");
         return false;
     }
@@ -320,6 +329,10 @@ bool nvme_init(void)
     nvme_sart = NULL;
     memset(&adminq, 0, sizeof(adminq));
     memset(&ioq, 0, sizeof(ioq));
+    nvme_multi_enabled = true;
+    nvme_multi_verified = false;
+    nvme_prp_list = NULL;
+    nvme_verify_bounce = NULL;
 
     bool adopting = false;
     int adt_path[8];
@@ -655,25 +668,79 @@ bool nvme_flush(u32 nsid)
     return nvme_exec_command(&ioq, &cmd, NULL);
 }
 
-bool nvme_read(u32 nsid, u64 lba, void *buffer)
+static bool nvme_submit_read(u32 nsid, u64 lba, void *buffer, u32 count, u64 prp2)
 {
     struct nvme_command cmd;
-    u64 buffer_addr = (u64)buffer;
-
-    if (!nvme_initialized)
-        return false;
-
-    /* no need for 16K alignment here since the NVME page size is 4k */
-    if (buffer_addr & (SZ_4K - 1))
-        return false;
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.opcode = NVME_CMD_READ;
     cmd.nsid = nsid;
-    cmd.prp1 = (u64)buffer_addr;
+    cmd.prp1 = (u64)buffer;
+    cmd.prp2 = prp2;
     cmd.cdw10 = lba;
     cmd.cdw11 = lba >> 32;
-    cmd.cdw12 = 0; // #blocks, 0-based -> 1 block a 4096 bytes
+    cmd.cdw12 = count - 1;
 
     return nvme_exec_command(&ioq, &cmd, NULL);
+}
+
+bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
+{
+    if (!nvme_initialized || !count || count > 256 || ((u64)buffer & (SZ_4K - 1)) ||
+        lba > UINT64_MAX - (count - 1))
+        return false;
+
+    if (count > 1 && nvme_multi_enabled) {
+        if (!nvme_verify_bounce)
+            nvme_verify_bounce = memalign(SZ_16K, SZ_4K);
+        if (count > 2 && !nvme_prp_list)
+            nvme_prp_list = memalign(SZ_16K, SZ_4K);
+        if (nvme_verify_bounce && (count <= 2 || nvme_prp_list)) {
+            u64 prp2 = (u64)buffer + SZ_4K;
+            if (count > 2) {
+                for (u32 i = 1; i < count; i++)
+                    nvme_prp_list[i - 1] = (u64)buffer + (u64)i * SZ_4K;
+                prp2 = (u64)nvme_prp_list;
+            }
+            if (!nvme_multi_verified)
+                memset(buffer, 0xa5, (size_t)count * SZ_4K);
+            if (nvme_submit_read(nsid, lba, buffer, count, prp2)) {
+                if (nvme_multi_verified)
+                    return true;
+
+                u8 *bytes = buffer;
+                bool verified = true;
+                for (u32 i = 0; i < 2; i++) {
+                    u32 block = i ? count - 1 : 0;
+                    memset(nvme_verify_bounce, 0x5a, SZ_4K);
+                    if (!nvme_submit_read(nsid, lba + block, nvme_verify_bounce, 1, 0) ||
+                        memcmp(nvme_verify_bounce, bytes + (size_t)block * SZ_4K, SZ_4K)) {
+                        verified = false;
+                        break;
+                    }
+                }
+                if (verified) {
+                    nvme_multi_verified = true;
+                    printf("nvme: %u-block reads verified\n", count);
+                    return true;
+                }
+            }
+            if (nvme_cmd_timed_out)
+                return false;
+            printf("nvme: multi-block read failed verification; using single blocks\n");
+            nvme_multi_enabled = false;
+        }
+    }
+
+    u8 *bytes = buffer;
+    for (u32 i = 0; i < count; i++) {
+        if (!nvme_submit_read(nsid, lba + i, bytes + (size_t)i * SZ_4K, 1, 0))
+            return false;
+    }
+    return true;
+}
+
+bool nvme_read(u32 nsid, u64 lba, void *buffer)
+{
+    return nvme_read_blocks(nsid, lba, buffer, 1);
 }
