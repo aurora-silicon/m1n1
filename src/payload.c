@@ -6,6 +6,7 @@
 #include "payload.h"
 #include "adt.h"
 #include "assert.h"
+#include "boot_storage.h"
 #include "chainload.h"
 #include "cpufreq.h"
 #include "display.h"
@@ -44,6 +45,8 @@ static char expect_compatible[256];
 static struct kernel_header *kernel = NULL;
 static void *fdt = NULL;
 static char *chainload_spec = NULL;
+static char *boot_spec = NULL;
+static bool payload_scanned = false;
 
 static void *load_one_payload(void *start, size_t size);
 
@@ -201,6 +204,9 @@ static bool check_var(u8 **p)
             chosen[chosen_cnt++] = (char *)*p;
     } else if (IS_VAR("chainload=")) {
         chainload_spec = val;
+    } else if (IS_VAR("boot=")) {
+        if (!boot_spec)
+            boot_spec = val;
     } else if (IS_VAR("nvme.adopt=")) {
         if (!strcmp(val, "live-rtkit-v1"))
             nvme_adopt_live_session = true;
@@ -309,20 +315,27 @@ int payload_run(void)
         return -1;
     }
 
-    void *p = _payload_start;
+    if (!payload_scanned) {
+        void *p = _payload_start;
+        while (p)
+            p = load_one_payload(p, 0);
+        payload_scanned = true;
+    }
 
-    while (p)
-        p = load_one_payload(p, 0);
-
-    if (chainload_spec) {
+    if (chainload_spec && !boot_spec) {
         return chainload_load(chainload_spec, chosen, &chosen_cnt, ARRAY_SIZE(chosen));
+    }
+
+    if (boot_spec && boot_storage_load(boot_spec, &kernel, &fdt)) {
+        next_stage.entry = NULL;
+        return -1;
     }
 
     if (kernel && fdt) {
         cpufreq_init();
         if (smp_start_secondaries() && chip_id == T8140) {
             printf("SMP: refusing payload handoff with missing T8140 CPUs\n");
-            return -1;
+            goto boot_failed;
         }
         mitigations_perform();
         if (enable_tso) {
@@ -352,10 +365,20 @@ int payload_run(void)
 
         if (kboot_prepare_dt(fdt)) {
             printf("Failed to prepare FDT!\n");
-            return -1;
+            goto boot_failed;
         }
 
-        return kboot_boot(kernel);
+        if (kboot_boot(kernel))
+            goto boot_failed;
+        return 0;
+
+    boot_failed:
+        if (boot_spec) {
+            next_stage.entry = NULL;
+            kboot_set_initrd(NULL, 0);
+            nvme_shutdown();
+        }
+        return -1;
     } else if (kernel && !fdt) {
         printf("ERROR: Kernel found but no devicetree for %s available.\n", expect_compatible);
     } else if (!kernel && fdt) {
@@ -363,4 +386,12 @@ int payload_run(void)
     }
 
     return -1;
+}
+
+int payload_boot_storage(const char *spec)
+{
+    if (!spec)
+        return -1;
+    boot_spec = (char *)spec;
+    return payload_run();
 }
