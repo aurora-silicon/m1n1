@@ -84,6 +84,8 @@ void run_actions(void)
             printf("Stage 1: host request received\n");
             fb_set_active(true);
             uartproxy_run_presynced(IODEV_DOCKCHANNEL_UART);
+            while (!next_stage.entry)
+                uartproxy_run(NULL);
             return;
         }
         printf("Stage 1: no host during proxy window\n");
