@@ -7,6 +7,7 @@
  * - https://www.beyondlogic.org/usbnutshell/usb1.shtml
  */
 
+#include "../build/build_cfg.h"
 #include "../build/build_tag.h"
 
 #include "usb_dwc3.h"
@@ -17,6 +18,7 @@
 #include "ringbuffer.h"
 #include "string.h"
 #include "types.h"
+#include "usb_cdc_ss_desc.h"
 #include "usb_dwc3_regs.h"
 #include "usb_types.h"
 #include "utils.h"
@@ -31,7 +33,15 @@
 #define STRING_DESCRIPTOR_PRODUCT      2
 #define STRING_DESCRIPTOR_SERIAL       3
 
-#define DWC3_EP0_MAX_DESC_LEN 62
+#ifdef J700_CDC_PROXY
+#define DWC3_EP0_MAX_DESC_LEN   510
+#define CDC_BULK_PACKET_SIZE    1024
+#define CDC_CONTROL_PACKET_SIZE 512
+#else
+#define DWC3_EP0_MAX_DESC_LEN   62
+#define CDC_BULK_PACKET_SIZE    512
+#define CDC_CONTROL_PACKET_SIZE 64
+#endif
 
 #define CDC_DEVICE_CLASS 0x02
 
@@ -180,6 +190,12 @@ static const struct usb_device_descriptor usb_cdc_device_descriptor = {
     .iSerialNumber = STRING_DESCRIPTOR_SERIAL,
     .bNumConfigurations = 1,
 };
+
+#ifdef J700_CDC_PROXY
+static struct usb_device_descriptor usb_cdc_ss_device_descriptor;
+static u8 usb_cdc_ss_configuration[sizeof(struct cdc_dev_desc) + CDC_SS_COMPANION_BYTES];
+static size_t usb_cdc_ss_configuration_len;
+#endif
 
 static const struct cdc_dev_desc cdc_configuration_descriptor = {
     .configuration =
@@ -503,7 +519,7 @@ static int usb_dwc3_ep0_start_data_send_phase(dwc3_dev_t *dev)
         return -1;
     }
 
-    memset(dev->endpoints[USB_LEP_CTRL_IN].xfer_buffer, 0, 64);
+    memset(dev->endpoints[USB_LEP_CTRL_IN].xfer_buffer, 0, CDC_CONTROL_PACKET_SIZE);
     memcpy(dev->endpoints[USB_LEP_CTRL_IN].xfer_buffer, dev->ep0_buffer, dev->ep0_buffer_len);
 
     return usb_dwc3_run_data_trb(dev, USB_LEP_CTRL_IN, dev->ep0_buffer_len);
@@ -517,9 +533,9 @@ static int usb_dwc3_ep0_start_data_recv_phase(dwc3_dev_t *dev)
         return -1;
     }
 
-    memset(dev->endpoints[USB_LEP_CTRL_OUT].xfer_buffer, 0, 64);
+    memset(dev->endpoints[USB_LEP_CTRL_OUT].xfer_buffer, 0, CDC_CONTROL_PACKET_SIZE);
 
-    return usb_dwc3_run_data_trb(dev, USB_LEP_CTRL_OUT, 64);
+    return usb_dwc3_run_data_trb(dev, USB_LEP_CTRL_OUT, CDC_CONTROL_PACKET_SIZE);
 }
 
 static void usb_dwc3_ep_set_stall(dwc3_dev_t *dev, u8 ep, u8 stall)
@@ -534,6 +550,11 @@ static void usb_build_serial(void)
 {
     if (str_serial)
         return;
+
+#ifdef J700_CDC_PROXY
+    str_serial = &str_serial_dummy;
+    return;
+#endif
 
     const char *serial = adt_getprop(adt, 0, "serial-number", NULL);
     if (!serial || !serial[0]) {
@@ -593,13 +614,29 @@ usb_dwc3_handle_ep0_get_descriptor(dwc3_dev_t *dev,
 
     switch (get_descriptor->type) {
         case USB_DEVICE_DESCRIPTOR:
+#ifdef J700_CDC_PROXY
+            descriptor = &usb_cdc_ss_device_descriptor;
+            descriptor_len = usb_cdc_ss_device_descriptor.bLength;
+#else
             descriptor = &usb_cdc_device_descriptor;
             descriptor_len = usb_cdc_device_descriptor.bLength;
+#endif
             break;
         case USB_CONFIGURATION_DESCRIPTOR:
+#ifdef J700_CDC_PROXY
+            descriptor = usb_cdc_ss_configuration;
+            descriptor_len = usb_cdc_ss_configuration_len;
+#else
             descriptor = &cdc_configuration_descriptor;
             descriptor_len = cdc_configuration_descriptor.configuration.wTotalLength;
+#endif
             break;
+#ifdef J700_CDC_PROXY
+        case 0x0f:
+            descriptor = usb_cdc_ss_bos(NULL);
+            descriptor_len = CDC_SS_BOS_BYTES;
+            break;
+#endif
         case USB_STRING_DESCRIPTOR:
             usb_cdc_get_string_descriptor(get_descriptor->index, &descriptor, &descriptor_len);
             break;
@@ -954,7 +991,7 @@ static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
 
     usb_dwc3_ep_start_transfer(dev, endpoint_number, trb_iova);
     dev->endpoints[endpoint_number].xfer_in_progress = true;
-    dev->endpoints[endpoint_number].zlp_pending = (len % 512) == 0;
+    dev->endpoints[endpoint_number].zlp_pending = (len % CDC_BULK_PACKET_SIZE) == 0;
 }
 
 static void usb_dwc3_cdc_handle_bulk_out_xfer_done(dwc3_dev_t *dev,
@@ -1039,7 +1076,11 @@ static void usb_dwc3_handle_event_connect_done(dwc3_dev_t *dev)
 {
     u32 speed = read32(dev->regs + DWC3_DSTS) & DWC3_DSTS_CONNECTSPD;
 
+#ifdef J700_CDC_PROXY
+    if (speed != DWC3_DSTS_SUPERSPEED) {
+#else
     if (speed != DWC3_DSTS_HIGHSPEED) {
+#endif
         usb_debug_printf(
             "WARNING: we only support high speed right now but %02x was requested in DSTS\n",
             speed);
@@ -1099,6 +1140,16 @@ void usb_dwc3_handle_events(dwc3_dev_t *dev)
 
 dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
 {
+#ifdef J700_CDC_PROXY
+    usb_cdc_ss_device_descriptor = usb_cdc_device_descriptor;
+    usb_cdc_ss_device_descriptor.bcdUSB = 0x0310;
+    usb_cdc_ss_device_descriptor.bMaxPacketSize0 = 9;
+    usb_cdc_ss_configuration_len = usb_cdc_ss_config(
+        (const u8 *)&cdc_configuration_descriptor, sizeof(cdc_configuration_descriptor),
+        usb_cdc_ss_configuration, sizeof(usb_cdc_ss_configuration));
+    if (!usb_cdc_ss_configuration_len)
+        return NULL;
+#endif
     /* sanity check */
     u32 snpsid = read32(regs + DWC3_GSNPSID);
     if ((snpsid & DWC3_GSNPSID_MASK) != 0x33310000) {
@@ -1179,6 +1230,11 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
     clear32(dev->regs + DWC3_GCTL, DWC3_GCTL_CORESOFTRESET);
     mdelay(100);
 
+#ifdef J700_CDC_PROXY
+    clear32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_SUSPHY);
+    clear32(dev->regs + DWC3_GUSB3PIPECTL(0), DWC3_GUSB3PIPECTL_SUSPHY);
+#endif
+
     /* disable unused features */
     clear32(dev->regs + DWC3_GCTL, DWC3_GCTL_SCALEDOWN_MASK | DWC3_GCTL_DISSCRAMBLE);
 
@@ -1186,8 +1242,12 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
     mask32(dev->regs + DWC3_GCTL, DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_OTG),
            DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_DEVICE));
 
-    /* stick to USB 2.0 high speed for now */
+    /* Advertise only the speed selected by this build. */
+#ifdef J700_CDC_PROXY
+    mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_SPEED_MASK, DWC3_DCFG_SUPERSPEED);
+#else
     mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_SPEED_MASK, DWC3_DCFG_HIGHSPEED);
+#endif
 
     /* setup scratchpad at SCRATCHPAD_IOVA */
     if (usb_dwc3_command(dev, DWC3_DGCMD_SET_SCRATCHPAD_ADDR_LO, SCRATCHPAD_IOVA)) {
@@ -1215,9 +1275,11 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
     }
 
     /* prepare control endpoint 0 IN and OUT */
-    if (usb_dwc3_ep_configure(dev, USB_LEP_CTRL_OUT, DWC3_DEPCMD_TYPE_CONTROL, 64))
+    if (usb_dwc3_ep_configure(dev, USB_LEP_CTRL_OUT, DWC3_DEPCMD_TYPE_CONTROL,
+                              CDC_CONTROL_PACKET_SIZE))
         goto error;
-    if (usb_dwc3_ep_configure(dev, USB_LEP_CTRL_IN, DWC3_DEPCMD_TYPE_CONTROL, 64))
+    if (usb_dwc3_ep_configure(dev, USB_LEP_CTRL_IN, DWC3_DEPCMD_TYPE_CONTROL,
+                              CDC_CONTROL_PACKET_SIZE))
         goto error;
 
     /* prepare CDC ACM interfaces */
@@ -1243,9 +1305,11 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
             goto error;
 
         /* prepare BULK endpoints so that we don't have to reconfigure this device later */
-        if (usb_dwc3_ep_configure(dev, dev->pipe[i].ep_in, DWC3_DEPCMD_TYPE_BULK, 512))
+        if (usb_dwc3_ep_configure(dev, dev->pipe[i].ep_in, DWC3_DEPCMD_TYPE_BULK,
+                                  CDC_BULK_PACKET_SIZE))
             goto error;
-        if (usb_dwc3_ep_configure(dev, dev->pipe[i].ep_out, DWC3_DEPCMD_TYPE_BULK, 512))
+        if (usb_dwc3_ep_configure(dev, dev->pipe[i].ep_out, DWC3_DEPCMD_TYPE_BULK,
+                                  CDC_BULK_PACKET_SIZE))
             goto error;
     }
 
