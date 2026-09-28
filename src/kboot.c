@@ -2806,7 +2806,28 @@ int kboot_prepare_dt(void *fdt)
     if (fdt_add_mem_rsv(dt, (u64)_base, ((u64)_end) - ((u64)_base)))
         bail("FDT: couldn't add reservation for m1n1\n");
 
-    if (!cpu_features->apple_sysregs_unlocked) {
+    if (chip_id == T8140) {
+        u64 ro_start, ro_end;
+        if (memory_fw_ro_range(&ro_start, &ro_end) != 1)
+            bail("FDT: invalid T8140 firmware RO range\n");
+        if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
+            bail("FDT: couldn't reserve T8140 firmware RO range\n");
+
+        int resv = fdt_path_offset(dt, "/reserved-memory");
+        if (resv < 0)
+            bail("FDT: missing /reserved-memory for firmware RO range\n");
+        char name[48];
+        snprintf(name, sizeof(name), "m1n1-secondary-ro@%lx", ro_start);
+        int node = fdt_subnode_offset(dt, resv, name);
+        if (node < 0)
+            node = fdt_add_subnode(dt, resv, name);
+        if (node < 0)
+            bail("FDT: couldn't create firmware RO node\n");
+        fdt64_t reg[] = {cpu_to_fdt64(ro_start), cpu_to_fdt64(ro_end - ro_start)};
+        if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) || fdt_setprop_empty(dt, node, "no-map"))
+            bail("FDT: couldn't describe firmware RO node\n");
+        printf("FDT: reserved firmware RO [0x%lx, 0x%lx)\n", ro_start, ro_end);
+    } else if (!cpu_features->apple_sysregs_unlocked) {
         // On M4* / A18 Pro / M5*, there is a CTRR instance left enabled only
         // on the secondary (non-boot) cores. Add a reserved-memory region to
         // prevent Linux from crashing when allocating this memory and writing
