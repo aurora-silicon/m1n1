@@ -93,6 +93,13 @@ CFG += CHAINLOADING
 CARGO_FLAGS += --features chainload
 endif
 
+ifeq ($(J700_ESP_STAGE2),1)
+ifneq ($(CHAINLOADING),1)
+$(error J700_ESP_STAGE2 requires CHAINLOADING=1 for boot=)
+endif
+CFG += J700_ESP_STAGE2
+endif
+
 ifeq ($(J700_CDC_PROXY),1)
 ifneq ($(CHAINLOADING),1)
 $(error J700_CDC_PROXY requires CHAINLOADING=1)

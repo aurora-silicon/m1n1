@@ -47,6 +47,12 @@ block is ignored by m1n1, which falls back to the proxy.
 
 ## Compose the ESP Stage 2
 
+For an ESP Stage 2 accepted by `esp-install-candidate.sh`, build a separate
+flavour with `RELEASE=1 CHAINLOADING=1 J700_ESP_STAGE2=1 BUILTIN_LOGO=aurora`.
+`CHAINLOADING=1` supplies the `boot=` storage loader; `J700_ESP_STAGE2=1`
+omits the Stage 1 config and ESP chainload marker. Keep the KIS Stage 2 above
+for tethered tests and the release package.
+
 `aurora/stage2.bin` on the ESP is the complete m1n1 Stage 2 image followed by
 newline-terminated variables. For the three-file Linux route, append the
 following lines to a copy of `m1n1-stage2.bin`:

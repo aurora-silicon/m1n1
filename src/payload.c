@@ -48,8 +48,10 @@ static void *fdt = NULL;
 static char *chainload_spec = NULL;
 static char *boot_spec = NULL;
 static bool payload_scanned = false;
+#ifndef J700_ESP_STAGE2
 static bool stage1_config_applied = false;
 static char stage1_esp_chosen[96];
+#endif
 
 static void *load_one_payload(void *start, size_t size);
 
@@ -326,6 +328,7 @@ int payload_run(void)
         payload_scanned = true;
     }
 
+#ifndef J700_ESP_STAGE2
     if (!stage1_config_applied && chip_id == T8140) {
         const char *target = stage1_config_target();
         if (target) {
@@ -342,6 +345,7 @@ int payload_run(void)
         }
         stage1_config_applied = true;
     }
+#endif
 
     if (chainload_spec && boot_spec) {
         printf("Payload: cannot combine boot= and chainload=\n");
