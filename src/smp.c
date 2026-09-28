@@ -11,6 +11,7 @@
 #include "string.h"
 #include "types.h"
 #include "utils.h"
+#include "xnuboot.h"
 
 #define CPU_START_OFF_S5L8960X 0x30000
 #define CPU_START_OFF_S8000    0xd4000
@@ -78,6 +79,84 @@ extern u8 _vectors_start[0];
 extern u8 _stack_bot[0];
 int boot_cpu_idx SMP_SHARED = -1;
 u64 boot_cpu_mpidr SMP_SHARED = 0;
+static u64 installed_relay SMP_SHARED;
+
+static bool smp_old_vector_owned(u64 locked)
+{
+    u64 ro_start, ro_end;
+    u64 inherited_top = cur_boot_args.top_of_kernel_data;
+    u64 image_start = (u64)_base;
+    u64 image_end = (u64)_end;
+
+    if (memory_fw_ro_range(&ro_start, &ro_end) != 1 || !cur_boot_args.mem_size ||
+        cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size ||
+        locked < cur_boot_args.phys_base ||
+        locked >= cur_boot_args.phys_base + cur_boot_args.mem_size || locked >= ro_start ||
+        locked >= inherited_top || (locked >= image_start && locked < image_end))
+        return false;
+
+    /* A retired m1n1 image has the same four vector slot tags and bare tail. */
+    u64 limit = min(ro_start, inherited_top);
+    limit = min(limit, locked + min((u64)16 * SZ_1M, UINT64_MAX - locked));
+    if (image_start > locked)
+        limit = min(limit, image_start);
+    if (limit - locked < 0x200 + sizeof("STACKBOT") - 1)
+        return false;
+    for (u64 off = 0; off <= 0x180; off += 0x80) {
+        if (read32(locked + off) != read32((u64)_vectors_start + off))
+            return false;
+    }
+    for (u64 p = locked + 0x200; p <= limit - (sizeof("STACKBOT") - 1); p += 8) {
+        if (!memcmp((const void *)p, "STACKBOT", sizeof("STACKBOT") - 1))
+            return true;
+    }
+    return false;
+}
+
+static int smp_prepare_rvbar(const struct cpu_info *cpu)
+{
+    u64 rvbar = read64(cpu->impl_reg);
+    u64 locked = rvbar & RVBAR_ADDR;
+    u64 target = (u64)_vectors_start;
+
+    if (locked == target || (!(rvbar & RVBAR_LOCK) && cpu_features->apple_sysregs_unlocked))
+        return 0;
+    if (chip_id != T8140 || !(rvbar & RVBAR_LOCK)) {
+        printf("SMP: RVBAR 0x%lx differs from vector 0x%lx; refusing start\n", locked, target);
+        return -1;
+    }
+
+    int64_t distance = (int64_t)target - (int64_t)locked;
+    if ((distance & 3) || distance < -0x8000000 || distance > 0x7fffffc)
+        return -1;
+
+    u32 branch = 0x14000000 | ((distance / 4) & 0x03ffffff);
+    if (installed_relay == locked)
+        return read32(locked) == branch ? 0 : -1;
+    if (!smp_old_vector_owned(locked)) {
+        printf("SMP: RVBAR 0x%lx is not a verified retired image vector\n", locked);
+        return -1;
+    }
+    u64 page = ALIGN_DOWN(locked, get_page_size());
+    if (mmu_active())
+        mmu_add_mapping(page, page, get_page_size(), MAIR_IDX_NORMAL, PERM_RW);
+    write32(locked, branch);
+    dc_cvac_range((void *)locked, sizeof(branch));
+    sysop("dsb sy");
+    ic_ivau_range((void *)locked, sizeof(branch));
+    sysop("dsb sy");
+    sysop("isb");
+    if (mmu_active())
+        mmu_add_mapping(page, page, get_page_size(), MAIR_IDX_NORMAL, PERM_RX);
+
+    if (read32(locked) != branch) {
+        printf("SMP: RVBAR relay read-back failed at 0x%lx\n", locked);
+        return -1;
+    }
+    installed_relay = locked;
+    printf("SMP: installed RVBAR relay at 0x%lx -> 0x%lx (0x%x)\n", locked, target, branch);
+    return 0;
+}
 
 void smp_secondary_entry(void)
 {
@@ -162,11 +241,8 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
     if (spin_table[index].flag)
         return;
 
-    if (!cpu_features->apple_sysregs_unlocked &&
-        (read64(cpu->impl_reg) & RVBAR_ADDR) != (u64)_vectors_start) {
-        printf("Failed! \n    RVBAR (=0x%lx) is locked and differs from entry point (=0x%lx)\n",
-               read64(cpu->impl_reg) & RVBAR_ADDR, (u64)_vectors_start);
-    }
+    if (smp_prepare_rvbar(cpu))
+        return;
 
     printf("Starting CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
 
@@ -440,6 +516,10 @@ void smp_start_secondaries(void)
             continue;
 
         if (i == boot_cpu_idx) {
+            if (smp_prepare_rvbar(cpu)) {
+                printf("SMP: boot CPU RVBAR check failed\n");
+                return;
+            }
             // Check if already locked
             if (FIELD_GET(RVBAR_LOCK, read64(cpu->impl_reg)))
                 continue;
