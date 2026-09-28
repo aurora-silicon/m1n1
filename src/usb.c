@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "../build/build_cfg.h"
-
 #include "usb.h"
 #include "adt.h"
 #include "dart.h"
@@ -94,6 +93,12 @@ static dart_dev_t *usb_dart_init(u32 idx)
 
     snprintf(path, sizeof(path), FMT_DART_MAPPER_PATH, idx, idx);
     mapper_offset = adt_path_offset(adt, path);
+#ifdef J700_CDC_PROXY
+    if (mapper_offset < 0 && chip_id == T8140 && idx == 0) {
+        snprintf(path, sizeof(path), "/arm-io/dart-usb/mapper-usb");
+        mapper_offset = adt_path_offset(adt, path);
+    }
+#endif
     if (mapper_offset < 0) {
         // Device not present
         return NULL;
@@ -106,6 +111,10 @@ static dart_dev_t *usb_dart_init(u32 idx)
     }
 
     snprintf(path, sizeof(path), FMT_DART_PATH, idx);
+#ifdef J700_CDC_PROXY
+    if (chip_id == T8140 && idx == 0 && adt_path_offset(adt, path) < 0)
+        snprintf(path, sizeof(path), "/arm-io/dart-usb");
+#endif
     return dart_init_adt(path, 1, dart_idx, false);
 }
 
@@ -120,6 +129,12 @@ static int usb_drd_get_regs(u32 idx, struct usb_drd_regs *regs)
 
     snprintf(drd_path, sizeof(drd_path), FMT_DRD_PATH, idx);
     adt_drd_offset = adt_path_offset_trace(adt, drd_path, adt_drd_path);
+#ifdef J700_CDC_PROXY
+    if (adt_drd_offset < 0 && chip_id == T8140 && idx == 0) {
+        snprintf(drd_path, sizeof(drd_path), "/arm-io/usb-drd");
+        adt_drd_offset = adt_path_offset_trace(adt, drd_path, adt_drd_path);
+    }
+#endif
     if (adt_drd_offset < 0) {
         // Nonexistent device
         return -1;
@@ -304,6 +319,10 @@ void usb_init(void)
     if (usb_is_initialized)
         return;
 
+    /* J700's inherited DebugUSB carrier must survive normal boot and kboot. */
+    if (chip_id == T8140)
+        return;
+
     /*
      * A7-A11 uses a custom internal otg controller with the peripheral part
      * being dwc2.
@@ -362,6 +381,9 @@ void usb_hpm_restore_irqs(bool force)
 
 void usb_iodev_init(void)
 {
+    if (chip_id == T8140)
+        return;
+
     for (int i = FIRST_USB_IODEV; i < USB_IODEV_COUNT; i++) {
         dwc3_dev_t *opaque;
         struct iodev *usb_iodev;

@@ -31,7 +31,7 @@
 
 #ifdef RELEASE
 # define FB_SILENT_MODE
-#if defined(CHAINLOADING) && !defined(T8140_KIS_PROXY) && !defined(T8140_CDC_PROXY)
+#if defined(CHAINLOADING) && !defined(J700_CDC_PROXY) && !defined(T8140_KIS_PROXY)
 #  define EARLY_PROXY_TIMEOUT 5
 # endif
 #endif
