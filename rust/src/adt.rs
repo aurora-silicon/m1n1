@@ -561,7 +561,9 @@ impl ADTProperty {
             let sp: *const [u8] = core::slice::from_raw_parts(
                 ptr,
                 // Size of name, size of size, size of value
-                size_of::<[char; 32]>() + size_of::<u32>() + *(ptr.add(32)) as usize,
+                size_of::<[c_char; 32]>()
+                    + size_of::<u32>()
+                    + core::ptr::read_unaligned(ptr.add(32) as *const u32) as usize,
             );
 
             sp as *mut ADTProperty
