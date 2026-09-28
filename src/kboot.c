@@ -1410,6 +1410,33 @@ static int dt_set_pcie_tunables(void)
     return 0;
 }
 
+static int dt_disable_t8140_pcie(void)
+{
+    int nodes[64];
+    int count = 0;
+    int node = -1;
+
+    while ((node = fdt_node_offset_by_prop_value(dt, node, "device_type", "pci", sizeof("pci"))) >=
+           0) {
+        if (count >= (int)ARRAY_SIZE(nodes)) {
+            printf("FDT: too many PCIe controller or port nodes\n");
+            return -1;
+        }
+        nodes[count++] = node;
+    }
+    if (node != -FDT_ERR_NOTFOUND)
+        return -1;
+
+    /* Work backwards so inserting a property cannot move an earlier offset. */
+    for (int i = count - 1; i >= 0; i--) {
+        if (fdt_setprop_string(dt, nodes[i], "status", "disabled") < 0)
+            return -1;
+    }
+
+    printf("FDT: T8140 APCIe skipped; disabled %d PCIe controller/port nodes\n", count);
+    return 0;
+}
+
 static int dt_get_iommu_node(int node, u32 num)
 {
     int len;
@@ -2993,6 +3020,9 @@ int kboot_prepare_dt(void *fdt)
      * for the usable memory span to make it into the devicetree.
      */
     if (dt_set_memory())
+        return -1;
+
+    if (chip_id == T8140 && dt_disable_t8140_pcie())
         return -1;
 
     if (fdt_pack(dt))
