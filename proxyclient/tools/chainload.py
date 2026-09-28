@@ -12,9 +12,16 @@ parser.add_argument('-c', '--call', action="store_true", help="Use call mode")
 parser.add_argument('-r', '--raw', action="store_true", help="Image is raw")
 parser.add_argument('-E', '--entry-point', action="store", type=int, help="Entry point for the raw image", default=0x800)
 parser.add_argument('-x', '--xnu', action="store_true", help="Set up for chainloading XNU")
+parser.add_argument('--vector-only', action="store_true", help="Return after vector reply without probing the next image")
+parser.add_argument('--capture', type=pathlib.Path, help="Write raw post-vector console bytes to this file")
+parser.add_argument('--capture-seconds', type=float, default=0, help="Seconds of raw console capture after vector")
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
+if args.vector_only and args.call:
+    parser.error('--vector-only cannot be combined with --call')
+if args.capture and not args.vector_only:
+    parser.error('--capture requires --vector-only')
 
 from m1n1.setup import *
 from m1n1.tgtypes import BootArgs_r1, BootArgs_r2, BootArgs_r3
@@ -60,7 +67,7 @@ image_addr = u.malloc(image_size)
 
 print(f"Loading kernel image (0x{len(image):x} bytes)...")
 u.compressed_writemem(image_addr, image, True)
-p.dc_cvau(image_addr, len(image))
+p.dc_cvac(image_addr, len(image))
 
 if not args.no_sepfw:
     print(f"Copying SEPFW (0x{sepfw_length:x} bytes)...")
@@ -100,6 +107,9 @@ if rvbar != u.base:
         if cpu.state == "running":
             continue
         addr, size = cpu.cpu_impl_reg
+        if p.read64(addr) & 1:
+            print(f"  {cpu.name}: RVBAR locked, leaving it unchanged")
+            continue
         print(f"  {cpu.name}: [0x{addr:x}] = 0x{rvbar:x}")
         p.write64(addr, rvbar)
 
@@ -134,21 +144,40 @@ elif tba.revision == 3:
 print(f"Copying stub...")
 
 stub = asm.ARMAsm(f"""
+        mov x7, x2
+        mov x8, x3
 1:
         ldp x4, x5, [x1], #16
         stp x4, x5, [x2]
-        dc cvau, x2
-        ic ivau, x2
         add x2, x2, #16
-        sub x3, x3, #16
-        cbnz x3, 1b
+        subs x3, x3, #16
+        b.ne 1b
+
+        mov x2, x7
+        mov x3, x8
+2:
+        dc cvac, x2
+        add x2, x2, #64
+        subs x3, x3, #64
+        b.ne 2b
+        dsb sy
+
+        mov x2, x7
+        mov x3, x8
+3:
+        ic ivau, x2
+        add x2, x2, #64
+        subs x3, x3, #64
+        b.ne 3b
+        dsb sy
+        isb
 
         ldr x1, ={entry}
         br x1
 """, image_addr + image_size)
 
 iface.writemem(stub.addr, stub.data)
-p.dc_cvau(stub.addr, stub.len)
+p.dc_cvac(stub.addr, stub.len)
 p.ic_ivau(stub.addr, stub.len)
 
 print(f"Entry point: 0x{entry:x}")
@@ -165,6 +194,17 @@ if args.call:
         pass
     print(f"Jumping to stub at 0x{stub.addr:x}")
     p.call(stub.addr, new_base + bootargs_off, image_addr, new_base, image_size, reboot=True)
+elif args.vector_only:
+    print(f"Vectoring to 0x{stub.addr:x}; no next-stage proxy request will be sent")
+    p.request(p.P_VECTOR, stub.addr, new_base + bootargs_off, image_addr, new_base, image_size)
+    if args.capture:
+        deadline = time.monotonic() + max(0, args.capture_seconds)
+        with args.capture.open('wb') as output:
+            while time.monotonic() < deadline:
+                data = iface.dev.read(4096)
+                if data:
+                    output.write(data)
+    sys.exit(0)
 else:
     print(f"Reloading into stub at 0x{stub.addr:x}")
     p.reload(stub.addr, new_base + bootargs_off, image_addr, new_base, image_size)
