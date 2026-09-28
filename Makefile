@@ -99,7 +99,7 @@ TINF_OBJECTS := $(patsubst %,tinf/%, \
 DLMALLOC_OBJECTS := dlmalloc/malloc.o
 
 LIBFDT_OBJECTS := $(patsubst %,libfdt/%, \
-	fdt_addresses.o fdt_empty_tree.o fdt_ro.o fdt_rw.o fdt_strerror.o fdt_sw.o \
+	fdt_addresses.o fdt_check.o fdt_empty_tree.o fdt_ro.o fdt_rw.o fdt_strerror.o fdt_sw.o \
 	fdt_wip.o fdt.o)
 
 CHICKENS_OBJECTS := $(patsubst %,chickens/%, \
