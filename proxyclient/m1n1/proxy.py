@@ -416,6 +416,15 @@ class UartInterface(Reloadable):
         self.reply(self.REQ_MEMWRITE)
 
     def readmem(self, addr, size):
+        if size < 0:
+            raise ValueError("Negative memory read size")
+        result = bytearray()
+        for offset in range(0, size, 16 * 1024):
+            count = min(16 * 1024, size - offset)
+            result.extend(self._readmem_one(addr + offset, count))
+        return bytes(result)
+
+    def _readmem_one(self, addr, size):
         if size == 0:
             return b""
 
