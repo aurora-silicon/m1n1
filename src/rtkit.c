@@ -299,18 +299,18 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
         bfr->dva = addr;
         bfr->bfr = (void *)addr;
         bfr->sz = sz;
+        bfr->owned = false;
         return true;
     } else if (addr) {
+        if (!rtk->dart)
+            return false;
         bfr->dva = addr & ~rtk->dva_base;
         bfr->sz = sz;
+        bfr->owned = false;
         bfr->bfr = dart_translate(rtk->dart, bfr->dva & IOVA_MASK);
         if (!bfr->bfr) {
-            rtkit_printf("failed to translate pre-allocated buffer (ep 0x%x, buf 0x%lx)\n", msg->ep,
-                         addr);
+            rtkit_printf("failed to translate pre-allocated buffer (ep 0x%x)\n", msg->ep);
             return false;
-        } else {
-            rtkit_printf("pre-allocated buffer (ep 0x%x, dva 0x%lx, phys %p)\n", msg->ep, addr,
-                         bfr->bfr);
         }
         return true;
 
