@@ -153,6 +153,25 @@ struct mcc_regs {
 static int mcc_count;
 static struct mcc_regs mcc_regs[MAX_MCC_INSTANCES];
 
+static int mcc_get_count(int node, const char *name, u64 *value)
+{
+    u32 len;
+    const void *prop = adt_getprop(adt, node, name, &len);
+
+    if (!prop)
+        return -1;
+    if (len == sizeof(u32)) {
+        u32 count;
+        memcpy(&count, prop, sizeof(count));
+        *value = count;
+    } else if (len == sizeof(u64)) {
+        memcpy(value, prop, sizeof(*value));
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
 static u32 plane_read32(int mcc, int plane, u64 offset)
 {
     return read32(mcc_regs[mcc].plane_base + plane * mcc_regs[mcc].plane_stride + offset);
@@ -506,6 +525,56 @@ int mcc_init_m4(int node, int *path)
     return 0;
 }
 
+static int mcc_init_t8140(int node, int *path)
+{
+    u32 reg_idx;
+    u64 count = 1, channels = 0, planes = 4, stride = T8103_PLANE_STRIDE;
+    int lock_node = adt_path_offset(adt, "/chosen/lock-regs/amcc");
+
+    if (ADT_GETPROP(adt, node, "amcc-reg-idx", &reg_idx) < 0)
+        return -1;
+    if (adt_getprop(adt, node, "amcc-count", NULL) && mcc_get_count(node, "amcc-count", &count))
+        return -1;
+    if (adt_getprop(adt, node, "dcs-count-per-amcc", NULL) &&
+        mcc_get_count(node, "dcs-count-per-amcc", &channels))
+        return -1;
+    if (!count || count > MAX_MCC_INSTANCES || channels > INT32_MAX)
+        return -1;
+
+    if (lock_node >= 0 && adt_getprop(adt, lock_node, "plane-count", NULL)) {
+        if (mcc_get_count(lock_node, "plane-count", &planes))
+            return -1;
+    } else if (adt_getprop(adt, node, "amcc-plane-enable-mask", NULL)) {
+        u64 mask;
+        if (mcc_get_count(node, "amcc-plane-enable-mask", &mask))
+            return -1;
+        planes = __builtin_popcountll(mask);
+    }
+    if (lock_node >= 0 && adt_getprop(adt, lock_node, "plane-stride", NULL) &&
+        mcc_get_count(lock_node, "plane-stride", &stride))
+        return -1;
+    if (!planes || planes > INT32_MAX || !stride || (stride & 3))
+        return -1;
+
+    mcc_count = count;
+    for (int i = 0; i < mcc_count; i++) {
+        u64 base, size;
+        if (reg_idx > INT32_MAX - i || adt_get_reg(adt, path, "reg", reg_idx + i, &base, &size) ||
+            !base || (planes - 1) > (UINT64_MAX - 4) / stride || (planes - 1) * stride + 4 > size)
+            return -1;
+        mcc_regs[i].plane_base = base;
+        mcc_regs[i].plane_stride = stride;
+        mcc_regs[i].plane_count = planes;
+        mcc_regs[i].dcs_count = channels;
+        mcc_regs[i].tz = NULL;
+    }
+
+    printf("MCC: Initialized T8140 MCCs (%d instances, %d planes, %d channels)\n", mcc_count,
+           mcc_regs[0].plane_count, mcc_regs[0].dcs_count);
+    mcc_initialized = true;
+    return 0;
+}
+
 int mcc_init(void)
 {
     int path[8];
@@ -528,6 +597,8 @@ int mcc_init(void)
         return mcc_init_m3(node, path);
     } else if (adt_is_compatible(adt, node, "mcc,t8132")) {
         return mcc_init_m4(node, path);
+    } else if (adt_is_compatible(adt, node, "mcc,t8140")) {
+        return mcc_init_t8140(node, path);
     } else if (adt_is_compatible(adt, node, "mcc,t6030")) {
         return mcc_init_m3(node, path);
     } else if (adt_is_compatible(adt, node, "mcc,t6031")) {
