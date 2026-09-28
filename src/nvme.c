@@ -147,6 +147,28 @@ static bool nvme_multi_verified;
 static u64 *nvme_prp_list;
 static u8 *nvme_verify_bounce;
 
+static u64 nvme_read64_lo_hi(u64 addr)
+{
+    u64 lo = read32(addr);
+    return lo | ((u64)read32(addr + 4) << 32);
+}
+
+static void nvme_log_entry_state(bool running)
+{
+    printf("nvme: entry RUN=%d BOOT_STATUS=0x%x handoff=%d\n", running,
+           read32(nvme_base + NVME_BOOT_STATUS), nvme_adopt_live_session);
+    printf("nvme: entry CC=0x%x CSTS=0x%x AQA=0x%x IOSQ=0x%lx IOCQ=0x%lx IOQA=0x%x\n",
+           read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS), read32(nvme_base + NVME_AQA),
+           nvme_read64_lo_hi(nvme_base + NVME_IOQ_CMDS),
+           nvme_read64_lo_hi(nvme_base + NVME_IOQ_CQES),
+           read32(nvme_base + NVME_MAX_PEND_CMDS_CTRL));
+    printf("nvme: entry LINEAR_SQ=0x%x NVMMU_NUM=0x%x NVMMU_ASQ_TCB=0x%lx "
+           "NVMMU_IOSQ_TCB=0x%lx\n",
+           read32(nvme_base + NVME_LINEAR_SQ_CTRL), read32(nvmmu_base + NVMMU_NUM),
+           nvme_read64_lo_hi(nvmmu_base + NVMMU_ASQ_BASE),
+           nvme_read64_lo_hi(nvmmu_base + NVMMU_IOSQ_BASE));
+}
+
 static bool alloc_queue(struct nvme_queue *q)
 {
     memset(q, 0, sizeof(*q));
@@ -407,7 +429,8 @@ bool nvme_init(void)
 
     if (nvme_type == NVME_T8132) {
         bool running = asc_cpu_running(nvme_asc);
-        adopting = nvme_adopt_live_session || running;
+        nvme_log_entry_state(running);
+        adopting = nvme_adopt_live_session;
         if (adopting) {
             u32 boot_status = read32(nvme_base + NVME_BOOT_STATUS);
             u32 csts = read32(nvme_base + NVME_CSTS);
@@ -520,7 +543,6 @@ out_shutdown:
 out_rtkit:
     if (nvme_type == NVME_T8132 && nvme_asc && asc_cpu_running(nvme_asc)) {
         printf("nvme: preserving running post-M4 ANS after setup failure\n");
-        nvme_adopt_live_session = true;
         goto out_reset;
     }
     rtkit_free(nvme_rtkit);
