@@ -171,6 +171,7 @@ struct entry {
 };
 
 struct entry dapf_entries[] = {
+    /* Keep dart-ane out: its Linux driver owns that DAPF on T8140. */
     {"/arm-io/dart-aop", 1}, {"/arm-io/dart-mtp", 1},  {"/arm-io/dart-pmp", 1},
     {"/arm-io/dart-isp", 5}, {"/arm-io/dart-isp0", 5}, {NULL, -1},
 };
@@ -182,6 +183,12 @@ int dapf_init_all(void)
     struct entry *entry = dapf_entries;
 
     while (entry->path != NULL) {
+        if (chip_id == T8140 && strcmp(entry->path, "/arm-io/dart-mtp") &&
+            strcmp(entry->path, "/arm-io/dart-pmp")) {
+            printf("dapf: preserving inherited %s state on T8140\n", entry->path);
+            entry++;
+            continue;
+        }
         if (adt_path_offset(adt, entry->path) < 0) {
             entry++;
             continue;
