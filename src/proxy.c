@@ -591,10 +591,10 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_PCIE_INIT:
-            pcie_init();
+            reply->retval = pcie_init();
             break;
         case P_PCIE_SHUTDOWN:
-            pcie_shutdown();
+            reply->retval = pcie_shutdown();
             break;
 
         case P_NVME_INIT:
@@ -634,7 +634,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = dapf_init_all();
             break;
         case P_DAPF_INIT:
-            reply->retval = dapf_init((const char *)request->args[0], 1);
+            reply->retval = dapf_init((const char *)request->args[0], request->args[1]);
             break;
 
         case P_CPUFREQ_INIT:
