@@ -248,19 +248,17 @@ static void detect_firmware(struct fw_version_info *info, const char *ver)
 bool firmware_iboot_in_range(u32 min[IBOOT_VER_COMP], u32 max[IBOOT_VER_COMP],
                              u32 this[IBOOT_VER_COMP])
 {
-    int i;
-    for (i = 0; i < IBOOT_VER_COMP; i++)
-        if (this[i] != min[i])
-            break;
+    int lower = 0;
+    int upper = 0;
 
-    if (this[i] < min[i])
-        return false;
+    for (int i = 0; i < IBOOT_VER_COMP; i++) {
+        if (!lower && this[i] != min[i])
+            lower = this[i] < min[i] ? -1 : 1;
+        if (!upper && this[i] != max[i])
+            upper = this[i] < max[i] ? -1 : 1;
+    }
 
-    for (i = 0; i < IBOOT_VER_COMP; i++)
-        if (this[i] != max[i])
-            break;
-
-    return this[i] < max[i];
+    return lower >= 0 && upper < 0;
 }
 
 // Note: semi-open range
