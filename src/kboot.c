@@ -365,6 +365,17 @@ static int dt_set_chosen(void)
     if (fdt_setprop(dt, node, "asahi,m1n1-stage2-version", m1n1_version, strlen(m1n1_version) + 1))
         bail("FDT: couldn't set asahi,m1n1-stage2-version\n");
 
+    int sep_node = adt_path_offset(adt, "/arm-io/sep");
+    u32 booted_len = 0;
+    const u32 *sepfw_booted =
+        sep_node < 0 ? NULL : adt_getprop(adt, sep_node, "sepfw-booted", &booted_len);
+
+    if (chip_id == T8140 &&
+        (sep_node < 0 || (sepfw_booted && booted_len == sizeof(*sepfw_booted) && *sepfw_booted))) {
+        printf("FDT: using inherited ADT entropy; SEP ROM random service unavailable\n");
+        return dt_set_rng_seed_adt(node);
+    }
+
     if (dt_set_rng_seed_sep(node))
         return dt_set_rng_seed_adt(node);
 
