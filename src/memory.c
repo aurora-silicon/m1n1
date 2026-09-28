@@ -45,6 +45,50 @@ CACHE_RANGE_OP(dc_civac_range, "dc civac")
 extern u8 _stack_top[];
 
 uint64_t ram_base = 0;
+static u64 firmware_ro_start;
+static u64 firmware_ro_end;
+static bool firmware_ro_checked;
+static bool firmware_ro_valid;
+
+int memory_fw_ro_range(u64 *start, u64 *end)
+{
+    if (chip_id != T8140)
+        return 0;
+
+    if (!firmware_ro_checked) {
+        u64 lower, upper, ram_end;
+
+        firmware_ro_checked = true;
+        if (!is_boot_cpu())
+            return -1;
+        lower = mrs(CTRR_M4_LWR_EL2);
+        upper = mrs(CTRR_M4_UPR_EL2);
+        if ((lower | upper) & (SZ_4K - 1))
+            return -1;
+        if (!cur_boot_args.mem_size ||
+            cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size ||
+            upper > UINT64_MAX - SZ_4K)
+            return -1;
+        ram_end = cur_boot_args.phys_base + cur_boot_args.mem_size;
+        firmware_ro_end = upper + SZ_4K;
+        if (firmware_ro_end < lower || firmware_ro_end - lower != 3 * SZ_16K ||
+            lower < cur_boot_args.phys_base || firmware_ro_end > ram_end ||
+            cur_boot_args.top_of_kernel_data < cur_boot_args.phys_base ||
+            cur_boot_args.top_of_kernel_data >= ram_end)
+            return -1;
+        firmware_ro_start = lower;
+        firmware_ro_valid = true;
+        printf("MMU: firmware RO range [0x%lx, 0x%lx)\n", firmware_ro_start, firmware_ro_end);
+    }
+
+    if (!firmware_ro_valid)
+        return -1;
+    if (start)
+        *start = firmware_ro_start;
+    if (end)
+        *end = firmware_ro_end;
+    return 1;
+}
 
 static inline u64 read_sctlr(void)
 {
@@ -583,6 +627,9 @@ void mmu_init(void)
         printf("MMU: already initialized.\n");
         return;
     }
+
+    if (memory_fw_ro_range(NULL, NULL) < 0)
+        panic("MMU: invalid T8140 firmware RO range\n");
 
     mmu_init_pagetables();
     mmu_add_default_mappings();
