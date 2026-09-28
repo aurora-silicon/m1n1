@@ -704,7 +704,8 @@ impl<'a, IO: ReadWriteSeek, TP, OCC: OemCpConverter> DirEntry<'a, IO, TP, OCC> {
         }
     }
 
-    pub(crate) fn eq_name(&self, name: &str) -> bool {
+    /// Matches a path component against the long name and short alias using filesystem case rules.
+    pub fn eq_name(&self, name: &str) -> bool {
         #[cfg(feature = "lfn")]
         {
             if self.eq_name_lfn(name) {

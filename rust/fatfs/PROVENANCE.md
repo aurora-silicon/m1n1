@@ -10,3 +10,5 @@ Local code changes after the import:
 
 1. `explicit-fat32` feature: use the BPB's zero 16-bit sectors-per-FAT field to select FAT32 even
    on a small volume, while retaining the remaining BPB validation. Enabled only by m1n1.
+2. Expose `DirEntry::eq_name` so the loader can detect duplicate matches while honoring long
+   names, short aliases and the filesystem's case rules.
