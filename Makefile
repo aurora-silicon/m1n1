@@ -1,4 +1,11 @@
 RUSTARCH ?= aarch64-unknown-none-softfloat
+BUILTIN_LOGO ?= bootlogo
+
+ifneq ($(BUILTIN_LOGO),bootlogo)
+ifneq ($(words $(wildcard data/$(BUILTIN_LOGO)_128.bin data/$(BUILTIN_LOGO)_256.bin)),2)
+$(error BUILTIN_LOGO assets are missing)
+endif
+endif
 
 ifeq ($(shell uname),Darwin)
 USE_CLANG ?= 1
@@ -159,7 +166,7 @@ OBJECTS := \
 	afk.o \
 	aic.o \
 	asc.o \
-	bootlogo_48.o bootlogo_128.o bootlogo_256.o \
+	bootlogo_48.o $(BUILTIN_LOGO)_128.o $(BUILTIN_LOGO)_256.o \
 	chainload.o \
 	chainload_asm.o \
 	chickens.o \
@@ -315,6 +322,7 @@ build-cfg src/../build/build_cfg.h &:
 	$(QUIET)for i in $(CFG); do echo "#define $$i"; done > build/build_cfg.tmp
 	$(QUIET)if [ -n "$(T8140_PROXY_WINDOW_MS)" ]; then \
 		echo "#define T8140_PROXY_WINDOW_MS $(T8140_PROXY_WINDOW_MS)" >> build/build_cfg.tmp; fi
+	$(QUIET)echo "#define BUILTIN_LOGO $(BUILTIN_LOGO)" >> build/build_cfg.tmp
 	$(QUIET)cmp -s build/build_cfg.h build/build_cfg.tmp 2>/dev/null || \
 	( mv -f build/build_cfg.tmp build/build_cfg.h && echo "  CFG   build/build_cfg.h" )
 

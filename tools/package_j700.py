@@ -24,8 +24,10 @@ def build_identity(folder: Path, commit: str) -> tuple[str, str]:
     cfg = (folder / "build_cfg.h").read_text()
     if any(define not in cfg.splitlines() for define in REQUIRED):
         raise ValueError(f"{folder}: missing J700 KIS flavour define")
-    if "BUILTIN_LOGO" in cfg or "LOGO=" in fields.get("make-vars", ""):
-        raise ValueError(f"{folder}: custom logo is not part of this release")
+    if "#define BUILTIN_LOGO aurora" not in cfg.splitlines() or \
+            "BUILTIN_LOGO=aurora" not in fields.get("make-vars", "").split() or \
+            any(var.startswith("LOGO=") for var in fields.get("make-vars", "").split()):
+        raise ValueError(f"{folder}: expected linked Aurora logo without appended payload")
     image = (folder / "m1n1.bin").read_bytes()
     if not image.endswith(b"STACKBOT") or image.count(b"AURORA-S1-CFG01\0") != 1:
         raise ValueError(f"{folder}: not a bare, configurable Stage 1/2 image")

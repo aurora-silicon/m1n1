@@ -1,15 +1,15 @@
 # J700 Stage 1 and Stage 2 release recipe
 
 The release uses a single source commit and two remote buildbox outputs. Build
-both images in the KIS carrier flavour with the upstream built-in boot logo.
+both images in the KIS carrier flavour with the linked Aurora Silicon logo.
 The `LOGO=` Makefile option appends a payload and must not be used for the
 installed Stage 1.
 
 ```sh
 BB=/Users/ryan/Projects/Aurora-Silicon/neo-bringup/tools/bb-build.sh
 WT=<CLEAN_M1N1_WORKTREE>
-$BB m1n1 "$WT" <release>-stage1 RELEASE=1 CHAINLOADING=1 T8140_KIS_PROXY=1
-$BB m1n1 "$WT" <release>-stage2 RELEASE=1 CHAINLOADING=1 T8140_KIS_PROXY=1
+$BB m1n1 "$WT" <release>-stage1 RELEASE=1 CHAINLOADING=1 T8140_KIS_PROXY=1 BUILTIN_LOGO=aurora
+$BB m1n1 "$WT" <release>-stage2 RELEASE=1 CHAINLOADING=1 T8140_KIS_PROXY=1 BUILTIN_LOGO=aurora
 python3 tools/package_j700.py \
   --stage1-out /Volumes/AuroraS500/bb-out/<release>-stage1 \
   --stage2-out /Volumes/AuroraS500/bb-out/<release>-stage2 \
@@ -18,11 +18,12 @@ python3 tools/package_j700.py \
 
 The packaging tool requires identical source commits and tags, clean buildbox
 inputs, `RELEASE`, `CHAINLOADING`, `T8140_KIS_PROXY`, `USE_DEBUG_USB` and
-no custom logo define or `LOGO=` build variable, one Stage 1 config marker, and
+`BUILTIN_LOGO=aurora`, no `LOGO=` build variable, one Stage 1 config marker, and
 `STACKBOT` as each image's final eight bytes. It ships each binary with the raw
 ELF from the same buildbox output folder, source/build metadata, licences,
 `fatfs/PROVENANCE.md` with the pinned revision and local changes, and
-`SHA256SUMS`. The image uses the upstream m1n1 boot logo.
+`SHA256SUMS`. The Aurora Silicon logo terms are in
+`3rdparty_licenses/LICENSE.AURORA-LOGO`.
 
 ## Fill the installed Stage 1
 
