@@ -2355,8 +2355,11 @@ static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix
         if (strncmp(name, adt_prefix, adt_prefix_len))
             continue;
 
-        if (name[adt_prefix_len] < '0' || name[adt_prefix_len] > '9')
+        if (name[adt_prefix_len] && (name[adt_prefix_len] < '0' || name[adt_prefix_len] > '9'))
             continue;
+
+        if (acnt >= max_devs)
+            bail_cleanup("ADT: too many /arm-io/%s devices\n", adt_prefix);
 
         path[pp] = node;
         if (adt_get_reg(adt, path, "reg", regnum, &addrs[acnt++], NULL) < 0)
