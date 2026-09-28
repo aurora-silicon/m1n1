@@ -191,11 +191,12 @@ static bool check_var(u8 **p)
         return false;
 
     *end = 0;
-    printf("Found a variable at %p: %s\n", *p, (char *)*p);
+    printf("Found variable %.*s\n", (int)(val - (char *)*p - 1), (char *)*p);
 
     if (IS_VAR("chosen.")) {
         if (chosen_cnt >= MAX_CHOSEN_VARS)
-            printf("Too many chosen vars, ignoring %s\n", *p);
+            printf("Too many chosen vars, ignoring %.*s\n", (int)(val - (char *)*p - 1),
+                   (char *)*p);
         else
             chosen[chosen_cnt++] = (char *)*p;
     } else if (IS_VAR("chainload=")) {
@@ -210,7 +211,7 @@ static bool check_var(u8 **p)
     } else if (IS_VAR("tso=")) {
         enable_tso = val[0] == '1';
     } else {
-        printf("Unknown variable %s\n", *p);
+        printf("Unknown variable %.*s\n", (int)(val - (char *)*p - 1), (char *)*p);
     }
 
     *p = (u8 *)(end + 1);
@@ -346,7 +347,7 @@ int payload_run(void)
             memcpy(var, chosen[i], val - chosen[i]);
             var[val - chosen[i]] = 0; // Terminate var name
             if (kboot_set_chosen(var + 7, val + 1) < 0)
-                printf("Failed to kboot set %s='%s'\n", chosen[i], val);
+                printf("Failed to kboot set %s\n", var + 7);
         }
 
         if (kboot_prepare_dt(fdt)) {

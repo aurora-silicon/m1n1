@@ -38,7 +38,7 @@ impl From<gpt::Error<nvme::Error>> for Error {
 }
 
 fn load_image(spec: &str) -> Result<Vec<u8>, Error> {
-    println!("Chainloading {}", spec);
+    println!("Chainloading from the ESP");
 
     let mut args = spec.split(';');
 
@@ -57,7 +57,7 @@ fn load_image(spec: &str) -> Result<Vec<u8>, Error> {
         //println!("Partitions:");
         //pt.dump();
 
-        println!("Searching for partition UUID: {}", uuid);
+        println!("Searching for the requested partition");
         pt.find_by_partuuid(uuid)?.ok_or(Error::PartitionNotFound)?
     };
 

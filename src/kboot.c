@@ -317,7 +317,7 @@ static int dt_set_chosen(void)
         const char *value = chosen_params[i][1];
         if (fdt_setprop(dt, node, name, value, strlen(value) + 1) < 0)
             bail("FDT: couldn't set chosen.%s property\n", name);
-        printf("FDT: %s = '%s'\n", name, value);
+        printf("FDT: set chosen.%s\n", name);
     }
 
     if (chip_id == T8140 && dt_set_t8140_wfx_args(node))
