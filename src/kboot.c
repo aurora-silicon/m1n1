@@ -382,6 +382,73 @@ static int dt_set_chosen(void)
     return 0;
 }
 
+static int dt_set_speaker_safety(void)
+{
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0)
+        return -1;
+
+    for (int node = fdt_first_subnode(dt, chosen); node >= 0;) {
+        int next = fdt_next_subnode(dt, node);
+        const char *name = fdt_get_name(dt, node, NULL);
+        if (!strncmp(name, "asahi-speaker-safety", 20) && (name[20] == 0 || name[20] == '@'))
+            fdt_nop_node(dt, node);
+        node = next;
+    }
+
+    if (chip_id != T8140)
+        return 0;
+
+    int audio = adt_path_offset(adt, "/product/audio");
+    u32 acoustic_id;
+    if (audio < 0 || ADT_GETPROP(adt, audio, "acoustic-id", &acoustic_id) != sizeof(acoustic_id) ||
+        acoustic_id != 44)
+        return 0;
+
+    static const struct {
+        const char *adt_name;
+        const char *dt_name;
+    } words[] =
+        {
+            {"enabledChannels", "asahi,adt-enabled-channels"},
+            {"historyChannels", "asahi,adt-history-channels"},
+            {"supportedChannels", "asahi,adt-supported-channels"},
+            {"safety-offset-seed-us", "asahi,adt-safety-offset-seed-us"},
+        },
+      longs[] = {
+          {"speaker-cpms-bgd_100ms", "asahi,adt-speaker-cpms-bgd-100ms-raw"},
+          {"speaker-cpms-bgd_1s", "asahi,adt-speaker-cpms-bgd-1s-raw"},
+          {"speaker-cpms-bgd_inst", "asahi,adt-speaker-cpms-instant-raw"},
+      };
+    u32 word_values[ARRAY_SIZE(words)];
+    u64 long_values[ARRAY_SIZE(longs)];
+    for (size_t i = 0; i < ARRAY_SIZE(words); i++)
+        if (ADT_GETPROP(adt, audio, words[i].adt_name, &word_values[i]) != sizeof(u32))
+            bail("ADT: incomplete speaker safety profile\n");
+    for (size_t i = 0; i < ARRAY_SIZE(longs); i++)
+        if (ADT_GETPROP(adt, audio, longs[i].adt_name, &long_values[i]) != sizeof(u64))
+            bail("ADT: incomplete speaker safety profile\n");
+
+    int node = fdt_add_subnode(dt, chosen, "asahi-speaker-safety");
+    if (node < 0 || fdt_setprop_string(dt, node, "compatible", "asahi,j700-speaker-safety") ||
+        fdt_setprop_u32(dt, node, "asahi,schema-version", 1) ||
+        fdt_setprop_string(dt, node, "asahi,speaker-output-policy", "forbidden") ||
+        fdt_setprop_string(dt, node, "asahi,cpms-value-encoding", "opaque-adt-u64") ||
+        fdt_setprop_string(dt, node, "asahi,calibration-data-status", "not-provided") ||
+        fdt_setprop_string(dt, node, "asahi,source", "adt:/product/audio") ||
+        fdt_setprop_u32(dt, node, "asahi,adt-acoustic-id", acoustic_id))
+        bail("FDT: could not create speaker safety profile\n");
+
+    for (size_t i = 0; i < ARRAY_SIZE(words); i++)
+        if (fdt_setprop_u32(dt, node, words[i].dt_name, word_values[i]))
+            bail("FDT: could not set speaker safety profile\n");
+    for (size_t i = 0; i < ARRAY_SIZE(longs); i++)
+        if (fdt_setprop_u64(dt, node, longs[i].dt_name, long_values[i]))
+            bail("FDT: could not set speaker safety profile\n");
+
+    return 0;
+}
+
 static int dt_set_uboot_config(void)
 {
     // return without modifying dt if no params are set
@@ -2975,6 +3042,8 @@ int kboot_prepare_dt(void *fdt)
     dt_setup_mtd_phram();
 
     if (dt_set_chosen())
+        return -1;
+    if (dt_set_speaker_safety())
         return -1;
     if (dt_set_uboot_config())
         return -1;
