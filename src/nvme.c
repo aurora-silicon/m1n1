@@ -568,11 +568,16 @@ fail:
     pmgr_reset(nvme_die, "ANS2");
 }
 
-void nvme_shutdown(void)
+bool nvme_has_live_post_m4_session(void)
+{
+    return nvme_initialized && nvme_type == NVME_T8132;
+}
+
+bool nvme_shutdown(void)
 {
     if (!nvme_initialized) {
         // nvme_ensure_shutdown();
-        return;
+        return true;
     }
 
     struct nvme_command cmd;
@@ -591,8 +596,22 @@ void nvme_shutdown(void)
 
     if (!nvme_ctrl_shutdown())
         printf("nvme: timeout while waiting for controller shutdown\n");
-    if (!nvme_ctrl_disable())
+    if (nvme_type == NVME_T8132) {
+        write64_lo_hi(nvme_base + NVME_IOQ_CMDS, 0);
+        write64_lo_hi(nvme_base + NVME_IOQ_CQES, 0);
+    }
+    if (!nvme_ctrl_disable()) {
         printf("nvme: timeout while waiting for CSTS.RDY to clear\n");
+        if (nvme_type == NVME_T8132)
+            return false;
+    }
+
+    if (nvme_type == NVME_T8132) {
+        nvme_adopt_live_session = true;
+        nvme_initialized = false;
+        printf("nvme: controller disabled; preserving live RTKit session\n");
+        return true;
+    }
 
     rtkit_sleep(nvme_rtkit);
     // Some machines call this ANS, some ANS2...
@@ -606,6 +625,7 @@ void nvme_shutdown(void)
     nvme_initialized = false;
 
     printf("nvme: shutdown done\n");
+    return true;
 }
 
 bool nvme_flush(u32 nsid)

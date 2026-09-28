@@ -199,7 +199,11 @@ void m1n1_main(void)
 
     printf("Preparing to run next stage at %p...\n", next_stage.entry);
 
-    nvme_shutdown();
+    if (!nvme_shutdown()) {
+        printf("NVMe handoff failed; returning to proxy\n");
+        uartproxy_run(NULL);
+        panic("NVMe handoff failed\n");
+    }
     exception_shutdown();
 #ifndef BRINGUP
     usb_iodev_shutdown();

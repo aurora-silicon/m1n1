@@ -604,7 +604,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = nvme_init();
             break;
         case P_NVME_SHUTDOWN:
-            nvme_shutdown();
+            if (!nvme_shutdown())
+                reply->status = S_ERROR;
             break;
         case P_NVME_READ:
             reply->retval = nvme_read(request->args[0], request->args[1], (void *)request->args[2]);
