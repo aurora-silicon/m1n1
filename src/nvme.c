@@ -497,11 +497,18 @@ out_disable_ctrl:
 out_shutdown:
     if (adopting)
         goto out_asc;
-    rtkit_sleep(nvme_rtkit);
-    // Some machines call this ANS, some ANS2...
-    pmgr_reset(nvme_die, "ANS");
-    pmgr_reset(nvme_die, "ANS2");
+    if (nvme_type != NVME_T8132) {
+        rtkit_sleep(nvme_rtkit);
+        // Some machines call this ANS, some ANS2...
+        pmgr_reset(nvme_die, "ANS");
+        pmgr_reset(nvme_die, "ANS2");
+    }
 out_rtkit:
+    if (nvme_type == NVME_T8132 && nvme_asc && asc_cpu_running(nvme_asc)) {
+        printf("nvme: preserving running post-M4 ANS after setup failure\n");
+        nvme_adopt_live_session = true;
+        goto out_reset;
+    }
     rtkit_free(nvme_rtkit);
 out_sart:
     sart_free(nvme_sart);
@@ -525,6 +532,12 @@ out_reset:
 
 void nvme_ensure_shutdown(void)
 {
+    int node = adt_path_offset(adt, "/arm-io/ans");
+    if (node >= 0 && adt_get_property(adt, node, "nvme-secure-bar")) {
+        printf("nvme: refusing post-M4 ANS power-down\n");
+        return;
+    }
+
     nvme_asc = asc_init("/arm-io/ans");
     if (!nvme_asc)
         return;
