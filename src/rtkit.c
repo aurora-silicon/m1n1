@@ -198,7 +198,7 @@ bool rtkit_map(rtkit_dev_t *rtk, void *phys, size_t sz, u64 *dva)
 
     if (rtk->sart) {
         if (!sart_add_allowed_region(rtk->sart, phys, sz)) {
-            rtkit_printf("sart_add_allowed_region failed (%p, 0x%lx)\n", phys, sz);
+            rtkit_printf("sart_add_allowed_region failed (size 0x%lx)\n", sz);
             return false;
         }
         *dva = (u64)phys;
@@ -211,7 +211,7 @@ bool rtkit_map(rtkit_dev_t *rtk, void *phys, size_t sz, u64 *dva)
         }
 
         if (dart_map(rtk->dart, iova, phys, sz) < 0) {
-            rtkit_printf("failed to DART map %p -> 0x%lx (0x%lx)\n", phys, iova, sz);
+            rtkit_printf("failed to DART map (size 0x%lx)\n", sz);
             iova_free(rtk->dart_iovad, iova, sz);
             return false;
         }
@@ -228,7 +228,7 @@ bool rtkit_unmap(rtkit_dev_t *rtk, u64 dva, size_t sz)
 {
     if (rtk->sart) {
         if (!sart_remove_allowed_region(rtk->sart, (void *)dva, sz))
-            rtkit_printf("sart_remove_allowed_region failed (0x%lx, 0x%lx)\n", dva, sz);
+            rtkit_printf("sart_remove_allowed_region failed (size 0x%lx)\n", sz);
         return true;
     } else if (rtk->dart) {
         dva &= ~rtk->dva_base;
