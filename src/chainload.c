@@ -114,8 +114,9 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
 
 #ifdef CHAINLOADING
 
-int chainload_load(const char *spec, char **vars, size_t var_cnt)
+int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_capacity)
 {
+    static char adopt_var[] = "nvme.adopt=live-rtkit-v1";
     void *image;
     size_t size;
     int ret;
@@ -125,21 +126,39 @@ int chainload_load(const char *spec, char **vars, size_t var_cnt)
         return -1;
     }
 
+    if (nvme_has_live_post_m4_session()) {
+        bool present = false;
+        for (size_t i = 0; i < *var_cnt; i++) {
+            if (!strcmp(vars[i], adopt_var))
+                present = true;
+        }
+        if (!present) {
+            if (*var_cnt >= var_capacity) {
+                printf("chainload: no room for ANS adoption variable\n");
+                nvme_shutdown();
+                return -1;
+            }
+            vars[(*var_cnt)++] = adopt_var;
+        }
+    }
+
     ret = rust_load_image(spec, &image, &size);
-    nvme_shutdown();
+    if (!nvme_shutdown())
+        return -1;
     if (ret < 0)
         return ret;
 
-    return chainload_image(image, size, vars, var_cnt);
+    return chainload_image(image, size, vars, *var_cnt);
 }
 
 #else
 
-int chainload_load(const char *spec, char **vars, size_t var_cnt)
+int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_capacity)
 {
     UNUSED(spec);
     UNUSED(vars);
     UNUSED(var_cnt);
+    UNUSED(var_capacity);
 
     printf("Chainloading files not supported in this build!\n");
     return -1;

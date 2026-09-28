@@ -12,6 +12,7 @@
 #include "heapblock.h"
 #include "kboot.h"
 #include "mitigations.h"
+#include "nvme.h"
 #include "smp.h"
 #include "utils.h"
 
@@ -199,6 +200,9 @@ static bool check_var(u8 **p)
             chosen[chosen_cnt++] = (char *)*p;
     } else if (IS_VAR("chainload=")) {
         chainload_spec = val;
+    } else if (IS_VAR("nvme.adopt=")) {
+        if (!strcmp(val, "live-rtkit-v1"))
+            nvme_adopt_live_session = true;
     } else if (IS_VAR("display=")) {
         display_configure(val);
     } else if (IS_VAR("mitigations=")) {
@@ -310,7 +314,7 @@ int payload_run(void)
         p = load_one_payload(p, 0);
 
     if (chainload_spec) {
-        return chainload_load(chainload_spec, chosen, chosen_cnt);
+        return chainload_load(chainload_spec, chosen, &chosen_cnt, ARRAY_SIZE(chosen));
     }
 
     if (kernel && fdt) {
