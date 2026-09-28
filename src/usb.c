@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "../build/build_cfg.h"
+
 #include "usb.h"
 #include "adt.h"
 #include "dart.h"
@@ -282,7 +283,7 @@ static int hpm_idx(char *hpm_path)
 {
     size_t len = strlen(hpm_path);
     if (len < 4)
-        return false;
+        return -1;
     if (memcmp(hpm_path + len - 4, "hpm", 3))
         return -1; // unexpected hpm node name
     u8 idx = hpm_path[len - 1] - '0';
@@ -296,7 +297,7 @@ static bool usb_init_match(char *hpm_path, void *)
     int idx = hpm_idx(hpm_path);
     if (idx < FIRST_USB_IODEV)
         return false;
-    if (idx > USB_IODEV_COUNT)
+    if (idx >= USB_IODEV_COUNT)
         return false;
     return true;
 }
