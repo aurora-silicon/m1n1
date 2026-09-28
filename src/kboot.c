@@ -3188,7 +3188,9 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_setup_sio())
         return -1;
-    if (dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false, isp_iova_base()))
+    u64 isp_heap_phys, isp_heap_iova, isp_heap_size;
+    if ((chip_id != T8140 || !isp_get_heap(&isp_heap_phys, &isp_heap_iova, &isp_heap_size)) &&
+        dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false, isp_iova_base()))
         return -1;
     if (dt_set_isp_fwdata())
         return -1;
