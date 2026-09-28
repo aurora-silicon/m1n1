@@ -228,21 +228,21 @@ void smp_secondary_prep_el3(void)
     return;
 }
 
-static void smp_start_cpu(int index, const struct cpu_info *cpu)
+static int smp_start_cpu(int index, const struct cpu_info *cpu)
 {
     int i;
 
     if (index >= MAX_CPUS)
-        return;
+        return -1;
 
     if (has_el3() && index >= MAX_EL3_CPUS)
-        return;
+        return -1;
 
     if (spin_table[index].flag)
-        return;
+        return 0;
 
     if (smp_prepare_rvbar(cpu))
-        return;
+        return -1;
 
     printf("Starting CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
 
@@ -278,13 +278,15 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
         udelay(1000);
     }
 
-    if (i >= 100)
+    if (i >= 100) {
         printf("Failed!\n");
-    else
+    } else {
         printf("  Started.\n");
+    }
 
     _reset_stack = dummy_stack + DUMMY_STACK_SIZE;
     _reset_stack_el1 = dummy_stack_el1 + DUMMY_STACK_SIZE;
+    return i >= 100 ? -1 : 0;
 }
 
 static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
@@ -433,28 +435,29 @@ int smp_init(void)
         cpu_nodes[cpu_id] = node;
     }
 
-    /* The boot cpu id never changes once set */
-    if (boot_cpu_idx == -1) {
-        /* Figure out which CPU we are on by seeing which CPU is running */
-
-        /* This seems silly but it's what XNU does */
-        for (int i = 0; i < MAX_CPUS; i++) {
-            int cpu_node = cpu_nodes[i];
-            if (!cpu_node)
-                continue;
-            const char *state = adt_getprop(adt, cpu_node, "state", NULL);
-            if (!state)
-                continue;
-            if (strcmp(state, "running") == 0) {
-                boot_cpu_idx = i;
-                boot_cpu_mpidr = mrs(MPIDR_EL1);
-                if (in_el2())
-                    msr(TPIDR_EL2, boot_cpu_idx);
-                else
-                    msr(TPIDR_EL1, boot_cpu_idx);
-                break;
+    int running_cpu = -1;
+    for (int i = 0; i < MAX_CPUS; i++) {
+        int cpu_node = cpu_nodes[i];
+        if (!cpu_node)
+            continue;
+        const char *state = adt_getprop(adt, cpu_node, "state", NULL);
+        if (state && !strcmp(state, "running")) {
+            if (running_cpu >= 0) {
+                printf("SMP: multiple running CPUs in ADT\n");
+                return -1;
             }
+            running_cpu = i;
         }
+    }
+    if (running_cpu < 0 || (boot_cpu_idx >= 0 && boot_cpu_idx != running_cpu))
+        return -1;
+    if (boot_cpu_idx == -1) {
+        boot_cpu_idx = running_cpu;
+        boot_cpu_mpidr = mrs(MPIDR_EL1);
+        if (in_el2())
+            msr(TPIDR_EL2, boot_cpu_idx);
+        else
+            msr(TPIDR_EL1, boot_cpu_idx);
     }
 
     if (boot_cpu_idx == -1) {
@@ -502,26 +505,32 @@ int smp_init(void)
     return 0;
 }
 
-void smp_start_secondaries(void)
+int smp_start_secondaries(void)
 {
     printf("Starting secondary CPUs...\n");
 
     if (!smp_initialized)
-        return;
+        return -1;
 
     if (chip_id == T8140)
         smp_set_wfe_mode(true);
 
+    bool failed = false;
     for (int i = 0; i < MAX_CPUS; i++) {
         struct cpu_info *cpu = &cpu_info[i];
 
-        if (!cpu->valid)
+        if (!cpu->valid) {
+            if (chip_id == T8140 && cpu_nodes[i]) {
+                printf("SMP: ADT CPU %d has no valid implementation register\n", i);
+                failed = true;
+            }
             continue;
+        }
 
         if (i == boot_cpu_idx) {
             if (smp_prepare_rvbar(cpu)) {
                 printf("SMP: boot CPU RVBAR check failed\n");
-                return;
+                return -1;
             }
             // Check if already locked
             if (FIELD_GET(RVBAR_LOCK, read64(cpu->impl_reg)))
@@ -534,8 +543,13 @@ void smp_start_secondaries(void)
             continue;
         }
 
-        smp_start_cpu(i, cpu);
+        if (smp_start_cpu(i, cpu))
+            failed = true;
     }
+
+    if (chip_id == T8140 && failed)
+        return -1;
+    return 0;
 }
 
 void smp_stop_secondaries(bool deep_sleep)

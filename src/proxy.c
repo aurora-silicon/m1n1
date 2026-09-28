@@ -346,7 +346,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         }
 
         case P_SMP_START_SECONDARIES:
-            smp_start_secondaries();
+            if (smp_start_secondaries())
+                reply->status = S_BADCMD;
             break;
         case P_SMP_STOP_SECONDARIES:
             smp_stop_secondaries(request->args[0]);

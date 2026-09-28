@@ -315,7 +315,10 @@ int payload_run(void)
 
     if (kernel && fdt) {
         cpufreq_init();
-        smp_start_secondaries();
+        if (smp_start_secondaries() && chip_id == T8140) {
+            printf("SMP: refusing payload handoff with missing T8140 CPUs\n");
+            return -1;
+        }
         mitigations_perform();
         if (enable_tso) {
 
