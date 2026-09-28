@@ -97,6 +97,16 @@ endif
 CFG += T8140_KIS_PROXY USE_DEBUG_USB
 endif
 
+ifneq ($(T8140_PROXY_WINDOW_MS),)
+ifneq ($(T8140_KIS_PROXY),1)
+$(error T8140_PROXY_WINDOW_MS requires T8140_KIS_PROXY=1)
+endif
+ifneq ($(shell test '$(T8140_PROXY_WINDOW_MS)' -ge 0 2>/dev/null && \
+	test '$(T8140_PROXY_WINDOW_MS)' -le 99999 2>/dev/null && echo valid),valid)
+$(error T8140_PROXY_WINDOW_MS must be a decimal value from 0 to 99999)
+endif
+endif
+
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
 	-z nocopyreloc --gc-sections -pie
@@ -186,6 +196,7 @@ OBJECTS := \
 	rtkit.o \
 	sart.o \
 	sep.o \
+	stage1_config.o \
 	sio.o \
 	smc.o \
 	smp.o \

@@ -22,6 +22,7 @@
 #include "pmgr.h"
 #include "sep.h"
 #include "smp.h"
+#include "stage1_config.h"
 #include "string.h"
 #include "tps6598x.h"
 #include "uart.h"
@@ -73,9 +74,13 @@ void run_actions(void)
 {
     bool usb_up = false;
 
+    u32 window_ms = chip_id == T8140 ? stage1_config_window_ms() : 0;
 #ifdef T8140_PROXY_WINDOW_MS
-    if (chip_id == T8140 && T8140_PROXY_WINDOW_MS > 0) {
-        if (uartproxy_wait_dockchannel(T8140_PROXY_WINDOW_MS)) {
+    if (!stage1_config_target())
+        window_ms = T8140_PROXY_WINDOW_MS;
+#endif
+    if (chip_id == T8140 && window_ms) {
+        if (uartproxy_wait_dockchannel(window_ms)) {
             printf("Stage 1: host request received\n");
             fb_set_active(true);
             uartproxy_run_presynced(IODEV_DOCKCHANNEL_UART);
@@ -83,7 +88,6 @@ void run_actions(void)
         }
         printf("Stage 1: no host during proxy window\n");
     }
-#endif
 
 #ifndef BRINGUP
 #ifdef EARLY_PROXY_TIMEOUT

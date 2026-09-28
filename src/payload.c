@@ -15,6 +15,7 @@
 #include "mitigations.h"
 #include "nvme.h"
 #include "smp.h"
+#include "stage1_config.h"
 #include "utils.h"
 
 #include "libfdt/libfdt.h"
@@ -47,6 +48,8 @@ static void *fdt = NULL;
 static char *chainload_spec = NULL;
 static char *boot_spec = NULL;
 static bool payload_scanned = false;
+static bool stage1_config_applied = false;
+static char stage1_esp_chosen[96];
 
 static void *load_one_payload(void *start, size_t size);
 
@@ -321,6 +324,23 @@ int payload_run(void)
         while (p)
             p = load_one_payload(p, 0);
         payload_scanned = true;
+    }
+
+    if (!stage1_config_applied && chip_id == T8140) {
+        const char *target = stage1_config_target();
+        if (target) {
+            if (chainload_spec && strcmp(chainload_spec, target)) {
+                printf("Payload: embedded and appended chainload targets differ\n");
+                return -1;
+            }
+            chainload_spec = (char *)target;
+            if (chosen_cnt >= MAX_CHOSEN_VARS)
+                return -1;
+            snprintf(stage1_esp_chosen, sizeof(stage1_esp_chosen),
+                     "chosen.asahi,efi-system-partition=%s", stage1_config_esp_uuid());
+            chosen[chosen_cnt++] = stage1_esp_chosen;
+        }
+        stage1_config_applied = true;
     }
 
     if (chainload_spec && boot_spec) {

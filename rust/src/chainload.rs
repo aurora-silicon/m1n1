@@ -31,6 +31,25 @@ impl From<fatfs::Error<nvme::Error>> for Error {
     }
 }
 
+fn valid_fat_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.bytes().all(|byte| (0x20..0x7f).contains(&byte) && byte != b';' && byte != b'\\')
+        && path.split('/').all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::valid_fat_path;
+
+    #[test]
+    fn stage1_path_grammar() {
+        assert!(valid_fat_path("aurora/stage2.bin"));
+        for path in ["aurora/a\0b", "aurora/a\x1fb", "aurora//b", "aurora/./b", "aurora/../b"] {
+            assert!(!valid_fat_path(path), "accepted {path:?}");
+        }
+    }
+}
+
 impl From<gpt::Error<nvme::Error>> for Error {
     fn from(err: gpt::Error<nvme::Error>) -> Error {
         Error::GPTError(err)
@@ -44,9 +63,7 @@ fn load_image(spec: &str) -> Result<Vec<u8>, Error> {
 
     let uuid = Uuid::parse_str(args.next().ok_or(Error::BadArgs)?).or(Err(Error::BadArgs))?;
     let path = args.next().ok_or(Error::BadArgs)?;
-    if args.next().is_some()
-        || path.split('/').any(|component| component.is_empty() || component == "." || component == "..")
-    {
+    if args.next().is_some() || !valid_fat_path(path) {
         return Err(Error::BadArgs);
     }
 
