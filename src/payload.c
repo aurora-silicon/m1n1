@@ -323,8 +323,20 @@ int payload_run(void)
         payload_scanned = true;
     }
 
-    if (chainload_spec && !boot_spec) {
-        return chainload_load(chainload_spec, chosen, &chosen_cnt, ARRAY_SIZE(chosen));
+    if (chainload_spec && boot_spec) {
+        printf("Payload: cannot combine boot= and chainload=\n");
+        next_stage.entry = NULL;
+        return -1;
+    }
+
+    if (chainload_spec) {
+        next_stage.entry = NULL;
+        int ret = chainload_load(chainload_spec, chosen, &chosen_cnt, ARRAY_SIZE(chosen));
+        if (ret) {
+            next_stage.entry = NULL;
+            nvme_shutdown();
+        }
+        return ret;
     }
 
     if (boot_spec && boot_storage_load(boot_spec, &kernel, &fdt)) {
