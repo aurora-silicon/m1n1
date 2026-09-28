@@ -12,6 +12,7 @@
 #include "string.h"
 #include "tps6598x.h"
 #include "types.h"
+#include "usb_cdc_atc.h"
 #include "usb_dwc3.h"
 #include "usb_dwc3_regs.h"
 #include "utils.h"
@@ -180,12 +181,25 @@ int usb_phy_bringup(u32 idx)
         return -1;
 
     snprintf(path, sizeof(path), FMT_DART_PATH, idx);
+#ifdef J700_CDC_PROXY
+    if (chip_id == T8140 && idx == 0)
+        snprintf(path, sizeof(path), "/arm-io/dart-usb");
+#endif
     if (pmgr_adt_power_enable(path) < 0)
         return -1;
 
     snprintf(path, sizeof(path), FMT_DRD_PATH, idx);
+#ifdef J700_CDC_PROXY
+    if (chip_id == T8140 && idx == 0)
+        snprintf(path, sizeof(path), "/arm-io/usb-drd");
+#endif
     if (pmgr_adt_power_enable(path) < 0)
         return -1;
+
+#ifdef J700_CDC_PROXY
+    if (chip_id == T8140 && idx == 0)
+        return usb_cdc_atc_power_on(usb_regs.drd_regs_unk3);
+#endif
 
     write32(usb_regs.atc + USB2PHY_SIG, 0x01c1000f);
     write32(usb_regs.atc + USB2PHY_CTL, USB2PHY_CTL_RESET | USB2PHY_CTL_PORT_RESET);
@@ -426,4 +440,39 @@ void usb_iodev_vuart_setup(iodev_id_t iodev)
         return;
 
     iodev_usb_vuart.opaque = iodev_get_opaque(iodev);
+}
+
+int usb_cdc_link_start(void)
+{
+#ifndef J700_CDC_PROXY
+    return -1;
+#else
+    if (chip_id != T8140 || iodev_get_usage(IODEV_USB0))
+        return -1;
+    if (usb_phy_bringup(0))
+        return -1;
+
+    dwc3_dev_t *dwc = usb_iodev_bringup(0);
+    if (!dwc)
+        return -1;
+
+    struct iodev *device = memalign(SPINLOCK_ALIGN, sizeof(*device));
+    if (!device) {
+        usb_dwc3_shutdown(dwc);
+        return -1;
+    }
+    device->ops = &iodev_usb_ops;
+    device->opaque = dwc;
+    device->usage = USAGE_CONSOLE | USAGE_UARTPROXY;
+    spin_init(&device->lock);
+    iodev_register_device(IODEV_USB0, device);
+
+    if (usb_cdc_atc_switch_pipe()) {
+        iodev_unregister_device(IODEV_USB0);
+        usb_dwc3_shutdown(dwc);
+        free(device);
+        return -1;
+    }
+    return 0;
+#endif
 }

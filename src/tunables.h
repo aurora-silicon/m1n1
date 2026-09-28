@@ -37,6 +37,9 @@ int tunables_apply_local(const char *path, const char *prop, u32 reg_idx);
  */
 int tunables_apply_local_addr(const char *path, const char *prop, uintptr_t base);
 
+/* Apply 12-byte ATC ADT records within a validated MMIO window. */
+int tunables_apply_compact_addr(const char *path, const char *prop, uintptr_t base, u64 span);
+
 int tunables_apply_static(void);
 
 #endif
