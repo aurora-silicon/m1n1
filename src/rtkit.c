@@ -679,7 +679,12 @@ static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state ta
         return false;
     }
 
+    u64 timeout = timeout_calculate(1000000);
     while (rtk->ap_power != RTKIT_POWER_QUIESCED) {
+        if (timeout_expired(timeout)) {
+            rtkit_printf("AP power transition timed out\n");
+            return false;
+        }
         struct rtkit_message rtk_msg;
         int ret = rtkit_recv(rtk, &rtk_msg);
 
@@ -699,7 +704,12 @@ static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state ta
         return false;
     }
 
+    timeout = timeout_calculate(1000000);
     while (rtk->iop_power != target) {
+        if (timeout_expired(timeout)) {
+            rtkit_printf("IOP power transition timed out\n");
+            return false;
+        }
         struct rtkit_message rtk_msg;
         int ret = rtkit_recv(rtk, &rtk_msg);
 
