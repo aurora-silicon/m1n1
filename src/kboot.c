@@ -2218,23 +2218,24 @@ static int dt_set_sep(void)
     if (ret < 0)
         bail("FDT: failed to add sepfw region");
 
-    int node = fdt_path_offset(dt, path);
-    if (node < 0)
-        bail("FDT: sep not not found in devtree\n");
-
     int anode_manifest = adt_path_offset(adt, "/chosen/boot-object-manifests");
-    if (anode_manifest < 0)
-        bail("ADT: /chosen/boot-object-manifests not found \n");
+    if (anode_manifest < 0) {
+        printf("ADT: no SEP boot-object manifests\n");
+        return 0;
+    }
 
-    ret = ADT_GETPROP_ARRAY(adt, anode_manifest, "lpol", phys_map);
-    if (ret != sizeof(phys_map))
-        bail("ADT: could not get local policy\n");
-    fdt_setprop(dt, node, "local-policy-manifest", (void *)phys_map[0], phys_map[1]);
-
-    ret = ADT_GETPROP_ARRAY(adt, anode_manifest, "ibot", phys_map);
-    if (ret != sizeof(phys_map))
-        bail("ADT: could not get iboot manifest\n");
-    fdt_setprop(dt, node, "iboot-manifest", (void *)phys_map[0], phys_map[1]);
+    const char *adt_names[] = {"lpol", "ibot"};
+    const char *dt_names[] = {"local-policy-manifest", "iboot-manifest"};
+    for (size_t i = 0; i < ARRAY_SIZE(adt_names); i++) {
+        ret = ADT_GETPROP_ARRAY(adt, anode_manifest, adt_names[i], phys_map);
+        if (ret != sizeof(phys_map) || !phys_map[0] || !phys_map[1] || phys_map[1] > dt_bufsize) {
+            printf("ADT: no usable SEP %s manifest\n", adt_names[i]);
+            continue;
+        }
+        int node = fdt_path_offset(dt, path);
+        if (node < 0 || fdt_setprop(dt, node, dt_names[i], (void *)phys_map[0], phys_map[1]))
+            printf("FDT: could not publish SEP %s manifest\n", adt_names[i]);
+    }
 
     return 0;
 }
