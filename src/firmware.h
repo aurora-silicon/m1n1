@@ -184,6 +184,7 @@ enum fw_version {
     V26_3B2,
     V26_3,
     V26_4,
+    V26_6_2,
     NUM_FW_VERSIONS,
 };
 
