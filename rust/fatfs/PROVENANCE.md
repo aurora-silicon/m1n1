@@ -12,3 +12,5 @@ Local code changes after the import:
    on a small volume, while retaining the remaining BPB validation. Enabled only by m1n1.
 2. Expose `DirEntry::eq_name` so the loader can detect duplicate matches while honoring long
    names, short aliases and the filesystem's case rules.
+3. Coalesce physically contiguous file clusters up to the caller's requested length so the
+   NVMe storage adapter can issue bounded bulk reads. Directory streams remain single-cluster.

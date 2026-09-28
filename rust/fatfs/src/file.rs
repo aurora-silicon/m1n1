@@ -281,9 +281,27 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
         let offset_in_cluster = self.offset % cluster_size;
         let bytes_left_in_cluster = (cluster_size - offset_in_cluster) as usize;
         let bytes_left_in_file = self.bytes_left_in_file().unwrap_or(bytes_left_in_cluster);
-        let read_size = buf.len().min(bytes_left_in_cluster).min(bytes_left_in_file);
+        let requested = buf.len().min(bytes_left_in_file);
+        let mut read_size = requested.min(bytes_left_in_cluster);
         if read_size == 0 {
             return Ok(0);
+        }
+        // Coalesce only adjacent clusters needed by this request. Directory streams keep
+        // the original one-cluster path, since they have no directory-entry file size.
+        if self.entry.is_some() {
+            let mut last_cluster = current_cluster;
+            while read_size < requested {
+                let Some(expected) = last_cluster.checked_add(1) else { break };
+                let next = self.fs.cluster_iter(last_cluster).next();
+                match next {
+                    Some(Err(err)) => return Err(err),
+                    Some(Ok(n)) if n == expected => {
+                        last_cluster = n;
+                        read_size += requested.saturating_sub(read_size).min(cluster_size as usize);
+                    }
+                    _ => break,
+                }
+            }
         }
         trace!("read {} bytes in cluster {}", read_size, current_cluster);
         let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
@@ -296,7 +314,8 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
             return Ok(0);
         }
         self.offset += read_bytes as u32;
-        self.current_cluster = Some(current_cluster);
+        let last_index = (offset_in_cluster as usize + read_bytes - 1) / cluster_size as usize;
+        self.current_cluster = Some(current_cluster + last_index as u32);
 
         if let Some(ref mut e) = self.entry {
             if self.fs.options.update_accessed_date {
