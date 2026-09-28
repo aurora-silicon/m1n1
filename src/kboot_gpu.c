@@ -427,7 +427,7 @@ static int dt_set_region(void *dt, int sgx, const char *name, const char *path)
         bail("ADT: GPU: failed to find %s property\n", prop);
 
     snprintf(prop, sizeof(prop), "%s-size", name);
-    if (ADT_GETPROP(adt, sgx, prop, &size) < 0 || !base)
+    if (ADT_GETPROP(adt, sgx, prop, &size) < 0 || !size)
         bail("ADT: GPU: failed to find %s property\n", prop);
 
     return dt_set_resvmem(dt, path, base, size);
