@@ -521,6 +521,7 @@ CPUFeatures = Struct(
 class M1N1Proxy(Reloadable):
     S_OK = 0
     S_BADCMD = -1
+    S_ERROR = -2
 
     P_NOP = 0x000
     P_EXIT = 0x001
@@ -723,6 +724,8 @@ class M1N1Proxy(Reloadable):
         if status != self.S_OK:
             if status == self.S_BADCMD:
                 raise ProxyCommandError("Reply error: Bad Command")
+            elif status == self.S_ERROR:
+                raise ProxyRemoteError("Reply error: Remote operation failed")
             else:
                 raise ProxyRemoteError("Reply error: Unknown error (%d)"%status)
         return retval

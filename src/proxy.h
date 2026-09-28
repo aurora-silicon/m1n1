@@ -185,6 +185,7 @@ typedef enum {
 
 #define S_OK     0
 #define S_BADCMD -1
+#define S_ERROR  -2
 
 typedef struct {
     u64 opcode;

@@ -349,7 +349,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 
         case P_SMP_START_SECONDARIES:
             if (smp_start_secondaries())
-                reply->status = S_BADCMD;
+                reply->status = S_ERROR;
             break;
         case P_SMP_STOP_SECONDARIES:
             smp_stop_secondaries(request->args[0]);
@@ -357,17 +357,17 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_SMP_CALL:
             if (smp_call4(request->args[0], (void *)request->args[1], request->args[2],
                           request->args[3], request->args[4], request->args[5]))
-                reply->status = S_BADCMD;
+                reply->status = S_ERROR;
             break;
         case P_SMP_CALL_SYNC:
             if (smp_call4(request->args[0], (void *)request->args[1], request->args[2],
                           request->args[3], request->args[4], request->args[5]) ||
                 smp_wait_timed(request->args[0], &reply->retval, 300000))
-                reply->status = S_BADCMD;
+                reply->status = S_ERROR;
             break;
         case P_SMP_WAIT:
             if (smp_wait_timed(request->args[0], &reply->retval, 300000))
-                reply->status = S_BADCMD;
+                reply->status = S_ERROR;
             break;
         case P_SMP_SET_WFE_MODE:
             smp_set_wfe_mode(request->args[0]);
@@ -378,24 +378,24 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_SMP_CALL_EL1:
             if (smp_call4(request->args[0], el1_call, request->args[1], request->args[2],
                           request->args[3], request->args[4]))
-                reply->status = S_BADCMD;
+                reply->status = S_ERROR;
             break;
         case P_SMP_CALL_EL1_SYNC:
             if (smp_call4(request->args[0], el1_call, request->args[1], request->args[2],
                           request->args[3], request->args[4]) ||
                 smp_wait_timed(request->args[0], &reply->retval, 300000))
-                reply->status = S_BADCMD;
+                reply->status = S_ERROR;
             break;
         case P_SMP_CALL_EL0:
             if (smp_call4(request->args[0], el0_call, request->args[1], request->args[2],
                           request->args[3], request->args[4]))
-                reply->status = S_BADCMD;
+                reply->status = S_ERROR;
             break;
         case P_SMP_CALL_EL0_SYNC:
             if (smp_call4(request->args[0], el0_call, request->args[1], request->args[2],
                           request->args[3], request->args[4]) ||
                 smp_wait_timed(request->args[0], &reply->retval, 300000))
-                reply->status = S_BADCMD;
+                reply->status = S_ERROR;
             break;
 
         case P_HEAPBLOCK_ALLOC:
