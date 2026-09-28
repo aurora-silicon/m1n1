@@ -509,6 +509,9 @@ void smp_start_secondaries(void)
     if (!smp_initialized)
         return;
 
+    if (chip_id == T8140)
+        smp_set_wfe_mode(true);
+
     for (int i = 0; i < MAX_CPUS; i++) {
         struct cpu_info *cpu = &cpu_info[i];
 
@@ -610,6 +613,10 @@ u64 smp_wait(int cpu)
 
 void smp_set_wfe_mode(bool new_mode)
 {
+    if (chip_id == T8140 && !new_mode) {
+        printf("SMP: T8140 secondaries must remain in WFE mode\n");
+        return;
+    }
     wfe_mode = new_mode;
     sysop("dsb sy");
 
