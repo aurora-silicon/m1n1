@@ -25,3 +25,41 @@ u32 usb_cdc_state_status(const struct usb_cdc_state *cdc)
 {
     return cdc ? (u32)cdc->state | (cdc->step << 8) : USB_CDC_FAILED;
 }
+
+void usb_cdc_recovery_arm(struct usb_cdc_recovery *recovery, u64 now_ms)
+{
+    if (!recovery || recovery->pending || recovery->attempts >= 3)
+        return;
+    recovery->pending = true;
+    recovery->deadline_ms = now_ms + 25;
+}
+
+void usb_cdc_recovery_connected(struct usb_cdc_recovery *recovery)
+{
+    if (!recovery)
+        return;
+    recovery->pending = false;
+    recovery->attempts = 0;
+    recovery->deadline_ms = 0;
+}
+
+bool usb_cdc_recovery_due(const struct usb_cdc_recovery *recovery, u64 now_ms)
+{
+    return recovery && recovery->pending && now_ms >= recovery->deadline_ms;
+}
+
+void usb_cdc_recovery_attempted(struct usb_cdc_recovery *recovery, u64 now_ms)
+{
+    if (!recovery || !recovery->pending)
+        return;
+    recovery->attempts++;
+    if (recovery->attempts >= 3)
+        recovery->pending = false;
+    else
+        recovery->deadline_ms = now_ms + 2000;
+}
+
+bool usb_cdc_dma_may_release(bool active, int end_status, bool reset_complete)
+{
+    return !active || end_status == 0 || reset_complete;
+}

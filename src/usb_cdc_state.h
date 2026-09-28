@@ -25,9 +25,20 @@ struct usb_cdc_state {
     u64 deadline_ms;
 };
 
+struct usb_cdc_recovery {
+    bool pending;
+    u32 attempts;
+    u64 deadline_ms;
+};
+
 int usb_cdc_state_schedule(struct usb_cdc_state *cdc, u32 delay_ms, u32 reserved, u32 flags,
                            u64 now_ms);
 bool usb_cdc_state_due(const struct usb_cdc_state *cdc, u64 now_ms);
 u32 usb_cdc_state_status(const struct usb_cdc_state *cdc);
+void usb_cdc_recovery_arm(struct usb_cdc_recovery *recovery, u64 now_ms);
+void usb_cdc_recovery_connected(struct usb_cdc_recovery *recovery);
+bool usb_cdc_recovery_due(const struct usb_cdc_recovery *recovery, u64 now_ms);
+void usb_cdc_recovery_attempted(struct usb_cdc_recovery *recovery, u64 now_ms);
+bool usb_cdc_dma_may_release(bool active, int end_status, bool reset_complete);
 
 #endif
