@@ -236,13 +236,13 @@ static int pmgr_set_mode_traced(u8 die, u16 id, const struct pmgr_device *device
 
     int ret = pmgr_set_mode(addr, mode);
     if (trace)
-        printf("pmgr: %d.%s (%u) mode %x at 0x%lx: 0x%x%s\n", die, device->name, id, mode,
-               addr, read32(addr), ret ? " failed" : "");
+        printf("pmgr: %d.%s (%u) mode %x at 0x%lx: 0x%x%s\n", die, device->name, id, mode, addr,
+               read32(addr), ret ? " failed" : "");
     return ret;
 }
 
-static int pmgr_set_mode_recursive_inner(u8 die, u16 id, u8 target_mode, bool recurse,
-                                         bool trace, unsigned int depth)
+static int pmgr_set_mode_recursive_inner(u8 die, u16 id, u8 target_mode, bool recurse, bool trace,
+                                         unsigned int depth)
 {
     if (!pmgr_initialized) {
         printf("pmgr: pmgr_set_mode_recursive() called before successful pmgr_init()\n");
@@ -267,9 +267,8 @@ static int pmgr_set_mode_recursive_inner(u8 die, u16 id, u8 target_mode, bool re
             u16 parents[2];
             pmgr_adt_get_parents(device, parents);
             if (parents[i]) {
-                int ret =
-                    pmgr_set_mode_recursive_inner(die, parents[i], target_mode, true, trace,
-                                                  depth + 1);
+                int ret = pmgr_set_mode_recursive_inner(die, parents[i], target_mode, true, trace,
+                                                        depth + 1);
                 if (ret < 0)
                     return ret;
             }
@@ -319,6 +318,65 @@ static int pmgr_adt_find_devices(const char *path, const u32 **devices, u32 *n_d
     *n_devices /= 4;
 
     return 0;
+}
+
+struct pmgr_saved_mode {
+    uintptr_t addr;
+    u8 mode;
+};
+
+static int pmgr_save_parents(u8 die, u16 id, struct pmgr_saved_mode *saved, size_t *count,
+                             size_t depth)
+{
+    const struct pmgr_device *device;
+    if (depth >= PMGR_MAX_PARENT_DEPTH || pmgr_find_device(id, &device))
+        return -1;
+    u16 parents[2];
+    pmgr_adt_get_parents(device, parents);
+    for (size_t i = 0; i < ARRAY_SIZE(parents); i++)
+        if (parents[i] && pmgr_save_parents(die, parents[i], saved, count, depth + 1))
+            return -1;
+    if (device->flags & PMGR_FLAG_VIRTUAL)
+        return 0;
+    uintptr_t addr = pmgr_device_get_addr(die, device);
+    if (!addr)
+        return -1;
+    for (size_t i = 0; i < *count; i++)
+        if (saved[i].addr == addr)
+            return 0;
+    if (*count == 64)
+        return -1;
+    saved[*count] = (struct pmgr_saved_mode){
+        .addr = addr,
+        .mode = FIELD_GET(PMGR_PS_ACTUAL, read32(addr)),
+    };
+    (*count)++;
+    return 0;
+}
+
+int pmgr_adt_power_enable_traced_rollback(const char *path)
+{
+    const u32 *devices;
+    u32 n_devices;
+    if (pmgr_adt_find_devices(path, &devices, &n_devices))
+        return -1;
+    struct pmgr_saved_mode saved[64];
+    size_t count = 0;
+    for (u32 i = 0; i < n_devices; i++) {
+        u16 id = FIELD_GET(PMGR_DEVICE_ID, devices[i]);
+        u8 die = FIELD_GET(PMGR_DIE_ID, devices[i]);
+        if (pmgr_save_parents(die, id, saved, &count, 0))
+            return -1;
+    }
+    if (!pmgr_adt_power_enable_traced(path))
+        return 0;
+    while (count) {
+        struct pmgr_saved_mode *entry = &saved[--count];
+        if (FIELD_GET(PMGR_PS_ACTUAL, read32(entry->addr)) != entry->mode &&
+            pmgr_set_mode(entry->addr, entry->mode))
+            printf("pmgr: failed to restore 0x%lx after enable error\n", entry->addr);
+    }
+    return -1;
 }
 
 static int pmgr_adt_devices_set_mode(const char *path, u8 target_mode, int recurse, bool trace)
@@ -487,6 +545,22 @@ int pmgr_power_on(int die, const char *name)
         return -1;
 
     return pmgr_set_mode(addr, PMGR_PS_ACTIVE);
+}
+
+int pmgr_power_is_on(int die, const char *name)
+{
+    if (die < 0 || die >= pmgr_dies)
+        return -1;
+    for (size_t i = 0; i < pmgr_devices_len; i++) {
+        const struct pmgr_device *dev = &pmgr_devices[i];
+        if (strncmp(dev->name, name, sizeof(dev->name)))
+            continue;
+        uintptr_t addr = pmgr_device_get_addr(die, dev);
+        if (!addr)
+            return -1;
+        return FIELD_GET(PMGR_PS_ACTUAL, read32(addr)) == PMGR_PS_ACTIVE;
+    }
+    return -1;
 }
 
 int pmgr_adt_path_offset_trace(const void *adt_ptr, int *path)

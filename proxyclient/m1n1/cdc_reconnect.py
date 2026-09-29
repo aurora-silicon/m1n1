@@ -39,7 +39,7 @@ class ImmutableRegion:
 @dataclass(frozen=True)
 class CdcIdentity:
     build_tag: str
-    adt_sha256: str
+    adt_digest: str
     regions: tuple[ImmutableRegion, ...]
 
 
@@ -61,7 +61,7 @@ class CdcSession:
         fresh = discover_cdc(self.identity, timeout=timeout, log=log, speed_probe=speed_probe)
         fresh.reconnect_count = self.reconnect_count + 1
         log({"event": "cdc_reconnected", "count": fresh.reconnect_count,
-             "adt_sha256": fresh.identity.adt_sha256})
+             "adt_digest": fresh.identity.adt_digest})
         return fresh
 
 
@@ -78,7 +78,7 @@ def _digest(data):
 
 
 def _artifact_regions(artifact_dir, ranges):
-    """Read file-backed load ranges from one buildbox ELF and raw image."""
+    """Read file-backed load ranges from one matching ELF and raw image."""
     folder = Path(artifact_dir)
     elf = (folder / "m1n1-raw.elf").read_bytes()
     image = (folder / "m1n1.bin").read_bytes()
@@ -130,7 +130,7 @@ def capture_identity(utils, build_tag, ranges, artifact_dir):
 def verify_identity(utils, identity):
     tag = ("##m1n1_ver##" + identity.build_tag).encode("ascii")
     found_tag = False
-    if _digest(utils.get_adt()) != identity.adt_sha256:
+    if _digest(utils.get_adt()) != identity.adt_digest:
         raise CdcIdentityMismatch("live ADT hash changed across carrier transition")
     for region in identity.regions:
         data = utils.iface.readmem(utils.base + region.offset, region.size)
@@ -179,7 +179,7 @@ def discover_cdc(identity, *, timeout=30, ports=list_ports.comports,
                         session.link_mbps = speed
                     log({"event": "cdc_primary_verified", "attempts": attempts,
                          "interface": str(port.interface or ""), "link_mbps": speed,
-                         "adt_sha256": identity.adt_sha256 if isinstance(identity, CdcIdentity) else None})
+                         "adt_digest": identity.adt_digest if isinstance(identity, CdcIdentity) else None})
                     return session
             except CdcIdentityMismatch:
                 log({"event": "cdc_identity_mismatch", "attempts": attempts})
@@ -201,7 +201,7 @@ def transition_to_cdc(proxy, utils, *, build_tag, immutable_ranges, artifact_dir
     """Check the candidate on KIS, then find the new ACM primary by NOP."""
     identity = capture_identity(utils, build_tag, immutable_ranges, artifact_dir)
     log({"event": "kis_identity_pinned", "build_tag": build_tag,
-         "adt_sha256": identity.adt_sha256,
+         "adt_digest": identity.adt_digest,
          "image_region_sha256": [region.sha256 for region in identity.regions]})
     try:
         proxy.cdc_schedule(delay_ms, flags)

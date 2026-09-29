@@ -274,30 +274,21 @@ struct state {
 
 static struct state controllers[NUM_CONTROLLERS];
 
-static int pcie_port_reg_count(u32 reg_len, u32 port_count, u32 shared, bool t8140)
-{
-    if (!port_count || port_count > 8 || reg_len % 16 || reg_len / 16 < shared)
-        return -1;
-    u32 remaining = reg_len / 16 - shared;
-    if (!remaining || remaining % port_count)
-        return -1;
-    u32 per_port = remaining / port_count;
-    if (per_port < 3 || (t8140 && per_port != 6))
-        return -1;
-    return per_port;
-}
-
 /* Check every T8140 ADT window and tunable before PMGR or MMIO changes. */
-static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, int port_regs)
+static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 reg_len)
 {
     static const char *const shared_props[] = {
-        "apcie-axi2af-tunables", "apcie-phy-tunables", "apcie-phy-ip-pll-tunables",
-        "apcie-phy-ip-auspma-tunables", "apcie-cio3pllcore-tunables",
-        "apcie-pcieclkgen-tunables",
+        "apcie-axi2af-tunables",        "apcie-phy-tunables",         "apcie-phy-ip-pll-tunables",
+        "apcie-phy-ip-auspma-tunables", "apcie-cio3pllcore-tunables", "apcie-pcieclkgen-tunables",
     };
     static const int shared_indices[] = {4, 2, 3, 3, 5, 6};
     u64 base, span, config_span;
     u32 present = 0;
+
+    /* PCIE-2: the observed ADT has seven shared windows followed by exactly
+     * six windows for each port. Reject truncated or extended descriptions. */
+    if (!ports || ports > 8 || reg_len != 16 * (7 + 6 * ports))
+        return -1;
 
     for (int i = 0; i < 7; i++) {
         if (adt_get_reg(adt, adt_path, "reg", i, &base, &span) || !base || !span ||
@@ -327,32 +318,37 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, int 
     }
 
     int node = adt_path_offset(adt, path);
+    if (adt_get_reg(adt, adt_path, "reg", 1, &base, &span))
+        return -1;
     if (adt_getprop(adt, node, "apcie-common-tunables", NULL) &&
-        tunables_validate_local(path, "apcie-common-tunables", 0x4000))
+        tunables_validate_local(path, "apcie-common-tunables", span))
         return -1;
 
     for (u32 port = 0; port < ports; port++) {
         char bridge[64];
         snprintf(bridge, sizeof(bridge), "%s/pci-bridge%d", path, port);
         int bridge_node = adt_path_offset(adt, bridge);
-        for (int reg = 0; reg < port_regs; reg++) {
-            int idx = 7 + port * port_regs + reg;
+        u64 port_config_span = 0;
+        for (int reg = 0; reg < 6; reg++) {
+            int idx = 7 + port * 6 + reg;
             if (adt_get_reg(adt, adt_path, "reg", idx, &base, &span) || !base || !span ||
                 base > UINT64_MAX - span || (reg == 0 && span < 0x4000) ||
                 (reg == 2 && span < 0x400)) {
                 printf("pcie: invalid T8140 port %d reg[%d]\n", port, idx);
                 return -1;
             }
+            if (reg == 0)
+                port_config_span = span;
         }
         if (bridge_node < 0)
             continue;
         if (!adt_is_compatible(adt, bridge_node, "apcie-bridge"))
             return -1;
         u32 max_speed;
-        if (ADT_GETPROP(adt, bridge_node, "maximum-link-speed", &max_speed) < 0 ||
-            !max_speed || max_speed > 4)
+        if (ADT_GETPROP(adt, bridge_node, "maximum-link-speed", &max_speed) < 0 || !max_speed ||
+            max_speed > 4)
             return -1;
-        if (tunables_validate_local(bridge, "apcie-config-tunables", 0x8000) ||
+        if (tunables_validate_local(bridge, "apcie-config-tunables", port_config_span) ||
             tunables_validate_local(bridge, "pcie-rc-tunables", 1 << 15) ||
             tunables_validate_local(bridge, "pcie-rc-gen3-shadow-tunables", 1 << 15) ||
             tunables_validate_local(bridge, "pcie-rc-gen4-shadow-tunables", 1 << 15))
@@ -528,9 +524,16 @@ static int pcie_init_controller(int controller, const char *path)
         return -1;
     }
 
-    int port_reg_cnt = pcie_port_reg_count(reg_len, state->port_count,
-                                           state->pcie_regs->shared_reg_count,
-                                           state->pcie_regs->type == APCIE_T8140);
+    int port_reg_cnt = -1;
+    if (state->pcie_regs->type == APCIE_T8140) {
+        port_reg_cnt = 6;
+    } else if (state->port_count && state->port_count <= 8 && reg_len % 16 == 0) {
+        u32 entries = reg_len / 16;
+        u32 shared = state->pcie_regs->shared_reg_count;
+        if (entries >= shared + 3 * state->port_count &&
+            (entries - shared) % state->port_count == 0)
+            port_reg_cnt = (entries - shared) / state->port_count;
+    }
     if (port_reg_cnt < 0) {
         printf("pcie: invalid ADT port geometry (%d bytes, %d ports)\n", reg_len,
                state->port_count);
@@ -539,7 +542,7 @@ static int pcie_init_controller(int controller, const char *path)
     printf("pcie: ADT uses %d reg entries per port\n", port_reg_cnt);
 
     if (state->pcie_regs->type == APCIE_T8140 &&
-        pcie_t8140_preflight(path, adt_path, state->port_count, port_reg_cnt)) {
+        pcie_t8140_preflight(path, adt_path, state->port_count, reg_len)) {
         printf("pcie: T8140 ADT preflight failed; leaving PCIe disabled\n");
         return -1;
     }
@@ -637,8 +640,8 @@ static int pcie_init_controller(int controller, const char *path)
 
         /* Confirm reset release before continuing with PHY control. */
         if (state->pcie_regs->type == APCIE_T8140 &&
-            poll32(state->phy_base[phy] + APCIE_PHY_CTRL,
-                   state->pcie_regs->phy_ctrl_reset, 0, 50000)) {
+            poll32(state->phy_base[phy] + APCIE_PHY_CTRL, state->pcie_regs->phy_ctrl_reset, 0,
+                   50000)) {
             printf("pcie: Timeout releasing T8140 PHY reset\n");
             return -1;
         }
@@ -976,10 +979,10 @@ static int pcie_init_controller(int controller, const char *path)
                     int target_speed;
                     if (ADT_GETPROP(adt, np, "target-link-speed", &target_speed) >= 0 &&
                         target_speed > 0) {
-                        max_speed = target_speed;
+                        max_speed = target_speed > 4 ? 4 : target_speed;
                     } else if (ADT_GETPROP(adt, np, "expected-link-speed", &target_speed) >= 0 &&
                                target_speed > 0) {
-                        max_speed = target_speed;
+                        max_speed = target_speed > 4 ? 4 : target_speed;
                     }
                 }
             }
@@ -990,6 +993,8 @@ static int pcie_init_controller(int controller, const char *path)
                 printf("pcie: Invalid max-speed\n");
                 return -1;
             }
+            if (max_speed > 4)
+                max_speed = 4;
 
             mask32(config_base + PCIE_CAP_BASE + PCIE_LNKCAP, PCIE_LNKCAP_SLS,
                    FIELD_PREP(PCIE_LNKCAP_SLS, max_speed));

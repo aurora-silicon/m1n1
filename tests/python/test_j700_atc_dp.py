@@ -1,4 +1,4 @@
-"""Exercise the production J700 ATC exporter against the captured entry ADT."""
+"""Exercise the production J700 ATC exporter with synthetic ADT records."""
 
 import json
 from pathlib import Path
@@ -199,9 +199,13 @@ int main(void)
     bad_bank = 0;
     u8 uncovered[sizeof(range_bytes)];
     memcpy(uncovered, range_bytes, sizeof(uncovered));
-    memset(uncovered + 24 + 16, 0, 8);
+    memset(uncovered + 16, 0, 8);
     range_override = uncovered;
-    run(); absent("apple,tunable-axi2af"); absent("apple,tunable-dp-common-pre");
+    run(); absent("apple,tunable-axi2af");
+    assert(fdt_getprop(tree, phy, "apple,tunable-dp-common-pre", NULL));
+    memcpy(uncovered, range_bytes, sizeof(uncovered));
+    memset(uncovered + 24 + 16, 0, 8);
+    run(); absent("apple,tunable-dp-common-pre");
     assert(fdt_getprop(tree, phy, "apple,tunable-usb2phy-reg-dflt", NULL));
     range_override = NULL;
     init_tree(); run();

@@ -72,8 +72,7 @@ void usb_cdc_atc_force_swapped(bool enable)
     force_swapped = enable;
 }
 
-static int apply_group(int node, uintptr_t window, u64 window_size,
-                       const struct atc_tuning_group *group)
+static int validate_group(int node, u64 window_size, const struct atc_tuning_group *group)
 {
     u32 length;
     const u8 *records = adt_getprop(adt, node, group->name, &length);
@@ -81,6 +80,17 @@ static int apply_group(int node, uintptr_t window, u64 window_size,
         return group->required ? -1 : 0;
     if (!length || length % 12 || window_size < 4 || group->span < 4 ||
         group->base > window_size - 4)
+        return -1;
+    return tunables_validate_compact("/arm-io/atc-phy0", group->name,
+                                     min((u64)group->span, window_size - group->base));
+}
+
+static int apply_group(int node, uintptr_t window, u64 window_size,
+                       const struct atc_tuning_group *group)
+{
+    if (!adt_getprop(adt, node, group->name, NULL))
+        return group->required ? -1 : 0;
+    if (validate_group(node, window_size, group))
         return -1;
     return tunables_apply_compact_addr("/arm-io/atc-phy0", group->name, window + group->base,
                                        min((u64)group->span, window_size - group->base));
@@ -102,6 +112,17 @@ int usb_cdc_atc_power_on(uintptr_t pipehandler)
     phy_ready = false;
     atc_node = node;
     atc_core_size = core_size;
+
+    struct atc_tuning_group axi_group = {"tunable_ATC0AXI2AF", 0, 0x8000, true};
+    if (validate_group(node, axi_size, &axi_group))
+        return -1;
+    for (size_t i = 0; i < ARRAY_SIZE(common_groups); i++)
+        if (validate_group(node, core_size, &common_groups[i]))
+            return -1;
+    for (size_t lane = 0; lane < ARRAY_SIZE(lane_groups); lane++)
+        for (size_t i = 0; i < ARRAY_SIZE(lane_groups[lane]); i++)
+            if (validate_group(node, core_size, &lane_groups[lane][i]))
+                return -1;
 
     set32(usb2 + USB2_SIG, 0xf);
     clear32(usb2 + USB2_SIG, 7 << 12); /* device role */
@@ -134,7 +155,6 @@ int usb_cdc_atc_power_on(uintptr_t pipehandler)
     clear32(core + ATC_POWER_CTRL, BIT(2));
     set32(core + ATC_POWER_CTRL, BIT(3));
 
-    struct atc_tuning_group axi_group = {"tunable_ATC0AXI2AF", 0, 0x8000, true};
     if (apply_group(node, axi, axi_size, &axi_group))
         return -1;
     for (size_t i = 0; i < ARRAY_SIZE(common_groups); i++) {

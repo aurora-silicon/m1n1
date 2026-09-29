@@ -111,6 +111,12 @@ static u64 physical_base = 0x10000000000, physical_size = 0x200000000;
 static u64 mem_size_actual = 0x200000000;
 static bool hole_dcp_vram, hole_dcp_firmware, hole_ext, bad_carveout, bad_segment;
 static int reservation_calls;
+static bool ext_power = true;
+static int pmgr_power_is_on(int die, const char *name)
+{
+    assert(die == 0 && !strcmp(name, "DISPEXT0_CPU"));
+    return ext_power;
+}
 
 static u64 translate(const char *device, u64 iova)
 {
@@ -282,10 +288,31 @@ static void setup(void)
         if (i == 0 || i == 2)
             assert(fdt_setprop_string(dt, fdt_path_offset(dt, path), "compatible",
                    i == 0 ? "apple,t8140-dcp" : "apple,t8140-dcpext") == 0);
-        if (i == 1)
+        if (i == 1 || i == 3)
             assert(fdt_setprop_string(dt, fdt_path_offset(dt, path), "compatible",
                                       "apple,display-subsystem") == 0);
         assert(fdt_setprop_string(dt, fdt_path_offset(dt, path), "status", "okay") == 0);
+    }
+    const char *refs[] = {"dart-dcp", "dart-dcpext", "mailbox-dcp", "mailbox-dcpext"};
+    const char *aliases[] = {"dcp_dart", "dcpext_dart", "dcp_mbox", "dcpext_mbox"};
+    for (int i = 0; i < 4; i++) {
+        assert(fdt_add_subnode(dt, fdt_path_offset(dt, "/soc"), refs[i]) >= 0);
+        char path[64];
+        snprintf(path, sizeof(path), "/soc/%s", refs[i]);
+        assert(fdt_setprop_string(dt, fdt_path_offset(dt, "/aliases"), aliases[i], path) == 0);
+        assert(fdt_setprop_u32(dt, fdt_path_offset(dt, path), "phandle", 100 + i) == 0);
+        assert(fdt_setprop_u32(dt, fdt_path_offset(dt, path),
+                               i < 2 ? "#iommu-cells" : "#mbox-cells", 1) == 0);
+        assert(fdt_setprop_string(dt, fdt_path_offset(dt, path), "status", "okay") == 0);
+    }
+    for (int i = 0; i < 2; i++) {
+        const char *name = i ? "/soc/dcpext" : "/soc/dcp";
+        fdt32_t iommu[] = {cpu_to_fdt32(100 + i), 0};
+        fdt32_t mbox[] = {cpu_to_fdt32(102 + i), 0};
+        assert(fdt_setprop(dt, fdt_path_offset(dt, name), "iommus", iommu,
+                           sizeof(iommu)) == 0);
+        assert(fdt_setprop(dt, fdt_path_offset(dt, name), "mboxes", mbox,
+                           sizeof(mbox)) == 0);
     }
     assert(fdt_add_subnode(dt, fdt_path_offset(dt, "/chosen"), "framebuffer") >= 0);
     cur_boot_args.phys_base = 0x1000342c000;
@@ -296,11 +323,12 @@ static void setup(void)
     carveouts[5].pa = 0x101e8ec8000;
     assert(cur_boot_args.phys_base + cur_boot_args.mem_size < carveouts[0].pa);
     cur_boot_args.video.base = carveouts[0].pa;
-    /* The h-499 boot framebuffer is a sub-range of the /vram carveout. */
+    /* The boot framebuffer is a sub-range of the /vram carveout. */
     cur_boot_args.video.stride = 0x1788;
     cur_boot_args.video.height = 2416;
     assert(cur_boot_args.video.stride * cur_boot_args.video.height == 0xde1380);
     reservation_calls = 0;
+    ext_power = true;
     hole_dcp_vram = hole_dcp_firmware = hole_ext = false;
     bad_carveout = bad_segment = false;
     for (size_t i = 0; i < ARRAY_SIZE(asc_state); i++) {
@@ -322,16 +350,22 @@ static void check_status(const char *name, const char *want)
     char path[64];
     snprintf(path, sizeof(path), "/soc/%s", name);
     const char *status = fdt_getprop(dt, fdt_path_offset(dt, path), "status", NULL);
+    if (!status || strcmp(status, want))
+        fprintf(stderr, "%s: expected %s, got %s\n", name, want, status ? status : "absent");
     assert(status && !strcmp(status, want));
 }
 static void check_fallback(const unsigned char *before)
 {
-    /* Refusal must leave the entire FDT exactly as j700-full-2 did. */
-    assert(memcmp(dt, before, sizeof(tree)) == 0);
-    check_status("dcp", "okay");
-    check_status("disp0", "okay");
-    check_status("dcpext", "okay");
-    check_status("dispext0", "okay");
+    (void)before;
+    check_status("dcp", "disabled");
+    check_status("disp0", "disabled");
+    check_status("dcpext", "disabled");
+    check_status("dispext0", "disabled");
+    check_status("dart-dcp", "disabled");
+    check_status("dart-dcpext", "disabled");
+    check_status("mailbox-dcp", "disabled");
+    check_status("mailbox-dcpext", "disabled");
+    check_claim(false);
     assert(fdt_path_offset(dt, "/chosen/framebuffer") >= 0);
     assert(fdt_path_offset(dt, "/reserved-memory/framebuffer@101eb4b8000") < 0);
     assert(fdt_check_header(dt) == 0);
@@ -393,8 +427,17 @@ int main(void)
     asc_state[1].i2a |= BIT(18);
     assert(dt_set_display_t8140() == 0);
     check_status("dcpext", "disabled");
+    check_status("dart-dcpext", "disabled");
+    check_status("mailbox-dcpext", "disabled");
     check_claim(true);
     assert(fdt_path_offset(dt, "/reserved-memory/dcpext0_data_tail@101ea79c000") < 0);
+
+    setup();
+    ext_power = false;
+    assert(dt_set_display_t8140() == 0);
+    check_status("dcp", "okay");
+    check_status("dcpext", "disabled");
+    check_claim(true);
 
     setup();
     carveouts[3].pa = physical_base + physical_size;
@@ -454,6 +497,13 @@ int main(void)
     memcpy(before, dt, sizeof(tree));
     assert(dt_set_display_t8140() == 0);
     check_fallback(before);
+
+    setup();
+    physical_size = SZ_16K;
+    assert(fdt_delprop(dt, fdt_path_offset(dt, "/chosen"),
+                       "apple,dcp-rtkit-quiesced") == 0);
+    assert(fdt_pack(dt) == 0);
+    assert(dt_set_display_t8140() == -1);
     return 0;
 }
 '''

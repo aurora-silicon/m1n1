@@ -640,8 +640,8 @@ int display_init(void)
         printf("display: Display is internal\n");
 
     if (chip_id == T8140) {
-        printf("display: preserving inherited T8140 display (%ldx%ld)\n",
-               cur_boot_args.video.width, cur_boot_args.video.height);
+        printf("display: preserving inherited T8140 display (%ldx%ld)\n", cur_boot_args.video.width,
+               cur_boot_args.video.height);
         return 0;
     }
 

@@ -77,6 +77,10 @@ int pmgr_adt_power_enable_traced(const char *path)
 {
     return pmgr_adt_power_enable(path);
 }
+int pmgr_adt_power_enable_traced_rollback(const char *path)
+{
+    return pmgr_adt_power_enable_traced(path);
+}
 int pmgr_adt_power_disable_traced(const char *path)
 {
     return pmgr_adt_power_disable(path);
@@ -169,7 +173,7 @@ static void failure(void)
     u64 phys, iova, size;
     assert(isp_init() != 0);
     assert(isp_get_heap(&phys, &iova, &size) != 0);
-    assert(enabled == 1 && disabled == 1);
+    assert(enabled == 1 && disabled == (adt_power_fails ? 0 : 1));
     assert(gated == active);
     for (int i = 0; i < gated; ++i)
         assert(gated_addrs[i] == active_addrs[gated - i - 1]);
@@ -186,6 +190,11 @@ int main(void)
     reset(); segments[1].iova = UINT64_MAX - 0x1000; segments[1].size = 1; failure();
     reset(); segments[1].size = 0x1354000; failure();
     reset(); segments[1].size = 0x1357fff; success();
+    reset();
+    struct adt_segment_ranges first = segments[0];
+    segments[0] = segments[1];
+    segments[1] = first;
+    success();
     reset(); allocation_fails = true; failure();
     reset(); cur_boot_args.mem_size = expected_heap_size; failure();
     reset(); dapf_fails = true; failure();
@@ -198,7 +207,7 @@ int main(void)
     assert(isp_init() == 0);
     u64 phys, iova, size;
     assert(isp_get_heap(&phys, &iova, &size) == 0);
-    assert(iova == 0xe40000 && size == 0xc0000);
+    assert(iova == 0xe94000 && size == 0x6c000);
     assert(disabled == 1 && gated == 1 && dapf_calls == 0);
     return 0;
 }

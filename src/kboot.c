@@ -1728,8 +1728,8 @@ static int dt_device_set_reserved_mem_from_dart(int node, dart_dev_t *dart, cons
 {
     u64 iova = dart_get_mapping(dart, name, paddr, size);
     if (DART_IS_ERR(iova)) {
-        printf("FDT: %s DART %s: no contiguous mapping for PA 0x%lx size 0x%lx\n",
-               device, name, paddr, size);
+        printf("FDT: %s DART %s: no contiguous mapping for PA 0x%lx size 0x%lx\n", device, name,
+               paddr, size);
         if (chip_id == T8140) {
             u64 first = dart_search_range(dart, paddr, SZ_16K);
             if (DART_IS_ERR(first)) {
@@ -1755,8 +1755,8 @@ static int dt_device_set_reserved_mem_from_dart(int node, dart_dev_t *dart, cons
     }
 
     if (chip_id == T8140)
-        printf("FDT: %s DART %s: IOVA 0x%lx -> PA 0x%lx size 0x%lx validated\n",
-               device, name, iova, paddr, size);
+        printf("FDT: %s DART %s: IOVA 0x%lx -> PA 0x%lx size 0x%lx validated\n", device, name, iova,
+               paddr, size);
 
     return dt_device_set_reserved_mem(node, name, phandle, iova, size);
 }
@@ -1902,7 +1902,7 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
         int dcp_node = fdt_path_offset(dt, dcp_alias);
         if (dcp_node < 0) {
             printf("FDT: could not resolve '%s' alias\n", dcp_alias);
-            ret = -1;
+            ret = chip_id == T8140 ? -1 : 0;
             goto err; // cleanup
         }
         dart_dcp = dt_init_dart_by_node(dcp_node, 0);
@@ -1915,7 +1915,7 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
         int disp_node = fdt_path_offset(dt, disp_alias);
         if (disp_node < 0) {
             printf("FDT: could not resolve '%s' alias\n", disp_alias);
-            ret = -1;
+            ret = chip_id == T8140 ? -1 : 0;
             goto err; // cleanup
         }
         dart_disp = dt_init_dart_by_node(disp_node, 0);
@@ -1928,7 +1928,7 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
         int piodma_node = fdt_path_offset(dt, piodma_alias);
         if (piodma_node < 0) {
             printf("FDT: could not resolve '%s' alias\n", piodma_alias);
-            ret = -1;
+            ret = chip_id == T8140 ? -1 : 0;
             goto err; // cleanup
         }
 
@@ -1953,21 +1953,23 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
         if (maps[i].map_dcp && dart_dcp) {
-            ret = dt_device_set_reserved_mem_from_dart(mem_node, dart_dcp, dcp_alias, node_name,
-                                                       dcp_phandle, region[i].paddr, region[i].size);
+            ret =
+                dt_device_set_reserved_mem_from_dart(mem_node, dart_dcp, dcp_alias, node_name,
+                                                     dcp_phandle, region[i].paddr, region[i].size);
             if (ret != 0)
                 goto err;
         }
         if (maps[i].map_disp && dart_disp) {
-            ret = dt_device_set_reserved_mem_from_dart(mem_node, dart_disp, disp_alias, node_name,
-                                                       disp_phandle, region[i].paddr, region[i].size);
+            ret =
+                dt_device_set_reserved_mem_from_dart(mem_node, dart_disp, disp_alias, node_name,
+                                                     disp_phandle, region[i].paddr, region[i].size);
             if (ret != 0)
                 goto err;
         }
         if (maps[i].map_piodma && dart_piodma) {
-            ret = dt_device_set_reserved_mem_from_dart(
-                mem_node, dart_piodma, piodma_alias, node_name, piodma_phandle,
-                region[i].paddr, region[i].size);
+            ret = dt_device_set_reserved_mem_from_dart(mem_node, dart_piodma, piodma_alias,
+                                                       node_name, piodma_phandle, region[i].paddr,
+                                                       region[i].size);
             if (ret != 0)
                 goto err;
         }
@@ -2148,7 +2150,7 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
         int mem_node =
             dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, seg->phys, seg_size);
         if (mem_node < 0)
-            return ret;
+            return -1;
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
         ret = dt_device_set_reserved_mem(mem_node, node_name, dev_phandle, iova, seg_size);
@@ -2402,28 +2404,27 @@ static bool dt_t8140_in_physical_dram(const struct dt_t8140_dram *dram, u64 base
 }
 
 static int dt_t8140_reserve_carveout(const char *dcp_path, const char *disp_path,
-                                    const char *region_id, const char *name, bool map_disp,
-                                    const struct dt_t8140_dram *dram)
+                                     const char *region_id, const char *name, bool map_disp,
+                                     const struct dt_t8140_dram *dram)
 {
     int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
     u64 pair[2] = {0};
     int len = node < 0 ? -1 : ADT_GETPROP_ARRAY(adt, node, region_id, pair);
-    if (len != sizeof(pair) || !pair[0] || !pair[1] ||
-        (pair[0] & (SZ_16K - 1)) || (pair[1] & (SZ_16K - 1)) ||
-        pair[0] > UINT64_MAX - pair[1]) {
-        printf("FDT: T8140 %s/%s: invalid ADT %s PA 0x%lx size 0x%lx (len %d)\n",
-               dcp_path, name, region_id, pair[0], pair[1], len);
+    if (len != sizeof(pair) || !pair[0] || !pair[1] || (pair[0] & (SZ_16K - 1)) ||
+        (pair[1] & (SZ_16K - 1)) || pair[0] > UINT64_MAX - pair[1]) {
+        printf("FDT: T8140 %s/%s: invalid ADT %s PA 0x%lx size 0x%lx (len %d)\n", dcp_path, name,
+               region_id, pair[0], pair[1], len);
         return -1;
     }
     if (!dt_t8140_in_physical_dram(dram, pair[0], pair[1])) {
         printf("FDT: T8140 %s/%s: ADT %s PA 0x%lx size 0x%lx outside physical DRAM"
-               " 0x%lx..0x%lx\n", dcp_path, name, region_id, pair[0], pair[1],
-               dram->base, dram->base + dram->size);
+               " 0x%lx..0x%lx\n",
+               dcp_path, name, region_id, pair[0], pair[1], dram->base, dram->base + dram->size);
         return -1;
     }
 
-    printf("FDT: T8140 %s/%s: check ADT %s PA 0x%lx size 0x%lx\n",
-           dcp_path, name, region_id, pair[0], pair[1]);
+    printf("FDT: T8140 %s/%s: check ADT %s PA 0x%lx size 0x%lx\n", dcp_path, name, region_id,
+           pair[0], pair[1]);
 
     struct disp_mapping map = {0};
     struct mem_region region = {pair[0], pair[1]};
@@ -2436,25 +2437,22 @@ static int dt_t8140_reserve_carveout(const char *dcp_path, const char *disp_path
 /* Region 50/73 ends with the nub's shared-data segment. Its physical pages
  * are adjacent, but the live DART puts the final segment at a different IOVA.
  * Export two truthful translations instead of one invented contiguous one. */
-static int dt_t8140_reserve_data(const char *dcp_path, const char *nub_path,
-                                const char *region_id, const char *name,
-                                const struct dt_t8140_dram *dram)
+static int dt_t8140_reserve_data(const char *dcp_path, const char *nub_path, const char *region_id,
+                                 const char *name, const struct dt_t8140_dram *dram)
 {
     int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
     u64 pair[2] = {0};
     int pair_len = node < 0 ? -1 : ADT_GETPROP_ARRAY(adt, node, region_id, pair);
     if (pair_len != sizeof(pair)) {
-        printf("FDT: T8140 %s/%s: missing ADT %s (len %d)\n", dcp_path, name,
-               region_id, pair_len);
+        printf("FDT: T8140 %s/%s: missing ADT %s (len %d)\n", dcp_path, name, region_id, pair_len);
         return -1;
     }
     node = adt_path_offset(adt, nub_path);
     u32 len = 0;
     const struct adt_segment_ranges *seg =
         node < 0 ? NULL : adt_getprop(adt, node, "segment-ranges", &len);
-    if (!seg || len < 2 * sizeof(*seg) || len % sizeof(*seg) ||
-        len > 32 * sizeof(*seg) || !pair[0] || !pair[1] ||
-        (pair[0] & (SZ_16K - 1)) || (pair[1] & (SZ_16K - 1)) ||
+    if (!seg || len < 2 * sizeof(*seg) || len % sizeof(*seg) || len > 32 * sizeof(*seg) ||
+        !pair[0] || !pair[1] || (pair[0] & (SZ_16K - 1)) || (pair[1] & (SZ_16K - 1)) ||
         pair[0] > UINT64_MAX - pair[1]) {
         printf("FDT: T8140 %s/%s: invalid ADT %s PA 0x%lx size 0x%lx; %s segment len %u\n",
                dcp_path, name, region_id, pair[0], pair[1], nub_path, len);
@@ -2462,26 +2460,23 @@ static int dt_t8140_reserve_data(const char *dcp_path, const char *nub_path,
     }
     if (!dt_t8140_in_physical_dram(dram, pair[0], pair[1])) {
         printf("FDT: T8140 %s/%s: ADT %s PA 0x%lx size 0x%lx outside physical DRAM"
-               " 0x%lx..0x%lx\n", dcp_path, name, region_id, pair[0], pair[1],
-               dram->base, dram->base + dram->size);
+               " 0x%lx..0x%lx\n",
+               dcp_path, name, region_id, pair[0], pair[1], dram->base, dram->base + dram->size);
         return -1;
     }
-    if (!seg[1].size ||
-        (seg[1].phys & (SZ_16K - 1)) || (seg[1].size & (SZ_16K - 1)) ||
+    if (!seg[1].size || (seg[1].phys & (SZ_16K - 1)) || (seg[1].size & (SZ_16K - 1)) ||
         seg[1].size >= pair[1] || seg[1].phys != pair[0] + pair[1] - seg[1].size) {
         printf("FDT: T8140 %s/%s: %s tail PA 0x%lx size 0x%x does not end"
                " ADT %s PA 0x%lx size 0x%lx\n",
-               dcp_path, name, nub_path, seg[1].phys, seg[1].size, region_id,
-               pair[0], pair[1]);
+               dcp_path, name, nub_path, seg[1].phys, seg[1].size, region_id, pair[0], pair[1]);
         return -1;
     }
 
     printf("FDT: T8140 %s/%s: check ADT %s PA 0x%lx size 0x%lx,"
-           " tail PA 0x%lx size 0x%x\n", dcp_path, name, region_id, pair[0], pair[1],
-           seg[1].phys, seg[1].size);
+           " tail PA 0x%lx size 0x%x\n",
+           dcp_path, name, region_id, pair[0], pair[1], seg[1].phys, seg[1].size);
 
-    struct mem_region regions[2] = {{pair[0], pair[1] - seg[1].size},
-                                    {seg[1].phys, seg[1].size}};
+    struct mem_region regions[2] = {{pair[0], pair[1] - seg[1].size}, {seg[1].phys, seg[1].size}};
     struct disp_mapping maps[2] = {0};
     snprintf(maps[0].mem_fdt, sizeof(maps[0].mem_fdt), "%s", name);
     snprintf(maps[1].mem_fdt, sizeof(maps[1].mem_fdt), "%s_tail", name);
@@ -2525,6 +2520,92 @@ static bool dt_t8140_validate_dcp_asc(const char *path, const char *name)
     return ready;
 }
 
+static int dt_t8140_disable_refs(int node, const char *prop, const char *cells_prop)
+{
+    int len;
+    const fdt32_t *refs = fdt_getprop(dt, node, prop, &len);
+    if (!refs)
+        return len == -FDT_ERR_NOTFOUND ? 0 : -1;
+    if (len < 0 || len % (int)sizeof(*refs) || len > 64 * (int)sizeof(*refs))
+        return -1;
+
+    u32 phandles[64];
+    size_t count = 0;
+    for (int i = 0; i < len / (int)sizeof(*refs);) {
+        u32 phandle = fdt32_to_cpu(refs[i]);
+        int target = fdt_node_offset_by_phandle(dt, phandle);
+        int cells_len;
+        const fdt32_t *args = target < 0 ? NULL : fdt_getprop(dt, target, cells_prop, &cells_len);
+        if (!args || cells_len != (int)sizeof(*args))
+            return -1;
+        u32 arg_count = fdt32_to_cpu(*args);
+        if (arg_count > 16 || arg_count >= (u32)(len / (int)sizeof(*refs) - i))
+            return -1;
+        phandles[count++] = phandle;
+        i += arg_count + 1;
+    }
+    for (size_t i = 0; i < count; i++) {
+        int target = fdt_node_offset_by_phandle(dt, phandles[i]);
+        if (target < 0 || fdt_setprop_string(dt, target, "status", "disabled"))
+            return -1;
+    }
+    return 0;
+}
+
+/* A refused handoff must not let Linux bind an unclaimed live controller. */
+static int dt_t8140_refuse_display(void)
+{
+    static const char *const compatibles[] = {
+        "apple,t8140-dcp",
+        "apple,t8140-dcpext",
+        "apple,display-subsystem",
+    };
+    static const char *const consumers[] = {
+        "dcp",        "disp0",       "dcpext",        "dispext0", "dcp_dart",
+        "disp0_dart", "dcpext_dart", "dispext0_dart", "dcp_mbox", "dcpext_mbox",
+    };
+    char paths[16][128];
+    size_t count = 0;
+
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0)
+        return -1;
+    int ret = fdt_delprop(dt, chosen, "apple,dcp-rtkit-quiesced");
+    if (ret && ret != -FDT_ERR_NOTFOUND)
+        return -1;
+
+    for (size_t i = 0; i < ARRAY_SIZE(compatibles); i++) {
+        int node = -1;
+        while ((node = fdt_node_offset_by_compatible(dt, node, compatibles[i])) >= 0) {
+            if (count == ARRAY_SIZE(paths) ||
+                fdt_get_path(dt, node, paths[count], sizeof(paths[count])))
+                return -1;
+            count++;
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        int node = fdt_path_offset(dt, paths[i]);
+        if (node < 0)
+            return -1;
+        if (dt_t8140_disable_refs(node, "iommus", "#iommu-cells"))
+            return -1;
+        node = fdt_path_offset(dt, paths[i]);
+        if (node < 0 || dt_t8140_disable_refs(node, "mboxes", "#mbox-cells"))
+            return -1;
+        node = fdt_path_offset(dt, paths[i]);
+        if (node < 0)
+            return -1;
+        if (fdt_setprop_string(dt, node, "status", "disabled"))
+            return -1;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(consumers); i++) {
+        int node = fdt_path_offset(dt, consumers[i]);
+        if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
+            return -1;
+    }
+    return 0;
+}
+
 static int dt_set_display_t8140(void)
 {
     int ret = -1;
@@ -2555,12 +2636,10 @@ static int dt_set_display_t8140(void)
         reason = "invalid ADT /vram reg or alignment";
         goto refuse;
     }
-    if (!cur_boot_args.video.base || !cur_boot_args.video.height ||
-        !cur_boot_args.video.stride ||
+    if (!cur_boot_args.video.base || !cur_boot_args.video.height || !cur_boot_args.video.stride ||
         cur_boot_args.video.stride > UINT64_MAX / cur_boot_args.video.height) {
         printf("FDT: T8140 framebuffer geometry: PA 0x%lx stride 0x%lx height 0x%lx\n",
-               cur_boot_args.video.base, cur_boot_args.video.stride,
-               cur_boot_args.video.height);
+               cur_boot_args.video.base, cur_boot_args.video.stride, cur_boot_args.video.height);
         reason = "invalid boot framebuffer geometry";
         goto refuse;
     }
@@ -2585,8 +2664,8 @@ static int dt_set_display_t8140(void)
         dram.base = 0x800000000;
     if (ADT_GETPROP(adt, node, "dram-size", &dram.size) < 0)
         dram.size = mem_size_actual;
-    printf("FDT: T8140 physical DRAM: PA 0x%lx size 0x%lx; /vram PA 0x%lx size 0x%lx\n",
-           dram.base, dram.size, base, size);
+    printf("FDT: T8140 physical DRAM: PA 0x%lx size 0x%lx; /vram PA 0x%lx size 0x%lx\n", dram.base,
+           dram.size, base, size);
     if (!dram.size || dram.base > UINT64_MAX - dram.size) {
         reason = "invalid physical DRAM extent";
         goto refuse;
@@ -2604,7 +2683,8 @@ static int dt_set_display_t8140(void)
     u64 carveout[2] = {0};
     int carveout_len = node < 0 ? -1 : ADT_GETPROP_ARRAY(adt, node, "region-id-14", carveout);
     printf("FDT: T8140 region-id-14: ADT PA 0x%lx size 0x%lx (len %d);"
-           " /vram PA 0x%lx size 0x%lx\n", carveout[0], carveout[1], carveout_len, base, size);
+           " /vram PA 0x%lx size 0x%lx\n",
+           carveout[0], carveout[1], carveout_len, base, size);
     if (carveout_len != sizeof(carveout) || carveout[0] != base || carveout[1] != size) {
         reason = "ADT region-id-14 differs from /vram";
         goto refuse;
@@ -2614,15 +2694,15 @@ static int dt_set_display_t8140(void)
     const struct adt_segment_ranges *seg =
         node < 0 ? NULL : adt_getprop(adt, node, "segment-ranges", &seg_len);
     if (!seg || !seg_len || seg_len % sizeof(*seg) || seg_len > 32 * sizeof(*seg)) {
-        printf("FDT: T8140 DCP nub: invalid segment-ranges len %u (node %d)\n",
-               seg_len, node);
+        printf("FDT: T8140 DCP nub: invalid segment-ranges len %u (node %d)\n", seg_len, node);
         reason = "invalid DCP nub segment-ranges";
         goto refuse;
     }
     bool segment_found = false;
     for (u32 i = 0; i < seg_len / sizeof(*seg); i++) {
         printf("FDT: T8140 DCP nub segment %u: PA 0x%lx size 0x%x;"
-               " /vram PA 0x%lx size 0x%lx\n", i, seg[i].phys, seg[i].size, base, size);
+               " /vram PA 0x%lx size 0x%lx\n",
+               i, seg[i].phys, seg[i].size, base, size);
         if (seg[i].phys == base && seg[i].size == size)
             segment_found = true;
     }
@@ -2652,13 +2732,12 @@ static int dt_set_display_t8140(void)
     }
     if (!ret) {
         step = "DCP region-id-49 reservation";
-        ret = dt_t8140_reserve_carveout("dcp", NULL, "region-id-49", "asc-firmware", false,
-                                        &dram);
+        ret = dt_t8140_reserve_carveout("dcp", NULL, "region-id-49", "asc-firmware", false, &dram);
     }
     if (!ret) {
         step = "DCP region-id-50 reservation";
-        ret = dt_t8140_reserve_data("dcp", "/arm-io/dcp/iop-dcp-nub", "region-id-50",
-                                    "dcp_data", &dram);
+        ret = dt_t8140_reserve_data("dcp", "/arm-io/dcp/iop-dcp-nub", "region-id-50", "dcp_data",
+                                    &dram);
     }
     const struct {
         const char *region, *name;
@@ -2671,9 +2750,9 @@ static int dt_set_display_t8140(void)
     };
     for (size_t i = 0; !ret && i < ARRAY_SIZE(internal); i++) {
         step = internal[i].region;
-        ret = dt_t8140_reserve_carveout("dcp", internal[i].disp ? "disp0" : NULL,
-                                        internal[i].region, internal[i].name, internal[i].disp,
-                                        &dram);
+        ret =
+            dt_t8140_reserve_carveout("dcp", internal[i].disp ? "disp0" : NULL, internal[i].region,
+                                      internal[i].name, internal[i].disp, &dram);
     }
     if (ret) {
         memcpy(dt, saved, dt_bufsize);
@@ -2707,13 +2786,13 @@ static int dt_set_display_t8140(void)
             ext = ext_path;
     }
     bool ext_ready = false;
-    if (ext) {
+    if (ext && pmgr_power_is_on(0, "DISPEXT0_CPU") == 1) {
         step = "DCPEXT firmware properties";
         ret = dt_set_dcp_firmware(ext);
         if (!ret) {
             step = "DCPEXT region-id-49 reservation";
-            ret = dt_t8140_reserve_carveout(ext, NULL, "region-id-49", "asc-firmware", false,
-                                            &dram);
+            ret =
+                dt_t8140_reserve_carveout(ext, NULL, "region-id-49", "asc-firmware", false, &dram);
         }
         if (!ret) {
             step = "DCPEXT region-id-73 reservation";
@@ -2722,13 +2801,11 @@ static int dt_set_display_t8140(void)
         }
         if (!ret) {
             step = "DCPEXT region-id-74 reservation";
-            ret = dt_t8140_reserve_carveout(ext, NULL, "region-id-74", "region74", false,
-                                            &dram);
+            ret = dt_t8140_reserve_carveout(ext, NULL, "region-id-74", "region74", false, &dram);
         }
         if (!ret) {
             step = "DCPEXT region-id-234 reservation";
-            ret = dt_t8140_reserve_carveout(ext, NULL, "region-id-234", "region234", false,
-                                            &dram);
+            ret = dt_t8140_reserve_carveout(ext, NULL, "region-id-234", "region234", false, &dram);
         }
         if (!ret) {
             step = "DCPEXT ASC and mailboxes";
@@ -2740,7 +2817,7 @@ static int dt_set_display_t8140(void)
             printf("FDT: T8140 %s failed (%d); leaving dcpext disabled\n", step, ret);
         }
     } else {
-        printf("FDT: T8140 DCPEXT absent; internal panel validation continues\n");
+        printf("FDT: T8140 DCPEXT absent or powered off; internal panel continues\n");
     }
     free(ext_saved);
 
@@ -2753,14 +2830,44 @@ static int dt_set_display_t8140(void)
             goto rollback;
     } else {
         step = "disable unvalidated DCPEXT";
+        static const char *const aliases[] = {
+            "dcpext", "dispext0", "dcpext_dart", "dispext0_dart", "dcpext_mbox",
+        };
+        for (size_t i = 0; i < ARRAY_SIZE(aliases); i++) {
+            node = fdt_path_offset(dt, aliases[i]);
+            if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled") < 0)
+                goto rollback;
+        }
         node = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
-        if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled") < 0)
-            goto rollback;
+        if (node >= 0) {
+            if (dt_t8140_disable_refs(node, "iommus", "#iommu-cells"))
+                goto rollback;
+            node = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
+            if (node < 0 || dt_t8140_disable_refs(node, "mboxes", "#mbox-cells"))
+                goto rollback;
+            node = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
+            if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled") < 0)
+                goto rollback;
+        }
     }
-    step = "disable unvalidated dispext0";
-    node = fdt_path_offset(dt, "dispext0");
-    if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled") < 0)
-        goto rollback;
+    step = "disable unvalidated external display consumer";
+    node = -1;
+    while ((node = fdt_node_offset_by_compatible(dt, node, "apple,display-subsystem")) >= 0) {
+        int name_len;
+        const char *name = fdt_get_name(dt, node, &name_len);
+        if (!name || name_len < 0)
+            goto rollback;
+        if (strstr(name, "dispext")) {
+            char path[128];
+            if (fdt_get_path(dt, node, path, sizeof(path)))
+                goto rollback;
+            if (fdt_setprop_string(dt, node, "status", "disabled") < 0)
+                goto rollback;
+            node = fdt_path_offset(dt, path);
+            if (node < 0)
+                goto rollback;
+        }
+    }
     step = "publish apple,dcp-rtkit-quiesced claim";
     node = fdt_path_offset(dt, "/chosen");
     if (node < 0)
@@ -2780,9 +2887,8 @@ rollback:
         reason = "FDT consumer or property update failed";
 
 refuse:
-    printf("FDT: T8140 display refused at %s: %s; retaining original FDT and simplefb\n",
-           step, reason);
-    return 0;
+    printf("FDT: T8140 display refused at %s: %s; retaining simplefb\n", step, reason);
+    return dt_t8140_refuse_display();
 }
 
 static int dt_set_display(void)
@@ -2968,9 +3074,8 @@ static int dt_set_sep(void)
     int ret = ADT_GETPROP_ARRAY(adt, anode_mmap, "SEPFW", phys_map);
     if (ret != (int)sizeof(phys_map) || !phys_map[0] || !phys_map[1] ||
         phys_map[0] > UINT64_MAX - phys_map[1] ||
-        (chip_id == T8140 &&
-         (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
-          phys_map[1] > dram_base + dram_size - phys_map[0])))
+        (chip_id == T8140 && (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
+                              phys_map[1] > dram_base + dram_size - phys_map[0])))
         bail("ADT: could not get sepfw memory\n");
 
     const char *node_name = "sep-firmware";
@@ -2996,9 +3101,8 @@ static int dt_set_sep(void)
         ret = ADT_GETPROP_ARRAY(adt, anode_manifest, adt_names[i], phys_map);
         if (ret != (int)sizeof(phys_map) || !phys_map[0] || !phys_map[1] ||
             phys_map[1] > (u64)dt_bufsize || phys_map[0] > UINT64_MAX - phys_map[1] ||
-            (chip_id == T8140 &&
-             (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
-              phys_map[1] > dram_base + dram_size - phys_map[0]))) {
+            (chip_id == T8140 && (phys_map[0] < dram_base || phys_map[0] > dram_base + dram_size ||
+                                  phys_map[1] > dram_base + dram_size - phys_map[0]))) {
             printf("ADT: no usable SEP %s manifest\n", adt_names[i]);
             continue;
         }
@@ -3168,7 +3272,7 @@ static int dt_set_isp_fwdata(void)
 
     int mem_node = dt_get_or_add_reserved_mem("isp-heap", "apple,asc-mem", true, phys, size);
     if (mem_node < 0)
-        return ret;
+        return -1;
 
     ret = dt_device_set_reserved_mem(mem_node, "isp-heap", dev_phandle, iova, size);
     if (ret < 0)
@@ -3871,6 +3975,24 @@ int kboot_boot(void *kernel)
 
     printf("Setting SMP mode to WFE...\n");
     smp_set_wfe_mode(true);
+    if (chip_id == T8140) {
+        int chosen = fdt_path_offset(dt, "/chosen");
+        if (chosen < 0)
+            return -1;
+        if (fdt_getprop(dt, chosen, "apple,dcp-rtkit-quiesced", NULL)) {
+            bool healthy = dt_t8140_validate_dcp_asc("/arm-io/dcp", "dcp");
+            int ext = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
+            const char *status = ext < 0 ? NULL : fdt_getprop(dt, ext, "status", NULL);
+            if (healthy && status && !strcmp(status, "okay"))
+                healthy = pmgr_power_is_on(0, "DISPEXT0_CPU") == 1 &&
+                          dt_t8140_validate_dcp_asc("/arm-io/dcpext", "dcpext");
+            if (!healthy) {
+                printf("kboot: DCP changed state before handoff; disabling display\n");
+                if (dt_t8140_refuse_display() || fdt_pack(dt))
+                    return -1;
+            }
+        }
+    }
     printf("Preparing to boot kernel at %p with fdt at %p\n", kernel, dt);
 
     next_stage.entry = kernel;

@@ -35,7 +35,7 @@ typedef uint64_t u64;
 static void *adt;
 static int chip_id = T8140;
 static const char *controller_compat = "apcie,t8140";
-static const u64 regs[][2] = {
+static u64 regs[][2] = {
     {0x1cb0000000, 0x10000000}, {0x394000000, 0x4000},
     {0x397000000, 0x40000}, {0x397040000, 0x28000},
     {0x396000000, 0x1000000}, {0x395046200, 0x4000}, {0x395044000, 0x4000},
@@ -53,6 +53,8 @@ static const u64 regs[][2] = {
 static int powered, accesses, polls, fail_poll, invalid_adt, stuck_reset;
 static int reset_delay, pll, auspma, port_run, fail_tunable;
 static int common_mode, rc_ready, port_tunables;
+static int bad_common;
+static u32 reg_len_override;
 static u32 phy_ctrl, port_ctrl, appclk;
 static int adt_path_offset(const void *a, const char *path)
 {
@@ -71,8 +73,8 @@ static bool adt_is_compatible(const void *a, int node, const char *compat)
 }
 static const void *adt_getprop(const void *a, int node, const char *prop, u32 *len)
 {
-    if (!strcmp(prop, "apcie-common-tunables")) return NULL;
-    if (len) *len = sizeof(regs);
+    if (!strcmp(prop, "apcie-common-tunables")) return bad_common ? regs : NULL;
+    if (len) *len = reg_len_override ? reg_len_override : sizeof(regs);
     return regs;
 }
 static int adt_getprop_copy(const void *a, int node, const char *prop, void *out, size_t len)
@@ -94,7 +96,10 @@ static int adt_first_child_offset(const void *a, int node) { return -1; }
 static int tunables_validate_local(const char *path, const char *prop, u64 span)
 {
     assert(!powered);
-    return invalid_adt ? -1 : 0;
+    if (invalid_adt) return -1;
+    if (!strcmp(prop, "apcie-common-tunables") && span < 0x100) return -1;
+    if (!strcmp(prop, "apcie-config-tunables") && span < 0x5000) return -1;
+    return 0;
 }
 static int pmgr_adt_power_enable(const char *path) { powered++; return 0; }
 static int pmgr_adt_power_disable_index(const char *path, int i) { assert(0); return -1; }
@@ -184,6 +189,10 @@ static void reset_model(void)
     powered = accesses = polls = fail_poll = invalid_adt = stuck_reset = 0;
     reset_delay = pll = auspma = port_run = fail_tunable = 0;
     common_mode = rc_ready = port_tunables = 0;
+    bad_common = 0;
+    reg_len_override = 0;
+    regs[1][1] = 0x4000;
+    regs[7][1] = 0x8000;
     phy_ctrl = port_ctrl = 0x10;
     appclk = 0;
 }
@@ -219,6 +228,16 @@ int main(void)
     assert(pcie_init() == 0 && pll == 0 && auspma == 0 && port_run);
     reset_model();
     invalid_adt = 1;
+    assert(pcie_init() == 1 && powered == 0 && accesses == 0);
+    reset_model();
+    reg_len_override = sizeof(regs) - 16;
+    assert(pcie_init() == 1 && powered == 0 && accesses == 0);
+    reset_model();
+    bad_common = 1;
+    regs[1][1] = 0x5c;
+    assert(pcie_init() == 1 && powered == 0 && accesses == 0);
+    reset_model();
+    regs[7][1] = 0x4000;
     assert(pcie_init() == 1 && powered == 0 && accesses == 0);
     reset_model();
     chip_id = 0x8132;

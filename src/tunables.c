@@ -91,8 +91,8 @@ int tunables_validate_local(const char *path, const char *prop, u64 span)
 
     for (u32 i = 0; i < len / sizeof(*tunables); i++) {
         u32 size = tunables[i].size;
-        if ((size != 1 && size != 2 && size != 4 && size != 8) ||
-            tunables[i].offset % size || size > span || tunables[i].offset > span - size)
+        if ((size != 1 && size != 2 && size != 4 && size != 8) || tunables[i].offset % size ||
+            size > span || tunables[i].offset > span - size)
             return -1;
     }
     return 0;
@@ -130,7 +130,7 @@ int tunables_apply_local_addr(const char *path, const char *prop, uintptr_t base
     return 0;
 }
 
-int tunables_apply_compact_addr(const char *path, const char *prop, uintptr_t base, u64 span)
+int tunables_validate_compact(const char *path, const char *prop, u64 span)
 {
     struct tunable_info info;
     if (span < 4 || tunables_adt_find(path, prop, &info, 12) < 0)
@@ -138,14 +138,30 @@ int tunables_apply_compact_addr(const char *path, const char *prop, uintptr_t ba
 
     const u8 *records = (const u8 *)info.tunable_raw;
     for (u32 i = 0; i < info.tunable_len; i++) {
+        u32 location;
+        memcpy(&location, records + i * 12, 4);
+        u32 offset = location & 0xffffff;
+        u32 width = location >> 24;
+        if (width != 32 || (offset & 3) || offset > span - 4)
+            return -1;
+    }
+    return 0;
+}
+
+int tunables_apply_compact_addr(const char *path, const char *prop, uintptr_t base, u64 span)
+{
+    if (tunables_validate_compact(path, prop, span))
+        return -1;
+    struct tunable_info info;
+    if (tunables_adt_find(path, prop, &info, 12) < 0)
+        return -1;
+    const u8 *records = (const u8 *)info.tunable_raw;
+    for (u32 i = 0; i < info.tunable_len; i++) {
         u32 location, mask, value;
         memcpy(&location, records + i * 12, 4);
         memcpy(&mask, records + i * 12 + 4, 4);
         memcpy(&value, records + i * 12 + 8, 4);
         u32 offset = location & 0xffffff;
-        u32 width = location >> 24;
-        if (width != 32 || (offset & 3) || offset > span - 4)
-            return -1;
         mask32(base + offset, mask, value & mask);
     }
     return 0;

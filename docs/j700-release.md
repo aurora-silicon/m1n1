@@ -1,26 +1,26 @@
 # J700 Stage 1 and Stage 2 release recipe
 
-The release uses a single source commit and two remote buildbox outputs. Build
+The release uses a single source commit and two remote build outputs. Build
 both images in the KIS carrier flavour with the linked Aurora Silicon logo.
 The `LOGO=` Makefile option appends a payload and must not be used for the
 installed Stage 1.
 
 ```sh
-BB=/Users/ryan/Projects/Aurora-Silicon/neo-bringup/tools/bb-build.sh
+BB=<remote-build-script>
 WT=<CLEAN_M1N1_WORKTREE>
 $BB m1n1 "$WT" <release>-stage1 RELEASE=1 CHAINLOADING=1 T8140_KIS_PROXY=1 BUILTIN_LOGO=aurora
 $BB m1n1 "$WT" <release>-stage2 RELEASE=1 CHAINLOADING=1 T8140_KIS_PROXY=1 BUILTIN_LOGO=aurora
 python3 tools/package_j700.py \
-  --stage1-out /Volumes/AuroraS500/bb-out/<release>-stage1 \
-  --stage2-out /Volumes/AuroraS500/bb-out/<release>-stage2 \
-  --output /Volumes/AuroraS500/<release>-draft
+  --stage1-out <build-output>/<release>-stage1 \
+  --stage2-out <build-output>/<release>-stage2 \
+  --output <release-dir>
 ```
 
-The packaging tool requires identical source commits and tags, clean buildbox
+The packaging tool requires identical source commits and tags, clean build
 inputs, `RELEASE`, `CHAINLOADING`, `T8140_KIS_PROXY`, `USE_DEBUG_USB` and
 `BUILTIN_LOGO=aurora`, no `LOGO=` build variable, one Stage 1 config marker, and
 `STACKBOT` as each image's final eight bytes. It ships each binary with the raw
-ELF from the same buildbox output folder, source/build metadata, licences,
+ELF from the same build output folder, source/build metadata, licences,
 `fatfs/PROVENANCE.md` with the pinned revision and local changes, and
 `SHA256SUMS`. The Aurora Silicon logo terms are in
 `3rdparty_licenses/LICENSE.AURORA-LOGO`.
@@ -34,8 +34,8 @@ the dedicated `aurora/stage2.bin` path only for the final installation.
 
 ```sh
 python3 tools/fill_stage1_config.py \
-  --input /Volumes/AuroraS500/<release>-draft/m1n1-stage1.bin \
-  --output /Volumes/AuroraS500/<release>-draft/m1n1-stage1-filled.bin \
+  --input <release-dir>/m1n1-stage1.bin \
+  --output <release-dir>/m1n1-stage1-filled.bin \
   --esp-partuuid '<ESP PARTUUID>' \
   --stage2-path aurora/stage2.bin --window-ms 15000
 ```
@@ -48,7 +48,7 @@ block is ignored by m1n1, which falls back to the proxy.
 
 ## Compose the ESP Stage 2
 
-For an ESP Stage 2 accepted by `esp-install-candidate.sh`, build a separate
+For a persistent ESP Stage 2, build a separate
 flavour with `RELEASE=1 CHAINLOADING=1 J700_ESP_STAGE2=1 BUILTIN_LOGO=aurora`.
 `CHAINLOADING=1` supplies the `boot=` storage loader; `J700_ESP_STAGE2=1`
 omits the Stage 1 config and ESP chainload marker. Keep the KIS Stage 2 above
@@ -69,10 +69,14 @@ its own chosen variables and `nvme.adopt=live-rtkit-v1`, then adds the terminato
 in RAM. A premature terminator prevents Stage 2 from seeing those variables.
 `boot=` uses exactly four nonempty semicolon-separated fields. The installer
 must put Image or Image.gz, the matching DTB, and a gzip or cpio initramfs at
-the named paths. Do not mix a kernel Image and modules from different buildbox
+the named paths. Do not mix a kernel Image and modules from different build
 output folders.
 
 ## Qualification and installation
+
+The J700 CDC transition arms a 170 second watchdog while waiting for
+the primary host session. A completed primary DTR handshake disarms it;
+an incomplete transition resets through the normal recovery path.
 
 First run PLAN P2 T-tethered on K-clean and K-full using only
 `aurora-ctl hw request`, and retain each `plan.json`, `receipt.json`, console

@@ -466,8 +466,10 @@ struct j700_atc_group {
 enum { J700_AXI2AF, J700_DP_PRE, J700_DP_LPDPTX, J700_DP_POST, J700_LISTS };
 
 static const char *const j700_list_names[J700_LISTS] = {
-    "apple,tunable-axi2af", "apple,tunable-dp-common-pre",
-    "apple,tunable-dp-lpdptx", "apple,tunable-dp-common-post",
+    "apple,tunable-axi2af",
+    "apple,tunable-dp-common-pre",
+    "apple,tunable-dp-lpdptx",
+    "apple,tunable-dp-common-post",
 };
 
 static const struct j700_atc_group j700_atc_groups[] = {
@@ -480,7 +482,7 @@ static const struct j700_atc_group j700_atc_groups[] = {
 };
 
 static const char *const j700_training_names[] = {
-    "dp-training-table", "dp-training-table-rbr", "dp-training-table-hbr",
+    "dp-training-table",      "dp-training-table-rbr",  "dp-training-table-hbr",
     "dp-training-table-hbr2", "dp-training-table-hbr3",
 };
 
@@ -517,8 +519,7 @@ static int j700_atc_resource(void *dt, int node, const char *name, u64 base, u64
     if (index < 0 || !reg || len < 0 || len % 16 || (size_t)index >= (size_t)len / 16)
         return -1;
     const u8 *entry = reg + 16 * index;
-    if (fdt64_ld((const fdt64_t *)entry) != base ||
-        fdt64_ld((const fdt64_t *)(entry + 8)) != size)
+    if (fdt64_ld((const fdt64_t *)entry) != base || fdt64_ld((const fdt64_t *)(entry + 8)) != size)
         return -1;
     return 0;
 }
@@ -534,14 +535,12 @@ static void j700_atc_clear_dp(void *dt, int node)
     }
 }
 
-static int j700_atc_check_bank(int *adt_path, int adt_node,
-                               const struct j700_atc_group *group)
+static int j700_atc_check_bank(int *adt_path, int adt_node, const struct j700_atc_group *group)
 {
     u32 reg_len, ranges_len;
     const u8 *reg = adt_getprop(adt, adt_node, "reg", &reg_len);
     int arm_io = adt_path_offset(adt, "/arm-io");
-    if (arm_io < 0 || !reg || reg_len % 16 ||
-        (size_t)group->reg_index >= reg_len / 16)
+    if (arm_io < 0 || !reg || reg_len % 16 || (size_t)group->reg_index >= reg_len / 16)
         return -1;
     const u8 *ranges = adt_getprop(adt, arm_io, "ranges", &ranges_len);
     if (!ranges || ranges_len != 7 * 24)
@@ -569,9 +568,8 @@ static int j700_atc_check_bank(int *adt_path, int adt_node,
         return -1;
 
     u64 translated, translated_size;
-    if (adt_get_reg(adt, adt_path, "reg", group->reg_index, &translated,
-                    &translated_size) < 0 || translated != group->bank_base ||
-        translated_size != group->bank_size)
+    if (adt_get_reg(adt, adt_path, "reg", group->reg_index, &translated, &translated_size) < 0 ||
+        translated != group->bank_base || translated_size != group->bank_size)
         return -1;
     return 0;
 }
@@ -617,9 +615,13 @@ static int j700_atc_prepare_group(int *adt_path, int adt_node, const struct j700
 
 static void dt_export_j700_atc(void *dt, int adt_node, int fdt_node)
 {
-    if (chip_id != T8140 || !adt_is_compatible_at(adt, adt_node, "atc-phy,t8130", 0) ||
-        fdt_node_check_compatible(dt, 0, "apple,j700") ||
+    if (chip_id != T8140 || fdt_node_check_compatible(dt, 0, "apple,j700") ||
         fdt_node_check_compatible(dt, fdt_node, "apple,t8140-atcphy"))
+        return;
+
+    fdt_delprop(dt, fdt_node, j700_list_names[J700_AXI2AF]);
+    j700_atc_clear_dp(dt, fdt_node);
+    if (adt_node < 0 || !adt_is_compatible_at(adt, adt_node, "atc-phy,t8130", 0))
         return;
 
     int adt_path[8];
@@ -629,11 +631,11 @@ static void dt_export_j700_atc(void *dt, int adt_node, int fdt_node)
     struct j700_atc_output output[J700_LISTS + ARRAY_SIZE(j700_training_names)] = {0};
     bool dp_valid = true;
     if (j700_atc_resource(dt, fdt_node, "axi2af", 0x408000000, 0x8000) ||
-        j700_atc_prepare_group(adt_path, adt_node, &j700_atc_groups[0],
-                               &output[J700_AXI2AF], 0x8000)) {
+        j700_atc_prepare_group(adt_path, adt_node, &j700_atc_groups[0], &output[J700_AXI2AF],
+                               0x8000)) {
         fdt_delprop(dt, fdt_node, j700_list_names[J700_AXI2AF]);
-    } else if (fdt_setprop(dt, fdt_node, j700_list_names[J700_AXI2AF],
-                           output[J700_AXI2AF].data, output[J700_AXI2AF].len)) {
+    } else if (fdt_setprop(dt, fdt_node, j700_list_names[J700_AXI2AF], output[J700_AXI2AF].data,
+                           output[J700_AXI2AF].len)) {
         fdt_delprop(dt, fdt_node, j700_list_names[J700_AXI2AF]);
     }
 
@@ -654,7 +656,12 @@ static void dt_export_j700_atc(void *dt, int adt_node, int fdt_node)
                 dp_valid = false;
             continue;
         }
-        if (len != 64 || !(output[J700_LISTS + i].data = malloc(64))) {
+        if (len != 64) {
+            dp_valid = false;
+            break;
+        }
+        output[J700_LISTS + i].data = malloc(64);
+        if (!output[J700_LISTS + i].data) {
             dp_valid = false;
             break;
         }
@@ -695,10 +702,6 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
     const struct adt_tunable_info *tunables;
     size_t tunable_count;
 
-    int adt_node = adt_path_offset(adt, adt_path);
-    if (adt_node < 0)
-        return;
-
     const char *fdt_path = fdt_get_alias(dt, dt_alias);
     if (fdt_path == NULL) {
         printf("FDT: Unable to find alias %s\n", dt_alias);
@@ -710,6 +713,11 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
         printf("FDT: Unable to find path %s for alias %s\n", fdt_path, dt_alias);
         return;
     }
+
+    int adt_node = adt_path_offset(adt, adt_path);
+    dt_export_j700_atc(dt, adt_node, fdt_node);
+    if (adt_node < 0)
+        return;
 
     ret = dt_append_fuses(dt, adt_node, fdt_node, port);
     if (ret) {
@@ -731,6 +739,9 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
     }
 
     for (size_t i = 0; i < tunable_count; ++i) {
+        if (chip_id == T8140 && !fdt_node_check_compatible(dt, 0, "apple,j700") &&
+            !strcmp(tunables[i].fdt_name, "apple,tunable-axi2af"))
+            continue;
         ret = dt_append_atc_tunable(dt, adt_node, fdt_node, &tunables[i]);
         if (ret)
             goto cleanup;
@@ -780,7 +791,6 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
         goto cleanup;
     }
 
-    dt_export_j700_atc(dt, adt_node, fdt_node);
     return;
 
 cleanup:
@@ -794,12 +804,13 @@ cleanup:
     for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8122); i++)
         fdt_delprop(dt, fdt_node, atc_tunables_t8122[i].fdt_name);
     for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8130); i++)
-        fdt_delprop(dt, fdt_node, atc_tunables_t8130[i].fdt_name);
+        if (chip_id != T8140 || fdt_node_check_compatible(dt, 0, "apple,j700") ||
+            strcmp(atc_tunables_t8130[i].fdt_name, "apple,tunable-axi2af"))
+            fdt_delprop(dt, fdt_node, atc_tunables_t8130[i].fdt_name);
     fdt_delprop(dt, fdt_node, "apple,tunable-common-a");
     fdt_delprop(dt, fdt_node, "apple,tunable-common");
 
     printf("FDT: Unable to setup ATC tunables for %s - USB3/Thunderbolt will not work\n", adt_path);
-    dt_export_j700_atc(dt, adt_node, fdt_node);
 }
 
 int kboot_setup_atc(void *dt)

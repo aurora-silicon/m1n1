@@ -98,15 +98,17 @@ int isp_init(void)
     if (node < 0 || isp_node < 0)
         return 0;
 
-    powered = true;
+    powered = !t8140;
     reason = "ISP ADT power gates failed";
-    if ((t8140 ? pmgr_adt_power_enable_traced(isp_path) : pmgr_adt_power_enable(isp_path)) < 0)
+    if ((t8140 ? pmgr_adt_power_enable_traced_rollback(isp_path)
+               : pmgr_adt_power_enable(isp_path)) < 0)
         goto out;
+    powered = true;
 
-    u64 isp_base;
+    u64 isp_base, isp_size;
     u64 pmgr_base = 0;
-    err = adt_get_reg(adt, adt_isp_path, "reg", 0, &isp_base, NULL);
-    if (err)
+    err = adt_get_reg(adt, adt_isp_path, "reg", 0, &isp_base, &isp_size);
+    if (err || isp_size < ISP_ASC_VERSION + sizeof(u32) || isp_base > UINT64_MAX - isp_size)
         goto out;
 
     if (t8140) {
@@ -119,8 +121,8 @@ int isp_init(void)
             global_base > UINT64_MAX - global_size || local_base > UINT64_MAX - local_size ||
             local_base < global_base + global_size)
             goto out;
-        printf("isp: global PMGR 0x%lx..0x%lx; separate local PMGR 0x%lx..0x%lx\n",
-               global_base, global_base + global_size, local_base, local_base + local_size);
+        printf("isp: global PMGR 0x%lx..0x%lx; separate local PMGR 0x%lx..0x%lx\n", global_base,
+               global_base + global_size, local_base, local_base + local_size);
 
         // The ADT's ISP_CPU, CORE0, CORE1 and FE slots belong to the global PMGR.
         // Start with CPU: the old sequence started at CORE0 and timed out there.
@@ -255,9 +257,13 @@ int isp_init(void)
     unsigned int count = segments_len / sizeof(*seg);
 
     reason = "segment end overflow";
-    if (seg[count - 1].iova > UINT64_MAX - seg[count - 1].size)
-        goto out;
-    u64 end = seg[count - 1].iova + seg[count - 1].size;
+    u64 end = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        if (seg[i].iova > UINT64_MAX - seg[i].size)
+            goto out;
+        if (seg[i].iova + seg[i].size > end)
+            end = seg[i].iova + seg[i].size;
+    }
     reason = "segment alignment overflow";
     if (end > UINT64_MAX - (SZ_16K - 1))
         goto out;
