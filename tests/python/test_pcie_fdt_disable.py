@@ -1,4 +1,4 @@
-"""Exercise the production T8140 PCIe FDT skip with bridge and port nodes."""
+"""Exercise the production T8140 PCIe FDT skip and its IOMMU references."""
 
 from pathlib import Path
 import subprocess
@@ -7,7 +7,7 @@ import subprocess
 def test_t8140_pcie_nodes_disabled(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     source = (repo / "src/kboot.c").read_text()
-    start = source.index("static int dt_disable_t8140_pcie(void)")
+    start = source.index("static int dt_add_pcie_iommu(")
     end = source.index("static int dt_get_iommu_node(", start)
     helper = source[start:end]
     harness = r'''
@@ -40,9 +40,20 @@ static void expect_status(const char *path, const char *status)
     assert(value && !strcmp(value, status));
 }
 
+static void set_iommu(const char *path, unsigned int phandle)
+{
+    int node = fdt_path_offset(dt, path);
+    assert(node >= 0);
+    assert(fdt_setprop_u32(dt, node, "phandle", phandle) == 0);
+    node = fdt_path_offset(dt, path);
+    assert(fdt_setprop_u32(dt, node, "#iommu-cells", 1) == 0);
+    node = fdt_path_offset(dt, path);
+    assert(fdt_setprop_string(dt, node, "status", "okay") == 0);
+}
+
 int main(void)
 {
-    unsigned char blob[4096];
+    unsigned char blob[8192];
     dt = blob;
     assert(fdt_create_empty_tree(dt, sizeof(blob)) == 0);
     add_node(0, "serial@0");
@@ -50,19 +61,59 @@ int main(void)
     add_node(fdt_path_offset(dt, "/pcie@1"), "port@0");
     add_node(0, "pcie@2");
     add_node(fdt_path_offset(dt, "/pcie@2"), "port@1");
+    add_node(fdt_path_offset(dt, "/pcie@1"), "piodma@0");
+    add_node(0, "iommu@390000000");
+    add_node(fdt_path_offset(dt, "/iommu@390000000"), "iommu-mapper@0");
+    add_node(fdt_path_offset(dt, "/iommu@390000000"), "piodma@1");
+    add_node(0, "iommu@391000000");
+    add_node(0, "iommu@other");
     set_node("/serial@0", "serial");
     set_node("/pcie@1", "pci");
     set_node("/pcie@1/port@0", "pci");
     set_node("/pcie@2", "pci");
     set_node("/pcie@2/port@1", "pci");
+    set_iommu("/iommu@390000000", 10);
+    set_iommu("/iommu@391000000", 11);
+    set_iommu("/iommu@other", 12);
+    assert(fdt_setprop_string(dt, fdt_path_offset(dt, "/iommu@390000000/iommu-mapper@0"),
+                              "status", "okay") == 0);
+    assert(fdt_setprop_string(dt, fdt_path_offset(dt, "/iommu@390000000/piodma@1"),
+                              "status", "okay") == 0);
+    assert(fdt_setprop_string(dt, fdt_path_offset(dt, "/pcie@1/piodma@0"),
+                              "status", "okay") == 0);
+    fdt32_t map[] = {cpu_to_fdt32(0x100), cpu_to_fdt32(10),
+                     cpu_to_fdt32(1), cpu_to_fdt32(2),
+                     cpu_to_fdt32(0x200), cpu_to_fdt32(10),
+                     cpu_to_fdt32(3), cpu_to_fdt32(1)};
+    assert(fdt_setprop(dt, fdt_path_offset(dt, "/pcie@1"), "iommu-map",
+                       map, sizeof(map)) == 0);
+    fdt32_t iommus[] = {cpu_to_fdt32(11), cpu_to_fdt32(17)};
+    assert(fdt_setprop(dt, fdt_path_offset(dt, "/pcie@2"), "iommus",
+                       iommus, sizeof(iommus)) == 0);
     assert(dt_disable_t8140_pcie() == 0);
     expect_status("/pcie@1", "disabled");
     expect_status("/pcie@1/port@0", "disabled");
     expect_status("/pcie@2", "disabled");
     expect_status("/pcie@2/port@1", "disabled");
+    expect_status("/pcie@1/piodma@0", "disabled");
+    expect_status("/iommu@390000000", "disabled");
+    expect_status("/iommu@390000000/iommu-mapper@0", "disabled");
+    expect_status("/iommu@390000000/piodma@1", "disabled");
+    expect_status("/iommu@391000000", "disabled");
+    expect_status("/iommu@other", "okay");
     expect_status("/serial@0", "okay");
     assert(fdt_pack(dt) == 0);
     assert(fdt_check_header(dt) == 0);
+
+    assert(fdt_create_empty_tree(dt, sizeof(blob)) == 0);
+    add_node(0, "pcie@bad");
+    set_node("/pcie@bad", "pci");
+    fdt32_t bad_map[] = {cpu_to_fdt32(0), cpu_to_fdt32(99),
+                         cpu_to_fdt32(1), cpu_to_fdt32(1)};
+    assert(fdt_setprop(dt, fdt_path_offset(dt, "/pcie@bad"), "iommu-map",
+                       bad_map, sizeof(bad_map)) == 0);
+    assert(dt_disable_t8140_pcie() == -1);
+    expect_status("/pcie@bad", "okay");
     return 0;
 }
 '''

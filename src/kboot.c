@@ -1504,16 +1504,122 @@ static int dt_set_pcie_tunables(void)
     return 0;
 }
 
+static int dt_add_pcie_iommu(uint32_t *phandles, int *count, uint32_t phandle)
+{
+    if (!phandle || fdt_node_offset_by_phandle(dt, phandle) < 0)
+        return -1;
+
+    for (int i = 0; i < *count; i++)
+        if (phandles[i] == phandle)
+            return 0;
+
+    if (*count >= 128)
+        return -1;
+    phandles[(*count)++] = phandle;
+    return 0;
+}
+
+static int dt_pcie_iommu_cells(uint32_t phandle)
+{
+    int iommu = fdt_node_offset_by_phandle(dt, phandle);
+    int len;
+    if (iommu < 0)
+        return -1;
+    const fdt32_t *cells = fdt_getprop(dt, iommu, "#iommu-cells", &len);
+    if (!cells || len != (int)sizeof(fdt32_t))
+        return -1;
+    return fdt32_ld(cells) <= 16 ? (int)fdt32_ld(cells) : -1;
+}
+
+static int dt_collect_pcie_iommus(int node, uint32_t *phandles, int *count)
+{
+    int len;
+    const fdt32_t *map = fdt_getprop(dt, node, "iommu-map", &len);
+    if (map) {
+        if (len % (int)sizeof(fdt32_t))
+            return -1;
+        for (int i = 0; i < len / (int)sizeof(fdt32_t);) {
+            if (len / (int)sizeof(fdt32_t) - i < 3)
+                return -1;
+            uint32_t phandle = fdt32_ld(&map[i + 1]);
+            int cells = dt_pcie_iommu_cells(phandle);
+            if (cells < 0 || len / (int)sizeof(fdt32_t) - i < 3 + cells ||
+                dt_add_pcie_iommu(phandles, count, phandle))
+                return -1;
+            i += 3 + cells;
+        }
+    } else if (len != -FDT_ERR_NOTFOUND) {
+        return -1;
+    }
+
+    const fdt32_t *iommus = fdt_getprop(dt, node, "iommus", &len);
+    if (!iommus)
+        return len == -FDT_ERR_NOTFOUND ? 0 : -1;
+    if (len % (int)sizeof(fdt32_t))
+        return -1;
+
+    for (int i = 0; i < len / (int)sizeof(fdt32_t);) {
+        uint32_t phandle = fdt32_ld(&iommus[i]);
+        int cells = dt_pcie_iommu_cells(phandle);
+        if (cells < 0 || cells > len / (int)sizeof(fdt32_t) - i - 1 ||
+            dt_add_pcie_iommu(phandles, count, phandle))
+            return -1;
+        i += 1 + cells;
+    }
+
+    return 0;
+}
+
+static bool dt_is_pcie_mapper(int node)
+{
+    const char *name = fdt_get_name(dt, node, NULL);
+    return (name && (!strncmp(name, "piodma", 6) || !strncmp(name, "pio-dma", 7) ||
+                     !strncmp(name, "mapper", 6) || !strncmp(name, "iommu-mapper", 12))) ||
+           !fdt_node_check_compatible(dt, node, "apple,t8140-pcie-piodma") ||
+           !fdt_node_check_compatible(dt, node, "iommu-mapper");
+}
+
+static int dt_disable_pcie_mappers(int parent)
+{
+    int nodes[64];
+    int count = 0;
+    int depth = 0;
+    int node = parent;
+
+    while ((node = fdt_next_node(dt, node, &depth)) >= 0 && depth > 0) {
+        if (!dt_is_pcie_mapper(node))
+            continue;
+        if (count >= (int)ARRAY_SIZE(nodes))
+            return -1;
+        nodes[count++] = node;
+    }
+    if (node < 0 && node != -FDT_ERR_NOTFOUND)
+        return -1;
+
+    for (int i = count - 1; i >= 0; i--) {
+        printf("FDT: disabling PCIe mapper/PIO-DMA %s\n", fdt_get_name(dt, nodes[i], NULL));
+        if (fdt_setprop_string(dt, nodes[i], "status", "disabled") < 0)
+            return -1;
+    }
+    return 0;
+}
+
 static int dt_disable_t8140_pcie(void)
 {
     int nodes[64];
     int count = 0;
     int node = -1;
+    uint32_t iommus[128];
+    int iommu_count = 0;
 
     while ((node = fdt_node_offset_by_prop_value(dt, node, "device_type", "pci", sizeof("pci"))) >=
            0) {
         if (count >= (int)ARRAY_SIZE(nodes)) {
             printf("FDT: too many PCIe controller or port nodes\n");
+            return -1;
+        }
+        if (dt_collect_pcie_iommus(node, iommus, &iommu_count)) {
+            printf("FDT: invalid PCIe IOMMU reference in %s\n", fdt_get_name(dt, node, NULL));
             return -1;
         }
         nodes[count++] = node;
@@ -1523,11 +1629,28 @@ static int dt_disable_t8140_pcie(void)
 
     /* Work backwards so inserting a property cannot move an earlier offset. */
     for (int i = count - 1; i >= 0; i--) {
+        if (dt_disable_pcie_mappers(nodes[i]))
+            return -1;
         if (fdt_setprop_string(dt, nodes[i], "status", "disabled") < 0)
             return -1;
     }
 
-    printf("FDT: T8140 APCIe skipped; disabled %d PCIe controller/port nodes\n", count);
+    /* Resolve each phandle again: the PCIe status writes can move DART nodes. */
+    for (int i = 0; i < iommu_count; i++) {
+        node = fdt_node_offset_by_phandle(dt, iommus[i]);
+        if (node < 0 || dt_disable_pcie_mappers(node))
+            return -1;
+        node = fdt_node_offset_by_phandle(dt, iommus[i]);
+        if (node < 0)
+            return -1;
+        printf("FDT: disabling PCIe IOMMU %s (phandle %u)\n", fdt_get_name(dt, node, NULL),
+               iommus[i]);
+        if (fdt_setprop_string(dt, node, "status", "disabled") < 0)
+            return -1;
+    }
+
+    printf("FDT: T8140 APCIe skipped; disabled %d PCIe controller/port nodes and %d IOMMUs\n",
+           count, iommu_count);
     return 0;
 }
 
