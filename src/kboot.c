@@ -106,6 +106,23 @@ void get_notchless_fb(u64 *fb_base, u64 *fb_height)
     *fb_height = new_height;
 }
 
+/*
+ * chosen.asahi,show-notch=1 (m1n1 config): the OS drives the full panel, notch rows
+ * included (on J613: appledrm.t6030_show_notch=1). Keep iBoot's full framebuffer then, so
+ * the boot framebuffer covers the same rows as the display driver later does and early
+ * users (fbcon, Plymouth) do not shift by the notch height at the handoff.
+ */
+static bool kboot_show_notch(void)
+{
+    for (int i = 0; i < MAX_CHOSEN_PARAMS; i++) {
+        if (!chosen_params[i][0])
+            break;
+        if (!strcmp(chosen_params[i][0], "asahi,show-notch"))
+            return chosen_params[i][1] && !strcmp(chosen_params[i][1], "1");
+    }
+    return false;
+}
+
 static int dt_set_rng_seed_sep(int node)
 {
     u64 kaslr_seed;
@@ -194,6 +211,13 @@ static int dt_set_fb(void)
 
     u64 fb_base, fb_height;
     get_notchless_fb(&fb_base, &fb_height);
+    u64 notch_height = cur_boot_args.video.height - fb_height;
+    if (notch_height && kboot_show_notch()) {
+        printf("display: keeping the notch rows (chosen.asahi,show-notch=1), %lux%lu\n",
+               cur_boot_args.video.width, cur_boot_args.video.height);
+        fb_base = cur_boot_args.video.base;
+        fb_height = cur_boot_args.video.height;
+    }
     u64 fb_size = cur_boot_args.video.stride * fb_height;
     u64 fbreg[2] = {cpu_to_fdt64(fb_base), cpu_to_fdt64(fb_size)};
     char fbname[32];
@@ -242,12 +266,12 @@ static int dt_set_fb(void)
     // We do not need to reserve the framebuffer, as it will be excluded from the usable RAM
     // range already.
 
-    // save notch height in the dcp node if present
-    if (cur_boot_args.video.height - fb_height) {
+    // save notch height in the dcp node if present (also when the notch rows are kept,
+    // so that a display driver hiding the notch still can)
+    if (notch_height) {
         int dcp = fdt_path_offset(dt, "dcp");
         if (dcp >= 0)
-            if (fdt_appendprop_u32(dt, dcp, "apple,notch-height",
-                                   cur_boot_args.video.height - fb_height))
+            if (fdt_appendprop_u32(dt, dcp, "apple,notch-height", notch_height))
                 printf("FDT: couldn't set apple,notch-height\n");
     }
 
