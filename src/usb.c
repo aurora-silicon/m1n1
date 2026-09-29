@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
+#include "../build/build_cfg.h"
+
 #include "usb.h"
 #include "adt.h"
 #include "dart.h"
@@ -10,6 +12,7 @@
 #include "string.h"
 #include "tps6598x.h"
 #include "types.h"
+#include "usb_cdc_atc.h"
 #include "usb_dwc3.h"
 #include "usb_dwc3_regs.h"
 #include "utils.h"
@@ -92,6 +95,12 @@ static dart_dev_t *usb_dart_init(u32 idx)
 
     snprintf(path, sizeof(path), FMT_DART_MAPPER_PATH, idx, idx);
     mapper_offset = adt_path_offset(adt, path);
+#ifdef J700_CDC_PROXY
+    if (mapper_offset < 0 && chip_id == T8140 && idx == 0) {
+        snprintf(path, sizeof(path), "/arm-io/dart-usb/mapper-usb");
+        mapper_offset = adt_path_offset(adt, path);
+    }
+#endif
     if (mapper_offset < 0) {
         // Device not present
         return NULL;
@@ -104,6 +113,10 @@ static dart_dev_t *usb_dart_init(u32 idx)
     }
 
     snprintf(path, sizeof(path), FMT_DART_PATH, idx);
+#ifdef J700_CDC_PROXY
+    if (chip_id == T8140 && idx == 0 && adt_path_offset(adt, path) < 0)
+        snprintf(path, sizeof(path), "/arm-io/dart-usb");
+#endif
     return dart_init_adt(path, 1, dart_idx, false);
 }
 
@@ -118,6 +131,12 @@ static int usb_drd_get_regs(u32 idx, struct usb_drd_regs *regs)
 
     snprintf(drd_path, sizeof(drd_path), FMT_DRD_PATH, idx);
     adt_drd_offset = adt_path_offset_trace(adt, drd_path, adt_drd_path);
+#ifdef J700_CDC_PROXY
+    if (adt_drd_offset < 0 && chip_id == T8140 && idx == 0) {
+        snprintf(drd_path, sizeof(drd_path), "/arm-io/usb-drd");
+        adt_drd_offset = adt_path_offset_trace(adt, drd_path, adt_drd_path);
+    }
+#endif
     if (adt_drd_offset < 0) {
         // Nonexistent device
         return -1;
@@ -162,12 +181,25 @@ int usb_phy_bringup(u32 idx)
         return -1;
 
     snprintf(path, sizeof(path), FMT_DART_PATH, idx);
+#ifdef J700_CDC_PROXY
+    if (chip_id == T8140 && idx == 0)
+        snprintf(path, sizeof(path), "/arm-io/dart-usb");
+#endif
     if (pmgr_adt_power_enable(path) < 0)
         return -1;
 
     snprintf(path, sizeof(path), FMT_DRD_PATH, idx);
+#ifdef J700_CDC_PROXY
+    if (chip_id == T8140 && idx == 0)
+        snprintf(path, sizeof(path), "/arm-io/usb-drd");
+#endif
     if (pmgr_adt_power_enable(path) < 0)
         return -1;
+
+#ifdef J700_CDC_PROXY
+    if (chip_id == T8140 && idx == 0)
+        return usb_cdc_atc_power_on(usb_regs.drd_regs_unk3);
+#endif
 
     write32(usb_regs.atc + USB2PHY_SIG, 0x01c1000f);
     write32(usb_regs.atc + USB2PHY_CTL, USB2PHY_CTL_RESET | USB2PHY_CTL_PORT_RESET);
@@ -261,80 +293,40 @@ struct iodev iodev_usb_vuart = {
     .lock = SPINLOCK_INIT,
 };
 
-static tps6598x_dev_t *hpm_init(i2c_dev_t *i2c, const char *hpm_path)
+static int hpm_idx(char *hpm_path)
 {
-    tps6598x_dev_t *tps = tps6598x_init(hpm_path, i2c);
-    if (!tps) {
-        printf("usb: tps6598x_init failed for %s.\n", hpm_path);
-        return NULL;
-    }
-
-    if (tps6598x_powerup(tps) < 0) {
-        printf("usb: tps6598x_powerup failed for %s.\n", hpm_path);
-        tps6598x_shutdown(tps);
-        return NULL;
-    }
-
-    return tps;
-}
-
-void usb_spmi_init(void)
-{
-    for (int idx = 0; idx < USB_IODEV_COUNT; ++idx)
-        usb_phy_bringup(idx); /* Fails on missing devices, just continue */
-
-    usb_is_initialized = true;
-}
-
-static int usb_init_i2c(const char *i2c_path)
-{
-    char hpm_path[MAX_HPM_PATH_LEN];
-
-    int node = adt_path_offset(adt, i2c_path);
-    if (node < 0)
-        return 0;
-
-    node = adt_first_child_offset(adt, node);
-    if (node < 0)
-        return 0;
-
-    if (!adt_is_compatible(adt, node, "usbc,manager"))
-        return 0;
-
-    const char *hpm_mngr_name = adt_get_name(adt, node);
-    if (!hpm_mngr_name || strnlen(hpm_mngr_name, 16) >= 16)
-        return 0;
-
-    i2c_dev_t *i2c = i2c_init(i2c_path);
-    if (!i2c) {
-        printf("usb: i2c init failed for %s\n", i2c_path);
+    size_t len = strlen(hpm_path);
+    if (len < 4)
         return -1;
-    }
+    if (memcmp(hpm_path + len - 4, "hpm", 3))
+        return -1; // unexpected hpm node name
+    u8 idx = hpm_path[len - 1] - '0';
+    if (idx > 9)
+        return -2; // unexpected hpm index
+    return idx;
+}
 
-    ADT_FOREACH_CHILD(adt, node)
-    {
-        const char *name = adt_get_name(adt, node);
-        if (!name || memcmp(name, "hpm", 3) || name[4] != '\0')
-            continue; // unexpected hpm node name
-        u32 idx = name[3] - '0';
-        if (idx >= USB_IODEV_COUNT)
-            continue; // unexpected hpm index
+static bool usb_init_match(char *hpm_path, void *unused)
+{
+    (void)unused;
+    int idx = hpm_idx(hpm_path);
+    if (idx < FIRST_USB_IODEV)
+        return false;
+    if (idx >= USB_IODEV_COUNT)
+        return false;
+    return true;
+}
 
-        snprintf(hpm_path, sizeof(hpm_path), "%s/%s/%s", i2c_path, hpm_mngr_name, name);
+static int usb_init_one(char *hpm_path, tps6598x_dev_t *tps, void *unused)
+{
+    (void)unused;
+    int idx = hpm_idx(hpm_path);
 
-        tps6598x_dev_t *tps = hpm_init(i2c, hpm_path);
-        if (!tps) {
-            printf("usb: failed to init %s\n", name);
-            continue;
-        }
+    if (tps6598x_powerup(tps) < 0)
+        printf("usb: tps6598x_powerup failed for %s.\n", hpm_path);
 
-        if (tps6598x_disable_irqs(tps, &tps6598x_irq_state[idx]))
-            printf("usb: unable to disable IRQ masks for %s\n", name);
-
-        tps6598x_shutdown(tps);
-    }
-
-    i2c_shutdown(i2c);
+    if (tps6598x_disable_irqs(tps, &tps6598x_irq_state[idx]))
+        printf("usb: unable to disable IRQ masks for %s.\n", hpm_path);
 
     return 0;
 }
@@ -344,14 +336,11 @@ void usb_init(void)
     if (usb_is_initialized)
         return;
 
-    /*
-     * M3/M4 models do not use i2c, but instead SPMI with a new controller.
-     * We can get USB going for now by just bringing up the phys.
-     */
-    if (adt_path_offset(adt, "/arm-io/nub-spmi-a0/hpm0") > 0) {
-        usb_spmi_init();
+    /* J700's inherited DebugUSB carrier must survive normal boot and kboot. */
+#if defined(J700_CDC_PROXY) || defined(T8140_KIS_PROXY) || defined(J700_ESP_STAGE2)
+    if (chip_id == T8140)
         return;
-    }
+#endif
 
     /*
      * A7-A11 uses a custom internal otg controller with the peripheral part
@@ -363,10 +352,7 @@ void usb_init(void)
         return;
     }
 
-    if (adt_is_compatible(adt, 0, "J180dAP") && usb_init_i2c("/arm-io/i2c3") < 0)
-        return;
-    if (usb_init_i2c("/arm-io/i2c0") < 0)
-        return;
+    tps6598x_foreach_hpm(usb_init_match, usb_init_one, NULL);
 
     for (int idx = 0; idx < USB_IODEV_COUNT; ++idx)
         usb_phy_bringup(idx); /* Fails on missing devices, just continue */
@@ -374,67 +360,35 @@ void usb_init(void)
     usb_is_initialized = true;
 }
 
-void usb_i2c_restore_irqs(const char *i2c_path, bool force)
+static bool usb_hpm_restore_irqs_match(char *hpm_path, void *state)
 {
-    char hpm_path[MAX_HPM_PATH_LEN];
+    int idx = hpm_idx(hpm_path);
+    if (idx < FIRST_USB_IODEV || idx >= USB_IODEV_COUNT)
+        return false;
 
-    int node = adt_path_offset(adt, i2c_path);
-    if (node < 0)
-        return;
+    bool force = *(bool *)state;
+    if (iodev_get_usage(IODEV_USB0 + idx) && !force)
+        return false;
 
-    node = adt_first_child_offset(adt, node);
-    if (node < 0)
-        return;
+    if (!tps6598x_irq_state[idx].valid)
+        return false;
 
-    if (!adt_is_compatible(adt, node, "usbc,manager"))
-        return;
+    return true;
+}
 
-    const char *hpm_mngr_name = adt_get_name(adt, node);
-    if (!hpm_mngr_name || strnlen(hpm_mngr_name, 16) >= 16)
-        return;
+static int usb_hpm_restore_irqs_one(char *hpm_path, tps6598x_dev_t *tps, void *unused)
+{
+    (void)unused;
+    int idx = hpm_idx(hpm_path);
 
-    i2c_dev_t *i2c = i2c_init(i2c_path);
-    if (!i2c) {
-        printf("usb: i2c init failed.\n");
-        return;
-    }
+    if (tps6598x_restore_irqs(tps, &tps6598x_irq_state[idx]))
+        printf("usb: unable to restore IRQ masks for %s\n", hpm_path);
 
-    ADT_FOREACH_CHILD(adt, node)
-    {
-        const char *name = adt_get_name(adt, node);
-        if (!name || memcmp(name, "hpm", 3) || name[4] != '\0')
-            continue; // unexpected hpm node name
-        u32 idx = name[3] - '0';
-        if (idx >= USB_IODEV_COUNT)
-            continue; // unexpected hpm index
-
-        if (iodev_get_usage(IODEV_USB0 + idx) && !force)
-            continue;
-
-        if (tps6598x_irq_state[idx].valid) {
-            snprintf(hpm_path, sizeof(hpm_path), "%s/%s/%s", i2c_path, hpm_mngr_name, name);
-            tps6598x_dev_t *tps = hpm_init(i2c, hpm_path);
-            if (!tps)
-                continue;
-
-            if (tps6598x_restore_irqs(tps, &tps6598x_irq_state[idx]))
-                printf("usb: unable to restore IRQ masks for %s\n", name);
-
-            tps6598x_shutdown(tps);
-        }
-    }
-
-    i2c_shutdown(i2c);
+    return 0;
 }
 
 void usb_hpm_restore_irqs(bool force)
 {
-    /*
-     * Do not try to restore irqs on M3/M4 which don't use i2c
-     */
-    if (adt_path_offset(adt, "/arm-io/nub-spmi-a0/hpm0") > 0)
-        return;
-
     /*
      * Do not try to restore irqs on A7-A11 which don't use i2c
      */
@@ -442,13 +396,16 @@ void usb_hpm_restore_irqs(bool force)
         adt_path_offset(adt, "/arm-io/usb-complex") > 0)
         return;
 
-    if (adt_is_compatible(adt, 0, "J180dAP"))
-        usb_i2c_restore_irqs("/arm-io/i2c3", force);
-    usb_i2c_restore_irqs("/arm-io/i2c0", force);
+    tps6598x_foreach_hpm(usb_hpm_restore_irqs_match, usb_hpm_restore_irqs_one, &force);
 }
 
 void usb_iodev_init(void)
 {
+#if defined(J700_CDC_PROXY) || defined(T8140_KIS_PROXY) || defined(J700_ESP_STAGE2)
+    if (chip_id == T8140)
+        return;
+#endif
+
     for (int i = FIRST_USB_IODEV; i < USB_IODEV_COUNT; i++) {
         dwc3_dev_t *opaque;
         struct iodev *usb_iodev;
@@ -490,4 +447,45 @@ void usb_iodev_vuart_setup(iodev_id_t iodev)
         return;
 
     iodev_usb_vuart.opaque = iodev_get_opaque(iodev);
+}
+
+int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
+{
+#ifndef J700_CDC_PROXY
+    (void)set_step;
+    (void)force_swapped;
+    return -1;
+#else
+    if (chip_id != T8140 || iodev_get_usage(IODEV_USB0))
+        return -1;
+    set_step(3);
+    usb_cdc_atc_force_swapped(force_swapped);
+    if (usb_phy_bringup(0))
+        return -1;
+
+    set_step(4);
+    dwc3_dev_t *dwc = usb_iodev_bringup(0);
+    if (!dwc)
+        return -1;
+
+    struct iodev *device = memalign(SPINLOCK_ALIGN, sizeof(*device));
+    if (!device) {
+        usb_dwc3_shutdown(dwc);
+        return -1;
+    }
+    device->ops = &iodev_usb_ops;
+    device->opaque = dwc;
+    device->usage = USAGE_CONSOLE | USAGE_UARTPROXY;
+    spin_init(&device->lock);
+    iodev_register_device(IODEV_USB0, device);
+
+    set_step(5);
+    if (usb_cdc_atc_switch_pipe()) {
+        iodev_unregister_device(IODEV_USB0);
+        usb_dwc3_shutdown(dwc);
+        free(device);
+        return -1;
+    }
+    return 0;
+#endif
 }

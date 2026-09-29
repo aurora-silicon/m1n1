@@ -12,9 +12,16 @@ parser.add_argument('-c', '--call', action="store_true", help="Use call mode")
 parser.add_argument('-r', '--raw', action="store_true", help="Image is raw")
 parser.add_argument('-E', '--entry-point', action="store", type=int, help="Entry point for the raw image", default=0x800)
 parser.add_argument('-x', '--xnu', action="store_true", help="Set up for chainloading XNU")
+parser.add_argument('--vector-only', action="store_true", help="Return after vector reply without probing the next image")
+parser.add_argument('--capture', type=pathlib.Path, help="Write raw post-vector console bytes to this file")
+parser.add_argument('--capture-seconds', type=float, default=0, help="Seconds of raw console capture after vector")
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
+if args.vector_only and args.call:
+    parser.error('--vector-only cannot be combined with --call')
+if args.capture and not args.vector_only:
+    parser.error('--capture requires --vector-only')
 
 from m1n1.setup import *
 from m1n1.tgtypes import BootArgs_r1, BootArgs_r2, BootArgs_r3
@@ -46,31 +53,71 @@ if not args.no_sepfw:
     if hasattr(u.adt["chosen"]["memory-map"], "preoslog"):
         preoslog_start, preoslog_size = u.adt["chosen"]["memory-map"].preoslog
 
-image_size = align(len(image))
-sepfw_off = image_size
-image_size += align(sepfw_length)
-preoslog_off = image_size
-image_size += align(preoslog_size)
-bootargs_off = image_size
+image_only_size = align(len(image))
+sepfw_off = 0
+preoslog_off = align(sepfw_length)
+bootargs_off = preoslog_off + align(preoslog_size)
 bootargs_size = 0x4000
-image_size += bootargs_size
+fw_size = bootargs_off + bootargs_size
+packed_end = new_base + image_only_size + fw_size
 
-print(f"Total region size: 0x{image_size:x} bytes")
-image_addr = u.malloc(image_size)
+if not (u.ba.phys_base <= new_base < u.ba.phys_base + u.ba.mem_size):
+    raise ValueError("Image base is outside inherited RAM")
+ram_end = u.ba.phys_base + u.ba.mem_size
+if ram_end > (1 << 64) or packed_end > ram_end or u.ba.top_of_kernel_data >= ram_end:
+    raise ValueError("Packed chainload span is outside inherited RAM")
+
+ro_start = ro_end = 0
+if p.get_chipid() == 0x8140:
+    ro_start = u.mrs("CTRR_M4_LWR_EL2")
+    upper = u.mrs("CTRR_M4_UPR_EL2")
+    ro_end = upper + 0x1000
+    if ((ro_start | upper) & 0xfff or ro_end - ro_start != 0xc000 or
+            not (u.ba.phys_base <= ro_start < ro_end <= ram_end) or
+            not (u.ba.phys_base <= u.ba.top_of_kernel_data < ram_end)):
+        raise ValueError("Invalid T8140 firmware RO range")
+
+live_heap = p.heapblock_alloc(0)
+inherited_top = u.ba.top_of_kernel_data
+image_end = new_base + image_only_size
+if ro_end and image_end > ro_start and new_base < ro_end:
+    raise ValueError("Image itself overlaps firmware RO memory")
+if live_heap > inherited_top and image_end > inherited_top and new_base < live_heap:
+    raise ValueError("Image overlaps live Stage 1 heap")
+
+park_fw = ((ro_end and packed_end > ro_start and image_end < ro_end) or
+           (live_heap > inherited_top and packed_end > inherited_top and image_end < live_heap))
+fw_dest = new_base + image_only_size
+if park_fw:
+    print("Packed span would overlap protected/live memory; parking firmware block")
+    fw_dest = p.memalign(0x4000, fw_size)
+    if not fw_dest or fw_dest + fw_size > ram_end:
+        raise ValueError("No safe location for firmware block")
+    if fw_dest < live_heap or (ro_end and fw_dest < ro_end and fw_dest + fw_size > ro_start):
+        raise ValueError("Parked firmware block overlaps protected/live memory")
+
+copy_size = image_only_size if park_fw else image_only_size + fw_size
+print(f"Copy span: 0x{copy_size:x} bytes; firmware block: 0x{fw_dest:x}")
+image_addr = p.memalign(0x4000, copy_size + 0x4000)
+if not image_addr:
+    raise MemoryError("No aligned staging block")
+fw_stage = fw_dest if park_fw else image_addr + image_only_size
 
 print(f"Loading kernel image (0x{len(image):x} bytes)...")
 u.compressed_writemem(image_addr, image, True)
-p.dc_cvau(image_addr, len(image))
+p.dc_cvac(image_addr, len(image))
 
 if not args.no_sepfw:
     print(f"Copying SEPFW (0x{sepfw_length:x} bytes)...")
-    p.memcpy8(image_addr + sepfw_off, sepfw_start, sepfw_length)
+    p.memcpy8(fw_stage + sepfw_off, sepfw_start, sepfw_length)
     print(f"Adjusting addresses in ADT...")
-    u.adt["chosen"]["memory-map"].SEPFW = (new_base + sepfw_off, sepfw_length)
-    u.adt["chosen"]["memory-map"].BootArgs = (new_base + bootargs_off, bootargs_size)
+    u.adt["chosen"]["memory-map"].SEPFW = (fw_dest + sepfw_off, sepfw_length)
+    u.adt["chosen"]["memory-map"].BootArgs = (fw_dest + bootargs_off, bootargs_size)
     if hasattr(u.adt["chosen"]["memory-map"], "preoslog"):
-        p.memcpy8(image_addr + preoslog_off, preoslog_start, preoslog_size)
-        u.adt["chosen"]["memory-map"].preoslog = (new_base + preoslog_off, preoslog_size)
+        p.memcpy8(fw_stage + preoslog_off, preoslog_start, preoslog_size)
+        u.adt["chosen"]["memory-map"].preoslog = (fw_dest + preoslog_off, preoslog_size)
+else:
+    u.adt["chosen"]["memory-map"].BootArgs = (fw_dest + bootargs_off, bootargs_size)
 
 if args.xnu:
     def remove_oslog(node):
@@ -100,6 +147,9 @@ if rvbar != u.base:
         if cpu.state == "running":
             continue
         addr, size = cpu.cpu_impl_reg
+        if p.read64(addr) & 1:
+            print(f"  {cpu.name}: RVBAR locked, leaving it unchanged")
+            continue
         print(f"  {cpu.name}: [0x{addr:x}] = 0x{rvbar:x}")
         p.write64(addr, rvbar)
 
@@ -108,7 +158,7 @@ u.push_adt()
 print("Setting up bootargs...")
 tba = u.ba.copy()
 
-tba.top_of_kernel_data = new_base + image_size
+tba.top_of_kernel_data = max(image_end, fw_dest + fw_size, live_heap, inherited_top, ro_end)
 
 if len(args.boot_args) > 0:
     boot_args = " ".join(args.boot_args)
@@ -125,30 +175,51 @@ if args.xnu:
     tba.devtree = u.ba.devtree - u.ba.virt_base + tba.virt_base
 
 if tba.revision <= 1:
-    iface.writemem(image_addr + bootargs_off, BootArgs_r1.build(tba))
+    iface.writemem(fw_stage + bootargs_off, BootArgs_r1.build(tba))
 elif tba.revision == 2:
-    iface.writemem(image_addr + bootargs_off, BootArgs_r2.build(tba))
+    iface.writemem(fw_stage + bootargs_off, BootArgs_r2.build(tba))
 elif tba.revision == 3:
-    iface.writemem(image_addr + bootargs_off, BootArgs_r3.build(tba))
+    iface.writemem(fw_stage + bootargs_off, BootArgs_r3.build(tba))
+
+p.dc_cvac(fw_stage, fw_size)
 
 print(f"Copying stub...")
 
 stub = asm.ARMAsm(f"""
+        mov x7, x2
+        mov x8, x3
 1:
         ldp x4, x5, [x1], #16
         stp x4, x5, [x2]
-        dc cvau, x2
-        ic ivau, x2
         add x2, x2, #16
-        sub x3, x3, #16
-        cbnz x3, 1b
+        subs x3, x3, #16
+        b.ne 1b
+
+        mov x2, x7
+        mov x3, x8
+2:
+        dc cvac, x2
+        add x2, x2, #64
+        subs x3, x3, #64
+        b.ne 2b
+        dsb sy
+
+        mov x2, x7
+        mov x3, x8
+3:
+        ic ivau, x2
+        add x2, x2, #64
+        subs x3, x3, #64
+        b.ne 3b
+        dsb sy
+        isb
 
         ldr x1, ={entry}
         br x1
-""", image_addr + image_size)
+""", image_addr + copy_size)
 
 iface.writemem(stub.addr, stub.data)
-p.dc_cvau(stub.addr, stub.len)
+p.dc_cvac(stub.addr, stub.len)
 p.ic_ivau(stub.addr, stub.len)
 
 print(f"Entry point: 0x{entry:x}")
@@ -164,10 +235,21 @@ if args.call:
     except ProxyCommandError:
         pass
     print(f"Jumping to stub at 0x{stub.addr:x}")
-    p.call(stub.addr, new_base + bootargs_off, image_addr, new_base, image_size, reboot=True)
+    p.call(stub.addr, fw_dest + bootargs_off, image_addr, new_base, copy_size, reboot=True)
+elif args.vector_only:
+    print(f"Vectoring to 0x{stub.addr:x}; no next-stage proxy request will be sent")
+    p.request(p.P_VECTOR, stub.addr, fw_dest + bootargs_off, image_addr, new_base, copy_size)
+    if args.capture:
+        deadline = time.monotonic() + max(0, args.capture_seconds)
+        with args.capture.open('wb') as output:
+            while time.monotonic() < deadline:
+                data = iface.dev.read(4096)
+                if data:
+                    output.write(data)
+    sys.exit(0)
 else:
     print(f"Reloading into stub at 0x{stub.addr:x}")
-    p.reload(stub.addr, new_base + bootargs_off, image_addr, new_base, image_size)
+    p.reload(stub.addr, fw_dest + bootargs_off, image_addr, new_base, copy_size)
 
 iface.nop()
 print("Proxy is alive again")

@@ -141,7 +141,7 @@ static void dart_t8110_tlb_invalidate(dart_dev_t *dart)
             FIELD_PREP(DART_T8110_TLB_CMD_OP, DART_T8110_TLB_CMD_OP_FLUSH_SID) |
                 FIELD_PREP(DART_T8110_TLB_CMD_STREAM, dart->device));
 
-    if (poll32(dart->regs + DART_T8110_TLB_CMD_OP, DART_T8110_TLB_CMD_BUSY, 0, 100))
+    if (poll32(dart->regs + DART_T8110_TLB_CMD, DART_T8110_TLB_CMD_BUSY, 0, 100))
         printf("dart: DART_T8110_TLB_CMD_BUSY did not clear.\n");
 }
 
@@ -202,6 +202,7 @@ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t
     dart->regs = base;
     dart->device = device;
     dart->type = type;
+    dart->keep = keep_pts;
 
     switch (type) {
         case DART_T8020:
@@ -226,16 +227,17 @@ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t
         case DART_T6000:
             if (read32(dart->regs + DART_T8020_CONFIG) & DART_T8020_CONFIG_LOCK)
                 dart->locked = true;
-            set32(dart->regs + DART_T8020_ENABLED_STREAMS, BIT(device & 0x1f));
+            if (!dart->locked)
+                set32(dart->regs + DART_T8020_ENABLED_STREAMS, BIT(device & 0x1f));
             break;
         case DART_T8110:
             if (read32(dart->regs + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR)
                 dart->locked = true;
-            write32(dart->regs + DART_T8110_ENABLE_STREAMS + 4 * (device >> 5), BIT(device & 0x1f));
+            if (!dart->locked)
+                write32(dart->regs + DART_T8110_ENABLE_STREAMS + 4 * (device >> 5),
+                        BIT(device & 0x1f));
             break;
     }
-
-    dart->keep = keep_pts;
 
     if (dart->locked || keep_pts) {
         for (int i = 0; i < dart->params->ttbr_count; i++) {
@@ -248,6 +250,10 @@ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t
 
     for (int i = 0; i < dart->params->ttbr_count; i++) {
         if (dart->l1[i])
+            continue;
+
+        /* Locked DARTs cannot accept a new translation root. */
+        if (dart->locked)
             continue;
 
         dart->l1[i] = memalign(SZ_16K, SZ_16K);
@@ -264,7 +270,8 @@ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t
     if (!dart->locked && !keep_pts)
         write32(DART_TCR(dart), dart->params->tcr_enabled);
 
-    dart->params->tlb_invalidate(dart);
+    if (!dart->locked && !dart->keep)
+        dart->params->tlb_invalidate(dart);
     return dart;
 
 error:
@@ -408,8 +415,28 @@ dart_dev_t *dart_init_fdt(void *dt, u32 phandle, int device, bool keep_pts)
     return dart;
 }
 
+/* Inspect an inherited display translation without creating a root or
+ * enabling a stream if firmware did not leave the DART locked. */
+dart_dev_t *dart_init_fdt_locked(void *dt, u32 phandle, int device)
+{
+    int node = fdt_node_offset_by_phandle(dt, phandle);
+    if (node < 0 || fdt_node_check_compatible(dt, node, "apple,t8110-dart"))
+        return NULL;
+
+    u64 base = dt_get_address(dt, node);
+    if (!base || !(read32(base + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR)) {
+        printf("dart: inherited DART for phandle %u is not locked\n", phandle);
+        return NULL;
+    }
+
+    return dart_init_fdt(dt, phandle, device, true);
+}
+
 int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_base)
 {
+    if (dart->locked)
+        return -1;
+
     int node = adt_path_offset(adt, path);
     if (node < 0) {
         printf("dart: Error getting DART node %s\n", path);
@@ -497,6 +524,9 @@ static u64 *dart_get_l2(dart_dev_t *dart, u32 idx)
     int ttbr = idx >> 11;
     idx &= 0x7ff;
 
+    if (!dart->l1[ttbr])
+        return NULL;
+
     if (dart->l1[ttbr][idx] & DART_PTE_VALID) {
         u64 off = FIELD_GET(dart->params->offset_mask, dart->l1[ttbr][idx])
                   << DART_PTE_OFFSET_SHIFT;
@@ -541,6 +571,9 @@ static int dart_map_page(dart_dev_t *dart, uintptr_t iova, uintptr_t paddr, u32 
 
 int dart_map_flags(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len, u32 flags)
 {
+    if (dart->locked)
+        return -1;
+
     uintptr_t paddr = (uintptr_t)bfr;
     u64 offset = 0;
 
@@ -586,6 +619,9 @@ static void dart_unmap_page(dart_dev_t *dart, uintptr_t iova)
 
 void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
 {
+    if (dart->locked)
+        return;
+
     if (len % SZ_16K)
         return;
     if (iova % SZ_16K)
@@ -603,6 +639,9 @@ void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
 
 void dart_free_l2(dart_dev_t *dart, uintptr_t iova)
 {
+    if (dart->locked)
+        return;
+
     if (iova & ((1 << 25) - 1)) {
         printf("dart: %08lx is not at the start of L2 table\n", iova);
         return;
@@ -701,6 +740,43 @@ u64 dart_search(dart_dev_t *dart, void *paddr)
     return DART_PTR_ERR;
 }
 
+u64 dart_search_range(dart_dev_t *dart, u64 paddr, size_t len)
+{
+    if (!len || (paddr & (SZ_16K - 1)) || paddr > UINT64_MAX - len || len > SIZE_MAX - (SZ_16K - 1))
+        return DART_PTR_ERR;
+
+    size_t pages = ALIGN_UP(len, SZ_16K) / SZ_16K;
+    for (int ttbr = 0; ttbr < dart->params->ttbr_count; ttbr++) {
+        if (!dart->l1[ttbr])
+            continue;
+        for (u32 l1 = 0; l1 < 2048; l1++) {
+            if (!(dart->l1[ttbr][l1] & DART_PTE_VALID))
+                continue;
+            u64 *l2 = (u64 *)(FIELD_GET(dart->params->offset_mask, dart->l1[ttbr][l1])
+                              << DART_PTE_OFFSET_SHIFT);
+            for (u32 page = 0; page < 2048; page++) {
+                if (!(l2[page] & DART_PTE_VALID))
+                    continue;
+                u64 first = FIELD_GET(dart->params->offset_mask, l2[page]) << DART_PTE_OFFSET_SHIFT;
+                if (first != paddr)
+                    continue;
+                u64 iova = ((u64)ttbr << 36) | ((u64)l1 << 25) | ((u64)page << 14);
+                bool contiguous = true;
+                for (size_t n = 1; n < pages; n++) {
+                    if (n > (UINT64_MAX - iova) / SZ_16K ||
+                        (u64)dart_translate_silent(dart, iova + n * SZ_16K) != paddr + n * SZ_16K) {
+                        contiguous = false;
+                        break;
+                    }
+                }
+                if (contiguous)
+                    return iova;
+            }
+        }
+    }
+    return DART_PTR_ERR;
+}
+
 u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len)
 {
     if (len % SZ_16K)
@@ -732,6 +808,11 @@ u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len)
 
 void dart_shutdown(dart_dev_t *dart)
 {
+    if (dart->locked || dart->keep) {
+        free(dart);
+        return;
+    }
+
     if (!dart->locked && !dart->keep)
         write32(DART_TCR(dart), dart->params->tcr_disabled);
 

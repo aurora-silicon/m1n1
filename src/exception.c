@@ -224,24 +224,26 @@ void print_regs(u64 *regs, int el12)
     const char *ec_desc = ec_table[(esr >> 26) & 0x3f];
     printf("ESR:      0x%lx (%s)\n", esr, ec_desc ? ec_desc : "?");
 
-    u64 sts = mrs(SYS_IMP_APL_L2C_ERR_STS);
-    printf("L2C_ERR_STS: 0x%lx\n", sts);
-    printf("L2C_ERR_ADR: 0x%lx\n", mrs(SYS_IMP_APL_L2C_ERR_ADR));
-    printf("L2C_ERR_INF: 0x%lx\n", mrs(SYS_IMP_APL_L2C_ERR_INF));
     if (cpu_features->apple_sysregs_unlocked) {
+        u64 sts = mrs(SYS_IMP_APL_L2C_ERR_STS);
+        printf("L2C_ERR_STS: 0x%lx\n", sts);
+        printf("L2C_ERR_ADR: 0x%lx\n", mrs(SYS_IMP_APL_L2C_ERR_ADR));
+        printf("L2C_ERR_INF: 0x%lx\n", mrs(SYS_IMP_APL_L2C_ERR_INF));
         msr(SYS_IMP_APL_L2C_ERR_STS, sts);
-    }
 
-    if (is_ecore()) {
-        printf("E_LSU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_E_LSU_ERR_STS));
-        printf("E_FED_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_E_FED_ERR_STS));
-        if (cpu_features->fast_ipi)
-            printf("E_MMU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_E_MMU_ERR_STS));
+        if (is_ecore()) {
+            printf("E_LSU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_E_LSU_ERR_STS));
+            printf("E_FED_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_E_FED_ERR_STS));
+            if (cpu_features->fast_ipi)
+                printf("E_MMU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_E_MMU_ERR_STS));
+        } else {
+            printf("LSU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_LSU_ERR_STS));
+            printf("FED_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_FED_ERR_STS));
+            if (cpu_features->fast_ipi)
+                printf("MMU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_MMU_ERR_STS));
+        }
     } else {
-        printf("LSU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_LSU_ERR_STS));
-        printf("FED_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_FED_ERR_STS));
-        if (cpu_features->fast_ipi)
-            printf("MMU_ERR_STS: 0x%lx\n", mrs(SYS_IMP_APL_MMU_ERR_STS));
+        printf("Apple error registers locked; skipping diagnostics\n");
     }
 }
 

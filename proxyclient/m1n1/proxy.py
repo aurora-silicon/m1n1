@@ -416,6 +416,15 @@ class UartInterface(Reloadable):
         self.reply(self.REQ_MEMWRITE)
 
     def readmem(self, addr, size):
+        if size < 0:
+            raise ValueError("Negative memory read size")
+        result = bytearray()
+        for offset in range(0, size, 16 * 1024):
+            count = min(16 * 1024, size - offset)
+            result.extend(self._readmem_one(addr + offset, count))
+        return bytes(result)
+
+    def _readmem_one(self, addr, size):
         if size == 0:
             return b""
 
@@ -513,7 +522,7 @@ CPUFeatures = Struct(
     "amx" / bool_,
     "actlr_el2" / bool_,
     "counter_redirect" / bool_,
-    "padding" / Bytes(1),
+    "unsafe_wfi" / bool_,
 )
 
 # Uses UartInterface.proxyreq() to send requests to M1N1 and process
@@ -521,6 +530,7 @@ CPUFeatures = Struct(
 class M1N1Proxy(Reloadable):
     S_OK = 0
     S_BADCMD = -1
+    S_ERROR = -2
 
     P_NOP = 0x000
     P_EXIT = 0x001
@@ -621,6 +631,7 @@ class M1N1Proxy(Reloadable):
     P_KBOOT_SET_INITRD = 0x702
     P_KBOOT_PREPARE_DT = 0x703
     P_KBOOT_SET_UBOOT = 0x704
+    P_KBOOT_BOOT_STORAGE = 0x705
 
     P_PMGR_POWER_ENABLE = 0x800
     P_PMGR_POWER_DISABLE = 0x801
@@ -635,6 +646,8 @@ class M1N1Proxy(Reloadable):
     P_IODEV_WRITE = 0x904
     P_IODEV_WHOAMI = 0x905
     P_USB_IODEV_VUART_SETUP = 0x906
+    P_CDC_SCHEDULE = 0x907
+    P_CDC_STATUS = 0x908
 
     P_TUNABLES_APPLY_GLOBAL = 0xa00
     P_TUNABLES_APPLY_LOCAL = 0xa01
@@ -723,6 +736,8 @@ class M1N1Proxy(Reloadable):
         if status != self.S_OK:
             if status == self.S_BADCMD:
                 raise ProxyCommandError("Reply error: Bad Command")
+            elif status == self.S_ERROR:
+                raise ProxyRemoteError("Reply error: Remote operation failed")
             else:
                 raise ProxyRemoteError("Reply error: Unknown error (%d)"%status)
         return retval
@@ -1073,6 +1088,8 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_KBOOT_PREPARE_DT, dt_addr)
     def kboot_set_uboot(self, name, value):
         self.request(self.P_KBOOT_SET_UBOOT, name, value)
+    def kboot_boot_storage(self, spec):
+        return self.request(self.P_KBOOT_BOOT_STORAGE, spec)
 
     def pmgr_power_enable(self, clkid):
         return self.request(self.P_PMGR_POWER_ENABLE, clkid)
@@ -1099,6 +1116,10 @@ class M1N1Proxy(Reloadable):
         return IODEV(self.request(self.P_IODEV_WHOAMI))
     def usb_iodev_vuart_setup(self, iodev):
         return self.request(self.P_USB_IODEV_VUART_SETUP, iodev)
+    def cdc_schedule(self, delay_ms=1000, flags=0x6):
+        return self.request(self.P_CDC_SCHEDULE, delay_ms, 0, flags)
+    def cdc_status(self):
+        return self.request(self.P_CDC_STATUS)
 
     def tunables_apply_global(self, path, prop):
         return self.request(self.P_TUNABLES_APPLY_GLOBAL, path, prop)
@@ -1204,8 +1225,8 @@ class M1N1Proxy(Reloadable):
 
     def dapf_init_all(self):
         return self.request(self.P_DAPF_INIT_ALL)
-    def dapf_init(self, path):
-        return self.request(self.P_DAPF_INIT, path)
+    def dapf_init(self, path, index=1):
+        return self.request(self.P_DAPF_INIT, path, index)
 
     def cpufreq_init(self):
         return self.request(self.P_CPUFREQ_INIT)

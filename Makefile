@@ -1,4 +1,11 @@
 RUSTARCH ?= aarch64-unknown-none-softfloat
+BUILTIN_LOGO ?= bootlogo
+
+ifneq ($(BUILTIN_LOGO),bootlogo)
+ifneq ($(words $(wildcard data/$(BUILTIN_LOGO)_128.bin data/$(BUILTIN_LOGO)_256.bin)),2)
+$(error BUILTIN_LOGO assets are missing)
+endif
+endif
 
 ifeq ($(shell uname),Darwin)
 USE_CLANG ?= 1
@@ -86,6 +93,54 @@ CFG += CHAINLOADING
 CARGO_FLAGS += --features chainload
 endif
 
+ifeq ($(J700_ESP_STAGE2),1)
+ifneq ($(CHAINLOADING),1)
+$(error J700_ESP_STAGE2 requires CHAINLOADING=1 for boot=)
+endif
+CFG += J700_ESP_STAGE2
+endif
+
+ifeq ($(J700_CDC_PROXY),1)
+ifneq ($(CHAINLOADING),1)
+$(error J700_CDC_PROXY requires CHAINLOADING=1)
+endif
+ifeq ($(T8140_KIS_PROXY),1)
+$(error J700_CDC_PROXY and T8140_KIS_PROXY are mutually exclusive)
+endif
+CFG += J700_CDC_PROXY USE_DEBUG_USB
+endif
+
+ifeq ($(J700_CDC_NO_WATCHDOG),1)
+ifneq ($(J700_CDC_PROXY),1)
+$(error J700_CDC_NO_WATCHDOG requires J700_CDC_PROXY=1)
+endif
+CFG += J700_CDC_NO_WATCHDOG
+endif
+
+ifeq ($(J700_CDC_AUTOSTART),1)
+ifneq ($(J700_CDC_PROXY),1)
+$(error J700_CDC_AUTOSTART requires J700_CDC_PROXY=1)
+endif
+CFG += J700_CDC_AUTOSTART
+endif
+
+ifeq ($(T8140_KIS_PROXY),1)
+ifneq ($(CHAINLOADING),1)
+$(error T8140_KIS_PROXY requires CHAINLOADING=1)
+endif
+CFG += T8140_KIS_PROXY USE_DEBUG_USB
+endif
+
+ifneq ($(T8140_PROXY_WINDOW_MS),)
+ifneq ($(T8140_KIS_PROXY),1)
+$(error T8140_PROXY_WINDOW_MS requires T8140_KIS_PROXY=1)
+endif
+ifneq ($(shell test '$(T8140_PROXY_WINDOW_MS)' -ge 0 2>/dev/null && \
+	test '$(T8140_PROXY_WINDOW_MS)' -le 99999 2>/dev/null && echo valid),valid)
+$(error T8140_PROXY_WINDOW_MS must be a decimal value from 0 to 99999)
+endif
+endif
+
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
 	-z nocopyreloc --gc-sections -pie
@@ -99,7 +154,7 @@ TINF_OBJECTS := $(patsubst %,tinf/%, \
 DLMALLOC_OBJECTS := dlmalloc/malloc.o
 
 LIBFDT_OBJECTS := $(patsubst %,libfdt/%, \
-	fdt_addresses.o fdt_empty_tree.o fdt_ro.o fdt_rw.o fdt_strerror.o fdt_sw.o \
+	fdt_addresses.o fdt_check.o fdt_empty_tree.o fdt_ro.o fdt_rw.o fdt_strerror.o fdt_sw.o \
 	fdt_wip.o fdt.o)
 
 CHICKENS_OBJECTS := $(patsubst %,chickens/%, \
@@ -133,11 +188,12 @@ HV_OBJECTS := $(patsubst %,hv/%, \
 	hv_wdt.o)
 
 OBJECTS := \
+	boot_storage.o \
 	adt.o \
 	afk.o \
 	aic.o \
 	asc.o \
-	bootlogo_48.o bootlogo_128.o bootlogo_256.o \
+	bootlogo_48.o $(BUILTIN_LOGO)_128.o $(BUILTIN_LOGO)_256.o \
 	chainload.o \
 	chainload_asm.o \
 	chickens.o \
@@ -174,6 +230,7 @@ OBJECTS := \
 	rtkit.o \
 	sart.o \
 	sep.o \
+	stage1_config.o \
 	sio.o \
 	smc.o \
 	smp.o \
@@ -182,10 +239,10 @@ OBJECTS := \
 	startup.o \
 	string.o \
 	tunables.o tunables_static.o \
-	tps6598x.o \
+	tps6598x.o tps6598x_command_core.o \
 	uart.o \
 	uartproxy.o \
-	usb.o usb_dwc3.o \
+	usb.o usb_dwc3.o usb_cdc.o usb_cdc_atc.o usb_cdc_bulk.o usb_cdc_ss_desc.o usb_cdc_state.o \
 	utils.o utils_asm.o \
 	vsprintf.o \
 	wdt.o \
@@ -290,6 +347,9 @@ build-tag src/../build/build_tag.h &:
 build-cfg src/../build/build_cfg.h &:
 	$(QUIET)mkdir -p build
 	$(QUIET)for i in $(CFG); do echo "#define $$i"; done > build/build_cfg.tmp
+	$(QUIET)if [ -n "$(T8140_PROXY_WINDOW_MS)" ]; then \
+		echo "#define T8140_PROXY_WINDOW_MS $(T8140_PROXY_WINDOW_MS)" >> build/build_cfg.tmp; fi
+	$(QUIET)echo "#define BUILTIN_LOGO $(BUILTIN_LOGO)" >> build/build_cfg.tmp
 	$(QUIET)cmp -s build/build_cfg.h build/build_cfg.tmp 2>/dev/null || \
 	( mv -f build/build_cfg.tmp build/build_cfg.h && echo "  CFG   build/build_cfg.h" )
 

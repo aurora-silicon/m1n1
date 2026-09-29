@@ -7,9 +7,14 @@
 
 #define ASC_CPU_CONTROL       0x44
 #define ASC_CPU_CONTROL_START 0x10
+#define ASC_CPU_STATUS         0x48
+#define ASC_CPU_STATUS_STOPPED BIT(1)
 
+#define ASC_MBOX_CONTROL_ENABLE   BIT(0)
 #define ASC_MBOX_CONTROL_FULL  BIT(16)
 #define ASC_MBOX_CONTROL_EMPTY BIT(17)
+#define ASC_MBOX_CONTROL_OVERFLOW BIT(18)
+#define ASC_MBOX_CONTROL_COUNT    GENMASK(23, 20)
 
 #define ASC_MBOX_A2I_CONTROL 0x110
 #define ASC_MBOX_A2I_SEND0   0x800
@@ -79,6 +84,48 @@ void asc_cpu_stop(asc_dev_t *asc)
 bool asc_cpu_running(asc_dev_t *asc)
 {
     return read32(asc->cpu_base + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_START;
+}
+
+static bool asc_mailbox_empty(u32 control)
+{
+    return (control & (ASC_MBOX_CONTROL_ENABLE | ASC_MBOX_CONTROL_EMPTY)) ==
+               (ASC_MBOX_CONTROL_ENABLE | ASC_MBOX_CONTROL_EMPTY) &&
+           !(control &
+             (ASC_MBOX_CONTROL_FULL | ASC_MBOX_CONTROL_OVERFLOW | ASC_MBOX_CONTROL_COUNT)) &&
+           ((control >> 12) & 0xf) == ((control >> 8) & 0xf);
+}
+
+bool asc_validate_inherited_dcp(asc_dev_t *asc, const char *name)
+{
+    u32 control = read32(asc->cpu_base + ASC_CPU_CONTROL);
+    u32 status = read32(asc->cpu_base + ASC_CPU_STATUS);
+    printf("asc: %s inherited CPU control=0x%x status=0x%x\n", name, control, status);
+    if (!(control & ASC_CPU_CONTROL_START) || (status & ASC_CPU_STATUS_STOPPED)) {
+        printf("asc: %s inherited CPU is not running\n", name);
+        return false;
+    }
+
+    u32 a2i = 0, i2a = 0;
+    u64 timeout = timeout_calculate(200000);
+    bool empty;
+    do {
+        a2i = read32(asc->base + ASC_MBOX_A2I_CONTROL);
+        i2a = read32(asc->base + ASC_MBOX_I2A_CONTROL);
+        empty = asc_mailbox_empty(a2i) && asc_mailbox_empty(i2a);
+    } while (!empty && !timeout_expired(timeout));
+    printf("asc: %s inherited mailboxes A2I=0x%x I2A=0x%x (%s)\n", name, a2i, i2a,
+           empty ? "healthy and empty" : "timeout or unhealthy");
+    if (!empty)
+        return false;
+
+    control = read32(asc->cpu_base + ASC_CPU_CONTROL);
+    status = read32(asc->cpu_base + ASC_CPU_STATUS);
+    printf("asc: %s inherited CPU recheck control=0x%x status=0x%x\n", name, control, status);
+    if (!(control & ASC_CPU_CONTROL_START) || (status & ASC_CPU_STATUS_STOPPED)) {
+        printf("asc: %s inherited CPU stopped during mailbox check\n", name);
+        return false;
+    }
+    return true;
 }
 
 bool asc_can_recv(asc_dev_t *asc)
