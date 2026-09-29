@@ -3148,7 +3148,7 @@ static int dt_set_sio_fwdata(const char *adt_path, const char *fdt_alias)
         int mem_node = dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, mapping->phys,
                                                   mapping->size);
         if (mem_node < 0)
-            return ret;
+            return -1;
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
         int ret =
