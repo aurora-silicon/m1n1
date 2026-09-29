@@ -10,6 +10,9 @@ def test_t8140_display_handoff(tmp_path):
     start = source.index("struct dt_t8140_dram {")
     end = source.index("static int dt_set_display(void)", start)
     helper = source[start:end]
+    asc_source = (repo / "src/asc.c").read_text()
+    asc_defs = asc_source[asc_source.index("#define ASC_CPU_CONTROL"):asc_source.index("struct asc_dev {")]
+    asc_check = asc_source[asc_source.index("static bool asc_mailbox_empty("):asc_source.index("bool asc_can_recv(")]
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -20,6 +23,8 @@ def test_t8140_display_handoff(tmp_path):
 #include "libfdt.h"
 typedef unsigned long u64;
 typedef uint32_t u32;
+#define BIT(n) (1U << (n))
+#define GENMASK(msb, lsb) ((BIT((msb) + 1 - (lsb)) - 1) << (lsb))
 #define SZ_16K 16384
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define ADT_GETPROP_ARRAY(a, n, p, v) adt_array((n), (p), (v), sizeof(v))
@@ -31,6 +36,40 @@ struct disp_mapping {
 };
 struct mem_region { u64 paddr, size; };
 struct run { u64 iova, size, pa; };
+''' + asc_defs + r'''
+typedef struct asc_dev { uintptr_t cpu_base, base; } asc_dev_t;
+struct asc_mock {
+    u32 control, status, a2i, i2a;
+    bool stop_on_recheck;
+    unsigned int cpu_reads;
+};
+static struct asc_mock asc_state[2];
+static asc_dev_t asc_devs[2] = {{0x1000, 0x9000}, {0x3000, 0xb000}};
+static unsigned int polls;
+static u64 timeout_calculate(u32 usec) { assert(usec == 200000); polls = 0; return 3; }
+static bool timeout_expired(u64 deadline) { return ++polls >= deadline; }
+static u32 read32(uintptr_t addr)
+{
+    unsigned int idx = ((addr >= 0x3000 && addr < 0x4000) || addr >= 0xb000) ? 1 : 0;
+    struct asc_mock *state = &asc_state[idx];
+    uintptr_t cpu = asc_devs[idx].cpu_base, box = asc_devs[idx].base;
+    if (addr == cpu + ASC_CPU_CONTROL) {
+        state->cpu_reads++;
+        return state->stop_on_recheck && state->cpu_reads > 1 ? 0 : state->control;
+    }
+    if (addr == cpu + ASC_CPU_STATUS) return state->status;
+    if (addr == box + ASC_MBOX_A2I_CONTROL) return state->a2i;
+    if (addr == box + ASC_MBOX_I2A_CONTROL) return state->i2a;
+    abort();
+}
+static asc_dev_t *asc_init(const char *path)
+{
+    if (!strcmp(path, "/arm-io/dcp")) return &asc_devs[0];
+    if (!strcmp(path, "/arm-io/dcpext")) return &asc_devs[1];
+    return NULL;
+}
+static void asc_free(asc_dev_t *asc) { (void)asc; }
+''' + asc_check + r'''
 static const struct run dcp[] = {
     {0x11c4000,0xc00000,0x101f0cd4000}, {0x1ddc000,0x4000,0x101f0cd0000},
     {0x1de0000,0xc0000,0x101f0c10000}, {0x1ea0000,0x160000,0x101eb4b8000},
@@ -264,6 +303,19 @@ static void setup(void)
     reservation_calls = 0;
     hole_dcp_vram = hole_dcp_firmware = hole_ext = false;
     bad_carveout = bad_segment = false;
+    for (size_t i = 0; i < ARRAY_SIZE(asc_state); i++) {
+        asc_state[i] = (struct asc_mock){
+            .control = 0x10, .status = 0x6d, .a2i = 0x2ff01, .i2a = 0x28801,
+        };
+    }
+}
+static void check_claim(bool present)
+{
+    int len = 0;
+    const u32 *cell = fdt_getprop(dt, fdt_path_offset(dt, "/chosen"),
+                                  "apple,dcp-rtkit-quiesced", &len);
+    if (present) assert(cell && len == sizeof(u32) && fdt32_to_cpu(*cell) == 1);
+    else assert(cell == NULL);
 }
 static void check_status(const char *name, const char *want)
 {
@@ -282,8 +334,6 @@ static void check_fallback(const unsigned char *before)
     check_status("dispext0", "okay");
     assert(fdt_path_offset(dt, "/chosen/framebuffer") >= 0);
     assert(fdt_path_offset(dt, "/reserved-memory/framebuffer@101eb4b8000") < 0);
-    assert(fdt_getprop(dt, fdt_path_offset(dt, "/chosen"),
-                       "apple,dcp-rtkit-quiesced", NULL) != NULL);
     assert(fdt_check_header(dt) == 0);
 }
 int main(void)
@@ -300,8 +350,7 @@ int main(void)
     assert(fdt_path_offset(dt, "/reserved-memory/dcp_data_tail@101eb488000") >= 0);
     assert(fdt_path_offset(dt, "/reserved-memory/dcpext0_data_tail@101ea79c000") >= 0);
     assert(fdt_path_offset(dt, "/chosen/framebuffer") >= 0);
-    assert(fdt_getprop(dt, fdt_path_offset(dt, "/chosen"),
-                       "apple,dcp-rtkit-quiesced", NULL) == NULL);
+    check_claim(true);
 
     setup();
     physical_size = carveouts[0].pa - physical_base + carveouts[0].size - SZ_16K;
@@ -309,6 +358,43 @@ int main(void)
     assert(dt_set_display_t8140() == 0);
     assert(reservation_calls == 0);
     check_fallback(before);
+
+    setup();
+    assert(fdt_delprop(dt, fdt_path_offset(dt, "/chosen"),
+                       "apple,dcp-rtkit-quiesced") == 0);
+    asc_state[0].control = 0;
+    memcpy(before, dt, sizeof(tree));
+    assert(dt_set_display_t8140() == 0);
+    check_fallback(before);
+    check_claim(false);
+
+    for (int fault = 0; fault < 9; fault++) {
+        setup();
+        assert(fdt_delprop(dt, fdt_path_offset(dt, "/chosen"),
+                           "apple,dcp-rtkit-quiesced") == 0);
+        switch (fault) {
+        case 0: asc_state[0].status |= BIT(1); break;
+        case 1: asc_state[0].a2i |= BIT(16); break;
+        case 2: asc_state[0].i2a |= BIT(18); break;
+        case 3: asc_state[0].a2i &= ~BIT(17); break;
+        case 4: asc_state[0].i2a |= BIT(20); break;
+        case 5: asc_state[0].a2i ^= BIT(8); break;
+        case 6: asc_state[0].i2a &= ~BIT(0); break;
+        case 7: asc_state[0].stop_on_recheck = true; break;
+        case 8: asc_state[0].i2a |= BIT(16); break;
+        }
+        memcpy(before, dt, sizeof(tree));
+        assert(dt_set_display_t8140() == 0);
+        check_fallback(before);
+        check_claim(false);
+    }
+
+    setup();
+    asc_state[1].i2a |= BIT(18);
+    assert(dt_set_display_t8140() == 0);
+    check_status("dcpext", "disabled");
+    check_claim(true);
+    assert(fdt_path_offset(dt, "/reserved-memory/dcpext0_data_tail@101ea79c000") < 0);
 
     setup();
     carveouts[3].pa = physical_base + physical_size;
@@ -323,6 +409,7 @@ int main(void)
     check_status("disp0", "okay");
     check_status("dcpext", "disabled");
     assert(fdt_path_offset(dt, "/reserved-memory/region74@101e8ec8000") < 0);
+    check_claim(true);
 
     setup(); hole_dcp_vram = true;
     memcpy(before, dt, sizeof(tree));

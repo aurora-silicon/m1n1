@@ -6,6 +6,7 @@
 
 #include "kboot.h"
 #include "adt.h"
+#include "asc.h"
 #include "assert.h"
 #include "clk.h"
 #include "dapf.h"
@@ -2512,6 +2513,18 @@ static int dt_t8140_enable_consumer(const char *path)
     return ret;
 }
 
+static bool dt_t8140_validate_dcp_asc(const char *path, const char *name)
+{
+    asc_dev_t *asc = asc_init(path);
+    if (!asc) {
+        printf("FDT: T8140 %s: ASC unavailable at %s\n", name, path);
+        return false;
+    }
+    bool ready = asc_validate_inherited_dcp(asc, name);
+    asc_free(asc);
+    return ready;
+}
+
 static int dt_set_display_t8140(void)
 {
     int ret = -1;
@@ -2669,6 +2682,12 @@ static int dt_set_display_t8140(void)
         goto refuse;
     }
 
+    step = "internal DCP ASC and mailboxes";
+    if (!dt_t8140_validate_dcp_asc("/arm-io/dcp", "dcp")) {
+        reason = "inherited DCP ASC is not live with healthy empty mailboxes";
+        goto rollback;
+    }
+
     /* External firmware has its own DART. It is optional for the internal
      * panel, so a failed external validation only rolls back that controller. */
     void *ext_saved = malloc(dt_bufsize);
@@ -2711,6 +2730,10 @@ static int dt_set_display_t8140(void)
             ret = dt_t8140_reserve_carveout(ext, NULL, "region-id-234", "region234", false,
                                             &dram);
         }
+        if (!ret) {
+            step = "DCPEXT ASC and mailboxes";
+            ret = dt_t8140_validate_dcp_asc("/arm-io/dcpext", "dcpext") ? 0 : -1;
+        }
         ext_ready = !ret;
         if (ret) {
             memcpy(dt, ext_saved, dt_bufsize);
@@ -2738,22 +2761,23 @@ static int dt_set_display_t8140(void)
     node = fdt_path_offset(dt, "dispext0");
     if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled") < 0)
         goto rollback;
-    step = "remove stale apple,dcp-rtkit-quiesced claim";
+    step = "publish apple,dcp-rtkit-quiesced claim";
     node = fdt_path_offset(dt, "/chosen");
     if (node < 0)
         goto rollback;
-    int del_success = fdt_delprop(dt, node, "apple,dcp-rtkit-quiesced");
-    if (del_success && del_success != -FDT_ERR_NOTFOUND)
+    if (fdt_setprop_u32(dt, node, "apple,dcp-rtkit-quiesced", 1) < 0)
         goto rollback;
     free(saved);
-    printf("FDT: T8140 DCP enabled with validated framebuffer and firmware mappings%s\n",
+    printf("FDT: T8140 DCP enabled with validated framebuffer, firmware and live ASC%s;"
+           " /chosen/apple,dcp-rtkit-quiesced=1\n",
            ext_ready ? " (dcpext enabled)" : "");
     return 0;
 
 rollback:
     memcpy(dt, saved, dt_bufsize);
     free(saved);
-    reason = "FDT consumer or property update failed";
+    if (!strcmp(reason, "validation failed"))
+        reason = "FDT consumer or property update failed";
 
 refuse:
     printf("FDT: T8140 display refused at %s: %s; retaining original FDT and simplefb\n",
