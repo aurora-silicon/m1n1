@@ -894,6 +894,12 @@ static void usb_dwc3_ep0_handle_standard_endpoint(dwc3_dev_t *dev,
             switch (setup->feature.wFeatureSelector) {
                 case USB_FEATURE_ENDPOINT_HALT:
                     usb_debug_printf("Host cleared EP 0x%x stall\n", setup->feature.wEndpoint);
+                    if ((setup->feature.wEndpoint & 0xff70) ||
+                        ep_to_num(setup->feature.wEndpoint) >= MAX_ENDPOINTS) {
+                        usb_dwc3_ep_set_stall(dev, 0, 1);
+                        dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
+                        break;
+                    }
                     usb_dwc3_ep_set_stall(dev, ep_to_num(setup->feature.wEndpoint), 0);
                     dev->ep0_state = usb_dwc3_start_status_phase(dev, USB_LEP_CTRL_IN)
                                          ? USB_DWC3_EP0_STATE_IDLE
@@ -1216,6 +1222,14 @@ static bool usb_dwc3_cdc_copy_bulk_out_progress(dwc3_dev_t *dev, u8 ep)
     if (!host2device)
         return false;
     dma_rmb();
+#ifndef J700_CDC_PROXY
+    u32 remaining = dev->endpoints[ep].trb->size & DWC3_TRB_SIZE_MASK;
+    if (remaining > XFER_SIZE)
+        return false;
+    size_t bytes = XFER_SIZE - remaining;
+    return bytes <= ringbuffer_get_free(host2device) &&
+           ringbuffer_write(dev->endpoints[ep].xfer_buffer, bytes, host2device) == bytes;
+#else
     /* A short OUT packet can leave a gap before the next chained TRB. */
     for (unsigned i = dev->endpoints[ep].completed_trbs; i < dev->endpoints[ep].trb_count; i++) {
         struct dwc3_trb *trb = &dev->endpoints[ep].trb[i];
@@ -1242,6 +1256,7 @@ static bool usb_dwc3_cdc_copy_bulk_out_progress(dwc3_dev_t *dev, u8 ep)
         dev->endpoints[ep].completed_trbs = i + 1;
     }
     return true;
+#endif
 }
 
 static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_depevt event)

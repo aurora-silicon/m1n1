@@ -363,7 +363,7 @@ void usb_init(void)
 static bool usb_hpm_restore_irqs_match(char *hpm_path, void *state)
 {
     int idx = hpm_idx(hpm_path);
-    if (idx < 0)
+    if (idx < FIRST_USB_IODEV || idx >= USB_IODEV_COUNT)
         return false;
 
     bool force = *(bool *)state;
