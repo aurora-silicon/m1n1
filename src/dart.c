@@ -415,6 +415,23 @@ dart_dev_t *dart_init_fdt(void *dt, u32 phandle, int device, bool keep_pts)
     return dart;
 }
 
+/* Inspect an inherited display translation without creating a root or
+ * enabling a stream if firmware did not leave the DART locked. */
+dart_dev_t *dart_init_fdt_locked(void *dt, u32 phandle, int device)
+{
+    int node = fdt_node_offset_by_phandle(dt, phandle);
+    if (node < 0 || fdt_node_check_compatible(dt, node, "apple,t8110-dart"))
+        return NULL;
+
+    u64 base = dt_get_address(dt, node);
+    if (!base || !(read32(base + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR)) {
+        printf("dart: inherited DART for phandle %u is not locked\n", phandle);
+        return NULL;
+    }
+
+    return dart_init_fdt(dt, phandle, device, true);
+}
+
 int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_base)
 {
     if (dart->locked)

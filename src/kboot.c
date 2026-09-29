@@ -1686,6 +1686,8 @@ static dart_dev_t *dt_init_dart_by_node(int node, u32 num)
 
     printf("FDT: iommu phande:%u stream:%u\n", iommu_phandle, iommu_stream);
 
+    if (chip_id == T8140)
+        return dart_init_fdt_locked(dt, iommu_phandle, iommu_stream);
     return dart_init_fdt(dt, iommu_phandle, iommu_stream, true);
 }
 
@@ -1725,7 +1727,9 @@ static int dt_device_set_reserved_mem_from_dart(int node, dart_dev_t *dart, cons
     u64 iova = dart_get_mapping(dart, name, paddr, size);
     if (DART_IS_ERR(iova)) {
         printf("ADT: no mapping found for '%s' (0x%012lx iova:0x%08lx)\n", name, paddr, iova);
-        return 0;
+        /* A T8140 reservation must never claim a device without a complete,
+         * inherited DART view of every page in the range. */
+        return chip_id == T8140 ? -1 : 0;
     }
 
     return dt_device_set_reserved_mem(node, name, phandle, iova, size);
@@ -1868,6 +1872,7 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
         int dcp_node = fdt_path_offset(dt, dcp_alias);
         if (dcp_node < 0) {
             printf("FDT: could not resolve '%s' alias\n", dcp_alias);
+            ret = -1;
             goto err; // cleanup
         }
         dart_dcp = dt_init_dart_by_node(dcp_node, 0);
@@ -1880,6 +1885,7 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
         int disp_node = fdt_path_offset(dt, disp_alias);
         if (disp_node < 0) {
             printf("FDT: could not resolve '%s' alias\n", disp_alias);
+            ret = -1;
             goto err; // cleanup
         }
         dart_disp = dt_init_dart_by_node(disp_node, 0);
@@ -1892,6 +1898,7 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
         int piodma_node = fdt_path_offset(dt, piodma_alias);
         if (piodma_node < 0) {
             printf("FDT: could not resolve '%s' alias\n", piodma_alias);
+            ret = -1;
             goto err; // cleanup
         }
 
@@ -1908,8 +1915,10 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
         snprintf(node_name, sizeof(node_name), "%s@%lx", name, region[i].paddr);
         int mem_node =
             dt_get_or_add_reserved_mem(node_name, compat, true, region[i].paddr, region[i].size);
-        if (mem_node < 0)
+        if (mem_node < 0) {
+            ret = -1;
             goto err;
+        }
 
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
@@ -1955,7 +1964,7 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
      * it and breaking display scanout when booting with old m1n1 which
      * does not lock dart-disp0.
      */
-    if (disp_alias) {
+    if (disp_alias && chip_id != T8140) {
         int disp_node = fdt_path_offset(dt, disp_alias);
 
         int dart_disp0 = dt_get_iommu_node(disp_node, 0);
@@ -1966,9 +1975,11 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
             bail_cleanup("FDT: failed to enable 'dart-disp0'\n");
     }
     /* enable dcp* */
-    int dcp_node = fdt_path_offset(dt, dcp_alias);
-    if (dcp_node < 0 || fdt_setprop_string(dt, dcp_node, "status", "okay") < 0)
-        bail_cleanup("FDT: failed to enable '%s'\n", dcp_alias);
+    if (chip_id != T8140) {
+        int dcp_node = fdt_path_offset(dt, dcp_alias);
+        if (dcp_node < 0 || fdt_setprop_string(dt, dcp_node, "status", "okay") < 0)
+            bail_cleanup("FDT: failed to enable '%s'\n", dcp_alias);
+    }
 
 err:
     if (dart_dcp)
@@ -2346,8 +2357,108 @@ static struct disp_mapping disp_reserved_regions_t602x[] = {
     {"region-id-157", "region157", true, true, false},
 };
 
+/* The captured J700 ADT identifies /vram, but the supplied DART mapping
+ * snapshots contain no entries. Do not infer a T8140 carveout table from
+ * another SoC. The live inherited tables can still prove a complete
+ * framebuffer mapping at this boot; leave DCP disabled until the remaining
+ * firmware/data regions and both controller paths are independently known.
+ */
+static int dt_set_display_t8140(void)
+{
+    const char *const aliases[] = {"dcp", "disp0", "dcpext", "dispext0"};
+    int ret = -1;
+    u64 base, size, end, fb_size;
+    int adt_path[4];
+    int node = adt_path_offset_trace(adt, "/vram", adt_path);
+    if (node < 0)
+        goto disable;
+
+    int depth = 0;
+    while (depth < 3 && adt_path[depth])
+        depth++;
+    if (depth >= 3)
+        goto disable;
+    adt_path[depth + 1] = 0;
+    if (adt_get_reg(adt, adt_path, "reg", 0, &base, &size) < 0 || !size ||
+        (base & (SZ_16K - 1)) || (size & (SZ_16K - 1)) || base > UINT64_MAX - size ||
+        !cur_boot_args.video.base || !cur_boot_args.video.height ||
+        !cur_boot_args.video.stride ||
+        cur_boot_args.video.stride > UINT64_MAX / cur_boot_args.video.height)
+        goto disable;
+
+    end = base + size;
+    fb_size = cur_boot_args.video.stride * cur_boot_args.video.height;
+    if (cur_boot_args.video.base < base || cur_boot_args.video.base > end ||
+        fb_size > end - cur_boot_args.video.base ||
+        cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size ||
+        base < cur_boot_args.phys_base || end > cur_boot_args.phys_base + cur_boot_args.mem_size)
+        goto disable;
+
+    /* On the measured J700 ADT, /vram exactly matches carveout region 14
+     * and an opaque DCP nub segment. Check both independent ADT descriptions
+     * before publishing it; neither establishes an IOVA on its own. */
+    node = adt_path_offset(adt, "/chosen/carveout-memory-map");
+    u64 carveout[2];
+    if (node < 0 || ADT_GETPROP_ARRAY(adt, node, "region-id-14", carveout) != sizeof(carveout) ||
+        carveout[0] != base || carveout[1] != size)
+        goto disable;
+    node = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
+    u32 seg_len = 0;
+    const struct adt_segment_ranges *seg =
+        node < 0 ? NULL : adt_getprop(adt, node, "segment-ranges", &seg_len);
+    if (!seg || !seg_len || seg_len % sizeof(*seg) || seg_len > 32 * sizeof(*seg))
+        goto disable;
+    bool segment_found = false;
+    for (u32 i = 0; i < seg_len / sizeof(*seg); i++) {
+        if (seg[i].phys == base && seg[i].size == size)
+            segment_found = true;
+    }
+    if (!segment_found)
+        goto disable;
+
+    if (!fdt_get_alias(dt, "dcp") || !fdt_get_alias(dt, "disp0"))
+        goto disable;
+
+    /* The upstream helpers mutate the FDT as they go. Restore the complete
+     * tree if a DART span or any property write fails. */
+    void *saved = malloc(dt_bufsize);
+    if (!saved)
+        goto disable;
+    memcpy(saved, dt, dt_bufsize);
+    ret = dt_vram_reserved_region("dcp", "disp0");
+    if (ret)
+        memcpy(dt, saved, dt_bufsize);
+    free(saved);
+    if (ret)
+        printf("FDT: T8140 framebuffer mapping incomplete; retaining simplefb\n");
+    else
+        printf("FDT: T8140 framebuffer reserved; DCP remains disabled pending complete mapping evidence\n");
+
+disable:
+    node = fdt_path_offset(dt, "/chosen");
+    if (node < 0)
+        return -1;
+    int del = fdt_delprop(dt, node, "apple,dcp-rtkit-quiesced");
+    if (del && del != -FDT_ERR_NOTFOUND)
+        return -1;
+
+    /* A template may have enabled these nodes already. Re-resolve each alias
+     * after every status write because libfdt can move later offsets. */
+    for (size_t i = 0; i < ARRAY_SIZE(aliases); i++) {
+        node = fdt_path_offset(dt, aliases[i]);
+        if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled") < 0)
+            return -1;
+    }
+    if (ret)
+        printf("FDT: T8140 display reservation unavailable; retaining simplefb\n");
+    return 0;
+}
+
 static int dt_set_display(void)
 {
+    if (chip_id == T8140)
+        return dt_set_display_t8140();
+
     /* lock dart-disp0 to prevent old software from resetting it */
     dart_lock_adt("/arm-io/dart-disp0", 0);
     const char compat_piodma_alias[] = "disp0_piodma";
