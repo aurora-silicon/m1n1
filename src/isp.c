@@ -319,9 +319,8 @@ out:
         unsigned int i = --global_attempted;
         uintptr_t addr = global_base + isp_t8140_domains[i].offset;
         int ret = pmgr_set_mode(addr, global_target[i]);
-        printf("isp: %s restore at 0x%lx from %x/%x: 0x%x%s\n",
-               isp_t8140_domains[i].name, addr, global_actual[i], global_target[i],
-               read32(addr), ret ? " failed" : "");
+        printf("isp: %s restore at 0x%lx from %x/%x: 0x%x%s\n", isp_t8140_domains[i].name, addr,
+               global_actual[i], global_target[i], read32(addr), ret ? " failed" : "");
     }
     if (local_powered)
         pmgr_set_mode(pmgr_base + pmgr_off, PMGR_PS_PWRGATE);

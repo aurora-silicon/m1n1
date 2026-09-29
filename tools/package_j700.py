@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Assemble a draft J700 release from two pinned buildbox output folders."""
+"""Assemble a draft J700 release from two pinned build output folders."""
 
 import argparse
 import hashlib
