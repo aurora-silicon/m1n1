@@ -20,10 +20,17 @@
 #define ISP_VER_T603X 0xf3001
 #define ISP_VER_T8140 0x110000
 
-#define ISP_PMGR_T8140_CPU   0x4008
-#define ISP_PMGR_T8140_CORE0 0x4010
-#define ISP_PMGR_T8140_CORE1 0x4018
-#define ISP_PMGR_T8140_FE    0x4020
+// Global PMGR PS slots from the T8140 ADT. These are virtual device entries,
+// so the generic PMGR recursion enables their real parents but skips these slots.
+static const struct {
+    const char *name;
+    u32 offset;
+} isp_t8140_domains[] = {
+    {"ISP_CPU", 0x4000},
+    {"ISP_CPU_CORE0", 0x4008},
+    {"ISP_CPU_CORE1", 0x4010},
+    {"ISP_FE", 0x4018},
+};
 
 // Candidate from the ISP-2 measurement plan; release requires its A/B receipts.
 #define ISP_T8140_HEAP_TOP 0x2200000
@@ -66,6 +73,8 @@ int isp_init(void)
     bool t8140 = chip_id == T8140;
     bool powered = false;
     unsigned int local_powered = 0;
+    unsigned int global_attempted = 0;
+    u64 global_base = 0;
     u32 ver_rev = 0;
     u64 selected_top = 0;
     u64 selected_iova = 0;
@@ -90,30 +99,48 @@ int isp_init(void)
         return 0;
 
     powered = true;
-    if (pmgr_adt_power_enable(isp_path) < 0)
+    reason = "ISP ADT power gates failed";
+    if ((t8140 ? pmgr_adt_power_enable_traced(isp_path) : pmgr_adt_power_enable(isp_path)) < 0)
         goto out;
 
     u64 isp_base;
-    u64 pmgr_base;
+    u64 pmgr_base = 0;
     err = adt_get_reg(adt, adt_isp_path, "reg", 0, &isp_base, NULL);
     if (err)
         goto out;
 
-    err = adt_get_reg(adt, adt_isp_path, "reg", 1, &pmgr_base, NULL);
-    if (err)
-        goto out;
-    err = -1;
-
     if (t8140) {
-        const u32 offsets[] = {ISP_PMGR_T8140_CPU, ISP_PMGR_T8140_CORE0, ISP_PMGR_T8140_CORE1,
-                               ISP_PMGR_T8140_FE};
-        for (unsigned int i = 0; i < ARRAY_SIZE(offsets); i++) {
-            reason = "local PMGR power failed";
-            local_powered++;
-            if (pmgr_set_mode(pmgr_base + offsets[i], PMGR_PS_ACTIVE))
+        u64 global_size, local_base, local_size;
+        reason = "invalid T8140 PMGR apertures";
+        err = -1;
+        if (adt_get_reg(adt, adt_isp_path, "reg", 1, &global_base, &global_size) ||
+            adt_get_reg(adt, adt_isp_path, "reg", 2, &local_base, &local_size) ||
+            global_size < 0x18000 || local_size != 0x4000 ||
+            global_base > UINT64_MAX - global_size || local_base > UINT64_MAX - local_size ||
+            local_base < global_base + global_size)
+            goto out;
+        printf("isp: global PMGR 0x%lx..0x%lx; separate local PMGR 0x%lx..0x%lx\n",
+               global_base, global_base + global_size, local_base, local_base + local_size);
+
+        // The ADT's ISP_CPU, CORE0, CORE1 and FE slots belong to the global PMGR.
+        // Start with CPU: the old sequence started at CORE0 and timed out there.
+        // The separate local aperture has no ADT-described PS slot for these devices.
+        for (unsigned int i = 0; i < ARRAY_SIZE(isp_t8140_domains); i++) {
+            reason = "global ISP PMGR power failed";
+            global_attempted++;
+            uintptr_t addr = global_base + isp_t8140_domains[i].offset;
+            int ret = pmgr_set_mode(addr, PMGR_PS_ACTIVE);
+            printf("isp: %s power on at 0x%lx: 0x%x%s\n", isp_t8140_domains[i].name, addr,
+                   read32(addr), ret ? " failed" : "");
+            if (ret)
                 goto out;
         }
+    } else {
+        err = adt_get_reg(adt, adt_isp_path, "reg", 1, &pmgr_base, NULL);
+        if (err)
+            goto out;
     }
+    err = -1;
 
     u32 pmgr_off;
     switch (chip_id) {
@@ -133,7 +160,7 @@ int isp_init(void)
             pmgr_off = ISP_PMGR_T6031;
             break;
         case T8140:
-            pmgr_off = ISP_PMGR_T8140_CPU;
+            pmgr_off = 0;
             break;
         default:
             reason = "unsupported SoC";
@@ -276,17 +303,16 @@ out:
     if (err)
         printf("isp: disabled: revision 0x%x firmware %s aligned end 0x%lx: %s\n", ver_rev,
                os_firmware.string ? os_firmware.string : "unknown", selected_iova, reason);
-    if (local_powered) {
-        if (t8140) {
-            const u32 offsets[] = {ISP_PMGR_T8140_CPU, ISP_PMGR_T8140_CORE0, ISP_PMGR_T8140_CORE1,
-                                   ISP_PMGR_T8140_FE};
-            while (local_powered)
-                pmgr_set_mode(pmgr_base + offsets[--local_powered], PMGR_PS_PWRGATE);
-        } else {
-            pmgr_set_mode(pmgr_base + pmgr_off, PMGR_PS_PWRGATE);
-        }
+    while (global_attempted) {
+        unsigned int i = --global_attempted;
+        uintptr_t addr = global_base + isp_t8140_domains[i].offset;
+        int ret = pmgr_set_mode(addr, PMGR_PS_PWRGATE);
+        printf("isp: %s power off at 0x%lx: 0x%x%s\n", isp_t8140_domains[i].name, addr,
+               read32(addr), ret ? " failed" : "");
     }
+    if (local_powered)
+        pmgr_set_mode(pmgr_base + pmgr_off, PMGR_PS_PWRGATE);
     if (powered)
-        pmgr_adt_power_disable(isp_path);
+        t8140 ? pmgr_adt_power_disable_traced(isp_path) : pmgr_adt_power_disable(isp_path);
     return err;
 }

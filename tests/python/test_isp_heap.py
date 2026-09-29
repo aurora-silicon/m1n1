@@ -73,10 +73,23 @@ int pmgr_adt_power_disable(const char *path)
     disabled++;
     return 0;
 }
+int pmgr_adt_power_enable_traced(const char *path)
+{
+    return pmgr_adt_power_enable(path);
+}
+int pmgr_adt_power_disable_traced(const char *path)
+{
+    return pmgr_adt_power_disable(path);
+}
 int adt_get_reg(const void *tree, int *path, const char *name, int index, u64 *addr, u64 *size)
 {
-    (void)tree; (void)path; (void)name; (void)size;
-    *addr = index ? 0xf0700000 : 0x320000000ULL;
+    (void)tree; (void)path; (void)name;
+    static const u64 bases[] = {0x320000000ULL, 0x300700000ULL, 0x300724000ULL};
+    static const u64 sizes[] = {0x3fe8000, 0x18000, 0x4000};
+    assert(index >= 0 && index < 3);
+    *addr = bases[index];
+    if (size)
+        *size = sizes[index];
     return 0;
 }
 int pmgr_set_mode(u64 addr, u8 mode)
@@ -147,8 +160,8 @@ static void success(void)
         assert(size == 0x14000);
     assert(isp_iova_base() == 0);
     assert(enabled == 1 && disabled == 0 && active == 4 && gated == 0);
-    assert(active_addrs[0] == 0xf0704008 && active_addrs[1] == 0xf0704010);
-    assert(active_addrs[2] == 0xf0704018 && active_addrs[3] == 0xf0704020);
+    assert(active_addrs[0] == 0x300704000ULL && active_addrs[1] == 0x300704008ULL);
+    assert(active_addrs[2] == 0x300704010ULL && active_addrs[3] == 0x300704018ULL);
     assert(dapf_calls == 1 && allocations == 1);
 }
 static void failure(void)
