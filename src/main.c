@@ -180,7 +180,6 @@ void m1n1_main(void)
 #endif
 
     cpufreq_fixup();
-    sep_init();
 #endif
 
     printf("Initialization complete.\n");
