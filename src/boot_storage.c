@@ -57,6 +57,7 @@ static struct kernel_header *boot_prepare_image(const void *data, size_t file_si
     bool compressed =
         file_size >= 18 && ((const u8 *)data)[0] == 0x1f && ((const u8 *)data)[1] == 0x8b;
     if (compressed) {
+        printf("boot: inflating Image.gz (%lu bytes)\n", file_size);
         u64 dest = (u64)heapblock_alloc_aligned(0, IMAGE_ALIGN);
         if (dest >= ram_end)
             return NULL;
