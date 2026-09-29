@@ -74,6 +74,9 @@ int isp_init(void)
     bool powered = false;
     unsigned int local_powered = 0;
     unsigned int global_attempted = 0;
+    u8 global_actual[ARRAY_SIZE(isp_t8140_domains)] = {0};
+    u8 global_target[ARRAY_SIZE(isp_t8140_domains)] = {0};
+    struct pmgr_saved_modes adt_modes = {0};
     u64 global_base = 0;
     u32 ver_rev = 0;
     u64 selected_top = 0;
@@ -100,7 +103,7 @@ int isp_init(void)
 
     powered = !t8140;
     reason = "ISP ADT power gates failed";
-    if ((t8140 ? pmgr_adt_power_enable_traced_rollback(isp_path)
+    if ((t8140 ? pmgr_adt_power_enable_traced_saved(isp_path, &adt_modes)
                : pmgr_adt_power_enable(isp_path)) < 0)
         goto out;
     powered = true;
@@ -131,6 +134,9 @@ int isp_init(void)
             reason = "global ISP PMGR power failed";
             global_attempted++;
             uintptr_t addr = global_base + isp_t8140_domains[i].offset;
+            u32 original = read32(addr);
+            global_actual[i] = (original >> 4) & 0xf;
+            global_target[i] = original & 0xf;
             int ret = pmgr_set_mode(addr, PMGR_PS_ACTIVE);
             printf("isp: %s power on at 0x%lx: 0x%x%s\n", isp_t8140_domains[i].name, addr,
                    read32(addr), ret ? " failed" : "");
@@ -312,13 +318,14 @@ out:
     while (global_attempted) {
         unsigned int i = --global_attempted;
         uintptr_t addr = global_base + isp_t8140_domains[i].offset;
-        int ret = pmgr_set_mode(addr, PMGR_PS_PWRGATE);
-        printf("isp: %s power off at 0x%lx: 0x%x%s\n", isp_t8140_domains[i].name, addr,
+        int ret = pmgr_set_mode(addr, global_target[i]);
+        printf("isp: %s restore at 0x%lx from %x/%x: 0x%x%s\n",
+               isp_t8140_domains[i].name, addr, global_actual[i], global_target[i],
                read32(addr), ret ? " failed" : "");
     }
     if (local_powered)
         pmgr_set_mode(pmgr_base + pmgr_off, PMGR_PS_PWRGATE);
     if (powered)
-        t8140 ? pmgr_adt_power_disable_traced(isp_path) : pmgr_adt_power_disable(isp_path);
+        t8140 ? pmgr_restore_modes(&adt_modes) : pmgr_adt_power_disable(isp_path);
     return err;
 }

@@ -320,13 +320,7 @@ static int pmgr_adt_find_devices(const char *path, const u32 **devices, u32 *n_d
     return 0;
 }
 
-struct pmgr_saved_mode {
-    uintptr_t addr;
-    u8 mode;
-};
-
-static int pmgr_save_parents(u8 die, u16 id, struct pmgr_saved_mode *saved, size_t *count,
-                             size_t depth)
+static int pmgr_save_parents(u8 die, u16 id, struct pmgr_saved_modes *saved, size_t depth)
 {
     const struct pmgr_device *device;
     if (depth >= PMGR_MAX_PARENT_DEPTH || pmgr_find_device(id, &device))
@@ -334,48 +328,57 @@ static int pmgr_save_parents(u8 die, u16 id, struct pmgr_saved_mode *saved, size
     u16 parents[2];
     pmgr_adt_get_parents(device, parents);
     for (size_t i = 0; i < ARRAY_SIZE(parents); i++)
-        if (parents[i] && pmgr_save_parents(die, parents[i], saved, count, depth + 1))
+        if (parents[i] && pmgr_save_parents(die, parents[i], saved, depth + 1))
             return -1;
     if (device->flags & PMGR_FLAG_VIRTUAL)
         return 0;
     uintptr_t addr = pmgr_device_get_addr(die, device);
     if (!addr)
         return -1;
-    for (size_t i = 0; i < *count; i++)
-        if (saved[i].addr == addr)
+    for (size_t i = 0; i < saved->count; i++)
+        if (saved->modes[i].addr == addr)
             return 0;
-    if (*count == 64)
+    if (saved->count == ARRAY_SIZE(saved->modes))
         return -1;
-    saved[*count] = (struct pmgr_saved_mode){
+    u32 reg = read32(addr);
+    saved->modes[saved->count++] = (struct pmgr_saved_mode){
         .addr = addr,
-        .mode = FIELD_GET(PMGR_PS_ACTUAL, read32(addr)),
+        .actual = FIELD_GET(PMGR_PS_ACTUAL, reg),
+        .target = FIELD_GET(PMGR_PS_TARGET, reg),
     };
-    (*count)++;
     return 0;
 }
 
-int pmgr_adt_power_enable_traced_rollback(const char *path)
+void pmgr_restore_modes(struct pmgr_saved_modes *saved)
+{
+    while (saved->count) {
+        struct pmgr_saved_mode *entry = &saved->modes[--saved->count];
+        u32 reg = read32(entry->addr);
+        // The saved target is the firmware's requested steady state. Its actual
+        // mode may still have been moving when the snapshot was taken.
+        if ((FIELD_GET(PMGR_PS_ACTUAL, reg) != entry->target ||
+             FIELD_GET(PMGR_PS_TARGET, reg) != entry->target) &&
+            pmgr_set_mode(entry->addr, entry->target))
+            printf("pmgr: failed to restore 0x%lx after ISP error\n", entry->addr);
+    }
+}
+
+int pmgr_adt_power_enable_traced_saved(const char *path, struct pmgr_saved_modes *saved)
 {
     const u32 *devices;
     u32 n_devices;
     if (pmgr_adt_find_devices(path, &devices, &n_devices))
         return -1;
-    struct pmgr_saved_mode saved[64];
-    size_t count = 0;
+    saved->count = 0;
     for (u32 i = 0; i < n_devices; i++) {
         u16 id = FIELD_GET(PMGR_DEVICE_ID, devices[i]);
         u8 die = FIELD_GET(PMGR_DIE_ID, devices[i]);
-        if (pmgr_save_parents(die, id, saved, &count, 0))
+        if (pmgr_save_parents(die, id, saved, 0))
             return -1;
     }
     if (!pmgr_adt_power_enable_traced(path))
         return 0;
-    while (count) {
-        struct pmgr_saved_mode *entry = &saved[--count];
-        if (FIELD_GET(PMGR_PS_ACTUAL, read32(entry->addr)) != entry->mode &&
-            pmgr_set_mode(entry->addr, entry->mode))
-            printf("pmgr: failed to restore 0x%lx after enable error\n", entry->addr);
-    }
+    pmgr_restore_modes(saved);
     return -1;
 }
 

@@ -53,6 +53,12 @@ static u32 revision;
 static u64 read_address, expected_heap_size;
 static int enabled, disabled, active, gated, dapf_calls, allocations, power_fail_at;
 static u64 active_addrs[8], gated_addrs[8];
+static u8 global_mode[4], initial_mode[4], adt_mode, initial_adt_mode;
+static u64 mode_addrs[16];
+static u8 mode_values[16];
+static int mode_calls;
+struct pmgr_saved_mode { uintptr_t addr; u8 actual, target; };
+struct pmgr_saved_modes { struct pmgr_saved_mode modes[64]; size_t count; };
 
 u64 isp_iova_base(void);
 int adt_path_offset_trace(const void *tree, const char *path, int *trace)
@@ -77,13 +83,24 @@ int pmgr_adt_power_enable_traced(const char *path)
 {
     return pmgr_adt_power_enable(path);
 }
-int pmgr_adt_power_enable_traced_rollback(const char *path)
+int pmgr_adt_power_enable_traced_saved(const char *path, struct pmgr_saved_modes *saved)
 {
-    return pmgr_adt_power_enable_traced(path);
+    saved->count = 1;
+    saved->modes[0].target = adt_mode;
+    adt_mode = PMGR_PS_ACTIVE;
+    int ret = pmgr_adt_power_enable_traced(path);
+    if (ret) {
+        adt_mode = saved->modes[0].target;
+        saved->count = 0;
+    }
+    return ret;
 }
-int pmgr_adt_power_disable_traced(const char *path)
+void pmgr_restore_modes(struct pmgr_saved_modes *saved)
 {
-    return pmgr_adt_power_disable(path);
+    assert(saved->count == 1);
+    adt_mode = saved->modes[0].target;
+    saved->count = 0;
+    disabled++;
 }
 int adt_get_reg(const void *tree, int *path, const char *name, int index, u64 *addr, u64 *size)
 {
@@ -98,16 +115,27 @@ int adt_get_reg(const void *tree, int *path, const char *name, int index, u64 *a
 }
 int pmgr_set_mode(u64 addr, u8 mode)
 {
+    assert(mode_calls < 16);
+    mode_addrs[mode_calls] = addr;
+    mode_values[mode_calls++] = mode;
     if (mode == PMGR_PS_ACTIVE) {
         active_addrs[active++] = addr;
-        return active == power_fail_at ? -1 : 0;
+        if (active == power_fail_at)
+            return -1;
+    } else {
+        gated_addrs[gated++] = addr;
     }
-    gated_addrs[gated++] = addr;
+    if (addr >= 0x300704000ULL && addr <= 0x300704018ULL)
+        global_mode[(addr - 0x300704000ULL) / 8] = mode;
     return 0;
 }
 u32 read32(u64 addr)
 {
     read_address = addr;
+    if (addr >= 0x300704000ULL && addr <= 0x300704018ULL) {
+        u8 mode = global_mode[(addr - 0x300704000ULL) / 8];
+        return (mode << 4) | mode;
+    }
     return revision;
 }
 const void *adt_getprop(const void *tree, int node, const char *name, u32 *len)
@@ -151,6 +179,10 @@ static void reset(void)
     read_address = 0;
     allocation_fails = dapf_fails = adt_power_fails = false;
     enabled = disabled = active = gated = dapf_calls = allocations = power_fail_at = 0;
+    mode_calls = 0;
+    memset(global_mode, 0, sizeof(global_mode));
+    memset(initial_mode, 0, sizeof(initial_mode));
+    adt_mode = initial_adt_mode = PMGR_PS_PWRGATE;
 }
 static void success(void)
 {
@@ -174,9 +206,16 @@ static void failure(void)
     assert(isp_init() != 0);
     assert(isp_get_heap(&phys, &iova, &size) != 0);
     assert(enabled == 1 && disabled == (adt_power_fails ? 0 : 1));
-    assert(gated == active);
-    for (int i = 0; i < gated; ++i)
-        assert(gated_addrs[i] == active_addrs[gated - i - 1]);
+    assert(adt_mode == initial_adt_mode);
+    assert(memcmp(global_mode, initial_mode, sizeof(global_mode)) == 0);
+    if (!adt_power_fails) {
+        int attempted = power_fail_at ? power_fail_at : 4;
+        assert(mode_calls == 2 * attempted);
+        for (int i = 0; i < attempted; i++) {
+            assert(mode_addrs[attempted + i] == mode_addrs[attempted - i - 1]);
+            assert(mode_values[attempted + i] == initial_mode[attempted - i - 1]);
+        }
+    }
 }
 int main(void)
 {
@@ -200,6 +239,9 @@ int main(void)
     reset(); dapf_fails = true; failure();
     reset(); adt_power_fails = true; failure();
     reset(); power_fail_at = 3; failure();
+    reset(); initial_mode[1] = global_mode[1] = PMGR_PS_ACTIVE;
+    initial_adt_mode = adt_mode = PMGR_PS_ACTIVE;
+    power_fail_at = 3; failure();
 
     reset(); chip_id = T6000; revision = 0xb3091;
     os_firmware.version = V13_5; os_firmware.string = "13.5";
