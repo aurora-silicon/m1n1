@@ -237,6 +237,7 @@ static const struct reg_info regs_t8140 = {
     .rc_idx = 1,
     .phy_common_idx = 2,
     .phy_idx = 2,
+    .phy_ctrl_reset = APCIE_PHY_CTRL_RESET_T8132,
     .phy_ip_idx = 3,
     .axi_idx = 4,
 };
@@ -267,9 +268,103 @@ struct state {
     u64 port_intr2axi_base[8];
     const struct reg_info *pcie_regs;
     bool initialized;
+    bool dirty;
+    u32 active_ports;
 };
 
 static struct state controllers[NUM_CONTROLLERS];
+
+static int pcie_port_reg_count(u32 reg_len, u32 port_count, u32 shared, bool t8140)
+{
+    if (!port_count || port_count > 8 || reg_len % 16 || reg_len / 16 < shared)
+        return -1;
+    u32 remaining = reg_len / 16 - shared;
+    if (!remaining || remaining % port_count)
+        return -1;
+    u32 per_port = remaining / port_count;
+    if (per_port < 3 || (t8140 && per_port != 6))
+        return -1;
+    return per_port;
+}
+
+/* Check every T8140 ADT window and tunable before PMGR or MMIO changes. */
+static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, int port_regs)
+{
+    static const char *const shared_props[] = {
+        "apcie-axi2af-tunables", "apcie-phy-tunables", "apcie-phy-ip-pll-tunables",
+        "apcie-phy-ip-auspma-tunables", "apcie-cio3pllcore-tunables",
+        "apcie-pcieclkgen-tunables",
+    };
+    static const int shared_indices[] = {4, 2, 3, 3, 5, 6};
+    u64 base, span, config_span;
+    u32 present = 0;
+
+    for (int i = 0; i < 7; i++) {
+        if (adt_get_reg(adt, adt_path, "reg", i, &base, &span) || !base || !span ||
+            base > UINT64_MAX - span) {
+            printf("pcie: invalid T8140 shared reg[%d]\n", i);
+            return -1;
+        }
+        if (i == 0) {
+            config_span = span;
+            if (span < (u64)ports * (1 << 15))
+                return -1;
+        }
+        if (i == 1 && span < 0x5c)
+            return -1;
+        if (i == 2 && span < 0xc000)
+            return -1;
+    }
+
+    for (int i = 0; i < (int)ARRAY_SIZE(shared_props); i++) {
+        if (adt_get_reg(adt, adt_path, "reg", shared_indices[i], &base, &span))
+            return -1;
+        int ret = tunables_validate_local(path, shared_props[i], span);
+        if (ret) {
+            printf("pcie: missing or invalid T8140 %s\n", shared_props[i]);
+            return -1;
+        }
+    }
+
+    int node = adt_path_offset(adt, path);
+    if (adt_getprop(adt, node, "apcie-common-tunables", NULL) &&
+        tunables_validate_local(path, "apcie-common-tunables", 0x4000))
+        return -1;
+
+    for (u32 port = 0; port < ports; port++) {
+        char bridge[64];
+        snprintf(bridge, sizeof(bridge), "%s/pci-bridge%d", path, port);
+        int bridge_node = adt_path_offset(adt, bridge);
+        for (int reg = 0; reg < port_regs; reg++) {
+            int idx = 7 + port * port_regs + reg;
+            if (adt_get_reg(adt, adt_path, "reg", idx, &base, &span) || !base || !span ||
+                base > UINT64_MAX - span || (reg == 0 && span < 0x4000) ||
+                (reg == 2 && span < 0x400)) {
+                printf("pcie: invalid T8140 port %d reg[%d]\n", port, idx);
+                return -1;
+            }
+        }
+        if (bridge_node < 0)
+            continue;
+        if (!adt_is_compatible(adt, bridge_node, "apcie-bridge"))
+            return -1;
+        u32 max_speed;
+        if (ADT_GETPROP(adt, bridge_node, "maximum-link-speed", &max_speed) < 0 ||
+            !max_speed || max_speed > 4)
+            return -1;
+        if (tunables_validate_local(bridge, "apcie-config-tunables", 0x8000) ||
+            tunables_validate_local(bridge, "pcie-rc-tunables", 1 << 15) ||
+            tunables_validate_local(bridge, "pcie-rc-gen3-shadow-tunables", 1 << 15) ||
+            tunables_validate_local(bridge, "pcie-rc-gen4-shadow-tunables", 1 << 15))
+            return -1;
+        present++;
+        printf("pcie: T8140 ADT bridge %d validated\n", port);
+    }
+    if (!present || config_span < (u64)ports * (1 << 15))
+        return -1;
+    printf("pcie: T8140 ADT preflight passed (%d ports, %d bridges)\n", ports, present);
+    return 0;
+}
 
 static int pcie_init_controller(int controller, const char *path)
 {
@@ -280,7 +375,12 @@ static int pcie_init_controller(int controller, const char *path)
     u32 link_width = 1;
     const struct fuse_bits *fuse_bits;
 
+    if (state->dirty) {
+        printf("pcie: refusing retry of partially initialized controller %d\n", controller);
+        return -1;
+    }
     state->initialized = false;
+    state->active_ports = 0;
     state->num_phys = 1;
 
     adt_offset = adt_path_offset_trace(adt, path, adt_path);
@@ -416,7 +516,8 @@ static int pcie_init_controller(int controller, const char *path)
         state->phy_ip_base[phy] = state->phy_ip_base[0] + PHYIP_STRIDE * phy;
     }
 
-    if (adt_get_reg(adt, adt_path, "reg", state->pcie_regs->fuse_idx, &state->fuse_base, NULL)) {
+    if (state->pcie_regs->type != APCIE_T8140 &&
+        adt_get_reg(adt, adt_path, "reg", state->pcie_regs->fuse_idx, &state->fuse_base, NULL)) {
         printf("pcie: Error getting reg with index %d for %s\n", state->pcie_regs->fuse_idx, path);
         return -1;
     }
@@ -427,22 +528,33 @@ static int pcie_init_controller(int controller, const char *path)
         return -1;
     }
 
-    int port_regs = (reg_len / 16) - state->pcie_regs->shared_reg_count;
-
-    if (port_regs % state->port_count) {
-        printf("pcie: %d port registers do not evenly divide into %d ports\n", port_regs,
+    int port_reg_cnt = pcie_port_reg_count(reg_len, state->port_count,
+                                           state->pcie_regs->shared_reg_count,
+                                           state->pcie_regs->type == APCIE_T8140);
+    if (port_reg_cnt < 0) {
+        printf("pcie: invalid ADT port geometry (%d bytes, %d ports)\n", reg_len,
                state->port_count);
         return -1;
     }
-
-    int port_reg_cnt = port_regs / state->port_count;
     printf("pcie: ADT uses %d reg entries per port\n", port_reg_cnt);
 
+    if (state->pcie_regs->type == APCIE_T8140 &&
+        pcie_t8140_preflight(path, adt_path, state->port_count, port_reg_cnt)) {
+        printf("pcie: T8140 ADT preflight failed; leaving PCIe disabled\n");
+        return -1;
+    }
+
+    state->dirty = true;
+    if (state->pcie_regs->type == APCIE_T8140)
+        printf("pcie: T8140 enabling controller power\n");
     if (pmgr_adt_power_enable(path)) {
         printf("pcie: Error enabling power for %s\n", path);
         return -1;
     }
+    printf("pcie: controller %d power enabled\n", controller);
 
+    if (state->pcie_regs->type == APCIE_T8140)
+        printf("pcie: T8140 AXI reg[4] tunables\n");
     if (!adt_getprop(adt, adt_offset, "apcie-axi2af-tunables", NULL)) {
         printf("pcie: No axi2af tunables\n");
     } else if (tunables_apply_local(path, "apcie-axi2af-tunables", state->pcie_regs->axi_idx)) {
@@ -450,7 +562,23 @@ static int pcie_init_controller(int controller, const char *path)
         return -1;
     }
 
+    if (state->pcie_regs->type == APCIE_T8140) {
+        printf("pcie: T8140 CIO3 PLL core reg[5] tunables\n");
+        if (tunables_apply_local(path, "apcie-cio3pllcore-tunables", 5)) {
+            printf("pcie: Error applying T8140 CIO3 PLL core tunables\n");
+            return -1;
+        }
+        printf("pcie: T8140 PCIe clock generator reg[6] tunables\n");
+        if (tunables_apply_local(path, "apcie-pcieclkgen-tunables", 6)) {
+            printf("pcie: Error applying T8140 PCIe clock generator tunables\n");
+            return -1;
+        }
+        printf("pcie: T8140 clock tunables applied\n");
+    }
+
     /* ??? */
+    if (state->pcie_regs->type == APCIE_T8140)
+        printf("pcie: T8140 RC reg[1] setup\n");
     if (controller == APCIE)
         write32(state->rc_base + 0x4, 0);
 
@@ -465,6 +593,8 @@ static int pcie_init_controller(int controller, const char *path)
      * Initialize PHY.
      */
 
+    if (state->pcie_regs->type == APCIE_T8140)
+        printf("pcie: T8140 PHY reg[2] tunables (including port PHYs)\n");
     if (!adt_getprop(adt, adt_offset, "apcie-phy-tunables", NULL)) {
         printf("pcie: No PHY tunables\n");
     } else if (tunables_apply_local(path, "apcie-phy-tunables", state->pcie_regs->phy_idx)) {
@@ -481,6 +611,8 @@ static int pcie_init_controller(int controller, const char *path)
     }
 
     for (int phy = 0; phy < state->num_phys; phy++) {
+        if (state->pcie_regs->type == APCIE_T8140)
+            printf("pcie: T8140 PHY %d requesting CLK0\n", phy);
         set32(state->phy_base[phy] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK0REQ);
         if (poll32(state->phy_base[phy] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK0ACK,
                    APCIE_PHY_CTRL_CLK0ACK, 50000)) {
@@ -488,6 +620,8 @@ static int pcie_init_controller(int controller, const char *path)
             return -1;
         }
 
+        if (state->pcie_regs->type == APCIE_T8140)
+            printf("pcie: T8140 PHY %d CLK0 acknowledged; requesting CLK1\n", phy);
         set32(state->phy_base[phy] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK1REQ);
         if (poll32(state->phy_base[phy] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK1ACK,
                    APCIE_PHY_CTRL_CLK1ACK, 50000)) {
@@ -495,8 +629,19 @@ static int pcie_init_controller(int controller, const char *path)
             return -1;
         }
 
-        clear32(state->phy_base[phy] + APCIE_PHY_CTRL, state->pcie_regs->phy_ctrl_reset);
+        if (state->pcie_regs->type == APCIE_T8140)
+            printf("pcie: T8140 PHY %d CLK1 acknowledged; releasing reset\n", phy);
+        if (state->pcie_regs->phy_ctrl_reset)
+            clear32(state->phy_base[phy] + APCIE_PHY_CTRL, state->pcie_regs->phy_ctrl_reset);
         udelay(1);
+
+        /* Confirm reset release before continuing with PHY control. */
+        if (state->pcie_regs->type == APCIE_T8140 &&
+            poll32(state->phy_base[phy] + APCIE_PHY_CTRL,
+                   state->pcie_regs->phy_ctrl_reset, 0, 50000)) {
+            printf("pcie: Timeout releasing T8140 PHY reset\n");
+            return -1;
+        }
 
         /* ??? */
         if (state->pcie_regs->type == APCIE_T81XX) {
@@ -518,8 +663,9 @@ static int pcie_init_controller(int controller, const char *path)
                    fuse << fuse_bits[i].tgt_bit);
         }
 
-        if (state->pcie_regs->type == APCIE_T81XX || state->pcie_regs->type == APCIE_T602X ||
-            state->pcie_regs->compat == APCIE_T8122) {
+        if (state->pcie_regs->type == APCIE_T8140) {
+            printf("pcie: T8140 PHY %d up; skipping PHY IP PLL and AUSPMA tunables\n", phy);
+        } else {
             char pll_prop[64];
             char auspma_prop[64];
 
@@ -548,12 +694,13 @@ static int pcie_init_controller(int controller, const char *path)
 
     if (state->pcie_regs->type == APCIE_T602X || state->pcie_regs->compat == APCIE_T8122 ||
         state->pcie_regs->type == APCIE_T8140) {
+        if (state->pcie_regs->type == APCIE_T8140)
+            printf("pcie: T8140 PHY common reg[2]+0x4000 clock mode\n");
         mask32(state->phy_common_base + APCIE_PHYCMN_CLK, APCIE_PHYCMN_CLK_MODE,
                FIELD_PREP(APCIE_PHYCMN_CLK_MODE, 1));
     }
 
-    if (state->pcie_regs->type == APCIE_T602X || state->pcie_regs->type == APCIE_T8122 ||
-        state->pcie_regs->type == APCIE_T6031) {
+    if (state->pcie_regs->type == APCIE_T602X || state->pcie_regs->compat == APCIE_T8122) {
         // Why always PHY 1 in this case?
         u32 off = state->num_phys > 1 ? PHY_STRIDE : 0;
         if (poll32(state->phy_base[0] + off + 0x8, 1, 1, 250000)) {
@@ -571,6 +718,8 @@ static int pcie_init_controller(int controller, const char *path)
 
     if (state->pcie_regs->type == APCIE_T602X || state->pcie_regs->compat == APCIE_T8122 ||
         state->pcie_regs->type == APCIE_T8140) {
+        if (state->pcie_regs->type == APCIE_T8140)
+            printf("pcie: T8140 RC readiness\n");
         write32(state->rc_base + 0x54, 0x140);
         write32(state->rc_base + 0x50, 0x1);
         if (poll32(state->rc_base + 0x58, 1, 1, 250000)) {
@@ -645,6 +794,9 @@ static int pcie_init_controller(int controller, const char *path)
             state->port_intr2axi_base[port] = 0;
         }
 
+        if (state->pcie_regs->type == APCIE_T8140)
+            printf("pcie: T8140 port %d config reg[%d] setup\n", port,
+                   port * port_reg_cnt + state->pcie_regs->shared_reg_count);
         if (state->pcie_regs->type == APCIE_T602X) {
             set32(state->rc_base + 0x3c, 0x1);
 
@@ -702,15 +854,22 @@ static int pcie_init_controller(int controller, const char *path)
                 write32(state->port_base[port] + 0x83c, 0x0);
         }
 
+        if (state->pcie_regs->type == APCIE_T8140)
+            printf("pcie: T8140 port %d config tunables\n", port);
         if (tunables_apply_local_addr(bridge, "apcie-config-tunables", state->port_base[port])) {
             printf("pcie: Error applying %s for %s\n", "apcie-config-tunables", bridge);
             return -1;
         }
 
+        if (state->pcie_regs->type == APCIE_T8140)
+            printf("pcie: T8140 port %d enabling APPCLK\n", port);
         set32(state->port_base[port] + APCIE_PORT_APPCLK, APCIE_PORT_APPCLK_EN);
 
         if (state->pcie_regs->type == APCIE_T602X || state->pcie_regs->compat == APCIE_T8122 ||
             state->pcie_regs->type == APCIE_T8140) {
+            if (state->pcie_regs->type == APCIE_T8140)
+                printf("pcie: T8140 port %d PHY reg[%d] clock/reset sequence\n", port,
+                       port * port_reg_cnt + state->pcie_regs->shared_reg_count + 2);
             clear32(state->port_phy_base[port] + APCIE_PHY_CTRL,
                     APCIE_PHY_CTRL_CLK0REQ | APCIE_PHY_CTRL_CLK1REQ);
 
@@ -743,6 +902,8 @@ static int pcie_init_controller(int controller, const char *path)
             set32(state->port_base[port] + APCIE_PORT_RESET, APCIE_PORT_RESET_DIS);
         }
 
+        if (state->pcie_regs->type == APCIE_T8140)
+            printf("pcie: T8140 port %d waiting for RUN\n", port);
         if (poll32(state->port_base[port] + APCIE_PORT_STATUS, APCIE_PORT_STATUS_RUN,
                    APCIE_PORT_STATUS_RUN, 250000)) {
             printf("pcie: Port failed to come up on %s\n", bridge);
@@ -784,6 +945,8 @@ static int pcie_init_controller(int controller, const char *path)
         }
 
         /* Make Designware PCIe Core registers writable. */
+        if (state->pcie_regs->type == APCIE_T8140)
+            printf("pcie: T8140 port %d ECAM reg[0] DBI and tunables\n", port);
         set32(config_base + DWC_DBI_RO_WR, DWC_DBI_RO_WR_EN);
 
         if (tunables_apply_local_addr(bridge, "pcie-rc-tunables", config_base)) {
@@ -861,7 +1024,10 @@ static int pcie_init_controller(int controller, const char *path)
                 write32(state->port_base[port] + APCIE_T602X_PORT_MSIMAP + 4 * i, 0x80000000 | i);
         }
 
-        read32(state->port_base[port] + APCIE_PORT_LINKSTS);
+        u32 link_status = read32(state->port_base[port] + APCIE_PORT_LINKSTS);
+        if (state->pcie_regs->type == APCIE_T8140)
+            printf("pcie: T8140 port %d ready, link status 0x%x\n", port, link_status);
+        state->active_ports |= BIT(port);
 
         /* Move to the next PCIe device on this bus. */
         config_base += (1 << 15);
@@ -869,6 +1035,7 @@ static int pcie_init_controller(int controller, const char *path)
 
     printf("pcie: Initialized controller %d\n", controller);
     state->initialized = true;
+    state->dirty = false;
 
     return 0;
 }
@@ -877,11 +1044,34 @@ int pcie_init(void)
 {
     bool success = false;
 
-    if (chip_id == T8140)
-        return 0;
-
     if (pcie_initialized)
         return 0;
+
+    if (chip_id == T8140) {
+        struct state *state = &controllers[APCIE];
+        if (state->dirty) {
+            printf("pcie: T8140 controller is partially initialized\n");
+            return -1;
+        }
+        const char *path = "/arm-io/apcie";
+        if (adt_path_offset(adt, path) < 0)
+            path = "/arm-io/apcie0";
+        if (adt_path_offset(adt, path) < 0) {
+            printf("pcie: T8140 controller absent\n");
+            return 1;
+        }
+        int ret = pcie_init_controller(APCIE, path);
+        if (!ret) {
+            pcie_initialized = true;
+            return 0;
+        }
+        if (state->dirty) {
+            printf("pcie: T8140 controller failed after power request\n");
+            return -1;
+        }
+        printf("pcie: T8140 controller skipped before MMIO\n");
+        return 1;
+    }
 
     success |= pcie_init_controller(APCIE, "/arm-io/apcie") == 0;
     success |= pcie_init_controller(APCIE, "/arm-io/apcie0") == 0;
@@ -896,8 +1086,10 @@ int pcie_init(void)
 
 int pcie_shutdown(void)
 {
-    if (chip_id == T8140)
-        return 0;
+    if (chip_id == T8140) {
+        printf("pcie: T8140 shutdown unsupported; leaving controller state intact\n");
+        return -1;
+    }
 
     if (!pcie_initialized)
         return 0;
@@ -909,6 +1101,8 @@ int pcie_shutdown(void)
             continue;
 
         for (u32 port = 0; port < state->port_count; port++) {
+            if (!(state->active_ports & BIT(port)))
+                continue;
             if (state->pcie_regs->type == APCIE_T602X)
                 clear32(state->port_base[port] + APCIE_T602X_PORT_RESET, APCIE_PORT_RESET_DIS);
             else
@@ -917,12 +1111,14 @@ int pcie_shutdown(void)
         }
 
         for (int phy = 0; phy < state->num_phys; phy++) {
-            clear32(state->phy_base[phy] + APCIE_PHY_CTRL, state->pcie_regs->phy_ctrl_reset);
+            if (state->pcie_regs->phy_ctrl_reset)
+                clear32(state->phy_base[phy] + APCIE_PHY_CTRL, state->pcie_regs->phy_ctrl_reset);
             clear32(state->phy_base[phy] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK1REQ);
             clear32(state->phy_base[phy] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK0REQ);
         }
 
         state->initialized = false;
+        state->active_ports = 0;
     }
 
     pcie_initialized = false;

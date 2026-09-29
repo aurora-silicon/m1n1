@@ -3810,15 +3810,15 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_memory())
         return -1;
 
-    if (chip_id == T8140 && dt_disable_t8140_pcie())
-        return -1;
-
-    if (fdt_pack(dt))
+    /* T8140 PCIe status is known only after pcie_init() in kboot_boot(). */
+    if (chip_id != T8140 && fdt_pack(dt))
         bail("FDT: fdt_pack() failed\n");
 
-    u32 dt_remain = dt_bufsize - fdt_totalsize(dt);
-    if (dt_remain < SZ_16K)
-        printf("FDT: free dt buffer space low, %u bytes left\n", dt_remain);
+    if (chip_id != T8140) {
+        u32 dt_remain = dt_bufsize - fdt_totalsize(dt);
+        if (dt_remain < SZ_16K)
+            printf("FDT: free dt buffer space low, %u bytes left\n", dt_remain);
+    }
 
     printf("FDT prepared at %p\n", dt);
 
@@ -3844,9 +3844,23 @@ int kboot_boot(void *kernel)
     else
         usb_init();
     ret = pcie_init();
-    if (ret && chip_id == T8140) {
-        printf("kboot: refusing T8140 handoff after PCIe failure\n");
-        return -1;
+    if (chip_id == T8140) {
+        if (ret < 0) {
+            printf("kboot: refusing T8140 handoff after partial PCIe setup\n");
+            return -1;
+        }
+        if (ret > 0) {
+            printf("kboot: T8140 APCIe unavailable; disabling PCIe consumers\n");
+            if (dt_disable_t8140_pcie())
+                return -1;
+        } else {
+            printf("kboot: T8140 APCIe initialized; retaining PCIe consumers\n");
+        }
+        if (fdt_pack(dt))
+            bail("FDT: fdt_pack() failed\n");
+        u32 dt_remain = dt_bufsize - fdt_totalsize(dt);
+        if (dt_remain < SZ_16K)
+            printf("FDT: free dt buffer space low, %u bytes left\n", dt_remain);
     }
     ret = dapf_init_all();
     if (ret < 0 && chip_id == T8140) {

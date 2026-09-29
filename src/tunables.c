@@ -76,6 +76,28 @@ struct tunable_local {
     u64 value;
 } PACKED;
 
+int tunables_validate_local(const char *path, const char *prop, u64 span)
+{
+    int node = adt_path_offset(adt, path);
+    u32 len;
+    if (node < 0)
+        return -1;
+
+    const struct tunable_local *tunables = adt_getprop(adt, node, prop, &len);
+    if (!tunables)
+        return 1;
+    if (!len || len % sizeof(*tunables))
+        return -1;
+
+    for (u32 i = 0; i < len / sizeof(*tunables); i++) {
+        u32 size = tunables[i].size;
+        if ((size != 1 && size != 2 && size != 4 && size != 8) ||
+            tunables[i].offset % size || size > span || tunables[i].offset > span - size)
+            return -1;
+    }
+    return 0;
+}
+
 int tunables_apply_local_addr(const char *path, const char *prop, uintptr_t base)
 {
     struct tunable_info info;
