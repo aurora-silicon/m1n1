@@ -42,7 +42,8 @@ python3 tools/fill_stage1_config.py \
 
 The tool requires a canonical lowercase UUID, a relative FAT path and a window
 from 0 to 99999 ms. It updates only the in-image block and retains the exact
-image length and `STACKBOT` tail. An empty block stays proxy-only. A malformed
+image length and `STACKBOT` tail. The filled raw image contains one
+`;aurora/stage2.bin` marker (or the selected path). An empty block stays proxy-only. A malformed
 block is ignored by m1n1, which falls back to the proxy.
 
 ## Compose the ESP Stage 2

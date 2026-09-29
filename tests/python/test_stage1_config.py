@@ -26,6 +26,7 @@ def test_fill_preserves_bare_image_and_checksum():
     body = image[body_start:body_start + module.BODY.size]
     assert struct.unpack_from("<II", body) == (1, 15000)
     assert struct.unpack_from("<I", image, body_start + module.BODY.size)[0] == zlib.crc32(body)
+    assert image.count(b";aurora/stage2.bin") == 1
 
 
 @pytest.mark.parametrize("uuid,path", [
@@ -68,6 +69,10 @@ int main(void)
     char path[192] = {0};
     strcpy(path, "aurora/stage2.bin");
     assert(valid_path(path));
+    strcpy(path, ";aurora/stage2.bin");
+    assert(valid_path(path));
+    strcpy(path, ";;aurora/stage2.bin");
+    assert(!valid_path(path));
     memset(path, 0, sizeof(path));
     memcpy(path, "aurora/a\0b", 10);
     assert(!valid_path(path));

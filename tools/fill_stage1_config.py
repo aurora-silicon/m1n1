@@ -26,7 +26,7 @@ def fill(image: bytes, uuid: str, path: str, window_ms: int) -> bytes:
         raise ValueError("ESP PARTUUID must use canonical lowercase 8-4-4-4-12 hex")
     if not valid_path(path):
         raise ValueError("Stage 2 path must be relative to the ESP root")
-    encoded = path.encode("ascii")
+    encoded = b";" + path.encode("ascii")
     if len(encoded) >= 192:
         raise ValueError("Stage 2 path is too long")
     if not 0 <= window_ms <= 99999:

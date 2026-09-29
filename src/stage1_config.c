@@ -46,13 +46,20 @@ static bool valid_uuid(const char *uuid)
 static bool valid_path(const char *path)
 {
     size_t len = strnlen(path, sizeof(config.stage2_path));
-    if (!len || len == sizeof(config.stage2_path) || path[0] == '/')
+    if (!len || len == sizeof(config.stage2_path))
         return false;
     /* The fixed-size field has one terminator and only zero padding. */
     for (size_t i = len + 1; i < sizeof(config.stage2_path); i++) {
         if (path[i])
             return false;
     }
+    /* New images store the delimiter; older filled images store only the path. */
+    if (path[0] == ';') {
+        path++;
+        len--;
+    }
+    if (!len || path[0] == '/')
+        return false;
     size_t component = 0;
     for (size_t i = 0; i < len; i++) {
         unsigned char c = path[i];
@@ -107,7 +114,10 @@ const char *stage1_config_target(void)
     static char target[sizeof(config.esp_uuid) + sizeof(config.stage2_path) + 1];
     if (!stage1_config_valid())
         return NULL;
-    snprintf(target, sizeof(target), "%s;%s", config.esp_uuid, config.stage2_path);
+    if (config.stage2_path[0] == ';')
+        snprintf(target, sizeof(target), "%s%s", config.esp_uuid, config.stage2_path);
+    else
+        snprintf(target, sizeof(target), "%s;%s", config.esp_uuid, config.stage2_path);
     return target;
 }
 
