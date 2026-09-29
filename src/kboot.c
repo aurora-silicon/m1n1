@@ -1328,6 +1328,8 @@ static int dt_set_acio_tunables(void)
                               sizeof(usb4_rc_tunables) / sizeof(*usb4_rc_tunables));
 
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_pcie_adapter", i);
+        if (!fdt_get_alias(dt, fdt_alias))
+            snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-pcie-adapter", i);
         dt_copy_acio_tunables(adt_path, fdt_alias, usb4_pcie_adapter_tunables,
                               sizeof(usb4_pcie_adapter_tunables) /
                                   sizeof(*usb4_pcie_adapter_tunables));
