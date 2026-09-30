@@ -14,6 +14,7 @@ static struct usb_cdc_state cdc;
 #ifdef J700_CDC_PROXY
 static tps6598x_irq_state_t cdc_irq_state;
 static bool watchdog_armed;
+static bool carrier_owned;
 
 static bool cdc_dfu_hpm(char *path, void *unused)
 {
@@ -69,6 +70,8 @@ void usb_cdc_poll(void)
         return;
 
     cdc.step = 1;
+    /* HPM0 cold reset irrevocably retires the inherited KIS carrier. */
+    carrier_owned = true;
     if (cdc.flags & BIT(2)) {
         if (tps6598x_foreach_hpm(cdc_dfu_hpm, cdc_reset_hpm, NULL) != HPM_ACTION_STOP)
             goto failed;
@@ -100,6 +103,48 @@ int usb_cdc_arm_watchdog(void)
     watchdog_armed = true;
 #endif
     return 0;
+}
+
+bool usb_cdc_ready(void)
+{
+    return cdc.state == USB_CDC_DWC_READY;
+}
+
+bool usb_cdc_failed(void)
+{
+    return cdc.state == USB_CDC_FAILED;
+}
+
+bool usb_cdc_owns_carrier(void)
+{
+#ifdef J700_CDC_PROXY
+    return carrier_owned;
+#else
+    return false;
+#endif
+}
+
+int usb_cdc_cancel(void)
+{
+#ifdef J700_CDC_PROXY
+    if (carrier_owned || cdc.state != USB_CDC_SCHEDULED)
+        return -1;
+    cdc.state = USB_CDC_IDLE;
+    return 0;
+#else
+    return -1;
+#endif
+}
+
+void usb_cdc_cleanup(void)
+{
+#ifdef J700_CDC_PROXY
+    usb_iodev_shutdown();
+    if (watchdog_armed) {
+        wdt_disable();
+        watchdog_armed = false;
+    }
+#endif
 }
 
 void usb_cdc_primary_opened(void)

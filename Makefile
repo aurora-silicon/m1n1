@@ -104,9 +104,6 @@ ifeq ($(J700_CDC_PROXY),1)
 ifneq ($(CHAINLOADING),1)
 $(error J700_CDC_PROXY requires CHAINLOADING=1)
 endif
-ifeq ($(T8140_KIS_PROXY),1)
-$(error J700_CDC_PROXY and T8140_KIS_PROXY are mutually exclusive)
-endif
 CFG += J700_CDC_PROXY USE_DEBUG_USB
 endif
 
@@ -128,7 +125,12 @@ ifeq ($(T8140_KIS_PROXY),1)
 ifneq ($(CHAINLOADING),1)
 $(error T8140_KIS_PROXY requires CHAINLOADING=1)
 endif
-CFG += T8140_KIS_PROXY USE_DEBUG_USB
+CFG += T8140_KIS_PROXY
+ifeq ($(J700_CDC_PROXY),1)
+CFG += J700_CDC_STAGE1
+else
+CFG += USE_DEBUG_USB
+endif
 endif
 
 ifneq ($(T8140_PROXY_WINDOW_MS),)
@@ -231,6 +233,7 @@ OBJECTS := \
 	sart.o \
 	sep.o \
 	stage1_config.o \
+	stage1_proxy.o \
 	sio.o \
 	smc.o \
 	smp.o \

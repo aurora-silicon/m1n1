@@ -71,6 +71,22 @@ static_assert(sizeof(UartReply) == (REPLY_SIZE + 4), "Invalid UartReply size");
 static u32 iodev_proxy_buffer[IODEV_MAX];
 static iodev_id_t presynced_iodev = IODEV_MAX;
 
+static bool uartproxy_sync_iodev(iodev_id_t iodev)
+{
+    if (!(iodev_get_usage(iodev) & USAGE_UARTPROXY))
+        return false;
+    iodev_handle_events(iodev);
+    for (unsigned int bytes = 0; bytes < 256 && iodev_can_read(iodev) > 0; bytes++) {
+        u8 byte;
+        if (iodev_read(iodev, &byte, 1) != 1)
+            break;
+        iodev_proxy_buffer[iodev] = (iodev_proxy_buffer[iodev] >> 8) | ((u32)byte << 24);
+        if ((iodev_proxy_buffer[iodev] & 0xffffff) == 0xAA55FF)
+            return true;
+    }
+    return false;
+}
+
 bool uartproxy_wait_dockchannel(unsigned int timeout_ms)
 {
     const iodev_id_t iodev = IODEV_DOCKCHANNEL_UART;
@@ -79,20 +95,47 @@ bool uartproxy_wait_dockchannel(unsigned int timeout_ms)
         return false;
     }
     for (unsigned int ms = 0; ms < timeout_ms; ms++) {
-        iodev_handle_events(iodev);
-        for (unsigned int bytes = 0; bytes < 256 && iodev_can_read(iodev) > 0; bytes++) {
-            u8 byte;
-            if (iodev_read(iodev, &byte, 1) != 1)
-                break;
-            iodev_proxy_buffer[iodev] = (iodev_proxy_buffer[iodev] >> 8) | ((u32)byte << 24);
-            if ((iodev_proxy_buffer[iodev] & 0xffffff) == 0xAA55FF) {
-                presynced_iodev = iodev;
-                return true;
-            }
+        if (uartproxy_sync_iodev(iodev)) {
+            presynced_iodev = iodev;
+            return true;
         }
         mdelay(1);
     }
     return false;
+}
+
+enum stage1_proxy_result uartproxy_wait_stage1(unsigned int timeout_ms)
+{
+    struct stage1_proxy_window window;
+    stage1_proxy_window_init(&window, timeout_ms);
+    bool schedule_failed = usb_cdc_schedule(1000, 0, BIT(1) | BIT(2));
+    u64 start = ticks_to_msecs(get_ticks());
+
+    while (true) {
+        usb_cdc_poll();
+        u64 now = ticks_to_msecs(get_ticks());
+        u64 elapsed = now - start;
+        bool carrier_owned = usb_cdc_owns_carrier();
+        bool cdc_sync = usb_cdc_ready() && uartproxy_sync_iodev(IODEV_USB0);
+        bool kis_sync = !carrier_owned && uartproxy_sync_iodev(IODEV_DOCKCHANNEL_UART);
+        enum stage1_proxy_result result = stage1_proxy_window_step(
+            &window, elapsed > 0xffffffffu ? 0xffffffffu : elapsed, usb_cdc_ready(),
+            schedule_failed || usb_cdc_failed(), carrier_owned, cdc_sync, kis_sync);
+
+        if (result == STAGE1_PROXY_CDC) {
+            presynced_iodev = IODEV_USB0;
+            return result;
+        }
+        if (result == STAGE1_PROXY_KIS) {
+            if (!schedule_failed && usb_cdc_cancel())
+                return STAGE1_PROXY_CDC_FAILED;
+            presynced_iodev = IODEV_DOCKCHANNEL_UART;
+            return result;
+        }
+        if (result != STAGE1_PROXY_WAIT)
+            return result;
+        mdelay(1);
+    }
 }
 
 int uartproxy_run_presynced(iodev_id_t iodev)
@@ -173,7 +216,8 @@ int uartproxy_run(struct uartproxy_msg_start *start)
         // Startup notification only goes out via UART and Dockchannel UART
         reply.checksum = checksum(&reply, REPLY_SIZE - 4);
         iodev_write(IODEV_UART, &reply, REPLY_SIZE);
-        iodev_write_atomic(IODEV_DOCKCHANNEL_UART, &reply, REPLY_SIZE);
+        if (!usb_cdc_owns_carrier())
+            iodev_write_atomic(IODEV_DOCKCHANNEL_UART, &reply, REPLY_SIZE);
     } else {
         // Exceptions / hooks keep the current iodev
         iodev = uartproxy_iodev;
@@ -193,6 +237,10 @@ int uartproxy_run(struct uartproxy_msg_start *start)
                     if (iodev == 0)
                         usb_cdc_poll();
                     u8 b;
+                    if (iodev == IODEV_DOCKCHANNEL_UART && usb_cdc_owns_carrier()) {
+                        iodev++;
+                        continue;
+                    }
                     if ((iodev_get_usage(iodev) & USAGE_UARTPROXY)) {
                         iodev_handle_events(iodev);
                         if (iodev_can_read(iodev) && iodev_read(iodev, &b, 1) == 1) {

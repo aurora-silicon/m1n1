@@ -23,6 +23,7 @@
 #include "sep.h"
 #include "smp.h"
 #include "stage1_config.h"
+#include "stage1_proxy.h"
 #include "string.h"
 #include "tps6598x.h"
 #include "uart.h"
@@ -74,6 +75,7 @@ void get_device_info(void)
 void run_actions(void)
 {
     bool usb_up = false;
+    enum stage1_proxy_result window_result = STAGE1_PROXY_TIMEOUT;
 
     u32 window_ms = chip_id == T8140 ? stage1_config_window_ms() : 0;
 #ifdef T8140_PROXY_WINDOW_MS
@@ -81,6 +83,23 @@ void run_actions(void)
         window_ms = T8140_PROXY_WINDOW_MS;
 #endif
     if (chip_id == T8140 && window_ms) {
+#if defined(J700_CDC_PROXY) && defined(T8140_KIS_PROXY)
+        window_result = uartproxy_wait_stage1(window_ms);
+        if (window_result == STAGE1_PROXY_CDC || window_result == STAGE1_PROXY_KIS) {
+            printf("Stage 1: %s host request received\n",
+                   window_result == STAGE1_PROXY_CDC ? "CDC" : "KIS");
+            fb_set_active(true);
+            uartproxy_run_presynced(window_result == STAGE1_PROXY_CDC ? IODEV_USB0
+                                                                      : IODEV_DOCKCHANNEL_UART);
+            while (!next_stage.entry)
+                uartproxy_run(NULL);
+            return;
+        }
+        if (window_result == STAGE1_PROXY_CDC_FAILED)
+            printf("Stage 1: CDC start failed after carrier takeover; KIS fallback unavailable\n");
+        else
+            printf("Stage 1: no host during proxy window\n");
+#else
         if (uartproxy_wait_dockchannel(window_ms)) {
             printf("Stage 1: host request received\n");
             fb_set_active(true);
@@ -90,6 +109,7 @@ void run_actions(void)
             return;
         }
         printf("Stage 1: no host during proxy window\n");
+#endif
     }
 
 #ifndef BRINGUP
@@ -138,15 +158,23 @@ void run_actions(void)
 
     printf("Checking for payloads...\n");
 
-#ifndef J700_CDC_PROXY
-    if (payload_run() == 0) {
+#ifdef J700_CDC_AUTOSTART
+    bool payload_valid = false;
+#else
+    bool payload_valid = payload_run() == 0;
+#endif
+    enum stage1_payload_action payload_action = stage1_proxy_payload_action(
+        window_result, payload_valid, usb_cdc_ready(), !usb_cdc_owns_carrier());
+    if (payload_action == STAGE1_PAYLOAD_NATIVE) {
         printf("Valid payload found\n");
         return;
     }
-#endif
     fb_set_active(true);
 
     printf("No valid payload found\n");
+
+    if (payload_action == STAGE1_PAYLOAD_HALT)
+        panic("Stage 1: no safe proxy carrier after CDC failure\n");
 
 #ifndef BRINGUP
     if (!usb_up && chip_id != T8140) {
@@ -157,7 +185,7 @@ void run_actions(void)
 
     printf("Running proxy...\n");
 
-#ifdef J700_CDC_AUTOSTART
+#if defined(J700_CDC_AUTOSTART) && !defined(T8140_KIS_PROXY)
     if (usb_cdc_schedule(1000, 0, BIT(1) | BIT(2)))
         panic("CDC autostart scheduling failed\n");
 #endif
@@ -190,7 +218,7 @@ void m1n1_main(void)
     smp_init();
 #endif
     wdt_disable();
-#ifdef J700_CDC_PROXY
+#if defined(J700_CDC_PROXY) && defined(J700_CDC_AUTOSTART)
     if (usb_cdc_arm_watchdog()) {
         wdt_reboot();
         panic("CDC watchdog could not be armed\n");
@@ -218,8 +246,10 @@ void m1n1_main(void)
 #endif
 #endif
 
+#ifndef J700_CDC_STAGE1
     cpufreq_fixup();
     sep_init();
+#endif
 #endif
 
     printf("Initialization complete.\n");
@@ -237,6 +267,7 @@ void m1n1_main(void)
         uartproxy_run(NULL);
         panic("NVMe handoff failed\n");
     }
+    usb_cdc_cleanup();
     exception_shutdown();
 #ifndef BRINGUP
     usb_iodev_shutdown();
