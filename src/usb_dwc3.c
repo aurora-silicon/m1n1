@@ -1349,6 +1349,13 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
          */
         if (dev->endpoints[event.endpoint_number].xfer_in_progress)
             return;
+#ifdef J700_CDC_PROXY
+        /* EP0 is one control pipe; an NRDY on the other direction is stale. */
+        if (event.endpoint_number <= USB_LEP_CTRL_IN &&
+            (dev->endpoints[USB_LEP_CTRL_OUT].xfer_in_progress ||
+             dev->endpoints[USB_LEP_CTRL_IN].xfer_in_progress))
+            return;
+#endif
 
         switch (event.endpoint_number) {
             case USB_LEP_CTRL_IN:
