@@ -2158,19 +2158,30 @@ static int dt_set_pmp(void)
 
 static int dt_set_sep(void)
 {
-    const char *path = fdt_get_alias(dt, "sep");
-    if (path == NULL) {
+    const char *alias = fdt_get_alias(dt, "sep");
+    if (alias == NULL) {
         printf("FDT: sep alias not found in devtree\n");
         return 0;
     }
+
+    /*
+     * fdt_get_alias() points into the FDT blob. Adding the sep-firmware
+     * reserved-memory node below moves every property stored after
+     * /reserved-memory, so keep a copy of the path instead of the pointer.
+     */
+    char path[256];
+    size_t path_len = strnlen(alias, sizeof(path));
+    if (path_len == sizeof(path))
+        bail("FDT: sep alias path is too long\n");
+    memcpy(path, alias, path_len + 1);
 
     int anode_mmap = adt_path_offset(adt, "/chosen/memory-map");
     if (anode_mmap < 0)
         bail("ADT: /chosen/memory-map not found \n");
 
     u64 phys_map[2];
-    size_t ret = ADT_GETPROP_ARRAY(adt, anode_mmap, "SEPFW", phys_map);
-    if (ret != sizeof(phys_map))
+    int ret = ADT_GETPROP_ARRAY(adt, anode_mmap, "SEPFW", phys_map);
+    if (ret != (int)sizeof(phys_map))
         bail("ADT: could not get sepfw memory\n");
 
     const char *node_name = "sep-firmware";
@@ -2193,12 +2204,12 @@ static int dt_set_sep(void)
         bail("ADT: /chosen/boot-object-manifests not found \n");
 
     ret = ADT_GETPROP_ARRAY(adt, anode_manifest, "lpol", phys_map);
-    if (ret != sizeof(phys_map))
+    if (ret != (int)sizeof(phys_map))
         bail("ADT: could not get local policy\n");
     fdt_setprop(dt, node, "local-policy-manifest", (void *)phys_map[0], phys_map[1]);
 
     ret = ADT_GETPROP_ARRAY(adt, anode_manifest, "ibot", phys_map);
-    if (ret != sizeof(phys_map))
+    if (ret != (int)sizeof(phys_map))
         bail("ADT: could not get iboot manifest\n");
     fdt_setprop(dt, node, "iboot-manifest", (void *)phys_map[0], phys_map[1]);
 
