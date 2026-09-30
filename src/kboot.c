@@ -2010,6 +2010,50 @@ static struct disp_mapping disp_reserved_regions_t602x[] = {
     {"region-id-157", "region157", true, true, false},
 };
 
+/*
+ * T8122 (M3): iBoot leaves DCP running from preloaded firmware, and some of its
+ * segments (at least __OS_LOG) lie inside RAM that is otherwise handed to the
+ * OS. Reserve every segment so the OS cannot allocate pages the running DCP may
+ * still write to. There is no T8122 DCP node to link them to yet; the names
+ * match dt_reserve_asc_firmware() so a later linked handoff reuses the nodes.
+ * Never fails the boot.
+ */
+static void dt_reserve_dcp_segments(const char *adt_path)
+{
+    int node = adt_path_offset(adt, adt_path);
+    if (node < 0) {
+        printf("ADT: '%s' not found, DCP segments not reserved\n", adt_path);
+        return;
+    }
+
+    u32 len = 0;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+    if (!seg || !len || len % sizeof(*seg)) {
+        printf("ADT: '%s' has no usable segment-ranges\n", adt_path);
+        return;
+    }
+
+    for (unsigned int i = 0; i < len / sizeof(*seg); i++) {
+        u64 phys = seg[i].phys;
+        size_t size = ALIGN_UP((size_t)seg[i].size, SZ_16K);
+        char node_name[64];
+
+        if (!phys || !size)
+            continue;
+        if (phys & (SZ_16K - 1)) {
+            printf("ADT: DCP segment %u at 0x%lx is not 16k aligned, skipped\n", i, phys);
+            continue;
+        }
+
+        snprintf(node_name, sizeof(node_name), "asc-firmware@%lx", phys);
+        if (dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, phys, size) < 0) {
+            printf("FDT: failed to reserve DCP segment %u at 0x%lx\n", i, phys);
+            continue;
+        }
+        printf("FDT: reserved DCP segment %u at 0x%lx size 0x%zx\n", i, phys, size);
+    }
+}
+
 static int dt_set_display(void)
 {
     /* lock dart-disp0 to prevent old software from resetting it */
@@ -2074,6 +2118,9 @@ static int dt_set_display(void)
             return ret;
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6022")) {
         /* noop */
+    } else if (!fdt_node_check_compatible(dt, 0, "apple,t8122")) {
+        dt_reserve_dcp_segments("/arm-io/dcp/iop-dcp-nub");
+        return 0;
     } else {
         printf("FDT: unknown compatible, skip display reserved-memory setup\n");
         return 0;
