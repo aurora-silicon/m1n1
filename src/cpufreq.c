@@ -71,6 +71,7 @@ static u32 pstate_reg_to_pstate(u64 val)
         case T6031:
         case T6034:
         case T8122:
+        case T8140:
             return FIELD_GET(CLUSTER_PSTATE_DESIRED1, val);
         default:
             printf("cpufreq: Chip 0x%x is unsupported\n", chip_id);
@@ -112,6 +113,7 @@ static int set_pstate(const struct cluster_t *cluster, uint32_t pstate)
             case T6031:
             case T6034:
             case T8122:
+            case T8140:
                 val &= ~CLUSTER_PSTATE_DESIRED1;
                 val |= CLUSTER_PSTATE_SET | FIELD_PREP(CLUSTER_PSTATE_DESIRED1, pstate);
                 break;
@@ -509,6 +511,35 @@ const struct feat_t *cpufreq_get_features(void)
             printf("cpufreq: Chip 0x%x is unsupported\n", chip_id);
             return NULL;
     }
+}
+
+/*
+ * iBoot hands T8140 over with the P cluster at P1 (744 MHz), where inflating a
+ * 45 MB kernel Image takes ~2.3 s. cpufreq_init() leaves T8140 alone, so raise
+ * only the P cluster while payloads are loaded and put iBoot's P-state back
+ * before the SMP bring-up and the kernel handoff.
+ */
+#define T8140_PAYLOAD_BOOST_PSTATE 8
+
+static const struct cluster_t t8140_pcluster = {"PCPU", 0x211e00000, true, 0, 0, 0};
+static u32 t8140_inherited_pstate;
+static bool t8140_boosted;
+
+void cpufreq_payload_boost(bool enable)
+{
+    if (chip_id != T8140 || enable == t8140_boosted)
+        return;
+
+    if (enable)
+        t8140_inherited_pstate =
+            pstate_reg_to_pstate(read64(t8140_pcluster.base + CLUSTER_PSTATE));
+
+    u32 pstate = enable ? T8140_PAYLOAD_BOOST_PSTATE : t8140_inherited_pstate;
+    if (set_pstate(&t8140_pcluster, pstate))
+        printf("cpufreq: payload boost %d failed on %s\n", enable, t8140_pcluster.name);
+
+    /* Even after a failed raise, try to restore the inherited state. */
+    t8140_boosted = enable;
 }
 
 int cpufreq_init(void)
