@@ -137,6 +137,10 @@ typedef struct dwc3_dev {
     u32 evt_buffer_offset;
     bool failed;
     bool dma_unsafe;
+#ifdef J700_CDC_PROXY
+    bool reset_in_progress;
+    bool ep0_progressed_during_reset;
+#endif
 
     void *scratchpad;
     void *xferbuffer;
@@ -1281,6 +1285,11 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
 {
     if (event.endpoint_number >= MAX_ENDPOINTS)
         return;
+#ifdef J700_CDC_PROXY
+    if (dev->reset_in_progress && event.endpoint_number <= USB_LEP_CTRL_IN &&
+        event.endpoint_event != DWC3_DEPEVT_EPCMDCMPLT)
+        dev->ep0_progressed_during_reset = true;
+#endif
     if (event.endpoint_event == DWC3_DEPEVT_EPCMDCMPLT) {
 #ifdef J700_CDC_PROXY
         dev->endpoints[event.endpoint_number].end_cmd_pending = false;
@@ -1395,11 +1404,16 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
 static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev, bool rearm_setup)
 {
 #ifdef J700_CDC_PROXY
+    dev->reset_in_progress = true;
+    dev->ep0_progressed_during_reset = false;
+    /* A nested SET_ADDRESS must supersede the address cleared by this reset. */
+    mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_DEVADDR_MASK, DWC3_DCFG_DEVADDR(0));
     for (int i = 0; i < MAX_ENDPOINTS; ++i) {
         if (dev->endpoints[i].xfer_in_progress) {
             int status = usb_dwc3_end_transfer(dev, i);
             if (!usb_cdc_dma_may_release(true, status, false)) {
                 usb_debug_printf("ENDTRANSFER failed for EP %d on reset\n", i);
+                dev->reset_in_progress = false;
                 usb_dwc3_fail_session(dev);
                 return;
             }
@@ -1428,15 +1442,17 @@ static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev, bool rearm_setup)
 #ifdef J700_CDC_PROXY
     dev->primary_dtr_pending = false;
 #endif
-    dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
-
-    /* set device address back to zero */
-    mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_DEVADDR_MASK, DWC3_DCFG_DEVADDR(0));
-
     /* only keep control endpoints enabled */
     write32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(0) | DWC3_DALEPENA_EP(1));
-    if (rearm_setup && !usb_dwc3_start_setup_phase(dev))
-        dev->ep0_state = USB_DWC3_EP0_STATE_SETUP_HANDLE;
+    if (!dev->ep0_progressed_during_reset ||
+        (!dev->endpoints[USB_LEP_CTRL_OUT].xfer_in_progress &&
+         !dev->endpoints[USB_LEP_CTRL_IN].xfer_in_progress &&
+         dev->ep0_state == USB_DWC3_EP0_STATE_IDLE)) {
+        dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
+        if (rearm_setup && !usb_dwc3_start_setup_phase(dev))
+            dev->ep0_state = USB_DWC3_EP0_STATE_SETUP_HANDLE;
+    }
+    dev->reset_in_progress = false;
 #else
     (void)rearm_setup;
     dev->endpoints[0].xfer_in_progress = false;
