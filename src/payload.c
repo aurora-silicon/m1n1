@@ -323,8 +323,10 @@ int payload_run(void)
 
     if (!payload_scanned) {
         void *p = _payload_start;
+        cpufreq_payload_boost(true);
         while (p)
             p = load_one_payload(p, 0);
+        cpufreq_payload_boost(false);
         payload_scanned = true;
     }
 
@@ -363,9 +365,14 @@ int payload_run(void)
         return ret;
     }
 
-    if (boot_spec && boot_storage_load(boot_spec, &kernel, &fdt)) {
-        next_stage.entry = NULL;
-        return -1;
+    if (boot_spec) {
+        cpufreq_payload_boost(true);
+        int ret = boot_storage_load(boot_spec, &kernel, &fdt);
+        cpufreq_payload_boost(false);
+        if (ret) {
+            next_stage.entry = NULL;
+            return -1;
+        }
     }
 
     if (kernel && fdt) {
