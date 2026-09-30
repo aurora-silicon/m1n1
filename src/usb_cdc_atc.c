@@ -148,6 +148,8 @@ int usb_cdc_atc_power_on(uintptr_t pipehandler)
     set32(usb2 + USB2_CTL, BIT(2)); /* APB_RESET_N */
     udelay(10);
     clear32(usb2 + USB2_MISCTUNE, BIT(29) | BIT(30));
+    /* T8140's eUSB2 repeater needs to settle after reset release (Linux atc.c). */
+    mdelay(5);
     write32(usb2 + USB2_USBCTL, 2); /* RUN */
 
     /* Park upstream m1n1's DWC3 PIPE on the dummy PHY until DWC3 is ready. */
