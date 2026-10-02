@@ -71,6 +71,7 @@ static u32 pstate_reg_to_pstate(u64 val)
         case T6031:
         case T6034:
         case T8122:
+        case T8142:
             return FIELD_GET(CLUSTER_PSTATE_DESIRED1, val);
         default:
             printf("cpufreq: Chip 0x%x is unsupported\n", chip_id);
@@ -80,6 +81,12 @@ static u32 pstate_reg_to_pstate(u64 val)
 
 static int set_pstate(const struct cluster_t *cluster, uint32_t pstate)
 {
+    if (chip_id == T8142 && poll64(cluster->base + CLUSTER_PSTATE, CLUSTER_PSTATE_BUSY, 0,
+                                   CLUSTER_SWITCH_TIMEOUT) < 0) {
+        printf("cpufreq: Cluster %s is busy before P-State request\n", cluster->name);
+        return -1;
+    }
+
     u64 val = read64(cluster->base + CLUSTER_PSTATE);
 
     if (pstate_reg_to_pstate(val) != pstate) {
@@ -112,6 +119,7 @@ static int set_pstate(const struct cluster_t *cluster, uint32_t pstate)
             case T6031:
             case T6034:
             case T8122:
+            case T8142:
                 val &= ~CLUSTER_PSTATE_DESIRED1;
                 val |= CLUSTER_PSTATE_SET | FIELD_PREP(CLUSTER_PSTATE_DESIRED1, pstate);
                 break;
@@ -125,6 +133,12 @@ static int set_pstate(const struct cluster_t *cluster, uint32_t pstate)
             printf("cpufreq: Timed out waiting for cluster %s P-State switch\n", cluster->name);
             return -1;
         }
+    }
+
+    if (chip_id == T8142 &&
+        pstate_reg_to_pstate(read64(cluster->base + CLUSTER_PSTATE)) != pstate) {
+        printf("cpufreq: Cluster %s did not accept P-State %u\n", cluster->name, pstate);
+        return -1;
     }
 
     return 0;
@@ -166,6 +180,7 @@ int cpufreq_init_cluster(const struct cluster_t *cluster, const struct feat_t *f
         case T7000 ... T7001:
         case S8000 ... S8003:
         case T8010 ... T8015: /* This covers a gap but T8013 and T8014 will not randomly appear. */
+        case T8142:           /* Keep firmware voltage, PLL and throttling configuration. */
             /* Do nothing */
             break;
         case T8103:
@@ -350,6 +365,13 @@ static const struct cluster_t t6030_clusters[] = {
     {},
 };
 
+/* J813 firmware handoff states: ECPU 1152 MHz, PCPU 3720 MHz. */
+static const struct cluster_t t8142_clusters[] = {
+    {"ECPU0", 0x210e00000, false, 1, 2},
+    {"PCPU0", 0x211e00000, true, 1, 10},
+    {},
+};
+
 const struct cluster_t *cpufreq_get_clusters(void)
 {
     switch (chip_id) {
@@ -387,6 +409,8 @@ const struct cluster_t *cpufreq_get_clusters(void)
         case T6030:
         case T8122:
             return t6030_clusters;
+        case T8142:
+            return t8142_clusters;
         case T6031:
         case T6034:
             return t6031_clusters;
@@ -471,6 +495,11 @@ static const struct feat_t t6030_features[] = {
     {},
 };
 
+/* M5 uses CLPC/PMP; the earlier chips' feature registers are not applicable. */
+static const struct feat_t t8142_features[] = {
+    {},
+};
+
 const struct feat_t *cpufreq_get_features(void)
 {
     switch (chip_id) {
@@ -497,6 +526,8 @@ const struct feat_t *cpufreq_get_features(void)
             return t8112_features;
         case T8122:
             return t8122_features;
+        case T8142:
+            return t8142_features;
         case T6020:
         case T6021:
         case T6022:
