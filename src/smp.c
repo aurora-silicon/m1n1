@@ -130,7 +130,7 @@ void smp_secondary_entry(void)
     else
         msr(TPIDR_EL1, index);
 
-    if (chip_id != T8152)
+    if (chip_id != T8142 && chip_id != T8152)
         printf("  Index: %d (table: %p)\n\n", index, me);
 
     me->mpidr = mpidr;
@@ -176,6 +176,50 @@ void smp_secondary_prep_el3(void)
     return;
 }
 
+static u32 cpu_start_bit(int index, const struct cpu_info *cpu)
+{
+    /* T8142 has six E cores followed by four P cores, not four-core banks. */
+    if (chip_id == T8142)
+        return BIT(index);
+
+    return BIT(4 * cpu->cluster + cpu->core);
+}
+
+static bool t8142_prepare_reset_vector(u64 rvbar)
+{
+    u64 vector = rvbar & RVBAR_ADDR;
+
+    if (vector == (u64)_vectors_start)
+        return true;
+
+    /*
+     * Resident images can lock RVBAR at the load base or old header padding.
+     * The Mach-O header has already been consumed; reset needs executable
+     * code here. Only patch this image's header, never live code or arbitrary
+     * firmware memory. The relay disappears on the next reboot.
+     */
+    if ((vector & 0x3fff) || vector < (u64)_base || vector >= (u64)_vectors_start) {
+        printf("Unsupported T8142 reset vector 0x%lx\n", vector);
+        return false;
+    }
+
+    u32 branch = 0x14000000 | (((u64)_vectors_start - vector) >> 2);
+    if (read32(vector) == branch)
+        return true;
+
+    if (vector == (u64)_base && read32(vector) != 0xfeedfacf)
+        return false;
+
+    mmu_add_mapping(vector, vector, 0x4000, MAIR_IDX_NORMAL, PERM_RWX);
+    write32(vector, branch);
+    dc_cvac_range((void *)vector, sizeof(branch));
+    ic_ivau_range((void *)vector, sizeof(branch));
+    sysop("dsb sy");
+    sysop("isb");
+    mmu_add_mapping(vector, vector, 0x4000, MAIR_IDX_NORMAL, PERM_RX_EL0);
+    return read32(vector) == branch;
+}
+
 static void smp_start_cpu(int index, const struct cpu_info *cpu)
 {
     int i;
@@ -189,7 +233,10 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
     if (spin_table[index].flag)
         return;
 
-    if (!cpu_features->apple_sysregs_unlocked &&
+    if (chip_id == T8142 && !t8142_prepare_reset_vector(read64(cpu->impl_reg)))
+        return;
+
+    if (chip_id != T8142 && !cpu_features->apple_sysregs_unlocked &&
         (read64(cpu->impl_reg) & RVBAR_ADDR) != (u64)_vectors_start) {
         printf("Failed! \n    RVBAR (=0x%lx) is locked and differs from entry point (=0x%lx)\n",
                read64(cpu->impl_reg) & RVBAR_ADDR, (u64)_vectors_start);
@@ -217,7 +264,7 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
 
     // Some kind of system level startup/status bit
     // Without this, IRQs don't work
-    write32(start_base + 0x4, 1 << (4 * cpu->cluster + cpu->core));
+    write32(start_base + 0x4, cpu_start_bit(index, cpu));
 
     // Actually start the core
     write32(start_base + 0x8 + 4 * cpu->cluster, 1 << cpu->core);
@@ -253,7 +300,7 @@ static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
     u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
 
     // Request CPU stop
-    write32(start_base + 0x0, 1 << (4 * cpu->cluster + cpu->core));
+    write32(start_base + 0x0, cpu_start_bit(index, cpu));
 
     u64 dsleep = deep_sleep;
     // Put the CPU to sleep
@@ -506,7 +553,18 @@ int smp_init(void)
         cpu_info[i].cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
         cpu_info[i].die = FIELD_GET(CPU_REG_DIE, reg);
         cpu_info[i].impl_reg = cpu_impl_reg[0];
+
+        /* Publish a permanent stack before the first reset, including late entries. */
+        if (chip_id == T8142 && i != boot_cpu_idx) {
+            /* ADT reg omits Aff2, which is 1 on the M5 performance cluster. */
+            smp_reset_stacks[i].mpidr = (reg & 0xFFFFFF) | (cpu_info[i].cluster ? BIT(16) : 0);
+            smp_reset_stacks[i].stack = (u64)secondary_stacks[i] + SECONDARY_STACK_SIZE;
+        }
     }
+
+    if (chip_id == T8142)
+        wfe_mode = true;
+    sysop("dsb sy");
 
     cpu_start_base = pmgr_reg + cpu_start_off;
     smp_initialized = true;
@@ -679,6 +737,14 @@ void smp_set_wfe_mode(bool new_mode)
 {
     if (chip_id == T8152 && !new_mode)
         return;
+    /* T8142 secondaries remain in the architectural WFE/SEV dispatch loop. */
+    if (chip_id == T8142) {
+        wfe_mode = true;
+        sysop("dsb sy");
+        sysop("sev");
+        return;
+    }
+
     wfe_mode = new_mode;
     sysop("dsb sy");
 

@@ -162,6 +162,11 @@ class UartInterface(Reloadable):
             device = Serial(self.devpath, baud)
 
         self.dev = device
+        # KIS bridges DockChannel through bounded USB receive windows. Split
+        # memory transactions, including their replies, instead of just the
+        # host write calls within one unbounded proxy request.
+        port = self.devpath or getattr(device, "port", "") or ""
+        self.is_kis = os.path.basename(port).startswith(("cu.kis-", "tty.kis-"))
         self.dev.timeout = 0
         self.dev.flushOutput()
         self.dev.flushInput()
@@ -394,6 +399,11 @@ class UartInterface(Reloadable):
             return self.reply(self.REQ_PROXY)
 
     def writemem(self, addr, data, progress=False):
+        if self.is_kis and len(data) > 1024:
+            for offset in range(0, len(data), 1024):
+                self.writemem(addr + offset, data[offset:offset + 1024])
+            return
+
         checksum = self.data_checksum(data)
         size = len(data)
         req = struct.pack("<QQI", addr, size, checksum)
@@ -418,6 +428,10 @@ class UartInterface(Reloadable):
     def readmem(self, addr, size):
         if size == 0:
             return b""
+
+        if self.is_kis and size > 256 * 1024:
+            return b"".join(self.readmem(addr + offset, min(size - offset, 256 * 1024))
+                            for offset in range(0, size, 256 * 1024))
 
         req = struct.pack("<QQ", addr, size)
         self.cmd(self.REQ_MEMREAD, req)

@@ -99,6 +99,11 @@ if rvbar != u.base:
     for cpu in u.adt["cpus"]:
         if cpu.state == "running":
             continue
+        if u.adt["/chosen"].chip_id == 0x8142:
+            # Host writes to a cold T8142 secondary's RVBAR can wedge CPU0.
+            # Leave the cold cores and their reset vectors to the next stage.
+            print(f"  {cpu.name}: preserving T8142 secondary RVBAR")
+            continue
         addr, size = cpu.cpu_impl_reg
         print(f"  {cpu.name}: [0x{addr:x}] = 0x{rvbar:x}")
         p.write64(addr, rvbar)
@@ -137,12 +142,14 @@ stub = asm.ARMAsm(f"""
 1:
         ldp x4, x5, [x1], #16
         stp x4, x5, [x2]
-        dc cvau, x2
+        dc cvac, x2
         ic ivau, x2
         add x2, x2, #16
         sub x3, x3, #16
         cbnz x3, 1b
 
+        dsb sy
+        isb
         ldr x1, ={entry}
         br x1
 """, image_addr + image_size)
