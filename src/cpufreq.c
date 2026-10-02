@@ -511,6 +511,102 @@ const struct feat_t *cpufreq_get_features(void)
     }
 }
 
+/* T8152ACC::setPerfState in matching 26A428 firmware uses logical offset
+ * 0xe20020. E/P ACC maps resolve that to RegMap 0x20/0x40 + 0x20. The ADT
+ * supplies the physical apertures and the hardware-index bias (2 on J873g).
+ * Do not apply earlier-generation voltage/PLL/chicken-bit initialization. */
+struct t8152_clock {
+    u64 reg;
+    const u32 *opps;
+    u32 count;
+    bool failed;
+};
+
+static struct t8152_clock t8152_clocks[2];
+static u32 t8152_state0;
+static bool t8152_clocks_ready;
+
+static int t8152_cpufreq_init(void)
+{
+    if (t8152_clocks_ready)
+        return 0;
+    int path[8];
+    int node = adt_path_offset_trace(adt, "/arm-io/pmgr-child", path);
+    if (chip_id != T8152 || board_id != 0x24 || !adt_is_compatible(adt, 0, "J873gAP") ||
+        node < 0 || !adt_is_compatible(adt, node, "pmgr2,t8152"))
+        return -1;
+    u32 len;
+    const u16 *maps = adt_getprop(adt, node, "reg-maps", &len);
+    if (!maps || len % 4 || ADT_GETPROP(adt, node, "cpu-perf-state0-index", &t8152_state0) < 0 ||
+        t8152_state0 != 2)
+        return -1;
+    const char *tables[] = {"voltage-states1-sram", "voltage-states5-sram"};
+    for (unsigned int c = 0; c < 2; c++) {
+        int idx = -1;
+        for (u32 i = 0; i < len / 2; i += 2) {
+            if (maps[i + 1] == (c ? 0x40 : 0x20)) {
+                if (idx >= 0)
+                    return -1;
+                idx = maps[i];
+            }
+        }
+        u64 base, size;
+        if (idx < 0 || adt_get_reg(adt, path, "reg", idx, &base, &size) || size < 0x28 ||
+            base != (c ? 0x211e20000ULL : 0x210e20000ULL))
+            return -1;
+        u32 table_len;
+        const u32 *opps = adt_getprop(adt, node, tables[c], &table_len);
+        if (!opps || !table_len || table_len % 8 || table_len / 8 + t8152_state0 > 32)
+            return -1;
+        for (u32 i = 0; i < table_len / 8; i++) {
+            if (!opps[2 * i] || opps[2 * i] > 5000000 ||
+                (i && opps[2 * i] <= opps[2 * (i - 1)]))
+                return -1;
+        }
+        t8152_clocks[c] = (struct t8152_clock){.reg = base + 0x20, .opps = opps, .count = table_len / 8};
+    }
+    t8152_clocks_ready = true;
+    return 0;
+}
+
+__attribute__((used, retain, noinline)) u64 cpufreq_get_cluster_hz(unsigned int cluster)
+{
+    if (cluster >= 2 || t8152_cpufreq_init())
+        return 0;
+    struct t8152_clock *c = &t8152_clocks[cluster];
+    u64 raw = read64(c->reg);
+    u32 state = raw & 31;
+    if ((raw & CLUSTER_PSTATE_BUSY) || state < t8152_state0 ||
+        state - t8152_state0 >= c->count)
+        return 0;
+    return (u64)c->opps[2 * (state - t8152_state0)] * 1000;
+}
+
+__attribute__((used, retain, noinline)) int cpufreq_set_cluster_pstate(unsigned int cluster,
+                                                                   unsigned int pstate)
+{
+    if (cluster >= 2 || t8152_cpufreq_init())
+        return -1;
+    struct t8152_clock *c = &t8152_clocks[cluster];
+    if (c->failed || pstate < t8152_state0 || pstate - t8152_state0 >= c->count)
+        return -1;
+    /* Matching firmware waits before and after changing low 5 request bits. */
+    if (poll64(c->reg, CLUSTER_PSTATE_BUSY, 0, 2000))
+        goto failed;
+    u64 raw = read64(c->reg);
+    if ((raw & 31) == pstate)
+        return 0;
+    write64(c->reg, (raw & ~31ULL) | CLUSTER_PSTATE_SET | pstate);
+    if (poll64(c->reg, CLUSTER_PSTATE_BUSY, 0, 2000))
+        goto failed;
+    if ((read64(c->reg) & 31) == pstate)
+        return 0;
+failed:
+    c->failed = true;
+    return -1;
+}
+
+
 int cpufreq_init(void)
 {
     printf("cpufreq: Initializing clusters\n");

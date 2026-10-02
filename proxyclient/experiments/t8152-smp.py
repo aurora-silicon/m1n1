@@ -6,7 +6,7 @@ sys.path.insert(0, str(HERE.parent))
 from m1n1.proxy import UartInterface, M1N1Proxy
 from m1n1.asm import ARMAsm
 ap = argparse.ArgumentParser(description=__doc__)
-ap.add_argument('action', choices=['start', 'cores', 'atomic', 'amp', 'status'])
+ap.add_argument('action', choices=['start', 'cores', 'atomic', 'amp', 'clocks', 'status'])
 ap.add_argument('image', type=Path)
 ap.add_argument('sha256')
 ap.add_argument('--device', required=True)
@@ -43,6 +43,8 @@ try:
         d = {n: p.read64(base+SYMS[n]) for n in ['smp_started_mask', 'smp_start_fail_mask']}
         d['boot_cpu'] = p.read32(base+SYMS['boot_cpu_idx'])
         d['alive'] = [i for i in range(12) if p.smp_is_alive(i)]
+        if 'cpufreq_get_cluster_hz' in SYMS:
+            d['clock_hz'] = [call('cpufreq_get_cluster_hz', c) for c in range(2)]
         return d
     if args.action == 'start':
         print('BEFORE_NATIVE_START', status(), flush=True)
@@ -89,6 +91,35 @@ try:
                 for i in range(32): assert execute(cpu,'math',i,7,13,11) == ((i*7+13)^11)
                 records.append({'cpu':cpu,**r}); print('CORE_PASS',cpu,{k:hex(x) for k,x in r.items()},flush=True)
             s['cores'] = records
+        elif args.action == 'clocks':
+            measurements=[]
+            for cluster,cpu,reg,trial in [(0,0,0x210e20020,3),(1,6,0x211e20020,3),(1,8,0x211e20020,3)]:
+                original=p.read64(reg)&31
+                assert 2 <= original < 32
+                def measure():
+                    times=[]
+                    for _ in range(5):
+                        assert execute(cpu,'work',2000000,data)==2000000
+                        a,b=struct.unpack('<QQ',f.readmem(data,16));times.append((b-a)/hz)
+                    return {'hz':call('cpufreq_get_cluster_hz',cluster),'seconds':times,'median':statistics.median(times),'raw':hex(p.read64(reg))}
+                try:
+                    assert call('cpufreq_set_cluster_pstate',cluster,2) == 0
+                    before=measure()
+                    ret=call('cpufreq_set_cluster_pstate',cluster,trial)
+                    print('CLOCK_SET',cluster,original,trial,ret,flush=True);assert ret==0
+                    during=measure();assert p.read64(reg)&31==trial
+                    assert call('cpufreq_set_cluster_pstate',cluster,2) == 0
+                    low_restored=measure()
+                    ratio=before['median']/during['median']
+                    expected=during['hz']/before['hz']
+                    assert abs(ratio/expected-1) < 0.10, (ratio,expected)
+                    assert abs(low_restored['median']/before['median']-1) < 0.10
+                finally:
+                    ret=call('cpufreq_set_cluster_pstate',cluster,original)
+                    assert ret==0 and p.read64(reg)&31==original, 'Clock restoration failed'
+                after=measure()
+                r={'cluster':cluster,'cpu':cpu,'original':original,'trial':trial,'before':before,'during':during,'after':after,'low_restored':low_restored,'speed_ratio':ratio,'expected_ratio':expected}
+                measurements.append(r);s['clocks']=measurements;save();print('CLOCK_ROUNDTRIP_PASS',r,flush=True)
         elif args.action == 'atomic':
             f.writemem(data,bytes(0x1000));count=1000000
             start=execute(6,'ticks')+hz*2
