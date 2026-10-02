@@ -116,6 +116,7 @@ struct nvme_queue {
     u8 cq_phase;
 
     bool adminq;
+    bool failed;
 };
 
 static_assert(sizeof(struct nvme_command) == 64, "invalid nvme_command size");
@@ -218,6 +219,10 @@ static bool nvme_ctrl_shutdown(void)
 
 static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u64 *result)
 {
+    /* A timed-out command may still own slot 0 and its DMA mappings. */
+    if (q->failed)
+        return false;
+
     bool found = false;
     u64 timeout;
     u8 tag = 0;
@@ -288,6 +293,7 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
     }
 
     if (!found) {
+        q->failed = true;
         printf("nvme: could not find command completion in CQ\n");
         return false;
     }
@@ -576,7 +582,7 @@ bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
     struct nvme_command cmd;
     u64 buffer_addr = (u64)buffer;
 
-    if (!nvme_initialized || !count || count > NVME_MAX_READ_BLOCKS)
+    if (!nvme_initialized || ioq.failed || !count || count > NVME_MAX_READ_BLOCKS)
         return false;
     if (buffer_addr & (SZ_4K - 1))
         return false;
