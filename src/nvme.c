@@ -116,7 +116,6 @@ struct nvme_queue {
     u8 cq_phase;
 
     bool adminq;
-    bool failed;
 };
 
 static_assert(sizeof(struct nvme_command) == 64, "invalid nvme_command size");
@@ -219,10 +218,6 @@ static bool nvme_ctrl_shutdown(void)
 
 static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u64 *result)
 {
-    /* A timed-out command may still own slot 0 and its DMA mappings. */
-    if (q->failed)
-        return false;
-
     bool found = false;
     u64 timeout;
     u8 tag = 0;
@@ -293,7 +288,6 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
     }
 
     if (!found) {
-        q->failed = true;
         printf("nvme: could not find command completion in CQ\n");
         return false;
     }
@@ -566,45 +560,6 @@ bool nvme_flush(u32 nsid)
     memset(&cmd, 0, sizeof(cmd));
     cmd.opcode = NVME_CMD_FLUSH;
     cmd.nsid = nsid;
-
-    return nvme_exec_command(&ioq, &cmd, NULL);
-}
-
-/*
- * Read up to NVME_MAX_READ_BLOCKS contiguous 4K blocks with one command.
- * One command per block costs ~0.55 ms each on T8140 (2.5 s for an 18 MB
- * chainload image); the data pages are described with a single PRP list page.
- */
-static u64 *nvme_prp_list;
-
-bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
-{
-    struct nvme_command cmd;
-    u64 buffer_addr = (u64)buffer;
-
-    if (!nvme_initialized || ioq.failed || !count || count > NVME_MAX_READ_BLOCKS)
-        return false;
-    if (buffer_addr & (SZ_4K - 1))
-        return false;
-
-    memset(&cmd, 0, sizeof(cmd));
-    cmd.opcode = NVME_CMD_READ;
-    cmd.nsid = nsid;
-    cmd.prp1 = buffer_addr;
-    if (count == 2) {
-        cmd.prp2 = buffer_addr + SZ_4K;
-    } else if (count > 2) {
-        if (!nvme_prp_list)
-            nvme_prp_list = memalign(SZ_16K, SZ_4K);
-        if (!nvme_prp_list)
-            return false;
-        for (u32 i = 1; i < count; i++)
-            nvme_prp_list[i - 1] = buffer_addr + (u64)i * SZ_4K;
-        cmd.prp2 = (u64)nvme_prp_list;
-    }
-    cmd.cdw10 = lba;
-    cmd.cdw11 = lba >> 32;
-    cmd.cdw12 = count - 1; // #blocks, 0-based
 
     return nvme_exec_command(&ioq, &cmd, NULL);
 }
