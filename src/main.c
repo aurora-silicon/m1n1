@@ -150,15 +150,18 @@ static void j873g_run_proxy(void)
         target_len != sizeof("J873g") || memcmp(target, "J873g", sizeof("J873g")))
         panic("Unsupported T8152 board\n");
 
-    /* Adopt firmware state. Legacy PMGR/SMP, DCP and USB initialization do
-     * not describe this SoC. Leave those devices and secondary CPUs alone. */
+    /* Adopt firmware power and USB state. Only the qualified display route
+     * may be initialized here; secondary CPUs remain parked for the proxy. */
     printf("J873g: KIS bring-up with native SMP\n");
     mmu_init();
     wdt_disable();
     if (smp_init() < 0)
         panic("Unsupported T8152 CPU topology\n");
 #ifdef USE_FB
+    if (display_init() < 0)
+        printf("display: initialization failed, continuing with firmware framebuffer\n");
     fb_init(false);
+    fb_display_logo();
     fb_set_active(true);
 #endif
     printf("Initialization complete. Running proxy...\n");
