@@ -54,7 +54,7 @@ try:
     u = ProxyUtils(p)
     assert u.adt['/chosen'].chip_id == 0x8152
     assert u.adt['/chosen'].board_id == 0x24
-    assert u.adt['/'].model == 'Mac18,5'
+    assert u.adt.model == 'Mac18,5'
     base = p.get_base()
     names = ['afk_epic_start_ep', 'afk_epic_start_interface', 'afk_epic_shutdown_ep', 'dcp_ib_set_power', 'display_start_dcp', 'display_shutdown', 'dcp_dpav_init', 'dcp_dptx_init',
              'dcp_dpav_shutdown', 'dcp_dptx_shutdown', 'dcp_work',
