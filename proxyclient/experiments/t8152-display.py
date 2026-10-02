@@ -331,7 +331,8 @@ try:
                     keep_active = True
                     state = {'base':hex(base),'dcp':hex(dcp),'dpav':hex(dpav),
                              'dptx':hex(dptx),'phy':hex(phy),'image_sha256':args.sha256,
-                             'modes':modes,'visible_confirmed':False}
+                             'modes':modes,'visible_confirmed':False,
+                             'host_heap_base':u.heap_base,'host_heap_top':u.heap_top}
                     Path('display-state.json').write_text(json.dumps(state,indent=2))
                     call('fb_set_active',1)
                     call('fb_clear',0)
@@ -390,7 +391,6 @@ try:
     print('DISPLAY_LEFT_ACTIVE',keep_active,flush=True)
 finally:
     f.dev.close()
-
 
 
 
