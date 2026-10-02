@@ -152,9 +152,11 @@ static void j873g_run_proxy(void)
 
     /* Adopt firmware state. Legacy PMGR/SMP, DCP and USB initialization do
      * not describe this SoC. Leave those devices and secondary CPUs alone. */
-    printf("J873g: single-CPU KIS bring-up\n");
+    printf("J873g: KIS bring-up with native SMP\n");
     mmu_init();
     wdt_disable();
+    if (smp_init() < 0)
+        panic("Unsupported T8152 CPU topology\n");
 #ifdef USE_FB
     fb_init(false);
     fb_set_active(true);

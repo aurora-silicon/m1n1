@@ -218,6 +218,15 @@ void _start_c(void *boot_args, void *base)
 /* Secondary SMP core boot */
 void _cpu_reset_c(void *stack)
 {
+    if (chip_id == T8152 && !is_boot_cpu()) {
+        if (smp_secondary_prepare() < 0)
+            while (1)
+                sysop("wfe");
+        init_cpu();
+        exception_initialize();
+        smp_secondary_entry();
+        return;
+    }
     if (!is_boot_cpu())
         uart_puts("RVBAR entry on secondary CPU");
     else

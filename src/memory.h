@@ -76,6 +76,8 @@ void dcsw_op_all(u64 op_type);
 
 void mmu_init(void);
 void mmu_init_secondary(int cpu);
+void mmu_init_secondary_local(void);
+void mmu_publish_secondary(void);
 void mmu_shutdown(void);
 void mmu_add_mapping(u64 from, u64 to, size_t size, u8 attribute_index, u64 perms);
 void mmu_rm_mapping(u64 from, size_t size);

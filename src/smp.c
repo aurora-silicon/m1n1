@@ -64,6 +64,29 @@ static bool smp_initialized = false;
 static u64 cpu_start_base;
 static struct cpu_info cpu_info[MAX_CPUS];
 
+u64 smp_started_mask;
+u64 smp_start_fail_mask;
+
+static int t8152_cpu_index(u64 mpidr)
+{
+    u32 core = mpidr & 0xff;
+    u32 cluster = (mpidr >> 8) & 0xff;
+
+    if (cluster > 1 || core >= 6)
+        return -1;
+    return cluster * 6 + core;
+}
+
+int smp_secondary_prepare(void)
+{
+    int cpu = t8152_cpu_index(mrs(MPIDR_EL1));
+
+    if (cpu < 0 || !in_el2())
+        return -1;
+    msr(TPIDR_EL2, cpu);
+    return cpu;
+}
+
 // Used from start.S to find the correct stack after the first entry
 struct smp_reset_stack {
     u64 mpidr;
@@ -82,7 +105,10 @@ u64 boot_cpu_mpidr SMP_SHARED = 0;
 void smp_secondary_entry(void)
 {
     u64 mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
-    int index = target_cpu;
+    int index = chip_id == T8152 ? smp_id() : target_cpu;
+
+    if (chip_id == T8152)
+        mmu_init_secondary_local();
 
     // target_cpu identifies us during the initial start handshake, but may
     // be stale on an RVBAR re-entry after deep wfi
@@ -104,7 +130,8 @@ void smp_secondary_entry(void)
     else
         msr(TPIDR_EL1, index);
 
-    printf("  Index: %d (table: %p)\n\n", index, me);
+    if (chip_id != T8152)
+        printf("  Index: %d (table: %p)\n\n", index, me);
 
     me->mpidr = mpidr;
 
@@ -112,7 +139,7 @@ void smp_secondary_entry(void)
     me->flag++;
     sysop("dmb sy");
     u64 target;
-    if (!cpu_features->fast_ipi)
+    if (chip_id != T8152 && !cpu_features->fast_ipi)
         aic_write(AIC_IPI_MASK_SET, AIC_IPI_SELF); // we only use the "other" IPI
 
     while (1) {
@@ -258,13 +285,69 @@ static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
     }
 }
 
+static int smp_init_t8152(void)
+{
+    if (smp_initialized)
+        return 0;
+
+    int path[8];
+    int pmgr = adt_path_offset_trace(adt, "/arm-io/pmgr-child", path);
+    int cpus = adt_path_offset(adt, "/cpus");
+    if (!in_el2() || board_id != 0x24 || !adt_is_compatible(adt, 0, "J873gAP") ||
+        pmgr < 0 || cpus < 0 || !adt_is_compatible(adt, pmgr, "pmgr2,t8152"))
+        return -1;
+
+    u32 len;
+    const u16 *maps = adt_getprop(adt, pmgr, "reg-maps", &len);
+    if (!maps || len % 4)
+        return -1;
+    int reg_index = -1;
+    for (u32 i = 0; i < len / 2; i += 2) {
+        if (maps[i + 1] != 0x128)
+            continue;
+        if (reg_index >= 0)
+            return -1;
+        reg_index = maps[i];
+    }
+    u64 base, size;
+    if (reg_index < 0 || adt_get_reg(adt, path, "reg", reg_index, &base, &size) ||
+        size < 0x4010 || base != 0x300730000ULL)
+        return -1;
+
+    u64 present = 0;
+    int node = cpus;
+    ADT_FOREACH_CHILD(adt, node) {
+        u32 id, reg;
+        u64 impl[2];
+        if (ADT_GETPROP(adt, node, "cpu-id", &id) != sizeof(id) || id >= 12 ||
+            (present & BIT(id)) || ADT_GETPROP(adt, node, "reg", &reg) != sizeof(reg) ||
+            ADT_GETPROP_ARRAY(adt, node, "cpu-impl-reg", impl) != sizeof(impl) ||
+            t8152_cpu_index(reg) != (int)id || impl[1] < 8 || (impl[0] & 7))
+            return -1;
+        present |= BIT(id);
+        cpu_nodes[id] = node;
+        cpu_info[id] = (struct cpu_info){true, 0, (reg >> 8) & 0xff, reg & 0xff, impl[0]};
+    }
+    int boot_cpu = t8152_cpu_index(mrs(MPIDR_EL1));
+    if (present != 0xfff || boot_cpu < 0)
+        return -1;
+
+    boot_cpu_idx = boot_cpu;
+    boot_cpu_mpidr = mrs(MPIDR_EL1);
+    msr(TPIDR_EL2, boot_cpu_idx);
+    spin_table[boot_cpu_idx].mpidr = boot_cpu_mpidr & 0xffffff;
+    spin_table[boot_cpu_idx].flag = 1;
+    cpu_start_base = base + 0x4000;
+    wfe_mode = true;
+    smp_initialized = true;
+    printf("SMP: T8152, 12 CPUs, boot CPU %d, WFE/SEV dispatch\n", boot_cpu_idx);
+    return 0;
+}
+
 int smp_init(void)
 {
-    /* T8152 uses PMGR2 and a different CPU release layout. */
-    if (chip_id == T8152) {
-        printf("SMP: T8152 secondary startup is not supported yet\n");
-        return -1;
-    }
+    if (chip_id == T8152)
+        return smp_init_t8152();
 
     if (smp_initialized)
         return 0;
@@ -431,8 +514,58 @@ int smp_init(void)
     return 0;
 }
 
+static void smp_start_t8152(void)
+{
+    if (!smp_initialized || smp_start_fail_mask)
+        return;
+
+    extern u8 _smp_shared_start[], _smp_shared_end[];
+    dc_cvac_range((void *)_base, _rodata_end - (char *)_base);
+    dc_cvac_range(&chip_id, sizeof(chip_id));
+    dc_cvac_range(&cpu_features, sizeof(cpu_features));
+    dc_cvac_range(_smp_shared_start, _smp_shared_end - _smp_shared_start);
+    mmu_publish_secondary();
+
+    for (int i = 0; i < 12; i++) {
+        if (i == boot_cpu_idx || spin_table[i].flag)
+            continue;
+        const struct cpu_info *cpu = &cpu_info[i];
+        u64 rvbar = read64(cpu->impl_reg);
+        if ((rvbar & RVBAR_LOCK) && (rvbar & RVBAR_ADDR) != (u64)_vectors_start) {
+            smp_start_fail_mask |= BIT(i);
+            break;
+        }
+        dc_civac_range(secondary_stacks[i], SECONDARY_STACK_SIZE);
+        if (!(rvbar & RVBAR_LOCK))
+            write64(cpu->impl_reg, (u64)_vectors_start);
+        sysop("dsb sy");
+        /* T8152ACC setCoreOnline/wakeCore preserve other released cores. */
+        set32(cpu_start_base + 4, BIT(i));
+        set32(cpu_start_base + 8 + 4 * cpu->cluster, BIT(cpu->core));
+        sysop("dsb sy");
+        sysop("sev");
+        unsigned int waited;
+        for (waited = 0; waited < 1000; waited++) {
+            sysop("dmb sy");
+            if (spin_table[i].flag)
+                break;
+            udelay(1000);
+        }
+        if (waited == 1000) {
+            smp_start_fail_mask |= BIT(i);
+            break;
+        }
+        smp_started_mask |= BIT(i);
+    }
+    printf("SMP: T8152 started 0x%lx failed 0x%lx\n", smp_started_mask, smp_start_fail_mask);
+}
+
 void smp_start_secondaries(void)
 {
+    if (chip_id == T8152) {
+        smp_start_t8152();
+        return;
+    }
     printf("Starting secondary CPUs...\n");
 
     if (!smp_initialized)
@@ -462,6 +595,10 @@ void smp_start_secondaries(void)
 
 void smp_stop_secondaries(bool deep_sleep)
 {
+    if (chip_id == T8152) {
+        printf("SMP: T8152 power-off is not supported; reset the target\n");
+        return;
+    }
     printf("Stopping secondary CPUs...\n");
 
     if (!smp_initialized)
@@ -481,6 +618,11 @@ void smp_stop_secondaries(bool deep_sleep)
 
 void smp_send_ipi(int cpu)
 {
+    if (chip_id == T8152) {
+        sysop("dsb sy");
+        sysop("sev");
+        return;
+    }
     if (cpu >= MAX_CPUS)
         return;
 
@@ -535,6 +677,8 @@ u64 smp_wait(int cpu)
 
 void smp_set_wfe_mode(bool new_mode)
 {
+    if (chip_id == T8152 && !new_mode)
+        return;
     wfe_mode = new_mode;
     sysop("dsb sy");
 
