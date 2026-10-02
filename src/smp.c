@@ -260,6 +260,12 @@ static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
 
 int smp_init(void)
 {
+    /* T8152 uses PMGR2 and a different CPU release layout. */
+    if (chip_id == T8152) {
+        printf("SMP: T8152 secondary startup is not supported yet\n");
+        return -1;
+    }
+
     if (smp_initialized)
         return 0;
 
@@ -317,7 +323,6 @@ int smp_init(void)
         case T8132:
         case T8140:
         case T8142:
-        case T8152:
             cpu_start_off = CPU_START_OFF_T8112;
             break;
         case T6020:

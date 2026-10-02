@@ -121,6 +121,12 @@ const struct midr_part_features features_m4 = {
  * Different behavior between the cores should be implemented with is_ecore()
  * instead.
  */
+/* T8152's E and M cores share part 0x072; P cores use 0x073. Keep
+ * implementation-defined tuning and fast IPIs off until separately qualified. */
+const struct midr_part_features features_m6 = {
+    .sleep_mode = SLEEP_NONE,
+};
+
 const struct midr_part_info midr_parts[] = {
     {MIDR_PART_S5L8960X_CYCLONE, "A7 Cyclone", init_s5l8960x_cyclone, &features_a7},
     {MIDR_PART_T7000_TYPHOON, "A8 Typhoon", init_t7000_typhoon, &features_a7},
@@ -165,8 +171,8 @@ const struct midr_part_info midr_parts[] = {
     {MIDR_PART_T6050_SOTRA_PCORE, "M5 Pro Sotra (P core)", NULL, &features_m4},
     {MIDR_PART_T6051_SOTRAC_MCORE, "M5 Max Sotra C (M core)", NULL, &features_m4},
     {MIDR_PART_T6051_SOTRAC_PCORE, "M5 Max Sotra C (P core)", NULL, &features_m4},
-    {MIDR_PART_T8152_KOMODO_ECORE, "M6 Komodo (E core)", NULL, &features_m4},
-    {MIDR_PART_T8152_KOMODO_PCORE, "M6 Komodo (P core)", NULL, &features_m4},
+    {MIDR_PART_T8152_KOMODO_ECORE, "M6 (E/M core)", NULL, &features_m6},
+    {MIDR_PART_T8152_KOMODO_PCORE, "M6 (P core)", NULL, &features_m6},
 };
 
 const struct midr_part_features features_unknown = {

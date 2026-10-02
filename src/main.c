@@ -139,6 +139,30 @@ void run_actions(void)
     uartproxy_run(NULL);
 }
 
+static void j873g_run_proxy(void)
+{
+    u32 model_len = 0, target_len = 0;
+    const char *model = adt_getprop(adt, 0, "model", &model_len);
+    const char *target = adt_getprop(adt, 0, "target-type", &target_len);
+
+    if (board_id != 0x24 || !model || model_len != sizeof("Mac18,5") ||
+        memcmp(model, "Mac18,5", sizeof("Mac18,5")) || !target ||
+        target_len != sizeof("J873g") || memcmp(target, "J873g", sizeof("J873g")))
+        panic("Unsupported T8152 board\n");
+
+    /* Adopt firmware state. Legacy PMGR/SMP, DCP and USB initialization do
+     * not describe this SoC. Leave those devices and secondary CPUs alone. */
+    printf("J873g: single-CPU KIS bring-up\n");
+    mmu_init();
+    wdt_disable();
+#ifdef USE_FB
+    fb_init(false);
+    fb_set_active(true);
+#endif
+    printf("Initialization complete. Running proxy...\n");
+    uartproxy_run(NULL);
+}
+
 void m1n1_main(void)
 {
     printf("\n\nm1n1 %s\n", m1n1_version);
@@ -150,6 +174,11 @@ void m1n1_main(void)
     firmware_init();
 
     heapblock_init();
+
+    if (chip_id == T8152) {
+        j873g_run_proxy();
+        goto next_stage;
+    }
 
 #ifndef BRINGUP
     if (supports_gxf())
@@ -188,17 +217,21 @@ void m1n1_main(void)
 
     run_actions();
 
+next_stage:
     if (!next_stage.entry) {
         panic("Nothing to do!\n");
     }
 
     printf("Preparing to run next stage at %p...\n", next_stage.entry);
 
-    nvme_shutdown();
+    if (chip_id != T8152)
+        nvme_shutdown();
     exception_shutdown();
 #ifndef BRINGUP
-    usb_iodev_shutdown();
-    display_shutdown(DCP_SLEEP_IF_EXTERNAL);
+    if (chip_id != T8152) {
+        usb_iodev_shutdown();
+        display_shutdown(DCP_SLEEP_IF_EXTERNAL);
+    }
 #ifdef USE_FB
     fb_shutdown(next_stage.restore_logo);
 #endif
