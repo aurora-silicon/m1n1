@@ -9,6 +9,8 @@
 #include "string.h"
 #include "utils.h"
 
+#include "libfdt/libfdt.h"
+
 struct dapf_t8020_config {
     u64 start;
     u64 end;
@@ -168,20 +170,37 @@ int dapf_init(const char *path, int index)
 struct entry {
     const char *path;
     int index;
+    const char *alias;
 };
 
 struct entry dapf_entries[] = {
-    {"/arm-io/dart-aop", 1}, {"/arm-io/dart-mtp", 1},  {"/arm-io/dart-pmp", 1},
-    {"/arm-io/dart-isp", 5}, {"/arm-io/dart-isp0", 5}, {NULL, -1},
+    {"/arm-io/dart-aop", 1, "aop"}, {"/arm-io/dart-mtp", 1, "mtp"},  {"/arm-io/dart-pmp", 1, "pmp"},
+    {"/arm-io/dart-isp", 5, "isp"}, {"/arm-io/dart-isp0", 5, "isp"}, {NULL, -1, NULL},
 };
 
-int dapf_init_all(void)
+int dapf_init_fdt(const void *fdt)
 {
     int ret = 0;
     int count = 0;
     struct entry *entry = dapf_entries;
 
     while (entry->path != NULL) {
+        /* Only prepare DMA for devices handed to the next stage. In
+         * particular, an initial J813 FDT has no AOP, MTP, PMP or ISP.
+         * Their firmware-owned protection registers must remain intact.
+         */
+        if (fdt) {
+            int node = fdt_path_offset(fdt, entry->alias);
+            if (node < 0) {
+                entry++;
+                continue;
+            }
+            const char *status = fdt_getprop(fdt, node, "status", NULL);
+            if (status && strcmp(status, "okay") && strcmp(status, "ok")) {
+                entry++;
+                continue;
+            }
+        }
         if (adt_path_offset(adt, entry->path) < 0) {
             entry++;
             continue;
@@ -193,4 +212,9 @@ int dapf_init_all(void)
         count += 1;
     }
     return ret ? ret : count;
+}
+
+int dapf_init_all(void)
+{
+    return dapf_init_fdt(NULL);
 }
