@@ -722,8 +722,12 @@ static int afkv2_handle_command(afk_epic_ep_t *epic, const struct afkv2_hdr *hdr
     u32 status = service->ops->call_v2(service, call->group, call->command,
                                       call + 1, call->length, rcall + 1, call->length);
     memcpy(rcall + 1, &status, sizeof(status));
-    printf("AFKV2: service callback group %u command %u status %#x\n",
-           call->group, call->command, status);
+    if (status)
+        printf("AFKV2: service callback group %u command %u status %#x\n",
+               call->group, call->command, status);
+    else
+        dprintf("AFKV2: service callback group %u command %u succeeded\n",
+                call->group, call->command);
     int ret = afk_epic_tx(epic, 0, 0, reply, length);
     free(reply);
     return ret;
@@ -911,7 +915,7 @@ static void afk_epic_notify_handler(afk_epic_ep_t *epic)
         void *payload;
         size_t size;
         if (afkv2_decode(rmsg, &hdr, &msg, &payload, &size)) {
-            printf("AFKV2: async interface %u category %u type %#x (%zu bytes)\n",
+            dprintf("AFKV2: async interface %u category %u type %#x (%zu bytes)\n",
                    hdr->interface, msg->category, msg->type, size);
             if (msg->category == AFKV2_COMMAND &&
                 afkv2_handle_command(epic, hdr, msg, payload, size) < 0)

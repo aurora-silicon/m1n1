@@ -285,6 +285,21 @@ void iodev_handle_events(iodev_id_t id)
         spin_unlock(&console_lock);
 }
 
+/* Replay retained history on one output after its contents have been lost.
+ * Other outputs keep their read positions, so serial logs are not duplicated. */
+void iodev_console_rewind(iodev_id_t id)
+{
+    if ((unsigned)id >= IODEV_NUM || !iodevs[id])
+        return;
+
+    bool do_lock = mmu_active();
+    if (do_lock)
+        spin_lock(&console_lock);
+    con_rp[id] = con_wp > CONSOLE_BUFFER_SIZE ? con_wp - CONSOLE_BUFFER_SIZE : 0;
+    if (do_lock)
+        spin_unlock(&console_lock);
+}
+
 void iodev_console_kick(void)
 {
     iodev_console_write(NULL, 0);

@@ -779,7 +779,7 @@ int atc_phy_set_drive_settings(atc_phy_t *phy, const dptx_drive_settings_t *sett
         if (atc_update(phy, offset, 0x7e07ff, control) ||
             atc_update(phy, offset - 0x14, 0x7f, (preset & 0x3f) | 0x40))
             return -1;
-        printf("ATC3: DP lane %u voltage %u emphasis %u preset %#x\n", i,
+        dprintf("ATC3: DP lane %u voltage %u emphasis %u preset %#x\n", i,
                settings[i].voltage, settings[i].pre_emphasis, preset);
     }
     return 0;
