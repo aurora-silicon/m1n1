@@ -31,3 +31,9 @@ must retain those allocations and build its framebuffer node from the updated
 `cur_boot_args`, including 32-bit BGRA pixels and the live stride, rather than
 the original firmware boot arguments. U-Boot's J873 configuration already enables
 `VIDEO_SIMPLE`, `NO_FB_CLEAR` and the video console.
+
+The physical J873g run trained four HBR lanes and acknowledged the 1280x720
+modeset. Public U-Boot inherited the framebuffer and booted Aurora WIP Linux;
+Linux bound its framebuffer console and passed twelve-CPU and bounded frequency
+workloads. The operator confirmed the Linux console and test banner were visible
+on the USB-C monitor. Hotplug and other connectors remain unqualified.
