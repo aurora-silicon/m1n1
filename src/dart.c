@@ -146,7 +146,7 @@ static void dart_t8110_tlb_invalidate(dart_dev_t *dart)
             FIELD_PREP(DART_T8110_TLB_CMD_OP, DART_T8110_TLB_CMD_OP_FLUSH_SID) |
                 FIELD_PREP(DART_T8110_TLB_CMD_STREAM, dart->device));
 
-    if (poll32(dart->regs + DART_T8110_TLB_CMD_OP, DART_T8110_TLB_CMD_BUSY, 0, 100))
+    if (poll32(dart->regs + DART_T8110_TLB_CMD, DART_T8110_TLB_CMD_BUSY, 0, 100))
         printf("dart: DART_T8110_TLB_CMD_BUSY did not clear.\n");
 }
 
@@ -824,7 +824,8 @@ u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len)
     if (start < 0 || start % SZ_16K)
         return -1;
 
-    uintptr_t end = 1LLU << 36;
+    /* High ADT windows still cover a 36-bit page-table address space. */
+    uintptr_t end = dart->vm_base + (1LLU << 36);
     uintptr_t iova = start;
 
     while (iova + len <= end) {
