@@ -32,10 +32,11 @@ print("BEFORE", [hex(v) for v in before], flush=True)
 report = {"target": "J813", "before": before, "rounds": [], "pass": False}
 pmgr = u.adt["/arm-io/pmgr"]
 report["firmware_states"] = {}
-for name, state, frequency in (("voltage-states1-sram", 2, 1152000),
-                               ("voltage-states5-sram", 10, 3720000)):
+for name, state, frequency in (("voltage-states1-sram", 2, 972000),
+                               ("voltage-states5-sram", 10, 3516000)):
     values = list(pmgr.getprop(name))
-    if len(values) % 2 or len(values) < state * 2 or values[(state - 1) * 2] != frequency:
+    # State 1 is the 300 MHz floor; SRAM table entries begin at state 2.
+    if len(values) % 2 or len(values) < (state - 1) * 2 or values[(state - 2) * 2] != frequency:
         raise RuntimeError("Unexpected firmware frequency table: " + name)
     report["firmware_states"][name] = values
 print("FIRMWARE_HANDOFF_STATES_VERIFIED", flush=True)

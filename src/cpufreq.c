@@ -365,7 +365,7 @@ static const struct cluster_t t6030_clusters[] = {
     {},
 };
 
-/* J813 firmware handoff states: ECPU 1152 MHz, PCPU 3720 MHz. */
+/* J813 firmware handoff states: ECPU 972 MHz, PCPU 3516 MHz. */
 static const struct cluster_t t8142_clusters[] = {
     {"ECPU0", 0x210e00000, false, 1, 2},
     {"PCPU0", 0x211e00000, true, 1, 10},
