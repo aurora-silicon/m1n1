@@ -71,6 +71,7 @@ static u32 pstate_reg_to_pstate(u64 val)
         case T6031:
         case T6034:
         case T8122:
+        case T8142:
             return FIELD_GET(CLUSTER_PSTATE_DESIRED1, val);
         default:
             printf("cpufreq: Chip 0x%x is unsupported\n", chip_id);
@@ -80,6 +81,12 @@ static u32 pstate_reg_to_pstate(u64 val)
 
 static int set_pstate(const struct cluster_t *cluster, uint32_t pstate)
 {
+    if (chip_id == T8142 && poll64(cluster->base + CLUSTER_PSTATE, CLUSTER_PSTATE_BUSY, 0,
+                                   CLUSTER_SWITCH_TIMEOUT) < 0) {
+        printf("cpufreq: Cluster %s is busy before P-State request\n", cluster->name);
+        return -1;
+    }
+
     u64 val = read64(cluster->base + CLUSTER_PSTATE);
 
     if (pstate_reg_to_pstate(val) != pstate) {
@@ -112,6 +119,7 @@ static int set_pstate(const struct cluster_t *cluster, uint32_t pstate)
             case T6031:
             case T6034:
             case T8122:
+            case T8142:
                 val &= ~CLUSTER_PSTATE_DESIRED1;
                 val |= CLUSTER_PSTATE_SET | FIELD_PREP(CLUSTER_PSTATE_DESIRED1, pstate);
                 break;
@@ -125,6 +133,12 @@ static int set_pstate(const struct cluster_t *cluster, uint32_t pstate)
             printf("cpufreq: Timed out waiting for cluster %s P-State switch\n", cluster->name);
             return -1;
         }
+    }
+
+    if (chip_id == T8142 &&
+        pstate_reg_to_pstate(read64(cluster->base + CLUSTER_PSTATE)) != pstate) {
+        printf("cpufreq: Cluster %s did not accept P-State %u\n", cluster->name, pstate);
+        return -1;
     }
 
     return 0;
@@ -166,6 +180,7 @@ int cpufreq_init_cluster(const struct cluster_t *cluster, const struct feat_t *f
         case T7000 ... T7001:
         case S8000 ... S8003:
         case T8010 ... T8015: /* This covers a gap but T8013 and T8014 will not randomly appear. */
+        case T8142:           /* Keep firmware voltage, PLL and throttling configuration. */
             /* Do nothing */
             break;
         case T8103:
@@ -350,6 +365,13 @@ static const struct cluster_t t6030_clusters[] = {
     {},
 };
 
+/* J813 firmware handoff states: ECPU 972 MHz, PCPU 3516 MHz. */
+static const struct cluster_t t8142_clusters[] = {
+    {"ECPU0", 0x210e00000, false, 1, 2},
+    {"PCPU0", 0x211e00000, true, 1, 10},
+    {},
+};
+
 const struct cluster_t *cpufreq_get_clusters(void)
 {
     switch (chip_id) {
@@ -387,6 +409,8 @@ const struct cluster_t *cpufreq_get_clusters(void)
         case T6030:
         case T8122:
             return t6030_clusters;
+        case T8142:
+            return t8142_clusters;
         case T6031:
         case T6034:
             return t6031_clusters;
@@ -471,6 +495,11 @@ static const struct feat_t t6030_features[] = {
     {},
 };
 
+/* M5 uses CLPC/PMP; the earlier chips' feature registers are not applicable. */
+static const struct feat_t t8142_features[] = {
+    {},
+};
+
 const struct feat_t *cpufreq_get_features(void)
 {
     switch (chip_id) {
@@ -497,6 +526,8 @@ const struct feat_t *cpufreq_get_features(void)
             return t8112_features;
         case T8122:
             return t8122_features;
+        case T8142:
+            return t8142_features;
         case T6020:
         case T6021:
         case T6022:
@@ -510,6 +541,102 @@ const struct feat_t *cpufreq_get_features(void)
             return NULL;
     }
 }
+
+/* T8152ACC::setPerfState in matching 26A428 firmware uses logical offset
+ * 0xe20020. E/P ACC maps resolve that to RegMap 0x20/0x40 + 0x20. The ADT
+ * supplies the physical apertures and the hardware-index bias (2 on J873g).
+ * Do not apply earlier-generation voltage/PLL/chicken-bit initialization. */
+struct t8152_clock {
+    u64 reg;
+    const u32 *opps;
+    u32 count;
+    bool failed;
+};
+
+static struct t8152_clock t8152_clocks[2];
+static u32 t8152_state0;
+static bool t8152_clocks_ready;
+
+static int t8152_cpufreq_init(void)
+{
+    if (t8152_clocks_ready)
+        return 0;
+    int path[8];
+    int node = adt_path_offset_trace(adt, "/arm-io/pmgr-child", path);
+    if (chip_id != T8152 || board_id != 0x24 || !adt_is_compatible(adt, 0, "J873gAP") ||
+        node < 0 || !adt_is_compatible(adt, node, "pmgr2,t8152"))
+        return -1;
+    u32 len;
+    const u16 *maps = adt_getprop(adt, node, "reg-maps", &len);
+    if (!maps || len % 4 || ADT_GETPROP(adt, node, "cpu-perf-state0-index", &t8152_state0) < 0 ||
+        t8152_state0 != 2)
+        return -1;
+    const char *tables[] = {"voltage-states1-sram", "voltage-states5-sram"};
+    for (unsigned int c = 0; c < 2; c++) {
+        int idx = -1;
+        for (u32 i = 0; i < len / 2; i += 2) {
+            if (maps[i + 1] == (c ? 0x40 : 0x20)) {
+                if (idx >= 0)
+                    return -1;
+                idx = maps[i];
+            }
+        }
+        u64 base, size;
+        if (idx < 0 || adt_get_reg(adt, path, "reg", idx, &base, &size) || size < 0x28 ||
+            base != (c ? 0x211e20000ULL : 0x210e20000ULL))
+            return -1;
+        u32 table_len;
+        const u32 *opps = adt_getprop(adt, node, tables[c], &table_len);
+        if (!opps || !table_len || table_len % 8 || table_len / 8 + t8152_state0 > 32)
+            return -1;
+        for (u32 i = 0; i < table_len / 8; i++) {
+            if (!opps[2 * i] || opps[2 * i] > 5000000 ||
+                (i && opps[2 * i] <= opps[2 * (i - 1)]))
+                return -1;
+        }
+        t8152_clocks[c] = (struct t8152_clock){.reg = base + 0x20, .opps = opps, .count = table_len / 8};
+    }
+    t8152_clocks_ready = true;
+    return 0;
+}
+
+__attribute__((used, retain, noinline)) u64 cpufreq_get_cluster_hz(unsigned int cluster)
+{
+    if (cluster >= 2 || t8152_cpufreq_init())
+        return 0;
+    struct t8152_clock *c = &t8152_clocks[cluster];
+    u64 raw = read64(c->reg);
+    u32 state = raw & 31;
+    if ((raw & CLUSTER_PSTATE_BUSY) || state < t8152_state0 ||
+        state - t8152_state0 >= c->count)
+        return 0;
+    return (u64)c->opps[2 * (state - t8152_state0)] * 1000;
+}
+
+__attribute__((used, retain, noinline)) int cpufreq_set_cluster_pstate(unsigned int cluster,
+                                                                   unsigned int pstate)
+{
+    if (cluster >= 2 || t8152_cpufreq_init())
+        return -1;
+    struct t8152_clock *c = &t8152_clocks[cluster];
+    if (c->failed || pstate < t8152_state0 || pstate - t8152_state0 >= c->count)
+        return -1;
+    /* Matching firmware waits before and after changing low 5 request bits. */
+    if (poll64(c->reg, CLUSTER_PSTATE_BUSY, 0, 2000))
+        goto failed;
+    u64 raw = read64(c->reg);
+    if ((raw & 31) == pstate)
+        return 0;
+    write64(c->reg, (raw & ~31ULL) | CLUSTER_PSTATE_SET | pstate);
+    if (poll64(c->reg, CLUSTER_PSTATE_BUSY, 0, 2000))
+        goto failed;
+    if ((read64(c->reg) & 31) == pstate)
+        return 0;
+failed:
+    c->failed = true;
+    return -1;
+}
+
 
 int cpufreq_init(void)
 {

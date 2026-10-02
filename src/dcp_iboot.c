@@ -166,13 +166,51 @@ int dcp_ib_shutdown(dcp_iboot_if_t *iboot)
 static int dcp_ib_cmd(dcp_iboot_if_t *iboot, int op, size_t in_size)
 {
     size_t rxsize = RXBUF_LEN;
+    /* The 26A428 AFKEPV2 handlers return only transport status for these
+     * setters. Supplying a reply buffer makes firmware try to copy an empty
+     * message and assert in AFKEPCommandContext::enqueueResponse. */
+    bool status_only = afk_epic_is_v2(iboot->epic) &&
+                       (op == IBOOT_SET_POWER || op == IBOOT_SET_MODE ||
+                        op == IBOOT_SET_SURFACE);
     assert(in_size <= TXBUF_LEN - sizeof(struct txcmd));
 
     iboot->txcmd.op = op;
     iboot->txcmd.len = sizeof(struct txcmd) + in_size;
 
-    return afk_epic_command(iboot->epic, iboot->channel, 0xc0, iboot->txbuf,
-                            sizeof(struct txcmd) + in_size, iboot->rxbuf, &rxsize);
+    int ret = afk_epic_command(iboot->epic, iboot->channel, 0xc0, iboot->txbuf,
+                              sizeof(struct txcmd) + in_size,
+                              status_only ? NULL : iboot->rxbuf,
+                              status_only ? NULL : &rxsize);
+    if (ret)
+        return ret;
+    if (status_only)
+        return 0;
+    if (rxsize < sizeof(struct rxcmd) || iboot->rxcmd.len < sizeof(struct rxcmd) ||
+        iboot->rxcmd.len > rxsize) {
+        printf("dcp-iboot: invalid response length for operation %d (%zu bytes)\n", op, rxsize);
+        return -1;
+    }
+    size_t payload_size = iboot->rxcmd.len - sizeof(struct rxcmd);
+    if ((op == IBOOT_GET_HPD && payload_size < sizeof(struct get_hpd_resp)) ||
+        (op == IBOOT_SWAP_BEGIN && payload_size < sizeof(struct swap_start_resp)))
+        return -1;
+    if (op == IBOOT_GET_TIMING_MODES) {
+        struct get_tmode_resp *resp = (void *)iboot->rxcmd.payload;
+        if (payload_size < sizeof(*resp) ||
+            resp->count > (payload_size - sizeof(*resp)) / sizeof(resp->modes[0]))
+            return -1;
+    }
+    if (op == IBOOT_GET_COLOR_MODES) {
+        struct get_cmode_resp *resp = (void *)iboot->rxcmd.payload;
+        if (payload_size < sizeof(*resp) ||
+            resp->count > (payload_size - sizeof(*resp)) / sizeof(resp->modes[0]))
+            return -1;
+    }
+#ifdef AFK_TRACE
+    printf("dcp-iboot: operation %d response %zu bytes\n", op, rxsize);
+    hexdump(iboot->rxbuf, min(rxsize, 64));
+#endif
+    return 0;
 }
 
 int dcp_ib_set_surface(dcp_iboot_if_t *iboot, dcp_layer_t *layer)
