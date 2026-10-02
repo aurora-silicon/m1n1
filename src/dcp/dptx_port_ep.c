@@ -23,6 +23,14 @@ struct dcpdptx_connection_cmd {
     u32 target;
 } __attribute__((packed));
 
+struct dcpdptx_connection_reply {
+    u32 unk;
+    u32 target;
+    u64 reserved;
+    u32 status;
+    u8 padding[12];
+} __attribute__((packed));
+
 struct dcpdptx_hotplug_cmd {
     u8 _pad0[16];
     u32 unk;
@@ -121,8 +129,9 @@ static int afk_service_call(afk_epic_service_t *service, u16 group, u32 command,
     if (ret)
         goto out;
 
-    if (call->magic != EPIC_SERVICE_CALL_MAGIC || call->group != group ||
-        call->command != command) {
+    if (rx_len < sizeof(*call) || call->magic != EPIC_SERVICE_CALL_MAGIC ||
+        call->group != group || call->command != command ||
+        call->data_len > rx_len - sizeof(*call) || call->data_len < output_len) {
         ret = -1;
         goto out;
     }
@@ -142,7 +151,8 @@ out:
 
 int dptxport_validate_connection(afk_epic_service_t *service, u8 core, u8 atc, u8 die)
 {
-    struct dcpdptx_connection_cmd cmd, resp;
+    struct dcpdptx_connection_cmd cmd;
+    struct dcpdptx_connection_reply resp;
     int ret;
     u32 target = FIELD_PREP(DCPDPTX_REMOTE_PORT_CORE, core) |
                  FIELD_PREP(DCPDPTX_REMOTE_PORT_DFP, atc) |
@@ -150,9 +160,11 @@ int dptxport_validate_connection(afk_epic_service_t *service, u8 core, u8 atc, u
 
     cmd.target = target;
     cmd.unk = 0x100;
-    ret = afk_service_call(service, 0, 12, &cmd, sizeof(cmd), 40, &resp, sizeof(resp), 40);
+    ret = afk_service_call(service, 0, 12, &cmd, sizeof(cmd), 40, &resp, sizeof(resp), 16);
     if (ret)
         return ret;
+    if (afk_epic_is_v2(service->epic) && resp.status)
+        return (s32)resp.status;
 
     if (resp.target != target)
         return -1;
@@ -164,17 +176,21 @@ int dptxport_validate_connection(afk_epic_service_t *service, u8 core, u8 atc, u
 
 int dptxport_connect(afk_epic_service_t *service, u8 core, u8 atc, u8 die)
 {
-    struct dcpdptx_connection_cmd cmd = {0}, resp = {0};
+    struct dcpdptx_connection_cmd cmd = {0};
+    struct dcpdptx_connection_reply resp = {0};
     int ret;
     u32 target = FIELD_PREP(DCPDPTX_REMOTE_PORT_CORE, core) |
                  FIELD_PREP(DCPDPTX_REMOTE_PORT_DFP, atc) |
                  FIELD_PREP(DCPDPTX_REMOTE_PORT_DIE, die) | DCPDPTX_REMOTE_PORT_CONNECTED;
 
     cmd.target = target;
-    // cmd.unk = 0x100;
-    ret = afk_service_call(service, 0, 11, &cmd, sizeof(cmd), 24, &resp, sizeof(resp), 24);
+    if (afk_epic_is_v2(service->epic))
+        cmd.unk = 0x100; /* IODPTXPortAttributes supportsHPD */
+    ret = afk_service_call(service, 0, 11, &cmd, sizeof(cmd), 24, &resp, sizeof(resp), 0);
     if (ret)
         return ret;
+    if (afk_epic_is_v2(service->epic) && resp.status)
+        return (s32)resp.status;
 
     if (resp.target != target)
         return -1;
@@ -186,11 +202,21 @@ int dptxport_connect(afk_epic_service_t *service, u8 core, u8 atc, u8 die)
 
 int dptxport_request_display(afk_epic_service_t *service)
 {
+    if (afk_epic_is_v2(service->epic)) {
+        u32 status = 0;
+        int ret = afk_service_call(service, 0, 6, NULL, 0, 16, &status, sizeof(status), 12);
+        return ret ? ret : (s32)status;
+    }
     return afk_service_call(service, 0, 6, NULL, 0, 16, NULL, 0, 16);
 }
 
 int dptxport_release_display(afk_epic_service_t *service)
 {
+    if (afk_epic_is_v2(service->epic)) {
+        u32 status = 0;
+        int ret = afk_service_call(service, 8, 7, NULL, 0, 16, &status, sizeof(status), 12);
+        return ret ? ret : (s32)status;
+    }
     return afk_service_call(service, 0, 7, NULL, 0, 16, NULL, 0, 16);
 }
 
@@ -207,6 +233,11 @@ int dptxport_set_hpd(afk_epic_service_t *service, bool hpd)
     ret = afk_service_call(service, 8, 8, &cmd, sizeof(cmd), 12, &resp, sizeof(resp), 12);
     if (ret)
         return ret;
+    if (afk_epic_is_v2(service->epic)) {
+        u32 status;
+        memcpy(&status, resp._pad0, sizeof(status));
+        return (s32)status;
+    }
     if (resp.unk != 1)
         return -1;
     return 0;
@@ -501,11 +532,115 @@ static void dptxport_init(afk_epic_service_t *service, const char *name, const c
     }
 }
 
+static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
+                           const void *data, size_t data_size, void *reply, size_t reply_size)
+{
+    if (group && !(group == 1 && command == DPTX_APCALL_SET_DRIVE_SETTINGS))
+        return 0xe00002c7; /* kIOReturnUnsupported */
+
+    dptx_port_t *port = service->cookie;
+    if ((!port || !port->phy) &&
+        (command == DPTX_APCALL_ACTIVATE || command == DPTX_APCALL_DEACTIVATE ||
+         command == DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG ||
+         command == DPTX_APCALL_DID_CHANGE_LINK_CONFIG ||
+         command == DPTX_APCALL_SET_LINK_RATE || command == DPTX_APCALL_SET_DOWN_SPREAD ||
+         command == DPTX_APCALL_SET_ACTIVE_LANE_COUNT || command == DPTX_APCALL_SET_DRIVE_SETTINGS ||
+         command == DPTX_APCALL_GET_LINK_RATE || command == DPTX_APCALL_GET_ACTIVE_LANE_COUNT))
+        return 0xe00002d8; /* kIOReturnNotReady */
+    /* Only the hardware-qualified HBR/four-lane configuration is exposed.
+     * Training changes still require their own implementation. */
+    u64 value;
+    switch (command) {
+        case DPTX_APCALL_ACTIVATE:
+            if (dptx_phy_activate(port->phy))
+                return 0xe00002bc; /* kIOReturnError */
+            port->link_rate = port->pending_link_rate = LINK_RATE_HBR;
+            return 0;
+        case DPTX_APCALL_DEACTIVATE:
+            if (dptx_phy_deactivate(port->phy))
+                return 0xe00002bc;
+            port->link_rate = port->pending_link_rate = 0;
+            return 0;
+        case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG:
+        case DPTX_APCALL_DID_CHANGE_LINK_CONFIG:
+            return dptx_phy_set_route(port->phy, command == DPTX_APCALL_DID_CHANGE_LINK_CONFIG)
+                       ? 0xe00002bc : 0;
+        case DPTX_APCALL_GET_MAX_LINK_RATE:
+            value = LINK_RATE_HBR;
+            break;
+        case DPTX_APCALL_GET_LINK_RATE:
+            value = port->link_rate;
+            break;
+        case DPTX_APCALL_SET_LINK_RATE:
+            if (!data || data_size < 17)
+                return 0xe00002c2;
+            if (((const u8 *)data)[16] != LINK_RATE_HBR || port->link_rate != LINK_RATE_HBR)
+                return 0xe00002c7;
+            return dptx_phy_set_link_rate(port->phy, 2700) ? 0xe00002bc : 0;
+        case DPTX_APCALL_GET_MAX_LANE_COUNT:
+            value = 4;
+            break;
+        case DPTX_APCALL_GET_ACTIVE_LANE_COUNT:
+            value = dptx_phy_get_active_lane_count(port->phy);
+            break;
+        case DPTX_APCALL_SET_ACTIVE_LANE_COUNT: {
+            u32 count;
+            if (!data || data_size < 20)
+                return 0xe00002c2;
+            memcpy(&count, data + 16, sizeof(count));
+            printf("DPTXV2: active lane count %u\n", count);
+            return dptx_phy_set_active_lane_count(port->phy, count) ? 0xe00002c2 : 0;
+        }
+        case DPTX_APCALL_GET_MAX_DRIVE_SETTINGS: {
+            const dptx_drive_settings_t maximum = {0, 3, 3};
+            if (reply_size < 32)
+                return 0xe00002c2;
+            memcpy(reply + 16, &maximum, sizeof(maximum));
+            return 0;
+        }
+        case DPTX_APCALL_SET_DRIVE_SETTINGS: {
+            u32 count;
+            dptx_drive_settings_t settings[4];
+            if (group != 1)
+                return 0xe00002c7;
+            if (!data || data_size < 32)
+                return 0xe00002c2;
+            memcpy(&count, data + 16, sizeof(count));
+            if (count > 4 || data_size < 32 + count * sizeof(*settings))
+                return 0xe00002c2;
+            memcpy(settings, data + 32, count * sizeof(*settings));
+            return dptx_phy_set_drive_settings(port->phy, settings, count) ? 0xe00002bc : 0;
+        }
+        case DPTX_APCALL_SET_DOWN_SPREAD:
+            if (!data || data_size < 17)
+                return 0xe00002c2;
+            /* Matching ATC port code records this request for the following
+             * rate setup. The qualified setup uses downspread disabled. */
+            return ((const u8 *)data)[16] ? 0xe00002c7 : 0;
+        case DPTX_APCALL_GET_SUPPORTS_DOWN_SPREAD:
+        case DPTX_APCALL_GET_DOWN_SPREAD:
+        case DPTX_APCALL_GET_SUPPORTS_LANE_MAPPING:
+        case 26: /* GetVirtualDeviceMode: this is a physical display path. */
+            value = 0;
+            break;
+        case DPTX_APCALL_GET_SUPPORTS_HPD:
+            value = 1;
+            break;
+        default:
+            return 0xe00002c7;
+    }
+    if (reply_size < 32)
+        return 0xe00002c2; /* kIOReturnBadArgument */
+    memcpy(reply + 16, &value, sizeof(value));
+    return 0;
+}
+
 static const afk_epic_service_ops_t dcp_dptx_ops[] = {
     {
         .name = "AppleDCPDPTXRemotePort",
         .init = dptxport_init,
         .call = dptxport_call,
+        .call_v2 = dptxport_call_v2,
     },
     {},
 };
@@ -521,28 +656,28 @@ int dcp_dptx_connect(dcp_dptx_if_t *dptx, dptx_phy_t *phy, u32 die, u32 port)
 
     dptx->port[port].phy = dptx->phy = phy;
 
-    dptxport_connect(dptx->port[port].service, 0, dptx_phy_dcp_output(phy), die);
-    dptxport_request_display(dptx->port[port].service);
-
-    return 0;
+    int ret = dptxport_connect(dptx->port[port].service, 0, dptx_phy_dcp_output(phy), die);
+    if (ret)
+        return ret;
+    return dptxport_request_display(dptx->port[port].service);
 }
 
 int dcp_dptx_hpd(dcp_dptx_if_t *dptx, u32 port, bool hpd)
 {
-    if (!dptx->port[port].service)
+    if (port > 1 || !dptx->port[port].service)
         return -1;
 
-    dptxport_set_hpd(dptx->port[port].service, hpd);
-
-    return 0;
+    return dptxport_set_hpd(dptx->port[port].service, hpd);
 }
 
 int dcp_dptx_disconnect(dcp_dptx_if_t *dptx, u32 port)
 {
-    dptxport_release_display(dptx->port[port].service);
-    dptxport_set_hpd(dptx->port[port].service, false);
-
-    return 0;
+    if (port > 1 || !dptx->port[port].service)
+        return -1;
+    int ret = dptxport_release_display(dptx->port[port].service);
+    if (ret)
+        return ret;
+    return dptxport_set_hpd(dptx->port[port].service, false);
 }
 
 dcp_dptx_if_t *dcp_dptx_init(dcp_dev_t *dcp, u32 num_dptxports)

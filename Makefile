@@ -115,6 +115,7 @@ CHICKENS_OBJECTS := $(patsubst %,chickens/%, \
 	twister.o)
 
 DCP_OBJECTS := $(patsubst %,dcp/%, \
+	atc_phy.o \
 	dpav_ep.o \
 	dptx_phy.o \
 	dptx_port_ep.o \
@@ -177,7 +178,7 @@ OBJECTS := \
 	sio.o \
 	smc.o \
 	smp.o \
-	spmi.o \
+	spmi.o ace3.o \
 	start.o \
 	startup.o \
 	string.o \

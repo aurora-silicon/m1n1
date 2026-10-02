@@ -28,4 +28,13 @@ typedef struct tps6598x_irq_state {
 int tps6598x_disable_irqs(tps6598x_dev_t *dev, tps6598x_irq_state_t *state);
 int tps6598x_restore_irqs(tps6598x_dev_t *dev, tps6598x_irq_state_t *state);
 
+/* Shared TI logical-register fields used by the ACE3 SPMI transport. */
+#define TPS6598X_REG_DATA_STATUS         0x5f
+#define TPS6598X_STATUS_PLUG_PRESENT     BIT(0)
+#define TPS6598X_STATUS_PLUG_UPSIDE_DOWN BIT(4)
+#define TPS6598X_DATA_USB3_CONNECTION    BIT(5)
+#define TPS6598X_DATA_DP_CONNECTION      BIT(8)
+#define TPS6598X_DATA_TBT_CONNECTION     BIT(16)
+#define TPS6598X_DATA_USB4_CONNECTION    BIT(23)
+
 #endif

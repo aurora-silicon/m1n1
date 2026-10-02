@@ -8,21 +8,13 @@
 
 #include "dcp/parser.h"
 
-struct afk_rb_hdr {
-    u32 bufsz;
-    u32 unk;
-    u32 _pad1[14];
-    u32 rptr;
-    u32 _pad2[15];
-    u32 wptr;
-    u32 _pad3[15];
-};
-
 struct afk_rb {
     bool ready;
-    struct afk_rb_hdr *hdr;
+    volatile u32 *rptr;
+    volatile u32 *wptr;
     void *buf;
     size_t bufsz;
+    size_t block_size;
 };
 
 enum EPICType {
@@ -82,6 +74,55 @@ struct epic_cmd {
     u8 txcookie;
 } PACKED;
 
+/* AFKEPV2, as used by the T8152 display firmware. These headers replace
+ * epic_hdr/epic_sub_hdr; neither the sequence nor reserved bytes are a version.
+ */
+struct afkv2_hdr {
+    u8 seq;
+    u8 reserved;
+    u16 interface;
+    u32 length;
+} PACKED;
+
+struct afkv2_msg {
+    u64 token;
+    u8 type;
+    u8 category;
+    u8 flags;
+    u8 reserved[5];
+} PACKED;
+
+struct afkv2_cmd {
+    u8 flags;
+    u8 id;
+    u16 reserved;
+    u32 value; /* command: response capacity; response: IOReturn */
+} PACKED;
+
+struct afkv2_oob {
+    u64 rxbuf;
+    u64 txbuf;
+    u32 rxlen;
+    u32 txlen;
+} PACKED;
+
+struct afkv2_service_call {
+    u16 reserved;
+    u16 group;
+    u32 command;
+    u32 length;
+    u32 magic;
+    u8 padding[48];
+} PACKED;
+
+enum {
+    AFKV2_REPORT = 0,
+    AFKV2_COMMAND = 1,
+    AFKV2_RESPONSE = 2,
+    AFKV2_PUBLISH = 0x11,
+    AFKV2_OPEN = 0x12,
+};
+
 struct afk_epic {
     rtkit_dev_t *rtk;
 
@@ -104,6 +145,8 @@ struct afk_epic_ep {
     struct rtkit_buffer rxbuf;
 
     bool started;
+    bool afkv2;
+    u8 command_id;
     u16 seq;
 
     u32 num_channels;
@@ -148,16 +191,39 @@ enum RBEP_MSG {
 
 bool afk_rb_init(afk_epic_ep_t *epic, struct afk_rb *rb, u64 base, u64 size)
 {
-    rb->hdr = epic->buf.bfr + base;
-
-    if (rb->hdr->bufsz + sizeof(*rb->hdr) != size) {
-        printf("AFK: ring buffer size mismatch\n");
+    if (base > epic->buf.sz || size > epic->buf.sz - base || size < 4 * 0x40) {
+        printf("AFK: ring buffer outside allocated region\n");
+        return false;
+    }
+    dma_rmb();
+    void *hdr = epic->buf.bfr + base;
+    u32 bufsz = *(volatile u32 *)hdr;
+    /* AFKRingBuf in proxyclient already supports variable cache-line blocks.
+     * Three blocks hold size, read pointer and write pointer respectively. */
+    if (!bufsz || bufsz >= size || (size - bufsz) % 3) {
+        printf("AFK: invalid ring buffer sizes (data %#x, total %#lx)\n", bufsz, size);
+        return false;
+    }
+    size_t block = (size - bufsz) / 3;
+    if (block < 0x40 || (block & (block - 1)) || bufsz % block) {
+        printf("AFK: invalid ring block size %#lx (data %#x, total %#lx)\n", block, bufsz,
+               size);
+        return false;
+    }
+    rb->rptr = hdr + block;
+    rb->wptr = hdr + 2 * block;
+    if (*rb->rptr >= bufsz || *rb->wptr >= bufsz || *rb->rptr % block || *rb->wptr % block) {
+        printf("AFK: invalid initial ring pointers\n");
         return false;
     }
 
-    rb->buf = rb->hdr + 1;
-    rb->bufsz = rb->hdr->bufsz;
+    rb->buf = hdr + 3 * block;
+    rb->bufsz = bufsz;
+    rb->block_size = block;
     rb->ready = true;
+    if (block != 0x40)
+        printf("AFK: adopted %#lx-byte ring blocks (data %#x, total %#lx)\n", block, bufsz,
+               size);
 
     return true;
 }
@@ -167,9 +233,16 @@ static int afk_epic_poll(afk_epic_t *afk, int endpoint, bool block)
     int ret;
     struct rtkit_message msg;
 
-    while ((ret = rtkit_recv(afk->rtk, &msg)) == 0)
+    u32 timeout_usec = rtkit_get_timeout(afk->rtk);
+    u64 timeout = timeout_usec ? timeout_calculate(timeout_usec) : 0;
+    while ((ret = rtkit_recv(afk->rtk, &msg)) == 0) {
         if (!block)
             break;
+        if (timeout && timeout_expired(timeout)) {
+            printf("EPIC: timed out waiting for endpoint %x\n", endpoint);
+            return -1;
+        }
+    }
 
     if (ret < 0) {
         printf("EPIC: rtkit_recv failed!\n");
@@ -243,7 +316,7 @@ static int afk_epic_poll(afk_epic_t *afk, int endpoint, bool block)
         case RBEP_RECV: {
             dma_rmb();
             struct afk_rb *rb = &epic->rx;
-            if (rb->hdr->rptr != rb->hdr->wptr) {
+            if (rb->ready && *rb->rptr != *rb->wptr) {
                 if (endpoint == epic->ep)
                     return EPIC_DATA_READY;
                 else if (epic->recv_handler)
@@ -271,7 +344,10 @@ static int afk_epic_poll(afk_epic_t *afk, int endpoint, bool block)
 static int afk_epic_rx(afk_epic_ep_t *epic, struct afk_qe **qe)
 {
     struct afk_rb *rb = &epic->rx;
-    u32 rptr = rb->hdr->rptr;
+    dma_rmb();
+    u32 rptr = *rb->rptr;
+    if (rptr >= rb->bufsz || rptr % rb->block_size)
+        return -1;
     struct afk_qe *hdr = rb->buf + rptr;
 
     if (hdr->magic != QE_MAGIC) {
@@ -279,14 +355,17 @@ static int afk_epic_rx(afk_epic_ep_t *epic, struct afk_qe **qe)
         return -1;
     }
 
-    if (rptr + hdr->size > rb->bufsz) {
+    if (hdr->size > rb->bufsz - sizeof(*hdr))
+        return -1;
+
+    if (sizeof(*hdr) + hdr->size > rb->bufsz - rptr) {
         rptr = 0;
         hdr = rb->buf + rptr;
-        if (hdr->magic != QE_MAGIC) {
+        if (hdr->magic != QE_MAGIC || hdr->size > rb->bufsz - sizeof(*hdr)) {
             printf("EPIC: bad queue entry magic!\n");
             return -1;
         }
-        rb->hdr->rptr = rptr;
+        *rb->rptr = rptr;
     }
 
     *qe = hdr;
@@ -298,10 +377,13 @@ static int afk_epic_tx(afk_epic_ep_t *epic, u32 channel, u32 type, void *data, s
 {
     struct afk_rb *rb = &epic->tx;
 
-    u32 rptr = rb->hdr->rptr;
-    u32 wptr = rb->hdr->wptr;
+    if (size > rb->bufsz - sizeof(struct afk_qe))
+        return -1;
+
+    u32 rptr = *rb->rptr;
+    u32 wptr = *rb->wptr;
     struct afk_qe *hdr = rb->buf + wptr;
-    size_t buf_advance = ALIGN_UP(sizeof(struct afk_qe) + size, 1 << BLOCK_SHIFT);
+    size_t buf_advance = ALIGN_UP(sizeof(struct afk_qe) + size, rb->block_size);
 
     if (wptr < rptr && buf_advance >= rptr - wptr)
         goto buffer_full;
@@ -327,14 +409,14 @@ static int afk_epic_tx(afk_epic_ep_t *epic, u32 channel, u32 type, void *data, s
     }
 
     wptr += size;
-    wptr = ALIGN_UP(wptr, 1 << BLOCK_SHIFT);
+    wptr = ALIGN_UP(wptr, rb->block_size);
     if (wptr >= rb->bufsz)
         wptr = 0;
 
     memcpy(hdr + 1, data, size);
 
     dma_mb();
-    rb->hdr->wptr = wptr;
+    *rb->wptr = wptr;
     dma_wmb();
 
     struct rtkit_message msg = {
@@ -357,7 +439,7 @@ buffer_full:
 static void afk_epic_rx_ack(afk_epic_ep_t *epic)
 {
     struct afk_rb *rb = &epic->rx;
-    u32 rptr = rb->hdr->rptr;
+    u32 rptr = *rb->rptr;
     struct afk_qe *hdr = rb->buf + rptr;
 
     if (hdr->magic != QE_MAGIC) {
@@ -366,11 +448,11 @@ static void afk_epic_rx_ack(afk_epic_ep_t *epic)
 
     dma_mb();
 
-    rptr = ALIGN_UP(rptr + sizeof(*hdr) + hdr->size, 1 << BLOCK_SHIFT);
+    rptr = ALIGN_UP(rptr + sizeof(*hdr) + hdr->size, rb->block_size);
     assert(rptr <= rb->bufsz);
     if (rptr == rb->bufsz)
         rptr = 0;
-    rb->hdr->rptr = rptr;
+    *rb->rptr = rptr;
 }
 
 int afk_epic_work(afk_epic_t *afk, int endpoint)
@@ -381,7 +463,7 @@ int afk_epic_work(afk_epic_t *afk, int endpoint)
         afk_epic_ep_t *cur = afk->endpoint[i++];
         if (cur) {
             struct afk_rb *rb = &cur->rx;
-            if (rb->hdr->rptr != rb->hdr->wptr) {
+            if (rb->ready && *rb->rptr != *rb->wptr) {
                 if (cur->ep == endpoint) {
                     return EPIC_DATA_READY;
                 }
@@ -409,6 +491,11 @@ int afk_epic_work(afk_epic_t *afk, int endpoint)
     }
 
     return 0;
+}
+
+bool afk_epic_is_v2(const afk_epic_ep_t *epic)
+{
+    return epic->afkv2;
 }
 
 static afk_epic_service_t *afk_epic_find_service(afk_epic_ep_t *epic, u32 channel)
@@ -493,9 +580,229 @@ static int afk_epic_handle_std_service(afk_epic_ep_t *epic, int channel, u8 cate
     return -1;
 }
 
+static bool afkv2_decode(struct afk_qe *qe, struct afkv2_hdr **hdr,
+                        struct afkv2_msg **msg, void **payload, size_t *size)
+{
+    if (qe->channel || qe->type || qe->size < sizeof(**hdr) + sizeof(**msg))
+        return false;
+    *hdr = (void *)qe->data;
+    if ((*hdr)->length != qe->size - sizeof(**hdr))
+        return false;
+    *msg = (void *)(*hdr + 1);
+    if ((*msg)->category > AFKV2_RESPONSE)
+        return false;
+    *payload = *msg + 1;
+    *size = (*hdr)->length - sizeof(**msg);
+    return true;
+}
+
+static int afkv2_open(afk_epic_ep_t *epic, u16 interface)
+{
+    struct {
+        struct afkv2_hdr hdr;
+        struct afkv2_msg msg;
+    } PACKED packet = {
+        .hdr = {.seq = epic->seq++, .interface = interface,
+                .length = sizeof(struct afkv2_msg)},
+        .msg = {.type = AFKV2_OPEN, .category = AFKV2_REPORT, .flags = 1},
+    };
+    return afk_epic_tx(epic, 0, 0, &packet, sizeof(packet));
+}
+
+static int afkv2_copy_response(afk_epic_ep_t *epic, void *payload, size_t size,
+                              u8 id, void *rxbuf, size_t *rxsize)
+{
+    if (size < sizeof(struct afkv2_cmd))
+        return -1;
+    struct afkv2_cmd *cmd = payload;
+    if (cmd->id != id || cmd->flags & ~1)
+        return -1;
+    if (cmd->value) {
+        printf("AFKV2: command returned %#x\n", cmd->value);
+        return (s32)cmd->value < 0 ? (s32)cmd->value : -1;
+    }
+    payload = cmd + 1;
+    size -= sizeof(*cmd);
+    if (cmd->flags & 1) {
+        if (size < sizeof(struct afkv2_oob))
+            return -1;
+        struct afkv2_oob *oob = payload;
+        payload = oob + 1;
+        size -= sizeof(*oob);
+        if (oob->rxlen) {
+            if (oob->rxbuf != epic->rxbuf.dva || oob->rxlen > epic->rxbuf.sz)
+                return -1;
+            payload = epic->rxbuf.bfr;
+            size = oob->rxlen;
+            dma_rmb();
+        }
+    }
+    if (size > (rxsize ? *rxsize : 0) || (size && !rxbuf))
+        return -1;
+    if (size)
+        memcpy(rxbuf, payload, size);
+    if (rxsize)
+        *rxsize = size;
+    return 0;
+}
+
+/* Until the native PHY callbacks are implemented, complete peer commands with
+ * kIOReturnUnsupported. AFKEPCommandLocal accepts an empty response; for OOB
+ * commands retain the descriptor addresses but return zero bytes. Never map or
+ * dereference a firmware-supplied address merely to reject an operation. */
+static int afkv2_reject_command(afk_epic_ep_t *epic, const struct afkv2_hdr *hdr,
+                               const struct afkv2_msg *msg, const void *payload, size_t size)
+{
+    if (msg->category != AFKV2_COMMAND || !hdr->interface ||
+        size < sizeof(struct afkv2_cmd))
+        return -1;
+    const struct afkv2_cmd *cmd = payload;
+    if (cmd->flags & ~1 ||
+        ((cmd->flags & 1) && size < sizeof(*cmd) + sizeof(struct afkv2_oob)))
+        return -1;
+
+    struct {
+        struct afkv2_hdr hdr;
+        struct afkv2_msg msg;
+        struct afkv2_cmd cmd;
+        struct afkv2_oob oob;
+    } PACKED reply = {
+        .hdr = {.seq = epic->seq++, .interface = hdr->interface},
+        .msg = {.token = msg->token, .type = msg->type, .category = AFKV2_RESPONSE},
+        .cmd = {.flags = cmd->flags, .id = cmd->id, .value = 0xe00002c7},
+    };
+    size_t length = sizeof(reply) - sizeof(reply.oob);
+    if (cmd->flags & 1) {
+        const struct afkv2_oob *oob = (const void *)(cmd + 1);
+        reply.oob.rxbuf = oob->rxbuf;
+        reply.oob.txbuf = oob->txbuf;
+        length += sizeof(reply.oob);
+    }
+    reply.hdr.length = length - sizeof(reply.hdr);
+    printf("AFKV2: rejecting callback interface %u type %#x id %u as unsupported\n",
+           hdr->interface, msg->type, cmd->id);
+    return afk_epic_tx(epic, 0, 0, &reply, length);
+}
+
+static int afkv2_handle_command(afk_epic_ep_t *epic, const struct afkv2_hdr *hdr,
+                               const struct afkv2_msg *msg, const void *payload, size_t size)
+{
+    if (size < sizeof(struct afkv2_cmd) || msg->category != AFKV2_COMMAND)
+        return -1;
+    const struct afkv2_cmd *cmd = payload;
+    afk_epic_service_t *service = afk_epic_find_service(epic, hdr->interface);
+    if (msg->type != SUBTYPE_STD_SERVICE || cmd->flags || !service ||
+        !service->ops->call_v2)
+        return afkv2_reject_command(epic, hdr, msg, payload, size);
+
+    /* Only the observed inline callback form is supported. Validate both
+     * lengths before copying or dispatching; no peer DMA address is used. */
+    size_t body_size = size - sizeof(*cmd);
+    const struct afkv2_service_call *call = (const void *)(cmd + 1);
+    if (body_size < sizeof(*call) + sizeof(u32) || cmd->value < body_size ||
+        call->magic != 0x69706378 || call->length != body_size - sizeof(*call))
+        return afkv2_reject_command(epic, hdr, msg, payload, size);
+
+    size_t length = sizeof(*hdr) + sizeof(*msg) + size;
+    u8 *reply = calloc(1, length);
+    if (!reply)
+        return -1;
+    struct afkv2_hdr *rhdr = (void *)reply;
+    struct afkv2_msg *rmsg = (void *)(rhdr + 1);
+    struct afkv2_cmd *rcmd = (void *)(rmsg + 1);
+    struct afkv2_service_call *rcall = (void *)(rcmd + 1);
+    rhdr->seq = epic->seq++;
+    rhdr->interface = hdr->interface;
+    rhdr->length = length - sizeof(*rhdr);
+    rmsg->token = msg->token;
+    rmsg->type = msg->type;
+    rmsg->category = AFKV2_RESPONSE;
+    rcmd->id = cmd->id;
+    memcpy(rcall, call, body_size);
+    u32 status = service->ops->call_v2(service, call->group, call->command,
+                                      call + 1, call->length, rcall + 1, call->length);
+    memcpy(rcall + 1, &status, sizeof(status));
+    printf("AFKV2: service callback group %u command %u status %#x\n",
+           call->group, call->command, status);
+    int ret = afk_epic_tx(epic, 0, 0, reply, length);
+    free(reply);
+    return ret;
+}
+
+static int afkv2_command(afk_epic_ep_t *epic, int channel, u16 type, void *txbuf,
+                         size_t txsize, void *rxbuf, size_t *rxsize)
+{
+    if (channel < 1 || channel > 0xffff || type > 0xff || txsize > epic->txbuf.sz ||
+        (rxsize && *rxsize > epic->rxbuf.sz))
+        return -1;
+    struct {
+        struct afkv2_hdr hdr;
+        struct afkv2_msg msg;
+        struct afkv2_cmd cmd;
+        struct afkv2_oob oob;
+    } PACKED packet = {
+        .hdr = {.seq = epic->seq++, .interface = channel,
+                .length = sizeof(struct afkv2_msg) + sizeof(struct afkv2_cmd) +
+                          sizeof(struct afkv2_oob)},
+        .msg = {.type = type, .category = AFKV2_COMMAND},
+        .cmd = {.flags = 1, .id = epic->command_id++, .value = rxsize ? *rxsize : 0},
+        .oob = {.rxbuf = rxsize && *rxsize ? epic->rxbuf.dva : 0,
+                .txbuf = epic->txbuf.dva,
+                .rxlen = rxsize ? *rxsize : 0, .txlen = txsize},
+    };
+    memcpy(epic->txbuf.bfr, txbuf, txsize);
+    if (afk_epic_tx(epic, 0, 0, &packet, sizeof(packet)) < 0)
+        return -1;
+    u32 usec = rtkit_get_timeout(epic->afk->rtk);
+    u64 deadline = timeout_calculate(usec ? usec : 2000000);
+    while (!timeout_expired(deadline)) {
+        int ret = afk_epic_work(epic->afk, epic->ep);
+        if (ret < 0)
+            return ret;
+        if (ret != EPIC_DATA_READY)
+            continue;
+        struct afk_qe *qe;
+        if (afk_epic_rx(epic, &qe) < 0)
+            return -1;
+#ifdef AFK_TRACE
+        printf("AFKV2: command receive size=%u\n", qe->size);
+        hexdump(qe, min((size_t)qe->size + sizeof(*qe), 128));
+#endif
+        struct afkv2_hdr *hdr;
+        struct afkv2_msg *msg;
+        void *payload;
+        size_t size;
+        if (!afkv2_decode(qe, &hdr, &msg, &payload, &size)) {
+            afk_epic_rx_ack(epic);
+            return -1;
+        }
+        /* Firmware supplies its own token/timestamp in responses. Correlate
+         * by interface, subtype and command ID, as AFKEPInterfaceV2 does. */
+        if (hdr->interface == channel && msg->category == AFKV2_RESPONSE &&
+            msg->type == type) {
+            ret = afkv2_copy_response(epic, payload, size, packet.cmd.id, rxbuf, rxsize);
+            afk_epic_rx_ack(epic);
+            return ret;
+        }
+        printf("AFKV2: received interface %u category %u type %#x while awaiting response\n",
+               hdr->interface, msg->category, msg->type);
+        if (msg->category == AFKV2_COMMAND &&
+            afkv2_handle_command(epic, hdr, msg, payload, size) < 0) {
+            afk_epic_rx_ack(epic);
+            return -1;
+        }
+        afk_epic_rx_ack(epic);
+    }
+    printf("AFKV2: timed out waiting for command %#x response\n", type);
+    return -1;
+}
+
 int afk_epic_command(afk_epic_ep_t *epic, int channel, u16 sub_type, void *txbuf, size_t txsize,
                      void *rxbuf, size_t *rxsize)
 {
+    if (epic->afkv2)
+        return afkv2_command(epic, channel, sub_type, txbuf, txsize, rxbuf, rxsize);
+
     struct {
         struct epic_hdr hdr;
         struct epic_sub_hdr sub;
@@ -596,6 +903,28 @@ static void afk_epic_notify_handler(afk_epic_ep_t *epic)
     if (ret < 0)
         return;
 
+    /* AFKEPV2 callbacks have their own command headers. Never feed these to
+     * the legacy EPIC notification parser or its unqualified PHY callbacks. */
+    if (epic->afkv2) {
+        struct afkv2_hdr *hdr;
+        struct afkv2_msg *msg;
+        void *payload;
+        size_t size;
+        if (afkv2_decode(rmsg, &hdr, &msg, &payload, &size)) {
+            printf("AFKV2: async interface %u category %u type %#x (%zu bytes)\n",
+                   hdr->interface, msg->category, msg->type, size);
+            if (msg->category == AFKV2_COMMAND &&
+                afkv2_handle_command(epic, hdr, msg, payload, size) < 0)
+                printf("AFKV2: failed to handle callback\n");
+        } else
+            printf("AFKV2: malformed async message\n");
+#ifdef AFK_TRACE
+        hexdump(rmsg, min((size_t)rmsg->size + sizeof(*rmsg), 128));
+#endif
+        afk_epic_rx_ack(epic);
+        return;
+    }
+
     if (rmsg->type != TYPE_NOTIFY) {
         dprintf("EPIC[0x%02x]: got unexpected message type %d in %s\n", epic->ep, rmsg->type,
                 __func__);
@@ -648,7 +977,7 @@ afk_epic_ep_t *afk_epic_start_ep(afk_epic_t *afk, int endpoint, const afk_epic_s
     while (!epic->started) {
         int ret = afk_epic_poll(epic->afk, endpoint, true);
         if (ret < 0)
-            break;
+            goto err;
         else if (ret > 0)
             printf("EPIC: received unexpected message during init\n");
     }
@@ -713,12 +1042,18 @@ int afk_epic_start_interface(afk_epic_ep_t *epic, void *intf, int expected, size
 
     /* consume messages for other endpoints, syslog or ioreport might be noisy
      * at startup */
+    u32 timeout_usec = rtkit_get_timeout(epic->afk->rtk);
+    u64 first_timeout = timeout_usec ? timeout_calculate(timeout_usec) : 0;
     while (1) {
         int ret = afk_epic_work(epic->afk, epic->ep);
         if (ret < 0)
             return ret;
         if (ret == EPIC_DATA_READY)
             break;
+        if (first_timeout && timeout_expired(first_timeout)) {
+            printf("EPIC: timed out waiting for service announcement\n");
+            return -1;
+        }
     }
 
     u64 timeout = timeout_calculate(500000);
@@ -739,6 +1074,12 @@ int afk_epic_start_interface(afk_epic_ep_t *epic, void *intf, int expected, size
         if (ret < 0)
             return ret;
 
+#ifdef AFK_TRACE
+        printf("AFK[ep:%02x]: service message channel=%u type=%u size=%u\n", epic->ep,
+               msg->channel, msg->type, msg->size);
+        hexdump(msg, min((size_t)msg->size + sizeof(*msg), 128));
+#endif
+
         if (msg->type != TYPE_NOTIFY && msg->type != TYPE_REPLY) {
             dprintf("AFK[ep:%02x]: got unexpected message type %d during iface start\n", epic->ep,
                     msg->type);
@@ -746,27 +1087,55 @@ int afk_epic_start_interface(afk_epic_ep_t *epic, void *intf, int expected, size
             continue;
         }
 
-        struct epic_hdr *hdr = (void *)(msg + 1);
-        struct epic_sub_hdr *sub = (void *)(hdr + 1);
+        struct afkv2_hdr *v2hdr;
+        struct afkv2_msg *v2msg;
+        void *payload;
+        size_t payload_size;
+        u32 channel = msg->channel;
+        size_t props_size;
+        bool v2 = afkv2_decode(msg, &v2hdr, &v2msg, &payload, &payload_size);
+        if (v2) {
+            if (!v2hdr->interface || v2msg->category != AFKV2_REPORT ||
+                v2msg->type != AFKV2_PUBLISH || payload_size < sizeof(*announce)) {
+                afk_epic_rx_ack(epic);
+                continue;
+            }
+            announce = payload;
+            channel = v2hdr->interface;
+            props_size = payload_size - sizeof(*announce);
+        } else {
+            if (epic->afkv2 || msg->size < sizeof(struct epic_hdr) +
+                                             sizeof(struct epic_sub_hdr) + sizeof(*announce)) {
+                afk_epic_rx_ack(epic);
+                continue;
+            }
+            struct epic_hdr *hdr = (void *)msg->data;
+            struct epic_sub_hdr *sub = (void *)(hdr + 1);
+            if (hdr->version != 2 || sub->category != CAT_REPORT ||
+                sub->type != SUBTYPE_ANNOUNCE || sub->length < sizeof(*announce) ||
+                sub->length > msg->size - sizeof(*hdr) - sizeof(*sub)) {
+                afk_epic_rx_ack(epic);
+                continue;
+            }
+            announce = (void *)(sub + 1);
+            props_size = sub->length - sizeof(*announce);
+        }
 
-        if (sub->category != CAT_REPORT || sub->type != SUBTYPE_ANNOUNCE) {
-            dprintf("AFK[ep:%02x]: got unexpected message %02x:%04x during iface start\n", epic->ep,
-                    sub->category, sub->type);
+        if (strnlen(announce->name, sizeof(announce->name)) == sizeof(announce->name)) {
             afk_epic_rx_ack(epic);
             continue;
         }
 
         if (epic->num_channels >= AFK_MAX_CHANNEL) {
             printf("AFK[ep:%02x]: Out of free service for service on channel %d\n", epic->ep,
-                   msg->channel);
+                   channel);
             afk_epic_rx_ack(epic);
             continue;
         }
 
-        announce = (void *)(sub + 1);
-
-        size_t props_size = sub->length - offsetof(struct epic_announce, props);
-
+        /* AFKEPV2's disp0 service has only its direct name. DPTX services
+         * still publish EPICName/EPICProviderClass/EPICUnit properties. */
+        service_name = announce->name;
         if (props_size > 36) {
             struct dcp_parse_ctx ctx;
 
@@ -778,22 +1147,25 @@ int afk_epic_start_interface(afk_epic_ep_t *epic, void *intf, int expected, size
                 continue;
             }
             ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit);
-            if (ret) {
+            if (ret && !v2) {
                 printf("AFK[ep:%02x]: failed to extract init props (len=%zu): %d\n", epic->ep,
                        props_size, ret);
                 hexdump(announce->props, props_size);
                 afk_epic_rx_ack(epic);
                 continue;
             }
-            service_name = epic_class;
-        } else {
-            service_name = announce->name;
+            if (!ret)
+                service_name = epic_class;
+            else
+                epic_unit = -1;
         }
 
         const afk_epic_service_ops_t *ops = afk_match_service(epic, service_name);
         if (!ops) {
             printf("AFK[ep:%02x]: unable to match service %s on channel %d\n", epic->ep,
-                   service_name, msg->channel);
+                   service_name, channel);
+            free(epic_name);
+            free(epic_class);
             afk_epic_rx_ack(epic);
             continue;
         }
@@ -803,12 +1175,23 @@ int afk_epic_start_interface(afk_epic_ep_t *epic, void *intf, int expected, size
         service->ops = ops;
         service->intf = intf;
         service->epic = epic;
-        service->channel = msg->channel;
+        service->channel = channel;
         service->seq = 0;
+
+        if (v2) {
+            epic->afkv2 = true;
+            printf("AFKV2: opening service %s on interface %u\n", service_name, channel);
+            if (afkv2_open(epic, channel) < 0) {
+                free(epic_name);
+                free(epic_class);
+                afk_epic_rx_ack(epic);
+                return -1;
+            }
+        }
 
         ops->init(service, epic_name, service_name, epic_unit);
         dprintf("AFK[ep:%02x]: new service %s on channel %d\n", epic->ep, service_name,
-                msg->channel);
+                channel);
         free(epic_name);
         free(epic_class);
 
