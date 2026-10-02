@@ -227,15 +227,19 @@ void _cpu_reset_c(void *stack)
         smp_secondary_entry();
         return;
     }
-    if (!is_boot_cpu())
-        uart_puts("RVBAR entry on secondary CPU");
-    else
-        uart_puts("RVBAR entry on primary CPU");
+    bool quiet = chip_id == T8142 && !is_boot_cpu();
+    if (!quiet) {
+        if (!is_boot_cpu())
+            uart_puts("RVBAR entry on secondary CPU");
+        else
+            uart_puts("RVBAR entry on primary CPU");
 
-    printf("\n  Stack base: %p\n", stack);
-    printf("  MPIDR: 0x%lx\n", mrs(MPIDR_EL1));
+        printf("\n  Stack base: %p\n", stack);
+        printf("  MPIDR: 0x%lx\n", mrs(MPIDR_EL1));
+    }
     init_cpu();
-    printf("  Running in EL%lu\n\n", mrs(CurrentEL) >> 2);
+    if (!quiet)
+        printf("  Running in EL%lu\n\n", mrs(CurrentEL) >> 2);
 
     exception_initialize();
 
