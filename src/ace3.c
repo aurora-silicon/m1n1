@@ -101,4 +101,3 @@ int ace3_read(spmi_dev_t *dev, u8 sid, u8 lreg, u8 *bfr, size_t len)
 
     return (int)len;
 }
-

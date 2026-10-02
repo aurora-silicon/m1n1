@@ -391,6 +391,3 @@ try:
     print('DISPLAY_LEFT_ACTIVE',keep_active,flush=True)
 finally:
     f.dev.close()
-
-
-
