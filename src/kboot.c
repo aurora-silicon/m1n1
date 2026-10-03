@@ -2164,43 +2164,52 @@ static int dt_set_sep(void)
         return 0;
     }
 
-    int anode_mmap = adt_path_offset(adt, "/chosen/memory-map");
-    if (anode_mmap < 0)
-        bail("ADT: /chosen/memory-map not found \n");
-
+    /*
+     * Nothing here is needed to boot: the SEP node stays disabled until a
+     * driver enables it. Each step warns and is skipped on failure instead of
+     * aborting the boot, so a warm-registration SoC (iBoot already booted the
+     * SEP; no SEPFW handoff needed) still gets the manifests its driver uses.
+     */
     u64 phys_map[2];
-    size_t ret = ADT_GETPROP_ARRAY(adt, anode_mmap, "SEPFW", phys_map);
-    if (ret != sizeof(phys_map))
-        bail("ADT: could not get sepfw memory\n");
+    size_t ret;
 
-    const char *node_name = "sep-firmware";
-    int mem_node =
-        dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", false, phys_map[0], phys_map[1]);
-    if (mem_node < 0)
-        bail("FDT: failed to reserve sepfw");
-
-    uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
-    ret = dt_device_add_mem_region(path, mem_phandle, "sepfw");
-    if (ret < 0)
-        bail("FDT: failed to add sepfw region");
+    int anode_mmap = adt_path_offset(adt, "/chosen/memory-map");
+    if (anode_mmap < 0) {
+        printf("ADT: /chosen/memory-map not found; not reserving sepfw\n");
+    } else if (ADT_GETPROP_ARRAY(adt, anode_mmap, "SEPFW", phys_map) != sizeof(phys_map)) {
+        printf("ADT: no SEPFW memory; not reserving sepfw\n");
+    } else {
+        int mem_node = dt_get_or_add_reserved_mem("sep-firmware", "apple,asc-mem", false,
+                                                  phys_map[0], phys_map[1]);
+        if (mem_node < 0)
+            printf("FDT: failed to reserve sepfw\n");
+        else if (dt_device_add_mem_region(path, fdt_get_phandle(dt, mem_node), "sepfw") < 0)
+            printf("FDT: failed to add sepfw region\n");
+    }
 
     int node = fdt_path_offset(dt, path);
-    if (node < 0)
-        bail("FDT: sep not not found in devtree\n");
+    if (node < 0) {
+        printf("FDT: sep not found in devtree\n");
+        return 0;
+    }
 
     int anode_manifest = adt_path_offset(adt, "/chosen/boot-object-manifests");
-    if (anode_manifest < 0)
-        bail("ADT: /chosen/boot-object-manifests not found \n");
+    if (anode_manifest < 0) {
+        printf("ADT: /chosen/boot-object-manifests not found; SEP manifests not set\n");
+        return 0;
+    }
 
     ret = ADT_GETPROP_ARRAY(adt, anode_manifest, "lpol", phys_map);
     if (ret != sizeof(phys_map))
-        bail("ADT: could not get local policy\n");
-    fdt_setprop(dt, node, "local-policy-manifest", (void *)phys_map[0], phys_map[1]);
+        printf("ADT: could not get local policy\n");
+    else if (fdt_setprop(dt, node, "local-policy-manifest", (void *)phys_map[0], phys_map[1]))
+        printf("FDT: could not set local-policy-manifest\n");
 
     ret = ADT_GETPROP_ARRAY(adt, anode_manifest, "ibot", phys_map);
     if (ret != sizeof(phys_map))
-        bail("ADT: could not get iboot manifest\n");
-    fdt_setprop(dt, node, "iboot-manifest", (void *)phys_map[0], phys_map[1]);
+        printf("ADT: could not get iboot manifest\n");
+    else if (fdt_setprop(dt, node, "iboot-manifest", (void *)phys_map[0], phys_map[1]))
+        printf("FDT: could not set iboot-manifest\n");
 
     return 0;
 }
