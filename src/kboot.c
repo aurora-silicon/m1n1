@@ -1108,6 +1108,17 @@ static const struct adt_tunable_info usb4_rc_tunables[] = {
     {"lbw_fabric_tunables", "apple,tunable-rc", 0x8000, 0x4000, true},
 };
 
+/* Type 7 firmware does not supply the four per-direction fabric tables. */
+static const struct adt_tunable_info usb4_t8142_nhi_tunables[] = {
+    {"hi_up_tx_desc_fabric_tunables", "apple,tunable-nhi", 0xe8000, 0x4000, false},
+    {"hi_up_tx_data_fabric_tunables", "apple,tunable-nhi", 0xec000, 0x4000, false},
+    {"hi_up_rx_desc_fabric_tunables", "apple,tunable-nhi", 0xf0000, 0x4000, false},
+    {"hi_up_wr_fabric_tunables", "apple,tunable-nhi", 0xf4000, 0x4000, false},
+    {"hi_up_merge_fabric_tunables", "apple,tunable-nhi", 0xf8000, 0x4000, true},
+    {"hi_dn_merge_fabric_tunables", "apple,tunable-nhi", 0xfc000, 0x4000, true},
+    {"fw_int_ctl_management_tunables", "apple,tunable-nhi", 0x4000, 0x4000, true},
+};
+
 static const struct adt_tunable_info usb4_pcie_adapter_tunables[] = {
     {"pcie_adapter_regs_tunables", "apple,tunable-pcie-adapter", 0x0, 0x4000, true},
 };
@@ -1141,7 +1152,7 @@ static int dt_append_acio_tunable(int adt_node, int fdt_node,
             return 0;
     }
 
-    if (tunables_len % sizeof(*tunable_adt)) {
+    if ((tunable_info->required && !tunables_len) || tunables_len % sizeof(*tunable_adt)) {
         printf("ADT: tunable %s with invalid length %d\n", tunable_info->adt_name, tunables_len);
         return -1;
     }
@@ -1160,8 +1171,15 @@ static int dt_append_acio_tunable(int adt_node, int fdt_node,
             return -1;
         }
 
-        if (tunable->offset + tunable->size > tunable_info->reg_size) {
+        if (tunable_info->reg_size < tunable->size ||
+            tunable->offset > tunable_info->reg_size - tunable->size ||
+            tunable_info->reg_offset > UINT32_MAX - tunable->offset) {
             printf("kboot: ACIO tunable has invalid offset %x\n", tunable->offset);
+            return -1;
+        }
+
+        if (tunable->mask > UINT32_MAX || tunable->value > UINT32_MAX) {
+            printf("kboot: ACIO tunable does not fit a 32-bit register\n");
             return -1;
         }
 
@@ -1208,7 +1226,7 @@ static int dt_copy_usb4_drom(const char *adt_path, const char *dt_alias, u64 rou
 
     u32 drom_len;
     const u8 *drom_blob = adt_getprop(adt, adt_node, "thunderbolt-drom", &drom_len);
-    if (!drom_blob || !drom_len)
+    if (!drom_blob || drom_len < 1 + sizeof(router_uuid))
         bail("ADT: Failed to get thunderbolt-drom\n");
 
     if (drom_len > sizeof(drom))
@@ -1258,6 +1276,13 @@ static int dt_set_acio_tunables(void)
     char adt_path[32];
     char fdt_alias[32];
     u64 router_uuid = rust_usb4_router_uuid();
+    const struct adt_tunable_info *nhi_tunables = usb4_nhi_tunables;
+    size_t n_nhi_tunables = ARRAY_SIZE(usb4_nhi_tunables);
+
+    if (chip_id == T8142) {
+        nhi_tunables = usb4_t8142_nhi_tunables;
+        n_nhi_tunables = ARRAY_SIZE(usb4_t8142_nhi_tunables);
+    }
 
     if (!router_uuid)
         bail("ADT: unable to generate USB4 router UUID\n");
@@ -1279,8 +1304,7 @@ static int dt_set_acio_tunables(void)
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_nhi", i);
         if (!fdt_get_alias(dt, fdt_alias))
             snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-nhi", i);
-        dt_copy_acio_tunables(adt_path, fdt_alias, usb4_nhi_tunables,
-                              sizeof(usb4_nhi_tunables) / sizeof(*usb4_nhi_tunables));
+        dt_copy_acio_tunables(adt_path, fdt_alias, nhi_tunables, n_nhi_tunables);
         dt_copy_usb4_drom(adt_path, fdt_alias, router_uuid | i);
     }
 
