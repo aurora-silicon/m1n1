@@ -215,7 +215,10 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
         goto out_iovad;
     }
 
-    if (!rtkit_boot(dcp->rtkit)) {
+    /* Keep unqualified ASCWrap-v8 firmware from trapping startup in a wait. */
+    bool booted = asc_is_v8(dcp->asc) ? rtkit_boot_timed(dcp->rtkit, 2000000)
+                                       : rtkit_boot(dcp->rtkit);
+    if (!booted) {
         printf("dcp: failed to boot RTKit\n");
         goto out_iovad;
     }
@@ -251,6 +254,12 @@ out_free:
 
 int dcp_shutdown(dcp_dev_t *dcp, bool sleep)
 {
+    /* The ASCWrap-v8 sleep path needs a PMGR2 reset, which is not implemented
+     * yet. Quiescing has a working RTKit wake/renegotiation path on T8152. */
+    if (sleep && asc_is_v8(dcp->asc)) {
+        printf("dcp: using quiesce instead of sleep without PMGR2 reset\n");
+        sleep = false;
+    }
     /* dcp/dcp0 on desktop M2 and M2 Pro/Max devices do not wake from sleep */
     dcp_system_shutdown(dcp->system_ep);
     dcp_dptx_shutdown(dcp->dptx_ep);

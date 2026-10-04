@@ -24,6 +24,11 @@ iova_domain_t *iovad_init(u64 base, u64 limit)
         return NULL;
     }
 
+    /* limit is exclusive, including when the ADT supplies a high IOVA base. */
+    u64 first = base ? base : SZ_16K;
+    if (limit <= first || limit != ALIGN_DOWN(limit, SZ_16K))
+        return NULL;
+
     iova_domain_t *iovad = calloc(1, sizeof(*iovad));
     if (!iovad)
         return NULL;
@@ -35,8 +40,8 @@ iova_domain_t *iovad_init(u64 base, u64 limit)
     }
 
     /* don't hand out NULL pointers */
-    blk->iova = base;
-    blk->sz = limit - SZ_16K;
+    blk->iova = first;
+    blk->sz = limit - first;
     blk->next = NULL;
     iovad->base = base;
     iovad->limit = limit;

@@ -6,6 +6,7 @@
 #include "adt.h"
 #include "assert.h"
 #include "dcp.h"
+#include "dcp/dptx_phy.h"
 #include "dcp_iboot.h"
 #include "fb.h"
 #include "firmware.h"
@@ -378,7 +379,7 @@ static int display_swap(u64 iova, u32 stride, u32 width, u32 height)
         .plane_cnt = 1,
         .width = width,
         .height = height,
-        .surface_fmt = FMT_w30r,
+        .surface_fmt = chip_id == T8152 ? FMT_BGRA : FMT_w30r,
         .colorspace = 2,
         .eotf = EOTF_GAMMA_SDR,
         .transform = XFRM_NONE,
@@ -574,12 +575,13 @@ int display_configure(const char *config)
     bool reinit = false;
     if (fb_pa != cur_boot_args.video.base || cur_boot_args.video.stride != stride ||
         cur_boot_args.video.width != tbest.width || cur_boot_args.video.height != tbest.height ||
-        cur_boot_args.video.depth != 30) {
+        (cur_boot_args.video.depth & FB_DEPTH_MASK) != (chip_id == T8152 ? 32 : 30)) {
         cur_boot_args.video.base = fb_pa;
         cur_boot_args.video.stride = stride;
         cur_boot_args.video.width = tbest.width;
         cur_boot_args.video.height = tbest.height;
-        cur_boot_args.video.depth = 30 | (opts.retina ? FB_DEPTH_FLAG_RETINA : 0);
+        cur_boot_args.video.depth = (chip_id == T8152 ? 32 : 30) |
+                                   (opts.retina ? FB_DEPTH_FLAG_RETINA : 0);
         reinit = true;
     }
 
@@ -607,8 +609,91 @@ int display_configure(const char *config)
     return 1;
 }
 
+static int display_t8152_work(u32 usec)
+{
+    u64 deadline = timeout_calculate(usec);
+    do {
+        if (dcp_work(dcp) < 0)
+            return -1;
+    } while (get_ticks() < deadline);
+    return 0;
+}
+
+static int display_init_t8152(void)
+{
+    /* A real firmware framebuffer already has a working transport. Adopt it
+     * unchanged, whether it came from HDMI, USB-C or another firmware route. */
+    if (cur_boot_args.video.base && cur_boot_args.video.width && cur_boot_args.video.height &&
+        !(cur_boot_args.video.width == 640 && cur_boot_args.video.height == 1136)) {
+        printf("display: Using firmware framebuffer (%ldx%ld)\n", cur_boot_args.video.width,
+               cur_boot_args.video.height);
+        return 0;
+    }
+
+#ifdef NO_DISPLAY
+    return 0;
+#endif
+
+    /* This read-only probe checks J873g's ADT, ACE3 connection, lane mode and
+     * routing before any PHY writes. Other ports and USB4 docks stay untouched. */
+    dptx_phy_t *phy = dptx_phy_init("/arm-io/atc-phy3", 0);
+    if (!phy) {
+        printf("display: No supported USB-C display connected\n");
+        return 0;
+    }
+
+    if (display_start_dcp() < 0) {
+        dptx_phy_shutdown(phy);
+        return -1;
+    }
+
+    /* Keep the native route owned by DCP for modesets and later shutdown.
+     * Do not use the older HDMI power/reset path on this PMGR2 platform. */
+    dcp->phy = phy;
+    dcp->dpav_ep = dcp_dpav_init(dcp);
+    if (!dcp->dpav_ep)
+        goto fail;
+    dcp->dptx_ep = dcp_dptx_init(dcp, 2);
+    if (!dcp->dptx_ep)
+        goto fail;
+    if (dcp_connect_dptx(dcp) || dcp_dptx_hpd(dcp->dptx_ep, 0, true))
+        goto fail;
+
+    /* Service firmware continuously while the qualified direct-DP route
+     * trains. Host round trips and idle delays interrupt this exchange. */
+    if (display_t8152_work(8000000) < 0)
+        goto fail;
+    int timing_cnt = 0, color_cnt = 0;
+    if (dcp_ib_get_hpd(iboot, &timing_cnt, &color_cnt) != 1 || !timing_cnt || !color_cnt)
+        goto fail;
+    if (dcp_ib_set_power(iboot, true) < 0 || display_t8152_work(8000000) < 0)
+        goto fail;
+
+    /* Start with the mode qualified for this route. Subsequent modesets use
+     * the common display path and retain the normal framebuffer console. */
+    if (display_configure("1280x720@60") > 0)
+        return 1;
+
+fail:
+    printf("display: USB-C initialization failed\n");
+    if (dcp->dptx_ep)
+        dcp_dptx_disconnect(dcp->dptx_ep, 0);
+    /* Stop a failed route, but leave successful scanout running when the
+     * normal next-stage shutdown quiesces DCP. */
+    dcp->phy = NULL;
+    display_shutdown(DCP_QUIESCED);
+    dptx_phy_shutdown(phy);
+    dcp = NULL;
+    return -1;
+}
+
 int display_init(void)
 {
+    if (chip_id == T8152) {
+        display_is_external = true;
+        return display_init_t8152();
+    }
+
     const char *disp_path;
     if (adt_is_compatible(adt, 0, "J180dAP") || adt_is_compatible(adt, 0, "J475dAP"))
         disp_path = "/arm-io/dispext4";

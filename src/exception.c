@@ -154,7 +154,8 @@ void exception_initialize(void)
             break;
     }
 
-    if (is_boot_cpu())
+    /* Initial T8152 bring-up polls KIS without configuring the AIC. */
+    if (is_boot_cpu() && chip_id != T8152)
         msr(DAIF, 0 << 6); // Enable SError, IRQ and FIQ
     else
         msr(DAIF, 3 << 6); // Disable IRQ and FIQ

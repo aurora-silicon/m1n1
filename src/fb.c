@@ -523,7 +523,10 @@ void fb_reinit(void)
     if (!console.initialized)
         return;
 
+    bool active = console.active;
     fb_shutdown(false);
     fb_init(true);
     fb_display_logo();
+    iodev_console_rewind(IODEV_FB);
+    fb_set_active(active);
 }

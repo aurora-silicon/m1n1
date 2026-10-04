@@ -11,6 +11,7 @@ extern u8 secondary_stacks[MAX_CPUS][SECONDARY_STACK_SIZE];
 extern u8 secondary_stacks_el3[MAX_EL3_CPUS][SECONDARY_STACK_SIZE];
 
 void smp_secondary_entry(void);
+int smp_secondary_prepare(void);
 void smp_secondary_prep_el3(void);
 
 int smp_init(void);

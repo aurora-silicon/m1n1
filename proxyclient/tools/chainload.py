@@ -146,6 +146,11 @@ if rvbar != u.base:
     for cpu in u.adt["cpus"]:
         if cpu.state == "running":
             continue
+        if u.adt["/chosen"].chip_id == 0x8142:
+            # Host writes to a cold T8142 secondary's RVBAR can wedge CPU0.
+            # Leave the cold cores and their reset vectors to the next stage.
+            print(f"  {cpu.name}: preserving T8142 secondary RVBAR")
+            continue
         addr, size = cpu.cpu_impl_reg
         if p.read64(addr) & 1:
             print(f"  {cpu.name}: RVBAR locked, leaving it unchanged")
@@ -213,7 +218,6 @@ stub = asm.ARMAsm(f"""
         b.ne 3b
         dsb sy
         isb
-
         ldr x1, ={entry}
         br x1
 """, image_addr + copy_size)

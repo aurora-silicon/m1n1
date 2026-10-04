@@ -14,6 +14,7 @@ enum dart_type_t {
     DART_T8020,
     DART_T8110,
     DART_T6000,
+    DART_GEN3,
 };
 
 dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t type);

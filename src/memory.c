@@ -559,6 +559,9 @@ void mmu_map_framebuffer(u64 addr, size_t size)
 
 static void mmu_remap_smp_shared(void)
 {
+    /* T8152 secondaries enable their MMU before publishing the handshake. */
+    if (chip_id == T8152)
+        return;
     extern u8 _smp_shared_start[], _smp_shared_end[];
     u64 base = (u64)_smp_shared_start;
     u64 size = _smp_shared_end - _smp_shared_start;
@@ -707,7 +710,13 @@ void mmu_init(void)
     printf("MMU: running with MMU and caches enabled!\n");
 }
 
-static void mmu_secondary_setup(void)
+void mmu_publish_secondary(void)
+{
+    dc_cvac_range(&mmu_pt_L0, sizeof(mmu_pt_L0));
+    sysop("dsb sy");
+}
+
+void mmu_init_secondary_local(void)
 {
     mmu_configure();
     if (cpu_features->mmu_sprr)
@@ -753,7 +762,7 @@ static void mmu_secondary_setup(void)
 
 void mmu_init_secondary(int cpu)
 {
-    smp_call4(cpu, mmu_secondary_setup, 0, 0, 0, 0);
+    smp_call4(cpu, mmu_init_secondary_local, 0, 0, 0, 0);
     smp_wait(cpu);
 }
 
