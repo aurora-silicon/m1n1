@@ -78,15 +78,22 @@ class AOPWakehintEndpoint(EPICEndpoint):
         AOPWakehintService,
     ]
 
-# unk26
-class AOPUNK26Service(EPICService):
-    NAME = "unk26"
-    SHORT = "unk26"
+# lid angle
+class AOPLASService(EPICService):
+    NAME = "las"
+    SHORT = "las"
+    last_report = None
 
-class AOPUNK26Endpoint(EPICEndpoint):
-    SHORT = "unk26"
+    @report_handler(0xc4, LASAngleReport)
+    def handle_angle(self, seq, fd, rep):
+        self.last_report = rep
+        self.log(rep)
+        return True
+
+class AOPLASEndpoint(EPICEndpoint):
+    SHORT = "las"
     SERVICES = [
-        AOPUNK26Service,
+        AOPLASService,
     ]
 
 # audio

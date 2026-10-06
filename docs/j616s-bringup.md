@@ -75,17 +75,20 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   mappings, ADT DAPF ranges and its external-code boot argument set to the
   ADT remap address (1 TiB). Starting the advertised application endpoints
   announces SPUApp, wakehint, aop-audio, aop-voicetrigger, accelerometer,
-  gyroscope and ambient-light services. All twelve application endpoints
-  acknowledge queue startup, including the standard gyroscope queue. Only the
-  external-code boot argument needs changing for this startup probe.
+  gyroscope, ambient-light and lid-angle services. All twelve application
+  endpoints acknowledge queue startup, including the standard gyroscope queue.
+  Only the external-code boot argument needs changing for this startup probe.
   ALS interval enable/disable, HID-descriptor and manufacturer queries return
   success, but no ALS samples were observed in a two-second capture. Periodic
-  reports from `las` and `cma` were captured; their formats are unqualified.
+  lid-angle reports from `las` now use the Asahi driver's angle byte and
+  return a live raw value of 112. Response to lid movement remains untested.
+  Reports from `cma` were captured; their format is unqualified.
   Fresh AFK shutdown responses are not received within the bounded wait.
   Earlier tests incorrectly counted the initially false `alive` flags as ACKs.
   IOP quiescence and sleep trials cause a firmware instruction abort. Mappings
   must remain installed until reboot on this
-  failure. Sensor measurements, audio paths and IOP shutdown remain unqualified.
+  failure. ALS and inertial measurements, audio paths and IOP shutdown remain
+  unqualified.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored

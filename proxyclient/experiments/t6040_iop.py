@@ -244,7 +244,7 @@ def probe(device, keyboard=False):
                 if ep >= 0x20 and ep in asc.epcls:
                     asc.start_ep(ep)
             services = {'SPUApp', 'wakehint', 'aop-audio', 'aop-voicetrigger',
-                        'accel', 'gyro', 'als'}
+                        'accel', 'gyro', 'als', 'las'}
             wait_until(lambda: services <= {name for ep, obj in asc.epmap.items()
                                             if ep >= 0x20 for name in obj.serv_map},
                        asc.work, timeout=5)
@@ -253,6 +253,9 @@ def probe(device, keyboard=False):
             result['endpoint_start_acks'] = [ep for ep in asc.epmap if ep >= 0x20]
             result['application_services'] = {
                 hex(ep): list(obj.serv_map) for ep, obj in asc.epmap.items() if ep >= 0x20}
+            las = asc.epmap[0x26].serv_map['las']
+            wait_until(lambda: las.last_report is not None, asc.work, timeout=2)
+            result['lid_angle'] = las.last_report.angle
         if device == 'mtp':
             result['mtp'] = {}
             probe_mtp(asc, keyboard, result['mtp'])

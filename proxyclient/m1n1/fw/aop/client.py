@@ -12,7 +12,7 @@ class AOPClient(StandardASC, AOPBase):
         0x22: AOPGyroEndpoint,
         0x24: AOPALSEndpoint,
         0x25: AOPWakehintEndpoint,
-        0x26: AOPUNK26Endpoint,
+        0x26: AOPLASEndpoint,
         0x27: AOPAudioEndpoint,
         0x28: AOPVoiceTriggerEndpoint,
     }
@@ -23,7 +23,7 @@ class AOPClient(StandardASC, AOPBase):
         0x23: AOPVoiceTriggerEndpoint,
         0x24: AOPAccelEndpoint,
         0x25: AOPGyroEndpoint,
-        0x26: AOPUNK26Endpoint,
+        0x26: AOPLASEndpoint,
         0x27: AOPALSEndpoint,
         0x28: AOPUNK23Endpoint,
         0x29: AOPUNK29Endpoint,

@@ -170,6 +170,12 @@ class ALSSetPropertyUnkE4(ALSSetProperty):
         "retcode" / Const(0x0, Int32ul),
     )
 
+LASAngleReport = Struct(
+    "report_id" / Hex(Int8ul),
+    "angle" / Int8ul,
+    "unknown" / HexDump(GreedyBytes),
+)
+
 ALSLuxReport = Struct(
     "unk0" / Const(0xec, Hex(Int8ul)),
     "sequence" / Int32ul,
