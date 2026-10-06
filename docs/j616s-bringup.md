@@ -96,8 +96,12 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   checksum-validated initialization packets with keyboard and multitouch HID
   descriptors. The optional keyboard probe sends enable only to the announced
   keyboard interface 2; its zero-status command ACK and fresh DeviceReady
-  response pass on repeated cold boots. No key events have been observed; trackpad enable, firmware
-  upload and input remain untested.
+  response pass on repeated cold boots. The optional touchpad probe uploads the
+  tested J616s 26A428 firmware, patches its interface slot and requires fresh
+  enable/upload ACKs, four version-2 power-request replies and DeviceReady.
+  Firmware logs report Touch MT ready and raw reports arrive. Key events and
+  finger motion remain untested. The touchpad probe retains DMA mappings until
+  reboot; firmware shutdown is unqualified.
 * SEP's existing RNG routine returned zero bytes. Successful SEP communication
   is not established.
 * ISP revision `0x100003` was read after powering the ADT parents and the
@@ -155,6 +159,23 @@ requires the tested cold IOP/DART state and prints a
 JSON result. Reboot before running it again: firmware resume is not qualified.
 Send, table invalidation, startup and quiescence waits are bounded. If shutdown
 is not acknowledged, mappings remain installed and the result requires reboot.
+
+To test the touchpad firmware in RAM, pass the HIDF file produced by Asahi's
+firmware extractor for J616s and macOS build 26A428:
+
+```sh
+M1N1DEVICE=/dev/ttyACM0 python proxyclient/experiments/t6040_iop.py mtp \
+    --touchpad-firmware /path/to/tpmtfw-j616s.bin
+```
+
+This mode requires the tested firmware hash and cannot be combined with
+`--keyboard`. It enables only the announced multitouch interface, sends no
+actuator commands and makes no GPIO writes. Version-2 power requests include
+Off/On and WillChange/HasChanged phases; replies must echo the exact request
+with the expected transfer counter and zero status. DeviceReady must arrive
+after the On request. The probe returns `reboot_required` and retains the IOP,
+DART, DAPF and DMA allocations after enable, including on failure. Reboot
+before any further proxy experiment. No firmware blob is included in this PR.
 
 AFK shutdown now waits for a fresh ACK instead of interpreting an initially
 false `alive` flag as completion. Its timeout bounds ACK polling; the shared

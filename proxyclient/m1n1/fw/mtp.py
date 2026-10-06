@@ -30,6 +30,33 @@ def decode_packet(packet):
     return iface, kind, seq, packet[8:-4]
 
 
+def prepare_firmware(data, iface):
+    if len(data) < 32:
+        raise ValueError("Truncated HIDF header")
+    magic, version, header_size, size, offset = struct.unpack_from("<4sIIII", data)
+    if (magic, version, header_size) != (b"HIDF", 1, 32):
+        raise ValueError("Unsupported HIDF header")
+    if size != len(data) - header_size or offset >= size:
+        raise ValueError("Invalid HIDF payload bounds")
+    if not 0 < iface < 256:
+        raise ValueError("Invalid firmware interface")
+    payload = bytearray(data[header_size:])
+    if payload[offset] != 0:
+        raise ValueError("Firmware interface placeholder is not zero")
+    payload[offset] = iface
+    return bytes(payload)
+
+
+def check_control_reply(request, expected_seq, received_seq, reply):
+    if received_seq != expected_seq or reply.hdr.flags != 0x80:
+        raise ValueError("Unexpected MTP control reply")
+    expected = request if request[0] == 0x40 else request[:1]
+    if reply.msg != expected:
+        raise ValueError("MTP control reply does not match its request")
+    if reply.hdr.retcode:
+        raise RuntimeError(f"MTP command {request[0]:#x} failed: {reply.hdr.retcode:#x}")
+
+
 class HIDDescriptor(ConstructClass):
     subcon = Struct(
         "descriptor" / HexDump(GreedyBytes)

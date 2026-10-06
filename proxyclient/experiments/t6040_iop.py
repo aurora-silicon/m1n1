@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Cold J616s SIO/MTP/AOP RTKit probe. Reboot before each run."""
 import argparse
+import hashlib
 import json
 import pathlib
 import struct
@@ -25,19 +26,35 @@ def wait_until(condition, service=lambda: None, timeout=1):
         service()
 
 
-def probe_mtp(asc, keyboard, result):
+def probe_mtp(asc, keyboard, result, firmware=None):
     from m1n1.hw.dockchannel import DockChannelDataRegs
-    from m1n1.fw.mtp import decode_packet, encode_packet, RXMessage, InitMsg
+    from m1n1.fw.mtp import (decode_packet, encode_packet, RXMessage, InitMsg,
+                            prepare_firmware, check_control_reply)
 
     data = DockChannelDataRegs(u, u.adt['/arm-io/dockchannel-mtp'].get_reg(3)[0])
     pending = bytearray()
+    expected_reply = None
+    reply_received = False
+    sequence = 0
+    image = None
+    if firmware is not None:
+        blob = pathlib.Path(firmware).read_bytes()
+        digest = hashlib.sha256(blob).hexdigest()
+        if digest != '7eb84312cb4ea74833ce9567ba8c92bc42a0c26c5c34d6bdfaa5cb65abfe4b26':
+            raise ValueError("Only the tested J616s 26A428 touchpad firmware is qualified")
+        image = prepare_firmware(blob, 1)
+        result.update(firmware_source_sha256=digest, touchpad_ready=False, touchpad_reports=[],
+                      commands=[], command_acks=[])
     result.update(initialization=[], keyboard_ready=False, keyboard_enable_ack=False,
                   packets=[], keyboard_reports=[])
 
-    def capture(seconds):
+    def capture(seconds, until=None):
+        nonlocal reply_received
         deadline = time.monotonic() + seconds
         received = 0
         while time.monotonic() < deadline:
+            if until is not None and until():
+                return
             asc.work()
             count = data.RX_COUNT.val
             if count >= 4:
@@ -71,13 +88,45 @@ def probe_mtp(asc, keyboard, result):
                                                 for block in init.msg if block.type == 0]})
                     elif msg.msg == b'\xf1\x02\x00\x00':
                         result['keyboard_ready'] = True
-                elif (iface == 0 and kind == 0x11 and seq == 0
+                    elif image is not None and msg.msg == b'\xf1\x01\x00\x00':
+                        result['touchpad_ready'] = True
+                    elif image is not None and msg.msg[:1] == b'\xa0':
+                        raise ValueError("Touchpad GPIO requests are not qualified")
+                elif expected_reply is not None and iface == 0 and kind == 0x11:
+                    counter, request = expected_reply
+                    check_control_reply(request, counter, seq, msg)
+                    result['command_acks'].append({'counter': seq, 'reply': msg.msg.hex(),
+                                                   'status': msg.hdr.retcode})
+                    reply_received = True
+                elif (keyboard and iface == 0 and kind == 0x11 and seq == 0
                       and msg.hdr.flags == 0x80 and msg.msg == b'\xb4'):
                     if msg.hdr.retcode:
                         raise RuntimeError("Keyboard enable was rejected")
                     result['keyboard_enable_ack'] = True
                 elif iface == 2 and msg.hdr.flags == 0:
                     result['keyboard_reports'].append(msg.msg.hex())
+                elif image is not None and iface == 1 and msg.hdr.flags == 0:
+                    result['touchpad_reports'].append(msg.msg.hex())
+
+    def control(request, power_on=False):
+        nonlocal expected_reply, reply_received, sequence
+        capture(.05)
+        packet = encode_packet(0, sequence, struct.pack('<HHI', 0x80, len(request), 0) + request)
+        wait_until(lambda: data.TX_FREE.val >= len(packet), asc.work)
+        if pending or data.RX_COUNT.val:
+            raise ValueError("MTP replies remain queued before control request")
+        if power_on:
+            result['touchpad_ready'] = False
+        expected_reply = sequence, request
+        reply_received = False
+        result['commands'].append({'counter': sequence, 'payload': request.hex()})
+        sequence += 1
+        for offset in range(0, len(packet), 4):
+            data.TX_32.val = struct.unpack_from('<I', packet, offset)[0]
+        capture(5, lambda: reply_received)
+        if not reply_received or pending:
+            raise TimeoutError("Fresh MTP control reply did not complete")
+        expected_reply = None
 
     capture(5)
     if pending:
@@ -97,12 +146,40 @@ def probe_mtp(asc, keyboard, result):
         capture(5)
         if pending or not result['keyboard_enable_ack'] or not result['keyboard_ready']:
             raise TimeoutError("Keyboard enable ACK/readiness did not complete")
+    if image is not None:
+        candidates = [entry for entry in result['initialization']
+                      if entry['name'] == 'multi-touch']
+        if len(candidates) != 1 or candidates[0]['id'] != 1 or candidates[0]['more_packets']:
+            raise ValueError("Multitouch interface was not uniquely announced")
+        result['touchpad_trial_active'] = True
+        control(b'\xb4\x01')
+        pa, dva = asc.ioalloc(len(image))
+        u.iface.writemem(pa, image)
+        p.dc_cvac(pa, len(image))
+        result.update(firmware_dma={'pa': hex(pa), 'dva': hex(dva), 'bytes': len(image)},
+                      firmware_payload_sha256=hashlib.sha256(image).hexdigest())
+        result['firmware_upload_attempted'] = True
+        control(struct.pack('<BBBBQI', 0x95, 2, 0, 1, dva, len(image)))
+        result['firmware_upload_ack'] = True
+        for state in (0, 2):
+            for phase in (0, 1):
+                control(struct.pack('<BBBBBI', 0x40, 2, 1, state, phase, 0),
+                        power_on=state == 2 and phase == 0)
+        result['power_request_acks'] = 4
+        capture(5, lambda: result['touchpad_ready'])
+        if not result['touchpad_ready']:
+            raise TimeoutError("Multitouch DeviceReady did not arrive")
+        capture(2)
+        if pending:
+            raise ValueError("Incomplete multitouch report")
     return result
 
 
-def probe(device, keyboard=False):
+def probe(device, keyboard=False, firmware=None):
     if p.get_chipid() != 0x6040 or u.adt['/chosen'].board_id != 6:
         raise ValueError("This probe is qualified only on J616s / board 6")
+    if firmware is not None and (keyboard or device != 'mtp'):
+        raise ValueError("Touchpad firmware testing requires MTP without --keyboard")
     if keyboard and device != 'mtp':
         raise ValueError("Keyboard testing requires the MTP probe")
     dev_path = f'/arm-io/{device}'
@@ -258,7 +335,7 @@ def probe(device, keyboard=False):
             result['lid_angle'] = las.last_report.angle
         if device == 'mtp':
             result['mtp'] = {}
-            probe_mtp(asc, keyboard, result['mtp'])
+            probe_mtp(asc, keyboard, result['mtp'], firmware)
         result['dart_error'] = hex(dart.regs.ERROR.val)
         if dart.regs.ERROR.reg.FLAG:
             raise RuntimeError("IOP DART reported a fault")
@@ -268,23 +345,27 @@ def probe(device, keyboard=False):
     finally:
         try:
             if boot_attempted:
-                if aop:
-                    result['endpoint_shutdown_acks'] = []
-                    for ep, obj in sorted(asc.epmap.items()):
-                        if ep < 0x20:
-                            continue
-                        obj.stop(timeout=5)
-                        result['endpoint_shutdown_acks'].append(ep)
-                asc.mgmt.send(Mgmt_SetAPPower(STATE=0x10))
-                wait_until(lambda: asc.mgmt.ap_power_state == 0x10, asc.work)
-                if aop:
-                    # IOP sleep/quiescence crashes this firmware; retain its mappings.
+                if result.get('mtp', {}).get('touchpad_trial_active'):
                     result['reboot_required'] = True
-                    result['iop_shutdown'] = 'unqualified'
+                    result['touchpad_shutdown'] = 'unqualified; retaining DMA mappings'
                 else:
-                    asc.mgmt.send(Mgmt_SetIOPPower(STATE=0x10))
-                    wait_until(lambda: asc.mgmt.iop_power_state == 0x10, asc.work)
-                    result['quiesced'] = True
+                    if aop:
+                        result['endpoint_shutdown_acks'] = []
+                        for ep, obj in sorted(asc.epmap.items()):
+                            if ep < 0x20:
+                                continue
+                            obj.stop(timeout=5)
+                            result['endpoint_shutdown_acks'].append(ep)
+                    asc.mgmt.send(Mgmt_SetAPPower(STATE=0x10))
+                    wait_until(lambda: asc.mgmt.ap_power_state == 0x10, asc.work)
+                    if aop:
+                        # IOP sleep/quiescence crashes this firmware; retain its mappings.
+                        result['reboot_required'] = True
+                        result['iop_shutdown'] = 'unqualified'
+                    else:
+                        asc.mgmt.send(Mgmt_SetIOPPower(STATE=0x10))
+                        wait_until(lambda: asc.mgmt.iop_power_state == 0x10, asc.work)
+                        result['quiesced'] = True
             if not boot_attempted or result.get('quiesced'):
                 p.write32(base + 0x44, ctrl)
                 p.write32(dart_base + 0xc20, 1)
@@ -348,5 +429,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('device', choices=('sio', 'mtp', 'aop'))
     parser.add_argument('--keyboard', action='store_true', help='Enable only the MTP keyboard')
+    parser.add_argument('--touchpad-firmware', help='Test the J616s 26A428 HIDF image in RAM')
     args = parser.parse_args()
-    probe(args.device, args.keyboard)
+    probe(args.device, args.keyboard, args.touchpad_firmware)
