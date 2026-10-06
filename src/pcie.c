@@ -282,7 +282,7 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
         "apcie-phy-ip-auspma-tunables", "apcie-cio3pllcore-tunables", "apcie-pcieclkgen-tunables",
     };
     static const int shared_indices[] = {4, 2, 3, 3, 5, 6};
-    u64 base, span, config_span;
+    u64 base, span;
     u32 present = 0;
 
     /* PCIE-2: the observed ADT has seven shared windows followed by exactly
@@ -297,7 +297,6 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
             return -1;
         }
         if (i == 0) {
-            config_span = span;
             if (span < (u64)ports * (1 << 15))
                 return -1;
         }
@@ -356,7 +355,7 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
         present++;
         printf("pcie: T8140 ADT bridge %d validated\n", port);
     }
-    if (!present || config_span < (u64)ports * (1 << 15))
+    if (!present)
         return -1;
     printf("pcie: T8140 ADT preflight passed (%d ports, %d bridges)\n", ports, present);
     return 0;
@@ -979,10 +978,10 @@ static int pcie_init_controller(int controller, const char *path)
                     int target_speed;
                     if (ADT_GETPROP(adt, np, "target-link-speed", &target_speed) >= 0 &&
                         target_speed > 0) {
-                        max_speed = target_speed > 4 ? 4 : target_speed;
+                        max_speed = target_speed;
                     } else if (ADT_GETPROP(adt, np, "expected-link-speed", &target_speed) >= 0 &&
                                target_speed > 0) {
-                        max_speed = target_speed > 4 ? 4 : target_speed;
+                        max_speed = target_speed;
                     }
                 }
             }

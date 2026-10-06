@@ -39,6 +39,5 @@ void usb_cdc_recovery_arm(struct usb_cdc_recovery *recovery, u64 now_ms);
 void usb_cdc_recovery_connected(struct usb_cdc_recovery *recovery);
 bool usb_cdc_recovery_due(const struct usb_cdc_recovery *recovery, u64 now_ms);
 void usb_cdc_recovery_attempted(struct usb_cdc_recovery *recovery, u64 now_ms);
-bool usb_cdc_dma_may_release(bool active, int end_status, bool reset_complete);
 
 #endif

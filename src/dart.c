@@ -930,8 +930,7 @@ void dart_shutdown(dart_dev_t *dart)
         return;
     }
 
-    if (!dart->locked && !dart->keep)
-        write32(DART_TCR(dart), dart->params->tcr_disabled);
+    write32(DART_TCR(dart), dart->params->tcr_disabled);
 
     for (int i = 0; i < dart->params->ttbr_count; ++i)
         if (is_heap(dart->l1[i]))

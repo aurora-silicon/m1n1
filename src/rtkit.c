@@ -333,18 +333,14 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
     reply.msg1 = msg->ep;
     reply.msg0 = FIELD_PREP(MGMT_TYPE, MSG_BUFFER_REQUEST);
     reply.msg0 |= FIELD_PREP(MSG_BUFFER_REQUEST_SIZE, n_4kpages);
-    if (!addr)
-        reply.msg0 |= FIELD_PREP(MSG_BUFFER_REQUEST_IOVA, bfr->dva | rtk->dva_base);
+    reply.msg0 |= FIELD_PREP(MSG_BUFFER_REQUEST_IOVA, bfr->dva | rtk->dva_base);
 
     if (!asc_send(rtk->asc, &reply)) {
         rtkit_printf("unable to send buffer reply\n");
-        goto error;
+        return false;
     }
 
     return true;
-
-error:
-    return false;
 }
 
 static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *msg)

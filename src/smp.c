@@ -585,7 +585,11 @@ int smp_init(void)
             running_cpu = i;
         }
     }
-    if (running_cpu < 0 || (boot_cpu_idx >= 0 && boot_cpu_idx != running_cpu))
+    if (running_cpu < 0) {
+        printf("SMP: no running CPU in ADT\n");
+        return -1;
+    }
+    if (boot_cpu_idx >= 0 && boot_cpu_idx != running_cpu)
         return -1;
     if (boot_cpu_idx == -1) {
         boot_cpu_idx = running_cpu;
@@ -594,12 +598,6 @@ int smp_init(void)
             msr(TPIDR_EL2, boot_cpu_idx);
         else
             msr(TPIDR_EL1, boot_cpu_idx);
-    }
-
-    if (boot_cpu_idx == -1) {
-        printf(
-            "Could not find currently running CPU in cpu table, can't start other processors!\n");
-        return -1;
     }
 
     spin_table[boot_cpu_idx].mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;

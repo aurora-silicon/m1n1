@@ -28,7 +28,6 @@ int pmgr_adt_power_disable(const char *path);
 int pmgr_adt_power_enable_traced(const char *path);
 struct pmgr_saved_mode {
     uintptr_t addr;
-    u8 actual;
     u8 target;
 };
 
@@ -39,7 +38,6 @@ struct pmgr_saved_modes {
 
 int pmgr_adt_power_enable_traced_saved(const char *path, struct pmgr_saved_modes *saved);
 void pmgr_restore_modes(struct pmgr_saved_modes *saved);
-int pmgr_adt_power_disable_traced(const char *path);
 int pmgr_adt_power_enable_index(const char *path, u32 index);
 int pmgr_adt_power_disable_index(const char *path, u32 index);
 int pmgr_adt_reset(const char *path);

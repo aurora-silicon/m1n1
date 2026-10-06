@@ -58,7 +58,7 @@ static u8 global_mode[4], initial_mode[4], adt_mode, initial_adt_mode;
 static u64 mode_addrs[16];
 static u8 mode_values[16];
 static int mode_calls;
-struct pmgr_saved_mode { uintptr_t addr; u8 actual, target; };
+struct pmgr_saved_mode { uintptr_t addr; u8 target; };
 struct pmgr_saved_modes { struct pmgr_saved_mode modes[64]; size_t count; };
 
 u64 isp_iova_base(void);
