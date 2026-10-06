@@ -32,7 +32,7 @@ static const struct {
     {"ISP_FE", 0x4018},
 };
 
-// Candidate from the ISP-2 measurement plan; release requires its A/B receipts.
+// Candidate heap limit; requires hardware validation.
 #define ISP_T8140_HEAP_TOP 0x2200000
 #define ISP_T8140_SEG_END  0x21ec000
 

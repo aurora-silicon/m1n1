@@ -77,6 +77,8 @@ output folders.
 The J700 CDC transition arms a 170 second watchdog while waiting for
 the primary host session. A completed primary DTR handshake disarms it;
 an incomplete transition resets through the normal recovery path.
+This path has host-side tests. Gen1 enumeration, primary handshake and
+reconnect still require hardware validation.
 
 First run PLAN P2 T-tethered on K-clean and K-full using only
 `aurora-ctl hw request`, and retain each `plan.json`, `receipt.json`, console

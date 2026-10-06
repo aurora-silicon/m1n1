@@ -285,7 +285,7 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
     u64 base, span;
     u32 present = 0;
 
-    /* PCIE-2: the observed ADT has seven shared windows followed by exactly
+    /* The observed ADT has seven shared windows followed by exactly
      * six windows for each port. Reject truncated or extended descriptions. */
     if (!ports || ports > 8 || reg_len != 16 * (7 + 6 * ports))
         return -1;
