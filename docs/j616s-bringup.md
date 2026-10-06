@@ -94,10 +94,15 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   `idle` before and after attachment; their main-property replies list separate
   dependency chains. These control queries produce no DART fault. The older
   PDM configuration queries are rejected, so existing microphone configuration
-  structures and input DMA have not been qualified for this firmware.
+  structures have not been qualified for this firmware. Typed property replies
+  use the request's device and modifier when decoding their payload; live
+  frontend-state queries and recovery after a rejected request build pass.
   `hpai` transitions from `idle` to `pw1 ` and back to `idle`, with fresh state
   readback. Requesting `pw1 ` on `lpai` instead causes an AOP data abort at
   address zero; that low-power transition is invalid qualification evidence.
+  Attaching `lai ` and `adpx`, then starting `lai ` with `runn`, succeeds. The
+  following `lpai` request for `runn` produces the same null-pointer abort;
+  the low-power path still needs its configuration prerequisites established.
   A guarded prototype maps the ADT-selected ADMAC stream 10 with four-level
   42-bit tables and submits one non-repeating 16 KiB RX descriptor only after
   `hpai` reaches `pwrd`. The split RX bank at offset 0xc000, completion report,

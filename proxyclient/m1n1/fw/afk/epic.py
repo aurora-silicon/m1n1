@@ -185,9 +185,8 @@ class EPICService:
         ret = data
         if (hasattr(self, "last_call") and hasattr(self.last_call, "RETS")):
             call = getattr(self, "last_call")
-            item = call.RETS.parse(data)
-            ret = item
-            self.reply = ret
+            call.read_resp(BytesIO(data))
+            self.reply = call.rets
             return
 
         if (type == EPICSubtype.RETCODE):
@@ -382,9 +381,10 @@ class EPICEndpoint(AFKRingBufEndpoint):
 
     def send_roundtrip(self, chan, call, **kwargs):
         self.serv_map[chan].last_call = call
-        ret = self.serv_map[chan].send_notify(call.TYPE, call.ARGS.build(call.args), **kwargs)
-        self.serv_map[chan].last_call = None
-        return ret
+        try:
+            return self.serv_map[chan].send_notify(call.TYPE, call.ARGS.build(call.args), **kwargs)
+        finally:
+            self.serv_map[chan].last_call = None
 
     def send_notify(self, chan, call, **kwargs):
         return self.serv_map[chan].send_notify(call.TYPE, call.ARGS.build(call.args), **kwargs)
