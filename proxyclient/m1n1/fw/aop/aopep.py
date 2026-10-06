@@ -42,9 +42,6 @@ class AOPGyroEndpoint(EPICEndpoint):
         AOPGyroService,
     ]
 
-    def start_queues(self):
-        pass  # don't init gyro ep (we don't have one)
-
 # als
 class AOPALSService(EPICService):
     NAME = "als"

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 
 import struct
+import time
 
 from ..common import *
 from ...utils import *
@@ -105,19 +106,15 @@ class AFKRingBuf(Reloadable):
     
     def get_rptr(self):
         return struct.unpack("<I", self.read_buf(self.block_size * 1, 4))[0]
-        #return self.ep.asc.p.read32(self.base + self.BLOCK_STEP)
 
     def get_wptr(self):
         return struct.unpack("<I", self.read_buf(self.block_size * 2, 4))[0]
-        #return self.ep.asc.p.read32(self.base + 2 * self.BLOCK_STEP)
 
     def update_rptr(self, rptr):
-        self.write_buf(self.block_size * 1, struct.pack("<I", rptr))
-        self.ep.asc.p.write32(self.base + self.BLOCK_STEP, rptr)
+        self.ep.asc.p.write32(self.base + self.block_size, rptr)
 
     def update_wptr(self, wptr):
-        self.write_buf(self.block_size * 2, struct.pack("<I", wptr))
-        self.ep.asc.p.write32(self.base + 2 * self.BLOCK_STEP, wptr)
+        self.ep.asc.p.write32(self.base + 2 * self.block_size, wptr)
 
     def read(self):
         self.wptr = self.get_wptr()
@@ -179,6 +176,7 @@ class AFKRingBufEndpoint(ASCBaseEndpoint):
         self.iface = self.asc.iface
         self.alive = False
         self.started = False
+        self.shutdown_complete = False
         self.iobuffer = None
         self.verbose = 2
         self.msgid = 0
@@ -186,10 +184,15 @@ class AFKRingBufEndpoint(ASCBaseEndpoint):
     def start(self):
         self.send(AFKEP_Init())
 
-    def stop(self):
+    def stop(self, timeout=3):
+        """Wait for a fresh shutdown ACK; timeout applies to ACK polling."""
         self.log("Shutting down")
+        self.shutdown_complete = False
+        deadline = time.monotonic() + timeout
         self.send(AFKEP_Shutdown())
-        while self.alive:
+        while not self.shutdown_complete:
+            if time.monotonic() >= deadline:
+                raise ASCTimeout("AFK endpoint shutdown was not acknowledged")
             self.asc.work()
 
     @msg_handler(0xa0, AFKEP_Init_Ack)
@@ -199,6 +202,8 @@ class AFKRingBufEndpoint(ASCBaseEndpoint):
 
     @msg_handler(0xc1, AFKEP_Shutdown_Ack)
     def Shutdown_Ack(self, msg):
+        self.shutdown_complete = True
+        self.started = False
         self.alive = False
         self.log("Shutdown ACKed")
         return True

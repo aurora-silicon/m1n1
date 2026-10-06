@@ -75,12 +75,17 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   mappings, ADT DAPF ranges and its external-code boot argument set to the
   ADT remap address (1 TiB). Starting the advertised application endpoints
   announces SPUApp, wakehint, aop-audio, aop-voicetrigger, accelerometer,
-  gyroscope and ambient-light services. Fresh AFK shutdown responses are not
-  received within the bounded wait.
+  gyroscope and ambient-light services. All twelve application endpoints
+  acknowledge queue startup, including the standard gyroscope queue. Only the
+  external-code boot argument needs changing for this startup probe.
+  ALS interval enable/disable, HID-descriptor and manufacturer queries return
+  success, but no ALS samples were observed in a two-second capture. Periodic
+  reports from `las` and `cma` were captured; their formats are unqualified.
+  Fresh AFK shutdown responses are not received within the bounded wait.
   Earlier tests incorrectly counted the initially false `alive` flags as ACKs.
   IOP quiescence and sleep trials cause a firmware instruction abort. Mappings
   must remain installed until reboot on this
-  failure. Application queries, audio paths and IOP shutdown remain unqualified.
+  failure. Sensor measurements, audio paths and IOP shutdown remain unqualified.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored
@@ -138,14 +143,23 @@ packet checksum before parsing its contents. It does not enable the actuator
 or multitouch interface, program GPIOs or upload firmware. Keyboard input
 events still require separate validation. AOP
 also initializes advertised AFK endpoints to read service announcements, then
-requests AFK shutdown. Fresh responses currently time out, so the AOP probe
-returns a failure and requires reboot. It sends no audio application commands.
+waits for all queue-start ACKs and requests AFK shutdown. Fresh responses
+currently time out, so the AOP probe returns a failure and requires reboot.
+It sends no audio application commands.
 AOP retains the IOP with its mappings and boot arguments installed and
 reports `reboot_required`: recover by rebooting before further experiments. It
 requires the tested cold IOP/DART state and prints a
 JSON result. Reboot before running it again: firmware resume is not qualified.
 Send, table invalidation, startup and quiescence waits are bounded. If shutdown
 is not acknowledged, mappings remain installed and the result requires reboot.
+
+AFK shutdown now waits for a fresh ACK instead of interpreting an initially
+false `alive` flag as completion. Its timeout bounds ACK polling; the shared
+IOP probe also bounds ASC sends. Ring pointers use one aligned 32-bit store
+at each negotiated header offset. This removes duplicate stores that
+overwrote the read pointer when the header block size was 128 bytes. Host
+tests cover both 64-byte and 128-byte layouts; live AOP queries and report
+reception pass with the corrected publication.
 
 StandardASC now accepts an optional DVA mask while preserving its existing
 36-bit default. The IOP probes configure a full 42-bit address range and mask.

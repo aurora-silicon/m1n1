@@ -173,14 +173,13 @@ def probe(device, keyboard=False):
     if device == 'aop':
         from m1n1.fw.aop.base import AOPBase
         from m1n1.fw.aop.client import AOPClient
-        from m1n1.fw.afk.rbep import AFKEP_Shutdown
         aop = AOPBase(u)
         bootargs = aop.read_bootargs()
         original_bootargs = bootargs.to_bytes()
         text = [va for va, _, _, flags in plan if flags & 1]
         if len(text) != 1 or text[0] != 1 << 40:
             raise ValueError("Unsupported AOP external code mapping")
-        bootargs.update(dict(p0CE=text[0], laCn=0, tPOA=0, gila=64))
+        bootargs.update(dict(p0CE=text[0]))
     try:
         dart.regs.TTBR[0].val = 0
         dart.regs.TCR[0].val = tcr | 8
@@ -249,6 +248,9 @@ def probe(device, keyboard=False):
             wait_until(lambda: services <= {name for ep, obj in asc.epmap.items()
                                             if ep >= 0x20 for name in obj.serv_map},
                        asc.work, timeout=5)
+            wait_until(lambda: all(obj.started for ep, obj in asc.epmap.items() if ep >= 0x20),
+                       asc.work, timeout=5)
+            result['endpoint_start_acks'] = [ep for ep in asc.epmap if ep >= 0x20]
             result['application_services'] = {
                 hex(ep): list(obj.serv_map) for ep, obj in asc.epmap.items() if ep >= 0x20}
         if device == 'mtp':
@@ -265,20 +267,11 @@ def probe(device, keyboard=False):
             if boot_attempted:
                 if aop:
                     result['endpoint_shutdown_acks'] = []
-                    shutdown_acks = set()
-                    for ep, obj in list(asc.epmap.items()):
+                    for ep, obj in sorted(asc.epmap.items()):
                         if ep < 0x20:
                             continue
-                        def shutdown_ack(msg, ep=ep, handler=obj.msghandler[0xc1]):
-                            if ep not in shutdown_acks:
-                                result['endpoint_shutdown_acks'].append(ep)
-                            shutdown_acks.add(ep)
-                            return handler(msg)
-
-                        obj.msghandler[0xc1] = shutdown_ack
-                        obj.send(AFKEP_Shutdown())
-                    expected_acks = {ep for ep in asc.epmap if ep >= 0x20}
-                    wait_until(lambda: expected_acks <= shutdown_acks, asc.work, timeout=5)
+                        obj.stop(timeout=5)
+                        result['endpoint_shutdown_acks'].append(ep)
                 asc.mgmt.send(Mgmt_SetAPPower(STATE=0x10))
                 wait_until(lambda: asc.mgmt.ap_power_state == 0x10, asc.work)
                 if aop:
