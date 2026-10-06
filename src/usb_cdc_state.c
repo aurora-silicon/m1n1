@@ -5,7 +5,7 @@
 int usb_cdc_state_schedule(struct usb_cdc_state *cdc, u32 delay_ms, u32 reserved, u32 flags,
                            u64 now_ms)
 {
-    /* Gen1 is the only qualified descriptor and controller mode in this build. */
+    /* Only Gen1 descriptors and controller setup are implemented. */
     if (!cdc || cdc->state != USB_CDC_IDLE || delay_ms < 1000 || delay_ms > 15000 || reserved ||
         (flags & ~7u) || !(flags & 2u))
         return -1;
@@ -57,9 +57,4 @@ void usb_cdc_recovery_attempted(struct usb_cdc_recovery *recovery, u64 now_ms)
         recovery->pending = false;
     else
         recovery->deadline_ms = now_ms + 2000;
-}
-
-bool usb_cdc_dma_may_release(bool active, int end_status, bool reset_complete)
-{
-    return !active || end_status == 0 || reset_complete;
 }

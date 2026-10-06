@@ -22,7 +22,6 @@
 #ifdef CHAINLOADING
 int rust_load_image(const char *spec, void **image, size_t *size);
 void rust_free_image(void *image, size_t size);
-#endif
 
 static int boot_image_header(const void *data, size_t file_size, u64 *text_offset, u64 *image_size)
 {
@@ -112,6 +111,7 @@ static int boot_check_dtb(const void *data, size_t size)
     compat[6 + i] = 0;
     return fdt_node_check_compatible(data, 0, compat);
 }
+#endif
 
 int boot_storage_load(const char *spec, struct kernel_header **kernel, void **fdt)
 {
