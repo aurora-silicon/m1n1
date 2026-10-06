@@ -398,7 +398,8 @@ bool nvme_init(void)
             goto out_reset;
         }
         if (nvmmu_size < NVMMU_TCB_STAT + sizeof(u32) ||
-            nvme_size < NVME_BOOT_STATUS + sizeof(u32) || nvmmu_base > UINT64_MAX - nvmmu_size ||
+            nvme_size < NVME_DB_LINEAR_IOSQ + sizeof(u32) ||
+            nvmmu_base > UINT64_MAX - nvmmu_size ||
             nvme_base > UINT64_MAX - nvme_size ||
             (nvmmu_base < nvme_base + nvme_size && nvme_base < nvmmu_base + nvmmu_size)) {
             printf("nvme: invalid split BAR geometry\n");
@@ -538,8 +539,11 @@ out_disable_ctrl:
     nvme_ctrl_disable();
     nvme_poll_syslog();
 out_shutdown:
-    if (adopting)
-        goto out_asc;
+    if (adopting) {
+        /* ANS may still reference the queues if controller shutdown failed. */
+        printf("nvme: preserving adopted ANS queues after setup failure\n");
+        goto out_reset;
+    }
     if (nvme_type != NVME_T8132) {
         rtkit_sleep(nvme_rtkit);
         // Some machines call this ANS, some ANS2...
