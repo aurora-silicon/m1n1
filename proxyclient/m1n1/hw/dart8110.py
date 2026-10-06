@@ -271,12 +271,12 @@ class DART8110(Reloadable):
         return dart
 
     def iomap_at(self, stream, iova, addr, size):
+        if not 0 <= stream < 256:
+            raise ValueError("Invalid DART stream")
+        if size < 0:
+            raise ValueError("Negative mapping size")
         if size == 0:
             return
-
-        if not (self.enabled_streams & (1 << stream)):
-            self.enabled_streams |= (1 << stream)
-            self.regs.ENABLE_STREAMS[stream // 32].val |= (1 << (stream % 32))
 
         tcr = self.regs.TCR[stream].reg
 
@@ -320,8 +320,6 @@ class DART8110(Reloadable):
                         OFFSET=l1addr >> self.PAGE_BITS, VALID=1)
                     l0[l0idx] = l0pte.value
                     dirty.add(ttbr.ADDR << self.PAGE_BITS)
-                else:
-                    l2addr = l1pte.OFFSET << self.PAGE_BITS
                 l1page = l0pte.OFFSET
             else:
                 l1page = ttbr.ADDR
@@ -348,6 +346,12 @@ class DART8110(Reloadable):
 
         for page in dirty:
             self.flush_pt(page)
+
+        # Publish a newly enabled stream only after its tables are populated.
+        # Rejected requests must not change the hardware stream mask.
+        if not (self.enabled_streams & (1 << stream)):
+            self.regs.ENABLE_STREAMS[stream // 32].val |= (1 << (stream % 32))
+            self.enabled_streams |= (1 << stream)
 
     def iotranslate(self, stream, start, size):
         if size == 0:

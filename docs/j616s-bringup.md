@@ -19,7 +19,7 @@ execution time. Higher states were rejected without changing the command.
 There is no voltage, PLL or thermal-policy programming here.
 
 The driver preserves other command bits, checks the previous expected state,
-and bounds busy polling to 2 ms. An ownership change or failed transition
+and bounds each busy poll to 2 ms. An ownership change or failed transition
 locks out subsequent writes for that cluster until the image is restarted.
 A timeout does not imply that hardware reverted to the previous state.
 
@@ -47,15 +47,39 @@ unqualified.
 * CDC proxy and bulk reads work at USB high speed (480 Mb/s). SuperSpeed is
   pending PHY/role bring-up and cable/port qualification.
 * AOP and SIO management-only startup attempts returned no endpoint map.
-  Their DARTs had no enabled streams or valid initial translation tables;
-  firmware mappings need investigation before further startup testing.
+  Their DARTs initially had no enabled streams or valid translation tables.
+  Mapping the ADT-described external firmware regions, cleaning tables and
+  using the existing AOP boot-argument configuration still produced no
+  handshake. CPU RUN readback succeeded, DART error stayed zero, and the
+  boot arguments, table pointer and stream mask were restored. The mappings
+  alone do not resolve startup.
 * SEP's existing RNG routine returned zero bytes. Successful SEP communication
   is not established.
-* ISP firmware and device registers are present in the ADT. ISP boot and its
-  power-domain layout remain untested.
+* ISP revision `0x100003` was read after powering the ADT parents and the
+  ISP_CPU/ISP_FE global slots at offsets 0x4000/0x4008. All tested domains
+  returned to their original states, including ISPSENS0 state 4. Firmware
+  startup, channels, heap requirements and camera operation remain untested.
 * No speaker output, speaker amplifier programming or audio DMA stream was
   started.
 
 The experimental stage 2 was chainloaded into RAM. Installed boot images,
 boot policy and partitions were not changed. Preserve a working CDC recovery
 path before experimenting with further devices.
+
+## Proxy-client DART fixes
+
+Rejected mapping requests previously enabled a stream before validating its
+mode and alignment. New stream publication now follows populated tables. A
+four-level root-reuse path referenced an undefined variable in an unnecessary
+assignment; removing it permits repeated mappings under the same root. Eight
+host cases cover rejected requests, publication order, three/four-level
+translation, reused roots and additional leaf allocation. Live three-level
+firmware mapping/readback and restoration also passed; four-level hardware
+operation remains unqualified.
+
+Direct native calls must use symbols from the matching raw ELF for raw images.
+An initial ISP trial used the Mach-O-layout ELF, called the wrong code and
+triggered a reboot. Installed stage 1 recovered CDC; the corrected raw-ELF
+probe passed. The earlier SEP result was discarded and repeated with verified
+raw ELF/image pairing. Proxy-opcode clock tests and scratch-code SMP tests
+were unaffected.
