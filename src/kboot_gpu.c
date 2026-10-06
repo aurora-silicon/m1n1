@@ -527,8 +527,8 @@ static int dt_set_gpu_t8140(void *dt)
     int opp, opp_count = 0;
     fdt_for_each_subnode(opp, dt, table)
     {
-        if (++opp_count > 16 || !fdt_getprop(dt, opp, "opp-hz", &len) || len != sizeof(u64) ||
-            !fdt_getprop(dt, opp, "opp-microvolt", &len) || len != sizeof(u32))
+        if (++opp_count > 16 || !fdt_getprop(dt, opp, "opp-hz", &ph_len) || ph_len != sizeof(u64) ||
+            !fdt_getprop(dt, opp, "opp-microvolt", &ph_len) || ph_len != sizeof(u32))
             goto disable;
     }
     if (opp_count != 16)

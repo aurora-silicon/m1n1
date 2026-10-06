@@ -398,8 +398,7 @@ bool nvme_init(void)
             goto out_reset;
         }
         if (nvmmu_size < NVMMU_TCB_STAT + sizeof(u32) ||
-            nvme_size < NVME_DB_LINEAR_IOSQ + sizeof(u32) ||
-            nvmmu_base > UINT64_MAX - nvmmu_size ||
+            nvme_size < NVME_DB_LINEAR_IOSQ + sizeof(u32) || nvmmu_base > UINT64_MAX - nvmmu_size ||
             nvme_base > UINT64_MAX - nvme_size ||
             (nvmmu_base < nvme_base + nvme_size && nvme_base < nvmmu_base + nvmmu_size)) {
             printf("nvme: invalid split BAR geometry\n");

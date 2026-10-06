@@ -74,16 +74,25 @@ impl TableHeader {
         let alternate = hdr.u64_at(32);
         let count = hdr.u32_at(80) as usize;
         let entry_size = hdr.u32_at(84) as usize;
-        if first > last || last >= alternate || count > MAX_ENTRIES
-            || entry_size < 128 || !entry_size.is_power_of_two() {
+        if first > last
+            || last >= alternate
+            || count > MAX_ENTRIES
+            || entry_size < 128
+            || !entry_size.is_power_of_two()
+        {
             return Err(Error::InvalidGPTHeader);
         }
         let table_bytes = count.checked_mul(entry_size).ok_or(Error::Overflow)?;
         if table_bytes > MAX_TABLE_BYTES || hdr.u64_at(72) < 2 {
             return Err(Error::InvalidGPTHeader);
         }
-        let table_start = hdr.u64_at(72).checked_mul(SECTOR_SIZE).ok_or(Error::Overflow)?;
-        let table_end = table_start.checked_add(table_bytes as u64).ok_or(Error::Overflow)?;
+        let table_start = hdr
+            .u64_at(72)
+            .checked_mul(SECTOR_SIZE)
+            .ok_or(Error::Overflow)?;
+        let table_end = table_start
+            .checked_add(table_bytes as u64)
+            .ok_or(Error::Overflow)?;
         let usable_start = first.checked_mul(SECTOR_SIZE).ok_or(Error::Overflow)?;
         if table_end > usable_start {
             return Err(Error::InvalidGPTHeader);
@@ -92,7 +101,9 @@ impl TableHeader {
     }
 
     fn table_offset(&self) -> Result<u64, Error<()>> {
-        self.u64_at(72).checked_mul(SECTOR_SIZE).ok_or(Error::Overflow)
+        self.u64_at(72)
+            .checked_mul(SECTOR_SIZE)
+            .ok_or(Error::Overflow)
     }
 
     fn count(&self) -> usize {
