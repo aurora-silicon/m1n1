@@ -97,6 +97,15 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   structures have not been qualified for this firmware. Typed property replies
   use the request's device and modifier when decoding their payload; live
   frontend-state queries and recovery after a rejected request build pass.
+  Error replies contain only the firmware return code; the decoder preserves
+  it without trying to parse a configuration payload. Successful payloads
+  are bounded by the reported length. Live PDM queries return 0xe00002c2
+  or 0xe00002f0, followed by a successful frontend-state query.
+  The J616s 25G76 AOP image matches the running ADT UUID and segment layout.
+  Its metadata identifies the T604x audio driver, but its native input
+  configuration ABI remains unqualified. The 16-byte `lpai` property 301
+  reads successfully; writing the same bytes returns 0xe00002cf (not writable).
+  It cannot serve as a configuration-write template.
   `hpai` transitions from `idle` to `pw1 ` and back to `idle`, with fresh state
   readback. Requesting `pw1 ` on `lpai` instead causes an AOP data abort at
   address zero; that low-power transition is invalid qualification evidence.
@@ -110,6 +119,10 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   all zeros. RX stops and the frontend returns through `pw1 ` to `idle`; the
   proxy remains responsive. This tests input DMA but does not establish live
   microphone audio. Source configuration and PCM format remain unqualified.
+  `hppx`, `lcpx`, `mcpx` and `smpx` state queries track each tested frontend
+  transition, including `pwrd`. Attaching `hppx` succeeds, while attaching
+  `lACp` returns 0xe00002e2 (not permitted); that trial stops before power
+  or DMA requests.
   Cleanup must stop RX before returning the frontend to `idle`; an earlier
   prototype accessed ADMAC again afterward and lost CDC.
   The Python ADMAC driver selects split channel banks for `admac,t604x` while

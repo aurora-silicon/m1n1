@@ -505,10 +505,10 @@ class GetDeviceProp(WrappedCall):
     )
     RETS = Struct(
         "retcode" / Default(Hex(Int32ul), 0),
-        "len" / Optional(Int32ul),
-        "data" / Switch(lambda s: (s._params.devid, s._params.modifier),
-            DEVPROPS,
-        default=HexDump(GreedyBytes))
+        "len" / If(this.retcode == 0, Int32ul),
+        "data" / If(this.retcode == 0, FixedSized(this.len,
+            Switch(lambda s: (s._params.devid, s._params.modifier),
+                DEVPROPS, default=HexDump(GreedyBytes))))
     )
 
     def read_resp(self, f):
