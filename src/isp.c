@@ -43,7 +43,7 @@ static const struct {
 #define ISP_PMGR_T6031 0x4030
 
 static bool isp_initialized = false;
-static u64 heap_phys, heap_iova, heap_size, heap_top;
+static u64 heap_phys, heap_iova, heap_size;
 
 int isp_get_heap(u64 *phys, u64 *iova, u64 *size)
 {
@@ -304,7 +304,6 @@ int isp_init(void)
            selected_phys);
 
     heap_iova = selected_iova;
-    heap_top = selected_top;
     heap_size = selected_size;
     heap_phys = selected_phys;
     isp_initialized = true;

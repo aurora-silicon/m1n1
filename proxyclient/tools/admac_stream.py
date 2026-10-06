@@ -50,7 +50,7 @@ dart_idx = mapper.reg
 
 if "clock-gates" in u.adt[dart_path]._properties:
     print(f"Enabling {dart_path}", file=sys.stderr)
-    p.pmgr_adt_power_enable(path)
+    p.pmgr_adt_power_enable(dart_path)
 
 dart = DART.from_adt(u, dart_path)
 admac = ADMAC(u, path, dart,
