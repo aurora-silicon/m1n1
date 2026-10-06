@@ -50,6 +50,7 @@ static struct adt_segment_ranges segments[2];
 static u32 segments_len;
 static bool segments_present, allocation_fails, dapf_fails, adt_power_fails;
 static u32 revision;
+static bool invalid_aperture;
 static u64 read_address, expected_heap_size;
 static int enabled, disabled, active, gated, dapf_calls, allocations, power_fail_at;
 static u64 active_addrs[8], gated_addrs[8];
@@ -110,7 +111,7 @@ int adt_get_reg(const void *tree, int *path, const char *name, int index, u64 *a
     assert(index >= 0 && index < 3);
     *addr = bases[index];
     if (size)
-        *size = sizes[index];
+        *size = invalid_aperture && index == 0 ? 4 : sizes[index];
     return 0;
 }
 int pmgr_set_mode(u64 addr, u8 mode)
@@ -178,6 +179,7 @@ static void reset(void)
     revision = 0x110000;
     read_address = 0;
     allocation_fails = dapf_fails = adt_power_fails = false;
+    invalid_aperture = false;
     enabled = disabled = active = gated = dapf_calls = allocations = power_fail_at = 0;
     mode_calls = 0;
     memset(global_mode, 0, sizeof(global_mode));
@@ -219,6 +221,11 @@ static void failure(void)
 }
 int main(void)
 {
+    reset(); invalid_aperture = true;
+    assert(isp_init() != 0);
+    assert(!isp_initialized);
+    assert(enabled == 1 && disabled == 1 && active == 0 && allocations == 0);
+    assert(adt_mode == initial_adt_mode);
     reset(); success();
     reset(); os_firmware.version = V14_7; failure();
     reset(); revision = 0x110001; failure();
