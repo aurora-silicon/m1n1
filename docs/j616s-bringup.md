@@ -41,8 +41,23 @@ was needed for this tested configuration. The boot CPU's `smp_is_alive()`
 result is not a secondary-start indicator.
 
 These checks cover startup, WFE/SEV dispatch and shared memory coherence.
-Independent AMP workloads, deep sleep, hotplug, hypervisor operation and
-sustained thermal load remain unqualified.
+A cold independent-workload probe also passed on all 13 secondaries. The E
+cores checked repeated memory sums, P0 cores ran integer recurrences and P1
+cores ran rotate/XOR loops in separate buffers. Every result matched its host
+calculation, all execution intervals overlapped, and nominal cluster clock
+settings were unchanged. The test initializes every secondary's MMU before
+calling through the RX alias and keeps its scratch code unchanged until all
+workers return. Earlier trials violated these assumptions and are invalid
+qualification evidence. No new SMP/AMP driver code was needed.
+
+Deep sleep, hotplug, hypervisor operation and sustained thermal load remain
+unqualified. Reproduce the cold independent-workload test with:
+
+```sh
+M1N1DEVICE=/dev/ttyACM0 python proxyclient/experiments/t6040_amp.py
+```
+
+The probe leaves secondaries running in WFE mode. Reboot before repeating it.
 
 ## Other devices
 
@@ -60,9 +75,11 @@ sustained thermal load remain unqualified.
   mappings, ADT DAPF ranges and its external-code boot argument set to the
   ADT remap address (1 TiB). Starting the advertised application endpoints
   announces SPUApp, wakehint, aop-audio, aop-voicetrigger, accelerometer,
-  gyroscope and ambient-light services. All 12 application endpoints
-  acknowledge AFK shutdown, but IOP quiescence and sleep both cause a firmware
-  instruction abort. Mappings must remain installed until reboot on this
+  gyroscope and ambient-light services. Fresh AFK shutdown responses are not
+  received within the bounded wait.
+  Earlier tests incorrectly counted the initially false `alive` flags as ACKs.
+  IOP quiescence and sleep trials cause a firmware instruction abort. Mappings
+  must remain installed until reboot on this
   failure. Application queries, audio paths and IOP shutdown remain unqualified.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
@@ -100,22 +117,29 @@ probe passed. The earlier SEP result was discarded and repeated with verified
 raw ELF/image pairing. Proxy-opcode clock tests and scratch-code SMP tests
 were unaffected.
 
-## Reproducing the cold SIO probe
+## Reproducing the cold IOP probes
 
 After rebooting into m1n1 proxy mode, run:
 
 ```sh
-M1N1DEVICE=/dev/ttyACM0 python proxyclient/experiments/t6040_sio.py
+M1N1DEVICE=/dev/ttyACM0 python proxyclient/experiments/t6040_iop.py sio
 ```
 
-The probe uses existing StandardASC system endpoints and sends no application
-endpoint commands. It requires the tested cold SIO/DART state and prints a
+Select `sio`, `mtp` or `aop` as the final argument. SIO/MTP use existing
+StandardASC system endpoints and send no application endpoint commands. AOP
+also initializes advertised AFK endpoints to read service announcements, then
+requests AFK shutdown. Fresh responses currently time out, so the AOP probe
+returns a failure and requires reboot. It sends no audio application commands.
+AOP retains the IOP with its mappings and boot arguments installed and
+reports `reboot_required`: recover by rebooting before further experiments. It
+requires the tested cold IOP/DART state and prints a
 JSON result. Reboot before running it again: firmware resume is not qualified.
 Send, table invalidation, startup and quiescence waits are bounded. If shutdown
 is not acknowledged, mappings remain installed and the result requires reboot.
 
 StandardASC now accepts an optional DVA mask while preserving its existing
-36-bit default. The SIO probe configures a full 42-bit address range and mask.
+36-bit default. The IOP probes configure a full 42-bit address range and mask.
 IOReporting reads its buffer through the ASC/DART translation path, including
-firmware-preallocated buffers. Host cases cover both masks across read, write and translation, preallocated
+firmware-preallocated buffers. Host cases cover both masks across read, write
+and translation, preallocated
 IOReporting buffers, and invalidation of the selected stream.
