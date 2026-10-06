@@ -134,6 +134,13 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   returns zero; GET readback remains `(7, 7, 7)`, both input frontends remain
   idle and DART faults stay zero. Alternate masks and microphone startup are
   unqualified. All 105 getter requests complete without DART faults.
+  Matching firmware identifies `lpai` property 303 as latency in frames (320)
+  and property 304 as safety offset in frames (672). Property 305 contains a
+  48-byte `IOAudio2Status`; its individual fields remain unqualified. The ADT
+  assigns the `adpx` LP mic buffer 768,000 bytes on base-controller DART stream
+  8, separate from the HP LEAP path on stream 10. Buffer initialization and
+  ownership transfer remain unqualified; the HP DMA trial does not qualify LP
+  capture.
   `hpai` transitions from `idle` to `pw1 ` and back to `idle`, with fresh state
   readback. Requesting `pw1 ` on `lpai` instead causes an AOP data abort at
   address zero; that low-power transition is invalid qualification evidence.
