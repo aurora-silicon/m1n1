@@ -93,6 +93,16 @@ CFG += CHAINLOADING
 CARGO_FLAGS += --features chainload
 endif
 
+ifeq ($(T6040_STAGE1_CDC),1)
+ifneq ($(CHAINLOADING),1)
+$(error T6040_STAGE1_CDC requires CHAINLOADING=1)
+endif
+ifneq ($(filter 1,$(J700_CDC_PROXY) $(T8140_KIS_PROXY) $(J700_ESP_STAGE2)),)
+$(error T6040_STAGE1_CDC cannot be combined with J700 transport flavours)
+endif
+CFG += T6040_STAGE1_CDC
+endif
+
 ifeq ($(J700_ESP_STAGE2),1)
 ifneq ($(CHAINLOADING),1)
 $(error J700_ESP_STAGE2 requires CHAINLOADING=1 for boot=)

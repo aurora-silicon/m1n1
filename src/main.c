@@ -75,6 +75,39 @@ void run_actions(void)
 {
     bool usb_up = false;
 
+#ifdef T6040_STAGE1_CDC
+    if (chip_id != T6040)
+        panic("T6040 Stage 1 CDC image requires an M4 Pro\n");
+#ifndef BRINGUP
+    /* Use the M4 Pro's ADT-discovered USB controllers, not J700's KIS/ATC route.
+     * The configurable window lets a host claim the proxy before ESP boot. */
+    usb_init();
+    usb_iodev_init();
+    usb_up = true;
+    u32 cdc_window_ms = stage1_config_target() ? stage1_config_window_ms() : 15000;
+    u64 cdc_start = ticks_to_msecs(get_ticks());
+    printf("Stage 1: CDC host window %u ms\n", cdc_window_ms);
+    while (ticks_to_msecs(get_ticks()) - cdc_start < cdc_window_ms) {
+        for (int j = 0; j < USB_IODEV_COUNT; j++) {
+            iodev_id_t iodev = IODEV_USB0 + j;
+            if (!(iodev_get_usage(iodev) & USAGE_UARTPROXY))
+                continue;
+            usb_iodev_vuart_setup(iodev);
+            iodev_handle_events(iodev);
+            if (iodev_can_write(iodev)) {
+                fb_set_active(true);
+                printf("Stage 1: CDC host connected\n");
+                uartproxy_run(NULL);
+                while (!next_stage.entry)
+                    uartproxy_run(NULL);
+                return;
+            }
+        }
+        mdelay(10);
+    }
+#endif
+#endif
+
     u32 window_ms = chip_id == T8140 ? stage1_config_window_ms() : 0;
 #ifdef T8140_PROXY_WINDOW_MS
     if (!stage1_config_target())

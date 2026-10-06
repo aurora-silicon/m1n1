@@ -329,7 +329,11 @@ int payload_run(void)
     }
 
 #ifndef J700_ESP_STAGE2
-    if (!stage1_config_applied && chip_id == T8140) {
+    bool use_stage1_config = chip_id == T8140;
+#ifdef T6040_STAGE1_CDC
+    use_stage1_config |= chip_id == T6040;
+#endif
+    if (!stage1_config_applied && use_stage1_config) {
         const char *target = stage1_config_target();
         if (target) {
             if (chainload_spec && strcmp(chainload_spec, target)) {
