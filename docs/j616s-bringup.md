@@ -89,6 +89,15 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   must remain installed until reboot on this
   failure. ALS and inertial measurements, audio paths and IOP shutdown remain
   unqualified.
+  The native audio directory contains 33 devices and rejects index 33.
+  `hpai`, `lpai` and `pdm0` attach successfully. Both input frontends return
+  `idle` before and after attachment; their main-property replies list separate
+  dependency chains. These control queries produce no DART fault. The older
+  PDM configuration queries are rejected, so existing microphone configuration
+  structures and input DMA have not been qualified for this firmware.
+  `hpai` transitions from `idle` to `pw1 ` and back to `idle`, with fresh state
+  readback. Requesting `pw1 ` on `lpai` instead causes an AOP data abort at
+  address zero; that low-power transition is invalid qualification evidence.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored
@@ -147,7 +156,35 @@ raw ELF/image pairing. Proxy-opcode clock tests and scratch-code SMP tests
 were unaffected.
 A later ISP power probe matched the raw code but hit a synchronous exception
 and lost CDC. Its failing step was not preserved before cleanup; the cause
-remains unconfirmed. Further live probes require a physical restart.
+remains unconfirmed. A later probe called matching raw-ELF symbols at their
+native addresses and repeated ISP parent/CPU/FE power, revision readback and
+state restoration without exceptions. A guarded follow-up fails while reading
+the older ASC control offset 0x1400044, after the revision read succeeds. The
+watchdog automatically restores a responsive installed-stage-1 proxy. This
+offset is unqualified for T6040; do not use the older ISP startup sequence.
+Hardware watchdog recovery now protects these experiments.
+
+
+## Hardware watchdog recovery
+
+`p.wdt_arm(seconds)` arms the primary watchdog on the tested T6040 or T8140
+version-2 layout. It accepts 1-178 seconds, verifies both ADT apertures and
+requires the secondary watchdog to be inactive. The proxy checks the full
+64-bit argument before narrowing it. The helper returns zero after alarm and
+control readback, or -1 if validation or readback fails. A readback failure
+occurs after programming and does not guarantee that the watchdog is disarmed.
+`p.wdt_disable()` uses the existing watchdog disable routine. J616s startup
+does not arm it; experiments must arm it explicitly. The existing J700 CDC
+startup policy still arms its watchdog.
+
+On J616s, counter measurements confirm a 24 MHz clock. A six-second alarm
+reset the target after 6.12 seconds and returned CDC in about 15 seconds.
+A second test deliberately stalled the CPU in an infinite loop; the watchdog
+again reset the target and returned a working proxy in 14.83 seconds. Both
+returned to the installed stage 1 without changing installed images. An AOP
+microphone query/attach probe also recovered automatically after its shutdown
+ACK timed out. Keep the watchdog armed when cleanup cannot establish IOP
+quiescence; reboot before creating another proxy heap or reusing DMA memory.
 
 ## Reproducing the cold IOP probes
 
@@ -215,3 +252,11 @@ IOReporting reads its buffer through the ASC/DART translation path, including
 firmware-preallocated buffers. Host cases cover both masks across read, write
 and translation, preallocated
 IOReporting buffers, and invalidation of the selected stream.
+
+An ASC address-range precedence error treated addresses above the DVA window
+as physical even when `allow_phys` was false. This made the AOP crash decoder
+read its firmware virtual stack as host physical memory, producing additional
+exceptions and obscuring the firmware failure. Physical bypass now requires
+explicit opt-in on either side of the DVA window; other addresses use the
+configured DART and address mask. Host cases cover reads, writes and translation
+for addresses below, within and above the window with both opt-in settings.

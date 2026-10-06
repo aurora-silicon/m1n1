@@ -42,6 +42,36 @@ def test_ioreport_preallocated_buffer_uses_dart_translation():
     assert sent == [(8 << 52, 4)]
 
 
+@pytest.mark.parametrize('allow_phys', [False, True])
+@pytest.mark.parametrize('address', [0x8000, 0x18000, 0xffffffffef010bf0])
+@pytest.mark.parametrize('operation,payload', [
+    ('ioread', 16), ('iowrite', b'test'), ('iotranslate', 16),
+])
+def test_asc_physical_bypass_requires_opt_in(allow_phys, address, operation, payload):
+    calls = []
+    iface = SimpleNamespace(
+        readmem=lambda *args: calls.append(('physical', args)),
+        writemem=lambda *args: calls.append(('physical', args)),
+    )
+    backend = SimpleNamespace(proxy=None, iface=iface,
+                              read=lambda *args, **kwargs: 0,
+                              write=lambda *args, **kwargs: None)
+    dart = SimpleNamespace()
+    setattr(dart, operation, lambda *args: calls.append(('dart', args)))
+    asc = StandardASC(backend, 0, dart, dva_mask=(1 << 42) - 1)
+    asc.dva_offset, asc.dva_size = 0x10000, 0x10000
+    asc.allow_phys = allow_phys
+    result = getattr(asc, operation)(address, payload)
+    if allow_phys and not 0x10000 <= address < 0x20000:
+        if operation == 'iotranslate':
+            assert result == [(address, payload)]
+            assert calls == []
+        else:
+            assert calls == [('physical', (address, payload))]
+    else:
+        assert calls == [('dart', (0, address & asc.dva_mask, payload))]
+
+
 @pytest.mark.parametrize('stream', [0, 1, 15])
 def test_asc_mapping_invalidates_its_stream(stream):
     calls = []

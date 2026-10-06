@@ -64,7 +64,7 @@ class StandardASC(ASC):
         return paddr, dva
 
     def ioread(self, dva, size):
-        if self.allow_phys and dva < self.dva_offset or dva >= (self.dva_offset + self.dva_size):
+        if self.allow_phys and not self.dva_offset <= dva < self.dva_offset + self.dva_size:
             return self.iface.readmem(dva, size)
 
         if self.dart:
@@ -73,7 +73,7 @@ class StandardASC(ASC):
             return self.iface.readmem(dva, size)
 
     def iowrite(self, dva, data):
-        if self.allow_phys and dva < self.dva_offset or dva >= (self.dva_offset + self.dva_size):
+        if self.allow_phys and not self.dva_offset <= dva < self.dva_offset + self.dva_size:
             return self.iface.writemem(dva, data)
 
         if self.dart:
@@ -82,7 +82,7 @@ class StandardASC(ASC):
             return self.iface.writemem(dva, data)
 
     def iotranslate(self, dva, size):
-        if self.allow_phys and dva < self.dva_offset or dva >= (self.dva_offset + self.dva_size):
+        if self.allow_phys and not self.dva_offset <= dva < self.dva_offset + self.dva_size:
             return [(dva, size)]
 
         if self.dart:
