@@ -116,8 +116,8 @@ class AOPAudioEndpoint(EPICEndpoint):
     def send_roundtrip(self, call, chan="aop-audio", **kwargs):
         return super(AOPAudioEndpoint, self).send_roundtrip(chan, call, **kwargs)
 
-    def send_cmd(self, call, chan="aop-audio", **kwargs):
-        return super(AOPAudioEndpoint, self).send_cmd(chan, call, **kwargs)
+    def send_cmd(self, type, data, chan="aop-audio", **kwargs):
+        return super(AOPAudioEndpoint, self).send_cmd(chan, type, data, **kwargs)
 
     def send_notifycmd(self, type, data, chan="aop-audio", **kwargs):
         return super(AOPAudioEndpoint, self).send_notifycmd(chan, type, data, **kwargs)

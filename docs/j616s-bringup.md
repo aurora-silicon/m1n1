@@ -92,9 +92,19 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   The native audio directory contains 33 devices and rejects index 33.
   `hpai`, `lpai` and `pdm0` attach successfully. Both input frontends return
   `idle` before and after attachment; their main-property replies list separate
-  dependency chains. These control queries produce no DART fault. The older
-  PDM configuration queries are rejected, so existing microphone configuration
-  structures have not been qualified for this firmware. Typed property replies
+  dependency chains. These control queries produce no DART fault.
+  Inline PDM configuration queries are rejected. A shared-buffer command read
+  returns 626 bytes for `pdm0` property 200; the legacy client structure expects
+  631 bytes and is incompatible with the captured layout. Four trailing
+  24-byte blocks match the separate property 206-209 replies. Earlier
+  fields, timing units and setter ABI remain unqualified; no PDM configuration
+  writes are made. The production shared-buffer command client also reads
+  8,200 bytes for `pdm0` property 212; its field meanings remain unqualified.
+  It accepts command envelopes carried by subtype 0xa0 while preserving typed
+  notification replies, validates request and response buffer bounds, performs
+  cache maintenance and clears pending state on failure. All four live command
+  getters complete with both input frontends idle and zero DART faults.
+  Typed property replies
   use the request's device and modifier when decoding their payload; live
   frontend-state queries and recovery after a rejected request build pass.
   Error replies contain only the firmware return code; the decoder preserves

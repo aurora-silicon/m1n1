@@ -120,6 +120,7 @@ class EPICService:
         self.ready = False
         self.chan = None
         self.seq = 0
+        self.pending_cmd = None
 
         self.reporthandler = {}
         self.reporttypes = {}
@@ -182,30 +183,37 @@ class EPICService:
         off = fd.tell()
         data = fd.read()
 
-        ret = data
-        if (hasattr(self, "last_call") and hasattr(self.last_call, "RETS")):
+        pending = getattr(self, "pending_cmd", None)
+        if (pending is None and hasattr(self, "last_call") and
+                hasattr(self.last_call, "RETS")):
             call = getattr(self, "last_call")
             call.read_resp(BytesIO(data))
             self.reply = call.rets
             return
 
-        if (type == EPICSubtype.RETCODE):
-            rc = struct.unpack("<I", data)[0]
-            self.log(f"Retcode #{seq}: {rc:#x}")
-            self.reply = ret
-            return
-        elif (type == EPICSubtype.STD_SERVICE):
+        if (type == EPICSubtype.STD_SERVICE or
+                (type == EPICSubtype.RETCODE_WITH_PAYLOAD and pending is not None)):
             fd.seek(off)
             cmd = EPICCmd.parse_stream(fd)
             payload = fd.read()
             self.log(f"Response {int(type):#x} #{seq}: {cmd.retcode:#x}")
             if cmd.retcode != 0:
                 raise EPICError(f"IOP returned errcode {cmd.retcode:#x}")
+            capacity = self.RX_BUFSIZE if pending is None else pending
+            if cmd.rxbuf != self.rxbuf_dva or cmd.rxlen > capacity:
+                raise EPICError("Invalid command response buffer")
             if payload:
                 self.log("Inline payload:")
                 chexdump(payload)
-            assert cmd.rxbuf == self.rxbuf_dva
+            self.ep.asc.p.dc_ivac(self.rxbuf, cmd.rxlen)
             self.reply = self.iface.readmem(self.rxbuf, cmd.rxlen)
+            return
+
+        ret = data
+        if (type == EPICSubtype.RETCODE):
+            rc = struct.unpack("<I", data)[0]
+            self.log(f"Retcode #{seq}: {rc:#x}")
+            self.reply = ret
             return
         elif (type == EPICSubtype.RETCODE_WITH_PAYLOAD):
             rc = struct.unpack("<I", data[:4])[0]
@@ -223,24 +231,37 @@ class EPICService:
         cmd = EPICCmd.parse_stream(fd)
         self.log(f"Command {type:#x} #{seq}: {cmd.retcode:#x}")
 
-    def send_cmd(self, type, data, retlen=None):
+    def send_cmd(self, type, data, retlen=None, **kwargs):
         if retlen is None:
             retlen = len(data)
+        if len(data) > self.TX_BUFSIZE or not 0 <= retlen <= self.RX_BUFSIZE:
+            raise ValueError("Command exceeds service buffer size")
+        if self.pending_cmd is not None or getattr(self, "last_call", None) is not None:
+            raise EPICError("Service already has a pending call")
         cmd = Container()
         cmd.rxbuf = self.rxbuf_dva
         cmd.txbuf = self.txbuf_dva
         cmd.txlen = len(data)
         cmd.rxlen = retlen
-        self.iface.writemem(self.txbuf, data)
-        self.reply = None
-        pkt = EPICCmd.build(cmd)
-        self.ep.send_epic(self.chan, EPICType.COMMAND, EPICCategory.COMMAND, type, self.seq, pkt)
-        self.seq += 1
-        while self.reply is None:
-            self.ep.asc.work()
-        return self.reply
+        self.pending_cmd = retlen
+        try:
+            pkt = EPICCmd.build(cmd)
+            self.iface.writemem(self.txbuf, data)
+            self.ep.asc.p.dc_cvac(self.txbuf, len(data))
+            self.ep.asc.p.dc_ivac(self.rxbuf, retlen)
+            self.reply = None
+            self.ep.send_epic(self.chan, EPICType.COMMAND, EPICCategory.COMMAND,
+                              type, self.seq, pkt, **kwargs)
+            self.seq += 1
+            while self.reply is None:
+                self.ep.asc.work()
+            return self.reply
+        finally:
+            self.pending_cmd = None
 
     def send_notify(self, type, data, **kwargs):
+        if self.pending_cmd is not None:
+            raise EPICError("Service already has a pending command")
         self.reply = None
         self.iface.writemem(self.txbuf, data)
         self.ep.send_epic(self.chan, EPICType.NOTIFY, EPICCategory.NOTIFY, type, self.seq, data, **kwargs)
