@@ -117,6 +117,10 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   ISP_CPU/ISP_FE global slots at offsets 0x4000/0x4008. All tested domains
   returned to their original states, including ISPSENS0 state 4. Firmware
   startup, channels, heap requirements and camera operation remain untested.
+  The captured boot firmware is `mBoot-18000.161.9` from macOS 26.6.1 (25G76).
+  Its ISP UUID and segment ranges match that restore image; macOS 26.6.2 and
+  the installed macOS 27.0 ISP image have different UUIDs. The version table
+  recognizes 26.6.1; this does not qualify an ISP startup profile.
 * No speaker output, speaker amplifier programming or audio DMA stream was
   started.
 
@@ -141,6 +145,9 @@ triggered a reboot. Installed stage 1 recovered CDC; the corrected raw-ELF
 probe passed. The earlier SEP result was discarded and repeated with verified
 raw ELF/image pairing. Proxy-opcode clock tests and scratch-code SMP tests
 were unaffected.
+A later ISP power probe matched the raw code but hit a synchronous exception
+and lost CDC. Its failing step was not preserved before cleanup; the cause
+remains unconfirmed. Further live probes require a physical restart.
 
 ## Reproducing the cold IOP probes
 
