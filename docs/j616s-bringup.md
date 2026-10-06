@@ -98,6 +98,15 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   `hpai` transitions from `idle` to `pw1 ` and back to `idle`, with fresh state
   readback. Requesting `pw1 ` on `lpai` instead causes an AOP data abort at
   address zero; that low-power transition is invalid qualification evidence.
+  A guarded prototype maps the ADT-selected ADMAC stream 10 with four-level
+  42-bit tables and submits one non-repeating 16 KiB RX descriptor only after
+  `hpai` reaches `pwrd`. The split RX bank at offset 0xc000, completion report,
+  zero residue and zero DART fault are observed; the sentinel buffer becomes
+  all zeros. RX stops and the frontend returns through `pw1 ` to `idle`; the
+  proxy remains responsive. This tests input DMA but does not establish live
+  microphone audio. Source configuration and PCM format remain unqualified.
+  Cleanup must stop RX before returning the frontend to `idle`; an earlier
+  prototype accessed ADMAC again afterward and lost CDC.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored
@@ -130,8 +139,8 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   Its ISP UUID and segment ranges match that restore image; macOS 26.6.2 and
   the installed macOS 27.0 ISP image have different UUIDs. The version table
   recognizes 26.6.1; this does not qualify an ISP startup profile.
-* No speaker output, speaker amplifier programming or audio DMA stream was
-  started.
+* No speaker output or speaker amplifier programming was performed. Only
+  the input-only ADMAC prototype described above submitted an audio descriptor.
 
 The experimental stage 2 was chainloaded into RAM. Installed boot images,
 boot policy and partitions were not changed. Preserve a working CDC recovery
