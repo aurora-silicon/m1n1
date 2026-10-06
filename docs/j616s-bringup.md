@@ -97,13 +97,20 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   descriptors. The optional keyboard probe sends enable only to the announced
   keyboard interface 2; its zero-status command ACK and fresh DeviceReady
   response pass on repeated cold boots. The optional touchpad probe uploads the
-  tested J616s 26A428 firmware, patches its interface slot and requires fresh
-  enable/upload ACKs, four version-2 power-request replies and DeviceReady.
-  Firmware logs report Touch MT ready and raw reports arrive. A combined
-  45-second capture recorded keyboard press/release reports for hello and space;
-  finger movement and taps produced no touch reports beyond startup status.
-  Both final Off replies, AP/IOP quiescence and DART/DAPF restoration pass.
-  Touchpad motion reporting remains unqualified.
+  tested J616s 26A428 firmware and patches its interface slot. It first enables
+  the announced actuator interface and requires its fresh DeviceReady response,
+  then requires upload ACKs, four version-2 power-request replies and touchpad
+  DeviceReady. A sensor-dimensions query returns sizes 15600/9600 and coordinate
+  bounds X -7456..7976, Y -163..9283. Human movement tests produce report 0x75
+  frames with changing coordinates; earlier runs without actuator enable
+  produced only startup reports. Enabling keyboard only after touchpad readiness and dimensions gives a
+  combined capture of 16 keyboard reports and 1791 touch frames, including
+  two- and three-contact frames, button transitions and pressure changes.
+  Enabling keyboard before touchpad startup produced neither input stream.
+  Both final touchpad Off replies, whole-MTP AP/IOP quiescence and DART/DAPF restoration pass with the actuator enabled.
+  The human tester confirms normal haptic clicks during touchpad-only and
+  combined tests; no host actuator output reports are sent. Separate actuator
+  output control remains unqualified.
 * SEP's existing RNG routine returned zero bytes. Successful SEP communication
   is not established.
 * ISP revision `0x100003` was read after powering the ADT parents and the
@@ -171,15 +178,21 @@ M1N1DEVICE=/dev/ttyACM0 python proxyclient/experiments/t6040_iop.py mtp \
 ```
 
 This mode requires the tested firmware hash. Add `--keyboard` to capture both
-interfaces and `--capture-seconds 45` for a longer input window (1-60 seconds;
-up to 1 MiB). It sends no actuator commands and makes no GPIO writes. Version-2 power requests include
+interfaces; keyboard enable follows touchpad startup. Add `--capture-seconds 45`
+for a longer input window (1-60 seconds;
+up to 1 MiB). It enables the announced multitouch and actuator interfaces,
+sends no actuator output reports and makes no GPIO writes. Version-2 power
+requests include
 Off/On and WillChange/HasChanged phases; replies must echo the exact request
 with the expected transfer counter and zero status. DeviceReady must arrive
 after the On request. After capture, both Off phases must be acknowledged
 before AP/IOP quiescence and register restoration. Failed or uncertain shutdown
 returns `reboot_required` and retains the IOP, DART, DAPF and DMA allocations
 until reboot. Control requests require an empty receive FIFO before transmission;
-continuous input may cause a safe refusal. Reboot before each probe run. No firmware blob is included in this PR.
+continuous input may cause a safe refusal. FIFO reads use bounded native
+batches of at most 4096 bytes; capture finishes the current packet within an
+additional one-second deadline. Reboot before each probe run. No firmware blob
+is included in this PR.
 
 AFK shutdown now waits for a fresh ACK instead of interpreting an initially
 false `alive` flag as completion. Its timeout bounds ACK polling; the shared

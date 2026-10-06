@@ -48,3 +48,16 @@ def test_nonzero_status_rejected():
     reply.hdr.retcode = 0xe00002bc
     with pytest.raises(RuntimeError, match='failed'):
         check_control_reply(POWER_REQUEST, 2, 2, reply)
+
+
+def test_short_power_error_reply_reports_firmware_status():
+    # Actual rejection of Off/Will for actuator interface 4.
+    reply = RXMessage.parse(bytes.fromhex('80000100e20200e040020400'))
+    with pytest.raises(RuntimeError, match='0xe00002e2'):
+        check_control_reply(bytes.fromhex('400204000000000000'), 9, 9, reply)
+
+
+def test_error_reply_for_another_command_is_not_accepted():
+    reply = RXMessage.parse(bytes.fromhex('80000100e20200e040020400'))
+    with pytest.raises(ValueError, match='command'):
+        check_control_reply(b'\xb4\x04', 9, 9, reply)

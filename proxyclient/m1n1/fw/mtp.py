@@ -50,11 +50,13 @@ def prepare_firmware(data, iface):
 def check_control_reply(request, expected_seq, received_seq, reply):
     if received_seq != expected_seq or reply.hdr.flags != 0x80:
         raise ValueError("Unexpected MTP control reply")
+    if reply.msg[:1] != request[:1]:
+        raise ValueError("MTP control reply does not match its command")
+    if reply.hdr.retcode:
+        raise RuntimeError(f"MTP command {request[0]:#x} failed: {reply.hdr.retcode:#x}")
     expected = request if request[0] == 0x40 else request[:1]
     if reply.msg != expected:
         raise ValueError("MTP control reply does not match its request")
-    if reply.hdr.retcode:
-        raise RuntimeError(f"MTP command {request[0]:#x} failed: {reply.hdr.retcode:#x}")
 
 
 class HIDDescriptor(ConstructClass):

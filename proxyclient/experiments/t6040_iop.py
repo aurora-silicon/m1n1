@@ -31,11 +31,24 @@ def probe_mtp(asc, keyboard, result, firmware=None, capture_seconds=2):
     from m1n1.fw.mtp import (decode_packet, encode_packet, RXMessage, InitMsg,
                             prepare_firmware, check_control_reply)
 
-    data = DockChannelDataRegs(u, u.adt['/arm-io/dockchannel-mtp'].get_reg(3)[0])
+    rx_base = u.adt['/arm-io/dockchannel-mtp'].get_reg(3)[0]
+    data = DockChannelDataRegs(u, rx_base)
     pending = bytearray()
+    rx_buffer = u.memalign(0x4000, 4096)
+    rx_copy = '''
+        cbz x2, 2f
+    1:  ldr w3, [x0]
+        str w3, [x1], #4
+        subs x2, x2, #1
+        b.ne 1b
+    2:  dsb sy
+    '''
     expected_reply = None
     reply_received = False
-    sequence = 1 if keyboard else 0
+    feature_reply = None
+    feature_pending = False
+    sequence = 0
+    keyboard_counter = None
     image = None
     if firmware is not None:
         blob = pathlib.Path(firmware).read_bytes()
@@ -43,23 +56,34 @@ def probe_mtp(asc, keyboard, result, firmware=None, capture_seconds=2):
         if digest != '7eb84312cb4ea74833ce9567ba8c92bc42a0c26c5c34d6bdfaa5cb65abfe4b26':
             raise ValueError("Only the tested J616s 26A428 touchpad firmware is qualified")
         image = prepare_firmware(blob, 1)
-        result.update(firmware_source_sha256=digest, touchpad_ready=False, touchpad_reports=[],
+        result.update(firmware_source_sha256=digest, touchpad_ready=False, actuator_ready=False,
+                      touchpad_reports=[],
                       commands=[], command_acks=[])
     result.update(initialization=[], keyboard_ready=False, keyboard_enable_ack=False,
                   packets=[], keyboard_reports=[])
 
     def capture(seconds, until=None, byte_limit=16384):
-        nonlocal reply_received
+        nonlocal reply_received, feature_reply
         deadline = time.monotonic() + seconds
         received = 0
-        while time.monotonic() < deadline:
-            if until is not None and until():
+        while True:
+            now = time.monotonic()
+            done = now >= deadline or (until is not None and until())
+            if done and not pending:
                 return
+            if now >= deadline + 1:
+                raise TimeoutError("Incomplete MTP packet at capture boundary")
             asc.work()
             count = data.RX_COUNT.val
-            if count >= 4:
-                pending.extend(struct.pack('<I', data.RX_32.val))
-                received += 4
+            size = min(count & ~3, 4096)
+            if done and count:
+                needed = (8 - len(pending) if len(pending) < 8 else
+                          struct.unpack_from('<H', pending, 2)[0] + 12 - len(pending))
+                size = min(size, needed & ~3)
+            if size:
+                u.exec(rx_copy, rx_base + 0x28, rx_buffer, size // 4)
+                pending.extend(u.iface.readmem(rx_buffer, size))
+                received += size
             elif count:
                 pending.append(data.RX_8.DATA)
                 received += 1
@@ -90,6 +114,8 @@ def probe_mtp(asc, keyboard, result, firmware=None, capture_seconds=2):
                         result['keyboard_ready'] = True
                     elif image is not None and msg.msg == b'\xf1\x01\x00\x00':
                         result['touchpad_ready'] = True
+                    elif image is not None and msg.msg == b'\xf1\x04\x00\x00':
+                        result['actuator_ready'] = True
                     elif image is not None and msg.msg[:1] == b'\xa0':
                         raise ValueError("Touchpad GPIO requests are not qualified")
                 elif expected_reply is not None and iface == 0 and kind == 0x11:
@@ -98,17 +124,24 @@ def probe_mtp(asc, keyboard, result, firmware=None, capture_seconds=2):
                     result['command_acks'].append({'counter': seq, 'reply': msg.msg.hex(),
                                                    'status': msg.hdr.retcode})
                     reply_received = True
-                elif (keyboard and iface == 0 and kind == 0x11 and seq == 0
+                elif (keyboard and iface == 0 and kind == 0x11 and seq == keyboard_counter
                       and msg.hdr.flags == 0x80 and msg.msg == b'\xb4'):
                     if msg.hdr.retcode:
                         raise RuntimeError("Keyboard enable was rejected")
                     result['keyboard_enable_ack'] = True
                 elif iface == 2 and msg.hdr.flags == 0:
                     result['keyboard_reports'].append(msg.msg.hex())
+                elif feature_pending and iface == 1 and kind == 0x11:
+                    if seq != 0 or msg.hdr.flags != 0x81 or msg.hdr.retcode:
+                        raise RuntimeError("Invalid sensor dimensions response")
+                    if not msg.msg or msg.msg[0] != 0xd9:
+                        raise ValueError("Wrong sensor dimensions report")
+                    feature_reply = msg.msg
+                    result['sensor_dimensions_reply'] = msg.msg.hex()
                 elif image is not None and iface == 1 and msg.hdr.flags == 0:
                     result['touchpad_reports'].append(msg.msg.hex())
 
-    def control(request, power_on=False):
+    def control(request, power_on=False, actuator=False):
         nonlocal expected_reply, reply_received, sequence
         capture(.05)
         packet = encode_packet(0, sequence, struct.pack('<HHI', 0x80, len(request), 0) + request)
@@ -117,6 +150,8 @@ def probe_mtp(asc, keyboard, result, firmware=None, capture_seconds=2):
             raise ValueError("MTP replies remain queued before control request")
         if power_on:
             result['touchpad_ready'] = False
+        if actuator:
+            result['actuator_ready'] = False
         expected_reply = sequence, request
         reply_received = False
         result['commands'].append({'counter': sequence, 'payload': request.hex()})
@@ -131,21 +166,28 @@ def probe_mtp(asc, keyboard, result, firmware=None, capture_seconds=2):
     capture(5)
     if pending:
         raise ValueError("Incomplete MTP initialization packet")
-    if keyboard:
+    def enable_keyboard():
+        nonlocal keyboard_counter, sequence
         candidates = [entry for entry in result['initialization'] if entry['name'] == 'keyboard']
         if len(candidates) != 1 or candidates[0]['id'] != 2 or candidates[0]['more_packets']:
             raise ValueError("Keyboard interface was not uniquely announced")
         msg = struct.pack('<HHI', 0x80, 2, 0) + b'\xb4\x02'
-        packet = encode_packet(0, 0, msg)
+        packet = encode_packet(0, sequence, msg)
         wait_until(lambda: data.TX_FREE.val >= len(packet), asc.work)
         if pending or data.RX_COUNT.val:
             raise ValueError("MTP replies remain queued before keyboard enable")
+        keyboard_counter = sequence
+        result['keyboard_enable_counter'] = sequence
+        sequence += 1
         result['keyboard_enable_ack'] = result['keyboard_ready'] = False
         for offset in range(0, len(packet), 4):
             data.TX_32.val = struct.unpack_from('<I', packet, offset)[0]
         capture(5)
         if pending or not result['keyboard_enable_ack'] or not result['keyboard_ready']:
             raise TimeoutError("Keyboard enable ACK/readiness did not complete")
+
+    if keyboard and image is None:
+        enable_keyboard()
     if image is not None:
         candidates = [entry for entry in result['initialization']
                       if entry['name'] == 'multi-touch']
@@ -153,6 +195,14 @@ def probe_mtp(asc, keyboard, result, firmware=None, capture_seconds=2):
             raise ValueError("Multitouch interface was not uniquely announced")
         result['touchpad_trial_active'] = True
         control(b'\xb4\x01')
+        actuator = [entry for entry in result['initialization'] if entry['name'] == 'actuator']
+        if len(actuator) != 1 or actuator[0]['id'] != 4 or actuator[0]['more_packets']:
+            raise ValueError("Actuator interface was not uniquely announced")
+        result['actuator_enable_attempted'] = True
+        control(b'\xb4\x04', actuator=True)
+        capture(5, lambda: result['actuator_ready'])
+        if not result['actuator_ready']:
+            raise TimeoutError("Actuator DeviceReady did not arrive")
         pa, dva = asc.ioalloc(len(image))
         u.iface.writemem(pa, image)
         p.dc_cvac(pa, len(image))
@@ -169,6 +219,27 @@ def probe_mtp(asc, keyboard, result, firmware=None, capture_seconds=2):
         capture(5, lambda: result['touchpad_ready'])
         if not result['touchpad_ready']:
             raise TimeoutError("Multitouch DeviceReady did not arrive")
+        packet = encode_packet(1, 0, struct.pack('<HHI', 0x81, 1, 0) + b'\xd9')
+        capture(.05)
+        wait_until(lambda: data.TX_FREE.val >= len(packet), asc.work)
+        if pending or data.RX_COUNT.val:
+            raise ValueError("MTP data remains queued before dimensions query")
+        feature_pending = True
+        result['sensor_dimensions_query_sent'] = True
+        for offset in range(0, len(packet), 4):
+            data.TX_32.val = struct.unpack_from('<I', packet, offset)[0]
+        capture(5, lambda: feature_reply is not None)
+        if feature_reply is None:
+            raise TimeoutError("Sensor dimensions query timed out")
+        feature_pending = False
+        if len(feature_reply) < 17:
+            raise ValueError("Truncated sensor dimensions report")
+        result['sensor_dimensions'] = dict(zip(
+            ('width', 'height', 'min_x', 'min_y', 'max_x', 'max_y'),
+            struct.unpack_from('<IIhhhh', feature_reply, 1)))
+        if keyboard:
+            enable_keyboard()
+        print(f'MTP input capture: {capture_seconds} seconds', flush=True)
         capture(capture_seconds, byte_limit=1048576)
         if pending:
             raise ValueError("Incomplete multitouch report")
