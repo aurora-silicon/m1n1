@@ -114,6 +114,18 @@ class ADMACRegs(RegMap):
     CHAN_INTMASK = (irange(0x8020, 32, 0x200), irange(0x0, 4, 0x4)), R_CHAN_STATUS
 
 
+class ADMACSplitRegs(ADMACRegs):
+    CHAN_CTL = irange(0x8000, 64, 0x200), R_CHAN_CONTROL
+    CHAN_BUSWIDTH = irange(0x8040, 64, 0x200), R_BUSWIDTH
+    CHAN_SRAM_CARVEOUT = irange(0x8050, 64, 0x200), R_CARVEOUT
+    CHAN_BURSTSIZE = irange(0x8054, 64, 0x200), Register32
+    CHAN_RESIDUE = irange(0x8064, 64, 0x200), Register32
+    CHAN_DESC_RING = irange(0x8070, 64, 0x200), R_RING
+    CHAN_REPORT_RING = irange(0x8074, 64, 0x200), R_RING
+    CHAN_STATUS = (irange(0x8010, 64, 0x200), irange(0x0, 4, 0x4)), R_CHAN_STATUS
+    CHAN_INTMASK = (irange(0x8020, 64, 0x200), irange(0x0, 4, 0x4)), R_CHAN_STATUS
+
+
 class ADMACDescriptorFlags(Register32):
     # whether to raise DESC_DONE in CHAN_STATUS
     NOTIFY = 16
@@ -198,6 +210,8 @@ class ADMACChannel(Reloadable):
         self.tx = (channo % 2) == 0
         self.rx = not self.tx
         self.ch = channo
+        # Logical channels remain TX0, RX0, TX1, RX1 across both layouts.
+        self.reg_ch = channo // 2 + (32 if self.rx else 0) if parent.split_channels else channo
 
         self._desc_id = 0
         self._submitted = {}
@@ -205,15 +219,15 @@ class ADMACChannel(Reloadable):
         self._est_byte_rate = None
 
     def reset(self):
-        self.regs.CHAN_CTL[self.ch].set(RESET_RINGS=1, CLEAR_OF_UF_COUNTERS=1)
-        self.regs.CHAN_CTL[self.ch].set(RESET_RINGS=0, CLEAR_OF_UF_COUNTERS=0)
+        self.regs.CHAN_CTL[self.reg_ch].set(RESET_RINGS=1, CLEAR_OF_UF_COUNTERS=1)
+        self.regs.CHAN_CTL[self.reg_ch].set(RESET_RINGS=0, CLEAR_OF_UF_COUNTERS=0)
 
         self.burstsize = 0xc0_0060
         self.buswidth = E_BUSWIDTH.W_32BIT
         self.framesize = E_FRAME.F_1_WORD
 
     def enable(self):
-        self.regs.CHAN_INTMASK[self.ch, 0].reg = \
+        self.regs.CHAN_INTMASK[self.reg_ch, 0].reg = \
                 R_CHAN_STATUS(DESC_DONE=1, DESC_RING_EMPTY=1,
                                 REPORT_RING_FULL=1, RING_ERR=1)
 
@@ -230,37 +244,37 @@ class ADMACChannel(Reloadable):
 
     @property
     def buswidth(self):
-        self.regs.CHAN_BUSWIDTH[self.ch].reg.WORD
+        return self.regs.CHAN_BUSWIDTH[self.reg_ch].reg.WORD
 
     @buswidth.setter
     def buswidth(self, wordsize):
-        return self.regs.CHAN_BUSWIDTH[self.ch].set(WORD=wordsize)
+        return self.regs.CHAN_BUSWIDTH[self.reg_ch].set(WORD=wordsize)
 
     @property
     def framesize(self):
-        self.regs.CHAN_BUSWIDTH[self.ch].reg.FRAME
+        return self.regs.CHAN_BUSWIDTH[self.reg_ch].reg.FRAME
 
     @framesize.setter
     def framesize(self, framesize):
-        return self.regs.CHAN_BUSWIDTH[self.ch].set(FRAME=framesize)
+        return self.regs.CHAN_BUSWIDTH[self.reg_ch].set(FRAME=framesize)
 
     @property
     def burstsize(self):
-        return self.regs.CHAN_BURSTSIZE[self.ch].val
+        return self.regs.CHAN_BURSTSIZE[self.reg_ch].val
 
     @burstsize.setter
     def burstsize(self, size):
-        self.regs.CHAN_BURSTSIZE[self.ch].val = size
+        self.regs.CHAN_BURSTSIZE[self.reg_ch].val = size
 
     @property
     def sram_carveout(self):
-        reg = self.regs.CHAN_SRAM_CARVEOUT[self.ch].reg
+        reg = self.regs.CHAN_SRAM_CARVEOUT[self.reg_ch].reg
         return (reg.BASE, reg.SIZE)
 
     @sram_carveout.setter
     def sram_carveout(self, carveout):
         base, size = carveout
-        self.regs.CHAN_SRAM_CARVEOUT[self.ch].reg = \
+        self.regs.CHAN_SRAM_CARVEOUT[self.reg_ch].reg = \
                     R_CARVEOUT(BASE=base, SIZE=size)
 
     @property
@@ -278,10 +292,10 @@ class ADMACChannel(Reloadable):
             return self.regs.RX_REPORT_READ[self.ch//2]
 
     def can_submit(self):
-        return not self.regs.CHAN_DESC_RING[self.ch].reg.FULL
+        return not self.regs.CHAN_DESC_RING[self.reg_ch].reg.FULL
 
     def submit_desc(self, desc):
-        if self.regs.CHAN_DESC_RING[self.ch].reg.FULL:
+        if self.regs.CHAN_DESC_RING[self.reg_ch].reg.FULL:
             raise Exception(f"ch{self.ch} descriptor ring full")
 
         if self.p.debug:
@@ -310,7 +324,7 @@ class ADMACChannel(Reloadable):
     def read_reports(self):
         data = bytearray()
 
-        while not self.regs.CHAN_REPORT_RING[self.ch].reg.EMPTY:
+        while not self.regs.CHAN_REPORT_RING[self.reg_ch].reg.EMPTY:
             pieces = []
             for _ in range(4):
                 pieces.append(self.REPORT_READ.val)
@@ -341,7 +355,7 @@ class ADMACChannel(Reloadable):
 
     @property
     def status(self):
-        return self.regs.CHAN_STATUS[self.ch, 0].reg
+        return self.regs.CHAN_STATUS[self.reg_ch, 0].reg
 
     def poll(self, wait=True):
         while not (self.status.DESC_DONE or self.status.RING_ERR):
@@ -350,16 +364,16 @@ class ADMACChannel(Reloadable):
             if not wait:
                 break
 
-        self.regs.CHAN_STATUS[self.ch,0].reg = R_CHAN_STATUS(DESC_DONE=1)
+        self.regs.CHAN_STATUS[self.reg_ch,0].reg = R_CHAN_STATUS(DESC_DONE=1)
 
         if self.status.RING_ERR:
             if self.p.debug:
-                print(f"STATUS={self.regs.CHAN_STATUS[self.ch,1].reg} " + \
-                      f"REPORT_RING={self.regs.CHAN_DESC_RING[self.ch]} " + \
-                      f"DESC_RING={self.regs.CHAN_REPORT_RING[self.ch]}",
+                print(f"STATUS={self.regs.CHAN_STATUS[self.reg_ch,1].reg} " + \
+                      f"DESC_RING={self.regs.CHAN_DESC_RING[self.reg_ch]} " + \
+                      f"REPORT_RING={self.regs.CHAN_REPORT_RING[self.reg_ch]}",
                       file=sys.stderr)
-            self.regs.CHAN_DESC_RING[self.ch].set(ERR=1)
-            self.regs.CHAN_REPORT_RING[self.ch].set(ERR=1)
+            self.regs.CHAN_DESC_RING[self.reg_ch].set(ERR=1)
+            self.regs.CHAN_REPORT_RING[self.reg_ch].set(ERR=1)
 
         return self.read_reports()
 
@@ -370,9 +384,12 @@ class ADMAC(Reloadable):
         self.u = u
         self.p = u.proxy
         self.debug = debug
+        self.split_channels = False
+        adt_node = None
 
         if type(devpath) is str:
             adt_node = u.adt[devpath]
+            self.split_channels = "admac,t604x" in adt_node.compatible
             # ADT's #dma-channels counts pairs of RX/TX channel, so multiply by two
             self.nchans = adt_node._properties["#dma-channels"] * 2
             self.base, _ = adt_node.get_reg(0)
@@ -380,7 +397,7 @@ class ADMAC(Reloadable):
             self.base = devpath
             self.nchans = 26
 
-        self.regs = ADMACRegs(u, self.base)
+        self.regs = (ADMACSplitRegs if self.split_channels else ADMACRegs)(u, self.base)
         self.dart, self.dart_stream = dart, dart_stream
 
         if dart is not None:
@@ -390,7 +407,7 @@ class ADMAC(Reloadable):
             self.resmem_pos = 0
             self.dart.invalidate_streams(1 << dart_stream)
 
-        if u.adt[devpath].compatible[0].startswith(("admac,t603", "admac,t8122")):
+        if adt_node and adt_node.compatible[0].startswith(("admac,t603", "admac,t8122")):
             self.regs.UNK_CTL_28.val = 0x200000
             self.regs.UNK_CTL_2C.val = 0x200000
         self.chans = [ADMACChannel(self, no) for no in range(self.nchans)]

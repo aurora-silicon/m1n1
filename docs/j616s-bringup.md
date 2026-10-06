@@ -112,6 +112,13 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   microphone audio. Source configuration and PCM format remain unqualified.
   Cleanup must stop RX before returning the frontend to `idle`; an earlier
   prototype accessed ADMAC again afterward and lost CDC.
+  The Python ADMAC driver selects split channel banks for `admac,t604x` while
+  preserving logical channel IDs, FIFO ports and global enable bits. A live
+  RX0 trial uses its bus-width, frame-size, carveout and burst-size accessors,
+  descriptor submission and report reader, with the same completion and
+  all-zero-buffer result. Channel startup configuration and final peripheral
+  teardown remain in the prototype; this change does not qualify stream
+  restart or select the DART stream automatically.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored
