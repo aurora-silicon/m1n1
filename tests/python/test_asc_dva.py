@@ -40,3 +40,18 @@ def test_ioreport_preallocated_buffer_uses_dart_translation():
     assert ep.Init(IOReporting_Report()) is True
     assert reads == [(0x10000123000, 64)]
     assert sent == [(8 << 52, 4)]
+
+
+@pytest.mark.parametrize('stream', [0, 1, 15])
+def test_asc_mapping_invalidates_its_stream(stream):
+    calls = []
+    backend = SimpleNamespace(proxy=None, iface=None,
+                              read=lambda *args, **kwargs: 0,
+                              write=lambda *args, **kwargs: None)
+    dart = SimpleNamespace(
+        iomap=lambda *args: calls.append(('map', args)) or 0x8000,
+        invalidate_streams=lambda mask: calls.append(('invalidate', mask)),
+    )
+    asc = StandardASC(backend, 0, dart, stream=stream)
+    assert asc.iomap(0x123000, 0x4000) == 0x8000
+    assert calls == [('map', (stream, 0x123000, 0x4000)), ('invalidate', 1 << stream)]

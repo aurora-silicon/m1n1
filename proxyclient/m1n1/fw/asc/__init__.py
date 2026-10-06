@@ -55,7 +55,7 @@ class StandardASC(ASC):
             return addr
         dva = self.dva_offset | self.dart.iomap(self.stream, addr, size)
 
-        self.dart.invalidate_streams(1)
+        self.dart.invalidate_streams(1 << self.stream)
         return dva
 
     def ioalloc(self, size):
