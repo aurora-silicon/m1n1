@@ -99,10 +99,15 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   24-byte blocks match the separate property 206-209 replies. Earlier
   fields, timing units and setter ABI remain unqualified; no PDM configuration
   writes are made. The production shared-buffer command client also reads
-  8,200 bytes for `pdm0` property 212; its field meanings remain unqualified.
+  8,200 bytes for `pdm0` properties 211 and 212, with identical payloads in
+  this capture. The existing high-frequency decimator decoder consumes and
+  rebuilds both payloads exactly; property 212 also passes the typed response
+  reader on a fresh live reply. The decoder reports latency 36, ratios
+  10/5/3 and 386 coefficients. No new decoder is needed; setter behavior and
+  the configuration needed for microphone startup remain unqualified.
   It accepts command envelopes carried by subtype 0xa0 while preserving typed
   notification replies, validates request and response buffer bounds, performs
-  cache maintenance and clears pending state on failure. All four live command
+  cache maintenance and clears pending state on failure. The live command
   getters complete with both input frontends idle and zero DART faults.
   Typed property replies
   use the request's device and modifier when decoding their payload; live
