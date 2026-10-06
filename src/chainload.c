@@ -15,6 +15,7 @@
 
 #ifdef CHAINLOADING
 int rust_load_image(const char *spec, void **image, size_t *size);
+void rust_free_image(void *image, size_t size);
 #endif
 
 extern u8 _chainload_stub_start[];
@@ -85,8 +86,10 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
         printf(
             "chainload: packed span would overlap protected/live memory; parking firmware block\n");
         parked = memalign(SZ_16K, fw_size);
-        if (!parked || (u64)parked > ram_end || fw_size > ram_end - (u64)parked)
+        if (!parked || (u64)parked > ram_end || fw_size > ram_end - (u64)parked) {
+            free(parked);
             return -1;
+        }
         fw_base = (u64)parked;
     }
 
@@ -186,8 +189,10 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
     }
 
     ret = rust_load_image(spec, &image, &size);
-    if (ret == 0)
+    if (ret == 0) {
         ret = chainload_image(image, size, vars, *var_cnt);
+        rust_free_image(image, size);
+    }
     if (!nvme_shutdown()) {
         next_stage.entry = NULL;
         return -1;

@@ -22,7 +22,6 @@ pub enum Error {
     InvalidFile,
     OutOfMemory,
     UnexpectedEof,
-    Unknown,
 }
 
 impl From<fatfs::Error<nvme::Error>> for Error {
@@ -70,9 +69,6 @@ fn load_image(spec: &str) -> Result<Vec<u8>, Error> {
     let part = {
         let storage = nvme::NVMEStorage::new(1, 0);
         let mut pt = gpt::GPT::new(storage)?;
-
-        //println!("Partitions:");
-        //pt.dump();
 
         println!("Searching for the requested partition");
         pt.find_by_partuuid(uuid)?.ok_or(Error::PartitionNotFound)?
