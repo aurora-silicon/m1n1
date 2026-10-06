@@ -208,7 +208,7 @@ int tps6598x_cmd_status(tps6598x_dev_t *dev, const char *cmd)
 {
     u32 cmd_status;
 
-    if (tps6598x_read_reg(dev, TPS_REG_CMD1, (u8 *)&cmd_status, 4) < 0) {
+    if (tps6598x_read_reg(dev, TPS_REG_CMD1, (u8 *)&cmd_status, 4) != 4) {
         printf("tps6598x: read status for cmd: %s failed\n", cmd);
         return -1;
     }
@@ -297,7 +297,7 @@ int tps6598x_powerup(tps6598x_dev_t *dev)
 {
     u8 power_state;
 
-    if (tps6598x_read_reg(dev, TPS_REG_POWER_STATE, &power_state, 1) < 0)
+    if (tps6598x_read_reg(dev, TPS_REG_POWER_STATE, &power_state, 1) != 1)
         return -1;
 
     if (power_state == 0)
@@ -307,7 +307,7 @@ int tps6598x_powerup(tps6598x_dev_t *dev)
     if (tps6598x_command(dev, "SSPS", &data, 1, NULL, 0))
         return -1;
 
-    if (tps6598x_read_reg(dev, TPS_REG_POWER_STATE, &power_state, 1) < 0)
+    if (tps6598x_read_reg(dev, TPS_REG_POWER_STATE, &power_state, 1) != 1)
         return -1;
 
     if (power_state != 0)
