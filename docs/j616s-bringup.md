@@ -112,9 +112,13 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   reads successfully; writing the same bytes returns 0xe00002cf (not writable).
   It cannot serve as a configuration-write template.
   A read-only input property scan also returns three words of value 7 from
-  `lpai` property 300, matching the ADT supported/enabled/history channel masks.
-  This does not establish a writable configuration layout. All 105 getter
-  requests complete, the frontend remains idle and DART faults stay zero.
+  `lpai` property 300, matching the ADT channel masks. The matching firmware's
+  initializer and validator identify a 12-byte structure ordered as supported,
+  enabled and history channel masks. Its write handler requires that size and
+  validates the values against the board configuration. An exact GET-byte SET
+  returns zero; GET readback remains `(7, 7, 7)`, both input frontends remain
+  idle and DART faults stay zero. Alternate masks and microphone startup are
+  unqualified. All 105 getter requests complete without DART faults.
   `hpai` transitions from `idle` to `pw1 ` and back to `idle`, with fresh state
   readback. Requesting `pw1 ` on `lpai` instead causes an AOP data abort at
   address zero; that low-power transition is invalid qualification evidence.
