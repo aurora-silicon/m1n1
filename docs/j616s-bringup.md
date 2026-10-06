@@ -84,8 +84,12 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored
-  after shutdown with no DART fault. Keyboard/trackpad protocol and input
-  remain untested.
+  after shutdown with no DART fault. Passive DockChannel capture receives six
+  checksum-validated initialization packets with keyboard and multitouch HID
+  descriptors. The optional keyboard probe sends enable only to the announced
+  keyboard interface 2; its zero-status command ACK and fresh DeviceReady
+  response pass on repeated cold boots. No key events have been observed; trackpad enable, firmware
+  upload and input remain untested.
 * SEP's existing RNG routine returned zero bytes. Successful SEP communication
   is not established.
 * ISP revision `0x100003` was read after powering the ADT parents and the
@@ -126,7 +130,13 @@ M1N1DEVICE=/dev/ttyACM0 python proxyclient/experiments/t6040_iop.py sio
 ```
 
 Select `sio`, `mtp` or `aop` as the final argument. SIO/MTP use existing
-StandardASC system endpoints and send no application endpoint commands. AOP
+StandardASC system endpoints. MTP also captures initialization packets from
+DockChannel without enabling any device. Add `--keyboard` to the MTP command
+to enable only the announced keyboard and check its ACK/readiness responses.
+The capture is bounded to five seconds per phase and 16 KiB; it verifies each
+packet checksum before parsing its contents. It does not enable the actuator
+or multitouch interface, program GPIOs or upload firmware. Keyboard input
+events still require separate validation. AOP
 also initializes advertised AFK endpoints to read service announcements, then
 requests AFK shutdown. Fresh responses currently time out, so the AOP probe
 returns a failure and requires reboot. It sends no audio application commands.

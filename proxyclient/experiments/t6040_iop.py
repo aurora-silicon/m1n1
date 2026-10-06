@@ -25,9 +25,86 @@ def wait_until(condition, service=lambda: None, timeout=1):
         service()
 
 
-def probe(device):
+def probe_mtp(asc, keyboard, result):
+    from m1n1.hw.dockchannel import DockChannelDataRegs
+    from m1n1.fw.mtp import decode_packet, encode_packet, RXMessage, InitMsg
+
+    data = DockChannelDataRegs(u, u.adt['/arm-io/dockchannel-mtp'].get_reg(3)[0])
+    pending = bytearray()
+    result.update(initialization=[], keyboard_ready=False, keyboard_enable_ack=False,
+                  packets=[], keyboard_reports=[])
+
+    def capture(seconds):
+        deadline = time.monotonic() + seconds
+        received = 0
+        while time.monotonic() < deadline:
+            asc.work()
+            count = data.RX_COUNT.val
+            if count >= 4:
+                pending.extend(struct.pack('<I', data.RX_32.val))
+                received += 4
+            elif count:
+                pending.append(data.RX_8.DATA)
+                received += 1
+            if received > 16384:
+                raise ValueError("MTP capture exceeds the probe limit")
+            while len(pending) >= 8:
+                hlen, kind, size, seq, iface, pad = struct.unpack_from('<BBHBBH', pending)
+                if hlen != 8 or size % 4 or size > 4096:
+                    raise ValueError("Invalid MTP header")
+                if len(pending) < size + 12:
+                    break
+                iface, kind, seq, payload = decode_packet(bytes(pending[:size + 12]))
+                del pending[:size + 12]
+                msg = RXMessage.parse(payload)
+                if len(payload) != (msg.hdr.length + 11) & ~3:
+                    raise ValueError("Invalid MTP message length")
+                result['packets'].append({'interface': iface, 'kind': kind,
+                                          'counter': seq, 'payload': payload.hex()})
+                if iface == 0 and msg.hdr.flags == 0:
+                    if msg.msg[:3] == b'\xf0\x01\x00':
+                        init = InitMsg.parse(msg.msg)
+                        result['initialization'].append({
+                            'id': init.device_id, 'name': init.device_name,
+                            'more_packets': init.more_packets,
+                            'hid_descriptors': [block.payload.descriptor.hex()
+                                                for block in init.msg if block.type == 0]})
+                    elif msg.msg == b'\xf1\x02\x00\x00':
+                        result['keyboard_ready'] = True
+                elif (iface == 0 and kind == 0x11 and seq == 0
+                      and msg.hdr.flags == 0x80 and msg.msg == b'\xb4'):
+                    if msg.hdr.retcode:
+                        raise RuntimeError("Keyboard enable was rejected")
+                    result['keyboard_enable_ack'] = True
+                elif iface == 2 and msg.hdr.flags == 0:
+                    result['keyboard_reports'].append(msg.msg.hex())
+
+    capture(5)
+    if pending:
+        raise ValueError("Incomplete MTP initialization packet")
+    if keyboard:
+        candidates = [entry for entry in result['initialization'] if entry['name'] == 'keyboard']
+        if len(candidates) != 1 or candidates[0]['id'] != 2 or candidates[0]['more_packets']:
+            raise ValueError("Keyboard interface was not uniquely announced")
+        msg = struct.pack('<HHI', 0x80, 2, 0) + b'\xb4\x02'
+        packet = encode_packet(0, 0, msg)
+        wait_until(lambda: data.TX_FREE.val >= len(packet), asc.work)
+        if pending or data.RX_COUNT.val:
+            raise ValueError("MTP replies remain queued before keyboard enable")
+        result['keyboard_enable_ack'] = result['keyboard_ready'] = False
+        for offset in range(0, len(packet), 4):
+            data.TX_32.val = struct.unpack_from('<I', packet, offset)[0]
+        capture(5)
+        if pending or not result['keyboard_enable_ack'] or not result['keyboard_ready']:
+            raise TimeoutError("Keyboard enable ACK/readiness did not complete")
+    return result
+
+
+def probe(device, keyboard=False):
     if p.get_chipid() != 0x6040 or u.adt['/chosen'].board_id != 6:
         raise ValueError("This probe is qualified only on J616s / board 6")
+    if keyboard and device != 'mtp':
+        raise ValueError("Keyboard testing requires the MTP probe")
     dev_path = f'/arm-io/{device}'
     dart_path = f'/arm-io/dart-{device}'
     base = u.adt[dev_path].get_reg(0)[0]
@@ -174,6 +251,9 @@ def probe(device):
                        asc.work, timeout=5)
             result['application_services'] = {
                 hex(ep): list(obj.serv_map) for ep, obj in asc.epmap.items() if ep >= 0x20}
+        if device == 'mtp':
+            result['mtp'] = {}
+            probe_mtp(asc, keyboard, result['mtp'])
         result['dart_error'] = hex(dart.regs.ERROR.val)
         if dart.regs.ERROR.reg.FLAG:
             raise RuntimeError("IOP DART reported a fault")
@@ -271,4 +351,6 @@ def probe(device):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('device', choices=('sio', 'mtp', 'aop'))
-    probe(parser.parse_args().device)
+    parser.add_argument('--keyboard', action='store_true', help='Enable only the MTP keyboard')
+    args = parser.parse_args()
+    probe(args.device, args.keyboard)

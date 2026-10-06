@@ -5,6 +5,31 @@ from construct import *
 from ..constructutils import *
 from ..utils import *
 
+def checksum(data):
+    if len(data) % 4:
+        raise ValueError("MTP checksum requires aligned data")
+    return (0xffffffff - sum(word[0] for word in struct.iter_unpack("<I", data))) & 0xffffffff
+
+
+def encode_packet(iface, seq, msg):
+    msg += bytes(-len(msg) % 4)
+    header = struct.pack("<BBHBBH", 8, 0x11, len(msg), seq, iface, 0)
+    return header + msg + struct.pack("<I", checksum(header + msg))
+
+
+def decode_packet(packet):
+    if len(packet) < 12:
+        raise ValueError("Truncated MTP packet")
+    hlen, kind, size, seq, iface, pad = struct.unpack_from("<BBHBBH", packet)
+    if hlen != 8 or size % 4 or len(packet) != size + 12:
+        raise ValueError("Invalid MTP packet length")
+    if kind not in (0x11, 0x12) or pad:
+        raise ValueError("Unsupported MTP header")
+    if checksum(packet[:-4]) != struct.unpack_from("<I", packet, len(packet) - 4)[0]:
+        raise ValueError("MTP checksum mismatch")
+    return iface, kind, seq, packet[8:-4]
+
+
 class HIDDescriptor(ConstructClass):
     subcon = Struct(
         "descriptor" / HexDump(GreedyBytes)
@@ -369,10 +394,8 @@ class MTPProtocol:
         setattr(self, name.replace("-", "_"), obj)
         return obj
 
-    def checksum(self, d):
-        assert len(d) % 4 == 0
-        c = len(d) // 4
-        return 0xffffffff - sum(struct.unpack(f"<{c}I", d)) & 0xffffffff
+    def checksum(self, data):
+        return checksum(data)
 
     def read_pkt(self):
         self.mtp.work_pending()
@@ -389,12 +412,7 @@ class MTPProtocol:
         return devid, data
 
     def send(self, iface, seq, msg):
-        if len(msg) % 4:
-            msg += bytes(4 - len(msg) % 4)
-        hdr = struct.pack("<BBHBBH", 8, 0x11, len(msg), seq, iface, 0)
-        checksum = self.checksum(hdr + msg)
-        pkt = hdr + msg + struct.pack("<I", checksum)
-        self.dockchannel.write(pkt)
+        self.dockchannel.write(encode_packet(iface, seq, msg))
         self.mtp.work_pending()
 
     def work_pending(self):
