@@ -26,7 +26,7 @@ def wait_until(condition, service=lambda: None, timeout=1):
         service()
 
 
-def probe_mtp(asc, keyboard, result, firmware=None):
+def probe_mtp(asc, keyboard, result, firmware=None, capture_seconds=2):
     from m1n1.hw.dockchannel import DockChannelDataRegs
     from m1n1.fw.mtp import (decode_packet, encode_packet, RXMessage, InitMsg,
                             prepare_firmware, check_control_reply)
@@ -35,7 +35,7 @@ def probe_mtp(asc, keyboard, result, firmware=None):
     pending = bytearray()
     expected_reply = None
     reply_received = False
-    sequence = 0
+    sequence = 1 if keyboard else 0
     image = None
     if firmware is not None:
         blob = pathlib.Path(firmware).read_bytes()
@@ -48,7 +48,7 @@ def probe_mtp(asc, keyboard, result, firmware=None):
     result.update(initialization=[], keyboard_ready=False, keyboard_enable_ack=False,
                   packets=[], keyboard_reports=[])
 
-    def capture(seconds, until=None):
+    def capture(seconds, until=None, byte_limit=16384):
         nonlocal reply_received
         deadline = time.monotonic() + seconds
         received = 0
@@ -63,7 +63,7 @@ def probe_mtp(asc, keyboard, result, firmware=None):
             elif count:
                 pending.append(data.RX_8.DATA)
                 received += 1
-            if received > 16384:
+            if received > byte_limit:
                 raise ValueError("MTP capture exceeds the probe limit")
             while len(pending) >= 8:
                 hlen, kind, size, seq, iface, pad = struct.unpack_from('<BBHBBH', pending)
@@ -169,17 +169,22 @@ def probe_mtp(asc, keyboard, result, firmware=None):
         capture(5, lambda: result['touchpad_ready'])
         if not result['touchpad_ready']:
             raise TimeoutError("Multitouch DeviceReady did not arrive")
-        capture(2)
+        capture(capture_seconds, byte_limit=1048576)
         if pending:
             raise ValueError("Incomplete multitouch report")
+        for phase in (0, 1):
+            control(struct.pack('<BBBBBI', 0x40, 2, 1, 0, phase, 0))
+        result['touchpad_off_acknowledged'] = True
     return result
 
 
-def probe(device, keyboard=False, firmware=None):
+def probe(device, keyboard=False, firmware=None, capture_seconds=2):
     if p.get_chipid() != 0x6040 or u.adt['/chosen'].board_id != 6:
         raise ValueError("This probe is qualified only on J616s / board 6")
-    if firmware is not None and (keyboard or device != 'mtp'):
-        raise ValueError("Touchpad firmware testing requires MTP without --keyboard")
+    if firmware is not None and device != 'mtp':
+        raise ValueError("Touchpad firmware testing requires the MTP probe")
+    if not 1 <= capture_seconds <= 60:
+        raise ValueError("Capture duration must be between 1 and 60 seconds")
     if keyboard and device != 'mtp':
         raise ValueError("Keyboard testing requires the MTP probe")
     dev_path = f'/arm-io/{device}'
@@ -335,7 +340,7 @@ def probe(device, keyboard=False, firmware=None):
             result['lid_angle'] = las.last_report.angle
         if device == 'mtp':
             result['mtp'] = {}
-            probe_mtp(asc, keyboard, result['mtp'], firmware)
+            probe_mtp(asc, keyboard, result['mtp'], firmware, capture_seconds)
         result['dart_error'] = hex(dart.regs.ERROR.val)
         if dart.regs.ERROR.reg.FLAG:
             raise RuntimeError("IOP DART reported a fault")
@@ -345,9 +350,10 @@ def probe(device, keyboard=False, firmware=None):
     finally:
         try:
             if boot_attempted:
-                if result.get('mtp', {}).get('touchpad_trial_active'):
+                if (result.get('mtp', {}).get('touchpad_trial_active')
+                        and not result['mtp'].get('touchpad_off_acknowledged')):
                     result['reboot_required'] = True
-                    result['touchpad_shutdown'] = 'unqualified; retaining DMA mappings'
+                    result['touchpad_shutdown'] = 'Off not acknowledged; retaining DMA mappings'
                 else:
                     if aop:
                         result['endpoint_shutdown_acks'] = []
@@ -428,7 +434,9 @@ def probe(device, keyboard=False, firmware=None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('device', choices=('sio', 'mtp', 'aop'))
-    parser.add_argument('--keyboard', action='store_true', help='Enable only the MTP keyboard')
+    parser.add_argument('--keyboard', action='store_true', help='Enable the MTP keyboard')
     parser.add_argument('--touchpad-firmware', help='Test the J616s 26A428 HIDF image in RAM')
+    parser.add_argument('--capture-seconds', type=int, default=2,
+                        help='Touchpad input capture duration (1-60 seconds)')
     args = parser.parse_args()
-    probe(args.device, args.keyboard, args.touchpad_firmware)
+    probe(args.device, args.keyboard, args.touchpad_firmware, args.capture_seconds)
