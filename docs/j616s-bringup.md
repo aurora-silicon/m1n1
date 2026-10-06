@@ -46,13 +46,19 @@ unqualified.
 
 * CDC proxy and bulk reads work at USB high speed (480 Mb/s). SuperSpeed is
   pending PHY/role bring-up and cable/port qualification.
-* AOP and SIO management-only startup attempts returned no endpoint map.
-  Their DARTs initially had no enabled streams or valid translation tables.
-  Mapping the ADT-described external firmware regions, cleaning tables and
-  using the existing AOP boot-argument configuration still produced no
-  handshake. CPU RUN readback succeeded, DART error stayed zero, and the
-  boot arguments, table pointer and stream mask were restored. The mappings
-  alone do not resolve startup.
+* SIO completes RTKit startup with four-level, full 42-bit mappings of its
+  ADT-described external firmware. Firmware text is mapped read-only. The
+  standard system endpoints start, AP/IOP both acknowledge state 0x20,
+  IOReporting messages are handled and management ping receives a pong.
+  Endpoint 0x20 is advertised but its application protocol and audio DMA are
+  untested. AP/IOP acknowledge quiescence at state 0x10; CPU control, table
+  pointer, TCR and stream mask return to their original values, with zero
+  DART errors and a successful proxy NOP.
+* AOP startup remains unresolved. Mapping external firmware and trying the
+  existing boot-argument configuration produced no handshake. CPU RUN
+  readback succeeded and DART error stayed zero. Boot arguments and mappings
+  were restored. The successful full SIO client setup has not yet been
+  qualified on AOP.
 * SEP's existing RNG routine returned zero bytes. Successful SEP communication
   is not established.
 * ISP revision `0x100003` was read after powering the ADT parents and the
@@ -74,8 +80,8 @@ four-level root-reuse path referenced an undefined variable in an unnecessary
 assignment; removing it permits repeated mappings under the same root. Eight
 host cases cover rejected requests, publication order, three/four-level
 translation, reused roots and additional leaf allocation. Live three-level
-firmware mapping/readback and restoration also passed; four-level hardware
-operation remains unqualified.
+firmware mapping/readback and restoration passed. SIO's successful cold
+firmware startup also validates four-level hardware operation on its DART.
 
 Direct native calls must use symbols from the matching raw ELF for raw images.
 An initial ISP trial used the Mach-O-layout ELF, called the wrong code and
@@ -83,3 +89,23 @@ triggered a reboot. Installed stage 1 recovered CDC; the corrected raw-ELF
 probe passed. The earlier SEP result was discarded and repeated with verified
 raw ELF/image pairing. Proxy-opcode clock tests and scratch-code SMP tests
 were unaffected.
+
+## Reproducing the cold SIO probe
+
+After rebooting into m1n1 proxy mode, run:
+
+```sh
+M1N1DEVICE=/dev/ttyACM0 python proxyclient/experiments/t6040_sio.py
+```
+
+The probe uses existing StandardASC system endpoints and sends no application
+endpoint commands. It requires the tested cold SIO/DART state and prints a
+JSON result. Reboot before running it again: firmware resume is not qualified.
+Send, table invalidation, startup and quiescence waits are bounded. If shutdown
+is not acknowledged, mappings remain installed and the result requires reboot.
+
+StandardASC now accepts an optional DVA mask while preserving its existing
+36-bit default. The SIO probe configures a full 42-bit address range and mask.
+IOReporting reads its buffer through the ASC/DART translation path, including
+firmware-preallocated buffers. Seven host cases cover both masks across read,
+write and translation, plus preallocated IOReporting buffer handling.

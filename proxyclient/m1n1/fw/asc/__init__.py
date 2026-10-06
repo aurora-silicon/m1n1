@@ -26,12 +26,13 @@ class StandardASC(ASC):
         0xa: ASCDummyEndpoint, # tracekit
     }
 
-    def __init__(self, u, asc_base, dart=None, stream=0):
+    def __init__(self, u, asc_base, dart=None, stream=0, *, dva_mask=0xFFFFFFFFF):
         super().__init__(u, asc_base)
         self.remote_eps = set()
         self.add_ep(0, ASCManagementEndpoint(self, 0))
         self.dart = dart
         self.stream = stream
+        self.dva_mask = dva_mask
         self.eps = []
         self.epcls = {}
         self.dva_offset = 0
@@ -67,7 +68,7 @@ class StandardASC(ASC):
             return self.iface.readmem(dva, size)
 
         if self.dart:
-            return self.dart.ioread(self.stream, dva & 0xFFFFFFFFF, size)
+            return self.dart.ioread(self.stream, dva & self.dva_mask, size)
         else:
             return self.iface.readmem(dva, size)
 
@@ -76,7 +77,7 @@ class StandardASC(ASC):
             return self.iface.writemem(dva, data)
 
         if self.dart:
-            return self.dart.iowrite(self.stream, dva & 0xFFFFFFFFF, data)
+            return self.dart.iowrite(self.stream, dva & self.dva_mask, data)
         else:
             return self.iface.writemem(dva, data)
 
@@ -85,7 +86,7 @@ class StandardASC(ASC):
             return [(dva, size)]
 
         if self.dart:
-            return self.dart.iotranslate(self.stream, dva & 0xFFFFFFFFF, size)
+            return self.dart.iotranslate(self.stream, dva & self.dva_mask, size)
         else:
             return [(dva, size)]
 
