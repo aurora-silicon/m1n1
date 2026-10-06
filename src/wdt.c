@@ -64,7 +64,7 @@ int wdt_arm_seconds(unsigned seconds)
     int node = adt_path_offset_trace(adt, "/arm-io/wdt", path);
     u64 primary, primary_size, secondary, secondary_size;
     u32 version;
-    if (chip_id != T8140 || seconds < 1 || seconds > 178 || node < 0 ||
+    if ((chip_id != T8140 && chip_id != T6040) || seconds < 1 || seconds > 178 || node < 0 ||
         ADT_GETPROP(adt, node, "wdt-version", &version) < 0 || version != 2 ||
         adt_get_reg(adt, path, "reg", 0, &primary, &primary_size) ||
         adt_get_reg(adt, path, "reg", 2, &secondary, &secondary_size) || (primary & 3) ||
