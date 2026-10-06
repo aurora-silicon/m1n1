@@ -101,11 +101,20 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   it without trying to parse a configuration payload. Successful payloads
   are bounded by the reported length. Live PDM queries return 0xe00002c2
   or 0xe00002f0, followed by a successful frontend-state query.
+  `AudioPropertyFormat` uses the same reply envelope and returns `retcode`,
+  `len` and raw `data`. Its old PCM field names incorrectly interpreted the
+  length prefix as a format code. Live property 302 replies contain 24 bytes
+  for `lpai`, four-byte `idle` for `a2px`/`adpx`, and four zero bytes for `dvpx`;
+  their meanings remain unqualified.
   The J616s 25G76 AOP image matches the running ADT UUID and segment layout.
   Its metadata identifies the T604x audio driver, but its native input
   configuration ABI remains unqualified. The 16-byte `lpai` property 301
   reads successfully; writing the same bytes returns 0xe00002cf (not writable).
   It cannot serve as a configuration-write template.
+  A read-only input property scan also returns three words of value 7 from
+  `lpai` property 300, matching the ADT supported/enabled/history channel masks.
+  This does not establish a writable configuration layout. All 105 getter
+  requests complete, the frontend remains idle and DART faults stay zero.
   `hpai` transitions from `idle` to `pw1 ` and back to `idle`, with fresh state
   readback. Requesting `pw1 ` on `lpai` instead causes an AOP data abort at
   address zero; that low-power transition is invalid qualification evidence.

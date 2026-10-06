@@ -4,7 +4,7 @@ import struct
 import pytest
 from construct import StreamError
 
-from m1n1.fw.aop.ipc import GetDeviceProp
+from m1n1.fw.aop.ipc import AudioPropertyFormat, GetDeviceProp
 
 
 @pytest.mark.parametrize('modifier', [200, 210, 212])
@@ -41,3 +41,26 @@ def test_generic_property_payload_is_bounded_by_declared_length():
     call.read_resp(BytesIO(struct.pack('<II', 0, 4) + b'data' + b'trailing'))
     assert call.rets.retcode == 0
     assert call.rets.data == b'data'
+
+
+@pytest.mark.parametrize('devid, payload', [
+    ('lpai', bytes.fromhex('6e69616d0000000000fa000000000000800c000000000000')),
+    ('a2px', b'eldi'),
+    ('adpx', b'eldi'),
+    ('dvpx', bytes(4)),
+])
+def test_format_reply_preserves_native_payload(devid, payload):
+    call = AudioPropertyFormat(devid=devid)
+    call.read_resp(BytesIO(struct.pack('<II', 0, len(payload)) + payload))
+    assert call.rets.retcode == 0
+    assert call.rets.len == len(payload)
+    assert call.rets.data == payload
+    assert 'sample_rate' not in call.rets
+
+
+def test_format_error_has_no_payload():
+    call = AudioPropertyFormat(devid='hpai')
+    call.read_resp(BytesIO(struct.pack('<I', 0xe00002f0)))
+    assert call.rets.retcode == 0xe00002f0
+    assert call.rets.len is None
+    assert call.rets.data is None
