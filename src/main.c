@@ -136,12 +136,12 @@ void run_actions(void)
     }
 
     if (chip_id != T8140 && !cur_boot_args.video.display && lp_sip0 == 127) {
-        printf("Bringing up USB for early debug...\n");
-
-        usb_init();
-        usb_iodev_init();
-
-        usb_up = true;
+        if (!usb_up) {
+            printf("Bringing up USB for early debug...\n");
+            usb_init();
+            usb_iodev_init();
+            usb_up = true;
+        }
 
         printf("Waiting for proxy connection... ");
         for (int i = 0; i < EARLY_PROXY_TIMEOUT * 100; i++) {
@@ -205,8 +205,8 @@ static void j873g_run_proxy(void)
     const char *target = adt_getprop(adt, 0, "target-type", &target_len);
 
     if (board_id != 0x24 || !model || model_len != sizeof("Mac18,5") ||
-        memcmp(model, "Mac18,5", sizeof("Mac18,5")) || !target ||
-        target_len != sizeof("J873g") || memcmp(target, "J873g", sizeof("J873g")))
+        memcmp(model, "Mac18,5", sizeof("Mac18,5")) || !target || target_len != sizeof("J873g") ||
+        memcmp(target, "J873g", sizeof("J873g")))
         panic("Unsupported T8152 board\n");
 
     /* Adopt firmware power and USB state. Only the qualified display route

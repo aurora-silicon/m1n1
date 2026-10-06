@@ -5,10 +5,7 @@
 #include "soc.h"
 #include "utils.h"
 
-/* J616s 26A428: CPM command apertures from the live ADT. The active P
- * cluster's 1 -> 2 -> 1 transition was verified by command readback and
- * a fixed-work benchmark. Keep firmware voltage/PLL/throttling ownership.
- * Higher states require thermal-policy qualification and remain disabled. */
+/* J616s CPM command apertures. Only states 1 and 2 have been tested. */
 #define T6040_CLOCK_COUNT    3
 #define T6040_MAX_TEST_STATE 2
 #define T6040_CMD_BUSY       BIT(31)

@@ -2,7 +2,8 @@
 
 Tested on J616sAP (Mac16,7), board 6, with the ADT supplied by macOS build
 26A428. The branch is stacked on `j700` while the draft targets `aurora-wip`.
-Linux and U-Boot handoff are outside this bring-up's scope.
+The target is m1n1/proxy parity with M1, M2 and A18 Pro. Linux and U-Boot
+handoff are outside this bring-up's scope.
 
 ## CPU clocks
 
@@ -13,13 +14,14 @@ use cluster 0 for E, 1 for P0 and 2 for P1. The getter reports the ADT frequency
 for the accepted command state; it is not a frequency measurement.
 
 Only states 1 and 2 are enabled. Fixed-work measurements on running cores
-confirmed 1020 -> 1404 MHz for E and 1260 -> 1512 MHz for both P clusters, with
-ratios of 1.376, 1.200 and 1.200. Each test restored state 1 and its original
+matched the ADT nominal transitions of 1020 -> 1404 MHz for E and
+1260 -> 1512 MHz for both P clusters, with execution-rate ratios of 1.376,
+1.200 and 1.200. Each test restored state 1 and approximately its original
 execution time. Higher states were rejected without changing the command.
 There is no voltage, PLL or thermal-policy programming here.
 
 The driver preserves other command bits, checks the previous expected state,
-and bounds each busy poll to 2 ms. An ownership change or failed transition
+and bounds each busy poll to 2 ms. An unexpected command state or failed transition
 locks out subsequent writes for that cluster until the image is restarted.
 A timeout does not imply that hardware reverted to the previous state.
 
@@ -39,8 +41,8 @@ was needed for this tested configuration. The boot CPU's `smp_is_alive()`
 result is not a secondary-start indicator.
 
 These checks cover startup, WFE/SEV dispatch and shared memory coherence.
-Deep sleep, hotplug, hypervisor operation and sustained thermal load remain
-unqualified.
+Independent AMP workloads, deep sleep, hotplug, hypervisor operation and
+sustained thermal load remain unqualified.
 
 ## Other devices
 
@@ -54,11 +56,19 @@ unqualified.
   untested. AP/IOP acknowledge quiescence at state 0x10; CPU control, table
   pointer, TCR and stream mask return to their original values, with zero
   DART errors and a successful proxy NOP.
-* AOP startup remains unresolved. Mapping external firmware and trying the
-  existing boot-argument configuration produced no handshake. CPU RUN
-  readback succeeded and DART error stayed zero. Boot arguments and mappings
-  were restored. The successful full SIO client setup has not yet been
-  qualified on AOP.
+* AOP completes RTKit startup and answers a management ping with full 42-bit
+  mappings, ADT DAPF ranges and its external-code boot argument set to the
+  ADT remap address (1 TiB). Starting the advertised application endpoints
+  announces SPUApp, wakehint, aop-audio, aop-voicetrigger, accelerometer,
+  gyroscope and ambient-light services. All 12 application endpoints
+  acknowledge AFK shutdown, but IOP quiescence and sleep both cause a firmware
+  instruction abort. Mappings must remain installed until reboot on this
+  failure. Application queries, audio paths and IOP shutdown remain unqualified.
+* MTP completes RTKit startup, answers a management ping and acknowledges
+  AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
+  experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored
+  after shutdown with no DART fault. Keyboard/trackpad protocol and input
+  remain untested.
 * SEP's existing RNG routine returned zero bytes. Successful SEP communication
   is not established.
 * ISP revision `0x100003` was read after powering the ADT parents and the
@@ -107,5 +117,5 @@ is not acknowledged, mappings remain installed and the result requires reboot.
 StandardASC now accepts an optional DVA mask while preserving its existing
 36-bit default. The SIO probe configures a full 42-bit address range and mask.
 IOReporting reads its buffer through the ASC/DART translation path, including
-firmware-preallocated buffers. Seven host cases cover both masks across read,
-write and translation, plus preallocated IOReporting buffer handling.
+firmware-preallocated buffers. Host cases cover both masks across read, write and translation, preallocated
+IOReporting buffers, and invalidation of the selected stream.
