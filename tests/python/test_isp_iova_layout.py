@@ -136,3 +136,34 @@ def test_exhausted_layout_rejected_before_ipc_mapping(isp_module):
     with pytest.raises(ValueError, match="exceeds IOVA range"):
         isp.initialize_firmware()
     assert len(mappings) == 3
+
+
+@pytest.mark.parametrize("base", [0, 1 << 40])
+def test_frame_metadata_preserves_surface_addresses(isp_module, base):
+    video = sys.modules["m1n1.fw.isp.isp_vid"]
+    record = bytearray(0x280)
+    addresses = [base + 0x400000, base + 0x500000, base + 0x600000]
+    for offset, address in zip((0x10, 0x50, 0x58), addresses):
+        struct.pack_into("<Q", record, offset, address)
+    struct.pack_into("<I", record, 0x218, 7)
+    parsed = video.ISPFrameMeta.parse(record)
+    assert (parsed.meta_iova, parsed.luma_iova, parsed.cbcr_iova) == tuple(addresses)
+    assert parsed.index == 7
+    assert video.ISPFrameMeta.build(parsed) == record
+
+
+@pytest.mark.parametrize("base", [0, 1 << 40])
+def test_buffer_submission_encodes_full_addresses(isp_module, base):
+    video = sys.modules["m1n1.fw.isp.isp_vid"]
+    addresses = (base + 0x400000, base + 0x500000)
+    record = video.BufH2TSendArgs.build(dict(
+        iova0=addresses[0], iova1=addresses[1],
+        flag0=0x40000000, flag1=0x40000000,
+        unk_30=2, pool=1, tag=0x500))
+    expected = bytearray(0x40)
+    struct.pack_into("<4Q6IQ", expected, 0,
+                     *addresses, 0, 0, 0x40000000, 0x40000000,
+                     0, 0, 2, 1, 0x500)
+    assert record == expected
+    parsed = video.BufH2TSendArgs.parse(record)
+    assert (parsed.iova0, parsed.iova1) == addresses
