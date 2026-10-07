@@ -224,7 +224,8 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   readback trial confirms ISP_SYS and ISPSENS0 reach active mode through the
   existing ADT parent traversal; missing parent power is not the cause in this
   sequence. This does not qualify clock/reset prerequisites. Firmware
-  startup, channels, heap requirements and camera operation remain untested.
+  startup trials have not produced the initial firmware handshake. Channels,
+  heap requirements and camera operation remain unqualified.
   The captured boot firmware is `mBoot-18000.161.9` from macOS 26.6.1 (25G76).
   Its ISP UUID and segment ranges match that restore image; macOS 26.6.2 and
   the installed macOS 27.0 ISP image have different UUIDs. The version table
@@ -235,6 +236,10 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   combined with a synthetic legacy extra-heap request reproduce an overlap
   with the old allocator start. The actual T6040 extra-heap request remains
   unqualified. Required boot-argument and channel-message imports are explicit.
+  Channel descriptors retain their 64-bit ring addresses at offset 0x50.
+  The matching firmware writes that field with 64-bit stores in all seven
+  0x100-byte records. Host tests cover legacy addresses and addresses above
+  1 TB; live channel parsing awaits successful firmware startup.
 * No speaker output or speaker amplifier programming was performed. Only
   the input-only ADMAC prototype described above submitted an audio descriptor.
 
