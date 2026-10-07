@@ -204,7 +204,7 @@ class ISPChannel:
     def handler(self):
         while True:
             req = self.read_msg(self.cursor)
-            if ((req.arg0 & 0xf) == 0x1): break  # ack flag
+            if ((req.arg0 & 0xf) in (0x1, 0x3)): break  # ACK or terminal ACK
             rsp = self.handle_once(req=req)
             if (rsp == None): raise RuntimeError("IRQ stuck")
 

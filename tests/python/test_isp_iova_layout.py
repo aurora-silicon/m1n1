@@ -167,3 +167,44 @@ def test_buffer_submission_encodes_full_addresses(isp_module, base):
     assert record == expected
     parsed = video.BufH2TSendArgs.parse(record)
     assert (parsed.iova0, parsed.iova1) == addresses
+
+
+@pytest.mark.parametrize("idle", [1, 3, 0x10000400001, 0x10000400003])
+def test_receive_ring_stops_at_ack_without_dispatch(isp_module, idle):
+    channel_module = sys.modules["m1n1.fw.isp.isp_chan"]
+    message = channel_module.ISPChannelMessage.build(arg0=idle)
+    isp = SimpleNamespace(ioread=lambda address, size: message.encode())
+    desc = SimpleNamespace(name="BUF_T2H", type=1, src=3, num=2, iova=0x8000)
+    channel = channel_module.ISPBufT2HChannel(isp, desc)
+    channel._stfu = True
+    channel.handler()
+    assert channel.cursor == 0
+
+
+@pytest.mark.parametrize("request_flag,cursor", [(0, 0), (2, 0), (0, 1), (2, 1)])
+def test_receive_ring_retires_request_before_terminal_ack(isp_module,
+                                                         request_flag, cursor):
+    channel_module = sys.modules["m1n1.fw.isp.isp_chan"]
+    request = channel_module.ISPChannelMessage.build(
+        arg0=0x10000400000 | request_flag, arg1=0x280, arg2=0x10000000)
+    idle = channel_module.ISPChannelMessage.build(arg0=3)
+    slots = {0x8000 + cursor * 64: request.encode(),
+             0x8000 + (1 - cursor) * 64: idle.encode()}
+    writes = []
+    isp = SimpleNamespace(
+        ioread=lambda address, size: slots[address],
+        iowrite=lambda address, data: writes.append((address, data)),
+        regs=SimpleNamespace(ISP_IRQ_DOORBELL=SimpleNamespace(val=0)))
+    desc = SimpleNamespace(name="BUF_T2H", type=1, src=3, num=2, iova=0x8000)
+    channel = channel_module.ISPBufT2HChannel(isp, desc)
+    channel._stfu = True
+    channel.cursor = cursor
+    frames = []
+    channel.push_frame = frames.append
+    channel.handler()
+    assert [frame.encode() for frame in frames] == [request.encode()]
+    assert writes == [(0x8000 + cursor * 64,
+                       channel_module.ISPChannelMessage.build(
+                           arg0=request.arg0 | 1, arg2=0x80000000).encode())]
+    assert channel.cursor == 1 - cursor
+    assert isp.regs.ISP_IRQ_DOORBELL.val == 8
