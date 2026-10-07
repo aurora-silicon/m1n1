@@ -104,7 +104,7 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   rebuilds both payloads exactly; property 212 also passes the typed response
   reader on a fresh live reply. The decoder reports latency 36, ratios
   10/5/3 and 386 coefficients. No new decoder is needed; setter behavior and
-  the configuration needed for microphone startup remain unqualified.
+  HP source configuration remain unqualified.
   It accepts command envelopes carried by subtype 0xa0 while preserving typed
   notification replies, validates request and response buffer bounds, performs
   cache maintenance and clears pending state on failure. The live command
@@ -122,8 +122,8 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   for `lpai`, four-byte `idle` for `a2px`/`adpx`, and four zero bytes for `dvpx`;
   their meanings remain unqualified.
   The J616s 25G76 AOP image matches the running ADT UUID and segment layout.
-  Its metadata identifies the T604x audio driver, but its native input
-  configuration ABI remains unqualified. The 16-byte `lpai` property 301
+  Its metadata identifies the T604x audio driver; the main PDM configuration
+  setter ABI remains unqualified. The 16-byte `lpai` property 301
   reads successfully; writing the same bytes returns 0xe00002cf (not writable).
   It cannot serve as a configuration-write template.
   A read-only input property scan also returns three words of value 7 from
@@ -132,21 +132,40 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   enabled and history channel masks. Its write handler requires that size and
   validates the values against the board configuration. An exact GET-byte SET
   returns zero; GET readback remains `(7, 7, 7)`, both input frontends remain
-  idle and DART faults stay zero. Alternate masks and microphone startup are
-  unqualified. All 105 getter requests complete without DART faults.
+  idle and DART faults stay zero. Alternate masks are unqualified. All 105
+  getter requests complete without DART faults.
   Matching firmware identifies `lpai` property 303 as latency in frames (320)
   and property 304 as safety offset in frames (672). Property 305 contains a
-  48-byte `IOAudio2Status`; its individual fields remain unqualified. The ADT
-  assigns the `adpx` LP mic buffer 768,000 bytes on base-controller DART stream
-  8, separate from the HP LEAP path on stream 10. Buffer initialization and
-  ownership transfer remain unqualified; the HP DMA trial does not qualify LP
-  capture.
-  `hpai` transitions from `idle` to `pw1 ` and back to `idle`, with fresh state
-  readback. Requesting `pw1 ` on `lpai` instead causes an AOP data abort at
-  address zero; that low-power transition is invalid qualification evidence.
-  Attaching `lai ` and `adpx`, then starting `lai ` with `runn`, succeeds. The
-  following `lpai` request for `runn` produces the same null-pointer abort;
-  the low-power path still needs its configuration prerequisites established.
+  48-byte `IOAudio2Status`. In 20 active captures, its second u64 advances as
+  a frame counter and the last u64 equals `(counter + 1) * 12 % 768000`.
+  Other fields and exact clock behavior remain unqualified.
+
+  LP input capture works with an owned destination configured before startup.
+  The ADT assigns the `adpx` buffer 768,000 bytes on DART stream 8. Zero a
+  page-rounded allocation, install and verify four-level identity mappings,
+  then SET `adpx` property 300 with a 16-byte address/capacity pair. Readback
+  returns the owned address and normalized size 768,000. Public attachment of
+  `lpai`, `pdm0` and `adpx`, followed by `lpai` `pw1 `, succeeds. Attach `lai `,
+  then request `runn` on `lai ` and `lpai`; both return matching state readbacks.
+  Earlier startup attempts without the buffer caused null-address aborts.
+
+  Twenty native memory copies at half-second intervals produce contiguous
+  observed update regions. Including an inferred initial 8,000-frame window,
+  reconstruction produces a normalized ten-second mono preview at 16 kHz.
+  The tester confirms recognizable speech; exact snapshot-boundary integrity
+  remains unqualified. This qualifies the tested LP input path, not three
+  independent microphones or
+  exact sample-clock accuracy. Candidate lanes 0/2 largely duplicate each
+  other; lane 1 has DC plus correlated signal. Allocation padding stays zero,
+  DART reports no faults and CDC remains responsive.
+
+  Stop requests `lpai` `pw1 ` and `lai` `idle` return success with matching
+  states; the destination then becomes zero and stable. Copy data before stop.
+  The buffer setter publishes its address before later validation, and public
+  ownership release is not established. Retain the buffer, heap, AOP and all
+  mappings on every attempted handoff until validated watchdog cold recovery.
+  Recordings, firmware and private probe harnesses are not included here.
+
   A guarded prototype maps the ADT-selected ADMAC stream 10 with four-level
   42-bit tables and submits one non-repeating 16 KiB RX descriptor only after
   `hpai` reaches `pwrd`. The split RX bank at offset 0xc000, completion report,
@@ -193,7 +212,10 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   is not established.
 * ISP revision `0x100003` was read after powering the ADT parents and the
   ISP_CPU/ISP_FE global slots at offsets 0x4000/0x4008. All tested domains
-  returned to their original states, including ISPSENS0 state 4. Firmware
+  returned to their original states, including ISPSENS0 state 4. A separate
+  readback trial confirms ISP_SYS and ISPSENS0 reach active mode through the
+  existing ADT parent traversal; missing parent power is not the cause in this
+  sequence. This does not qualify clock/reset prerequisites. Firmware
   startup, channels, heap requirements and camera operation remain untested.
   The captured boot firmware is `mBoot-18000.161.9` from macOS 26.6.1 (25G76).
   Its ISP UUID and segment ranges match that restore image; macOS 26.6.2 and
