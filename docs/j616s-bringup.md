@@ -177,6 +177,14 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   transition, including `pwrd`. Attaching `hppx` succeeds, while attaching
   `lACp` returns 0xe00002e2 (not permitted); that trial stops before power
   or DMA requests.
+  With LP active, all 30 public `hppx` property queries pass across HP
+  attachment and power transitions. Properties 500, 501 and 600 change from
+  zero to one at `pwrd` and return to zero at `pw1 ` and `idle`, confirming
+  native AudioControl enable in this sequence. Property 502 remains zero;
+  property 503 remains two. Property 600 returns 224 bytes because its native
+  getter leaves the response length unchanged; only its four-byte Boolean
+  prefix is qualified. No HP DMA is submitted in this status probe, and these
+  results do not establish PCM delivery or preset application.
   Cleanup must stop RX before returning the frontend to `idle`; an earlier
   prototype accessed ADMAC again afterward and lost CDC.
   The Python ADMAC driver selects split channel banks for `admac,t604x` while
