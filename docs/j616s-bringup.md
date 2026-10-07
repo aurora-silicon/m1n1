@@ -239,11 +239,16 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   T604x DSID configuration, START, IMX958 identification and all 13 preset
   queries also pass. RAW receiver configuration and buffer submission are
   acknowledged, and CH_START produces fresh pixels in two owned surfaces.
-  A 4,644,864-byte active RAW snapshot produces a diagnostic camera image.
-  Its first page changed during download and no completed RAW buffer report
-  was received; this does not qualify an untorn frame or continuous capture.
-  Missing YUV output buffers cause frame drops, and CH_STOP times out.
-  Watchdog recovery remains required after this private capture experiment.
+  A later RAW trial acknowledges CH_STOP while servicing shared allocations,
+  buffer returns and bounded terminal batches. Two complete 4,644,864-byte
+  reads after stop match byte for byte and produce a diagnostic camera image.
+  No completed RAW buffer report was received; stable memory after stop does
+  not qualify frame completion or continuous capture. Per-module lens-shading
+  queries return a valid 19-by-17, 8-bit grid. Its mapping to the RAW crop is
+  unqualified. Preview configuration and buffer submission are acknowledged,
+  but no completed YUV output is observed. A combined RAW/YUV trial exceeds
+  the retained shared-memory aperture and refuses the allocation before
+  mapping it. Watchdog recovery remains required after these private probes.
   The captured boot firmware is `mBoot-18000.161.9` from macOS 26.6.1 (25G76).
   Its ISP UUID and segment ranges match that restore image; macOS 26.6.2 and
   the installed macOS 27.0 ISP image have different UUIDs. The version table
