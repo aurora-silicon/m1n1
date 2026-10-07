@@ -155,10 +155,6 @@ class ISP:
     def iowrite(self, iova, data):
         self.dart.iowrite(0, iova & 0xFFFFFFFFFF, data)
 
-    def iomap(self, phys, size):
-        iova = self.dart.iomap(phys, size)
-        return iova
-
     def iomap_at(self, iova, phys, size):
         self.dart.iomap_at(0, iova & 0xFFFFFFFFFF, phys, size)
 

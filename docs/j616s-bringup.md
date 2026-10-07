@@ -245,8 +245,15 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   No completed RAW buffer report was received; stable memory after stop does
   not qualify frame completion or continuous capture. Per-module lens-shading
   queries return a valid 19-by-17, 8-bit grid. Its mapping to the RAW crop is
-  unqualified. Preview configuration and buffer submission are acknowledged,
-  but no completed YUV output is observed. A combined RAW/YUV trial exceeds
+  unqualified. A private processed-preview trial enables the native local RAW
+  allocation path and receives two completed pool-9 output reports. The native
+  firmware exports zero-extended 32-bit plane addresses; each report matches
+  one submitted surface uniquely by both addresses, plane count, pool and tag.
+  The 1280-by-720 output uses 2560-byte rows and MSB-aligned 10-bit samples in
+  two planes. Two complete reads of one returned surface match before reuse,
+  and CH_STOP acknowledges. Video-range BT.709 rendering produces a coherent
+  colour image. Continuous capture, colour calibration and a production
+  startup profile remain unqualified. A combined RAW/YUV trial exceeds
   the retained shared-memory aperture and refuses the allocation before
   mapping it. Watchdog recovery remains required after these private probes.
   The captured boot firmware is `mBoot-18000.161.9` from macOS 26.6.1 (25G76).

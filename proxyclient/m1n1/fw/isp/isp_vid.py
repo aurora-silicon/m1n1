@@ -8,6 +8,7 @@ import struct
 import _thread
 
 from .isp_cmd import ISPIOCommandDispatcher
+from . import ISPChannelMessage
 
 ISPFrameMeta = Struct(
         "unk_0" / Hex(Int32ul),

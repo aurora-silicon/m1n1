@@ -208,3 +208,56 @@ def test_receive_ring_retires_request_before_terminal_ack(isp_module,
                            arg0=request.arg0 | 1, arg2=0x80000000).encode())]
     assert channel.cursor == 1 - cursor
     assert isp.regs.ISP_IRQ_DOORBELL.val == 8
+
+
+def test_command_send_publishes_payload(isp_module):
+    module = importlib.import_module("m1n1.fw.isp.isp_cmd")
+    events = []
+    response = object()
+
+    def write(iova, data):
+        events.append(("write", iova, data))
+
+    def send(request):
+        events.append(("send", request.encode()))
+        return response
+
+    isp = SimpleNamespace(cmd_iova=0x1813140, iowrite=write,
+                          table=SimpleNamespace(io=SimpleNamespace(send=send)))
+    dispatcher = module.ISPIOCommandDispatcher(isp)
+    dispatcher._stfu = True
+    payload = struct.pack("<III", 0, 4, 1)
+    command = module.ISPIORequestCommand(isp.cmd_iova, len(payload), 8, payload)
+    result = dispatcher.send(command, cb=lambda: events.append(("callback",)))
+    assert result is response
+    assert events == [
+        ("write", isp.cmd_iova, bytes(0x200)),
+        ("write", isp.cmd_iova, payload),
+        ("send", struct.pack("<8q", isp.cmd_iova, len(payload), 8, 0, 0, 0, 0, 0)),
+        ("callback",),
+    ]
+
+
+def test_buffer_send_publishes_payload(isp_module):
+    module = importlib.import_module("m1n1.fw.isp.isp_vid")
+    events = []
+    response = object()
+
+    def write(iova, data):
+        events.append(("write", iova, data))
+
+    def send(request):
+        events.append(("send", request.encode()))
+        return response
+
+    isp = SimpleNamespace(cmd_iova=0x1813140, iowrite=write,
+                          table=SimpleNamespace(bufh2t=SimpleNamespace(send=send)))
+    header = struct.pack("<4I", 1, 0, 2, 0)
+    buffers = [SimpleNamespace(args=bytes([n + 1]) * 0x40) for n in range(10)]
+    pool = module.ISPBufH2TPool(isp, buffers, header)
+    result = pool.send()
+    assert result is response
+    assert events == [
+        ("write", isp.cmd_iova, header + b"".join(buf.args for buf in buffers)),
+        ("send", struct.pack("<8q", isp.cmd_iova, 0x280, 0x30000000, 0, 0, 0, 0, 0)),
+    ]
