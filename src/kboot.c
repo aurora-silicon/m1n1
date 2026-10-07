@@ -2553,6 +2553,34 @@ static int dt_set_t8122_display(void)
 
 /* Read-only snapshots taken before PMGR, after PMGR, after display init. */
 extern u32 j613_dcp_cpu_snapshots[10];
+/* Same-boot read-only ADT witness for host-free J613 display activation. */
+static int dt_set_j613_display_clock(void)
+{
+    if (chip_id != T8122 || os_firmware.version != V26_6_2 ||
+        fdt_node_check_compatible(dt, 0, "apple,j613"))
+        return 0;
+    struct m3_dcp_adt fw;
+    if (m3_dcp_read_adt(&m3_dcp_board_j613_25g83, &fw) ||
+        strcmp(fw.uuid, m3_dcp_board_j613_25g83.qualified_uuid))
+        return -1;
+    int disp = adt_path_offset(adt, "/arm-io/disp0");
+    int arm = adt_path_offset(adt, "/arm-io");
+    u32 ids[2], size = 0;
+    if (disp < 0 || arm < 0 || ADT_GETPROP_ARRAY(adt, disp, "clock-ids", ids) < 0 ||
+        ids[0] != 345 || ids[1] != 416)
+        return -1;
+    const u32 *frequencies = adt_getprop(adt, arm, "clock-frequencies", &size);
+    if (!frequencies || size % sizeof(u32) || size / sizeof(u32) <= ids[1] - 256 ||
+        !frequencies[ids[0] - 256])
+        return -1;
+    fdt32_t values[] = {cpu_to_fdt32(1), cpu_to_fdt32(ids[0]), cpu_to_fdt32(ids[1]),
+        cpu_to_fdt32(frequencies[ids[0] - 256]), cpu_to_fdt32(frequencies[ids[1] - 256])};
+    int chosen = fdt_path_offset(dt, "/chosen");
+    printf("J613 same-boot ADT display clock %u/%u Hz\n",
+           frequencies[ids[0] - 256], frequencies[ids[1] - 256]);
+    return fdt_setprop(dt, chosen, "apple,j613-25g83-display-clock-adt", values, sizeof(values));
+}
+
 static int dt_set_j613_dcp_snapshots(void)
 {
     if (chip_id != T8122 || os_firmware.version != V26_6_2)
@@ -3451,6 +3479,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_pcie_tunables())
         return -1;
     if (dt_set_display())
+        return -1;
+    if (dt_set_j613_display_clock())
         return -1;
     if (dt_set_j613_dcp_snapshots())
         return -1;
