@@ -252,8 +252,12 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   The 1280-by-720 output uses 2560-byte rows and MSB-aligned 10-bit samples in
   two planes. Two complete reads of one returned surface match before reuse,
   and CH_STOP acknowledges. Video-range BT.709 rendering produces a coherent
-  colour image. Continuous capture, colour calibration and a production
-  startup profile remain unqualified. A combined RAW/YUV trial exceeds
+  colour image. A bounded reuse trial returns six distinct frames across
+  three generations of both output surfaces. Fresh tags identify each lease;
+  completion acknowledgment precedes reads, and two matching full reads
+  precede resubmission. Metadata refill, CH_STOP, zero DART faults and zero
+  CPU exceptions also pass. Sustained streaming, colour calibration and a
+  production startup profile remain unqualified. A combined RAW/YUV trial exceeds
   the retained shared-memory aperture and refuses the allocation before
   mapping it. Watchdog recovery remains required after these private probes.
   The captured boot firmware is `mBoot-18000.161.9` from macOS 26.6.1 (25G76).
