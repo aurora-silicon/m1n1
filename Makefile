@@ -68,6 +68,9 @@ BASE_CFLAGS := -O2 -Wall -g -Wundef -Werror=strict-prototypes -fno-common -fno-P
 CFLAGS := $(BASE_CFLAGS) -mgeneral-regs-only
 
 CFG :=
+ifeq ($(J613_ESP_STAGE1),1)
+CFG += J613_ESP_STAGE1
+endif
 ifeq ($(RELEASE),1)
 CFG += RELEASE
 endif
@@ -127,6 +130,7 @@ OBJECTS := \
 	aic.o \
 	asc.o \
 	bootlogo_48.o bootlogo_128.o bootlogo_256.o \
+	stage1_config.o \
 	chainload.o \
 	chainload_asm.o \
 	chickens.o \

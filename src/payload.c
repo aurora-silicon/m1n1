@@ -7,6 +7,7 @@
 #include "adt.h"
 #include "assert.h"
 #include "chainload.h"
+#include "stage1_config.h"
 #include "cpufreq.h"
 #include "display.h"
 #include "heapblock.h"
@@ -308,6 +309,14 @@ int payload_run(void)
 
     while (p)
         p = load_one_payload(p, 0);
+
+#ifdef J613_ESP_STAGE1
+    /* main.c admits only J613/26.6.2 before invoking payload_run. */
+    const char *configured = stage1_config_target();
+    if (configured) {
+        chainload_spec = (char *)configured;
+    }
+#endif
 
     if (chainload_spec) {
         return chainload_load(chainload_spec, chosen, chosen_cnt);

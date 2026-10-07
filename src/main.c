@@ -31,6 +31,7 @@
 #include "usb.h"
 #include "utils.h"
 #include "wdt.h"
+#include "stage1_config.h"
 #include "xnuboot.h"
 
 struct vector_args next_stage;
@@ -75,8 +76,41 @@ void run_actions(void)
 {
     bool usb_up = false;
 
+#ifdef J613_ESP_STAGE1
+    const char *target = adt_getprop(adt, 0, "target-type", NULL);
+    bool j613 = chip_id == T8122 && target && !strcmp(target, "J613") &&
+                os_firmware.version == V26_6_2;
+    if (!j613) {
+        printf("J613 Stage 1: board/25G83 guard rejected; proxy only\n");
+        goto proxy_fallback;
+    }
+    if (stage1_config_target()) {
+        u32 window_ms = stage1_config_window_ms();
+        usb_init();
+        usb_iodev_init();
+        usb_up = true;
+        u64 deadline = timeout_calculate((u64)window_ms * 1000);
+        while (!timeout_expired(deadline)) {
+            for (int j = 0; j < USB_IODEV_COUNT; j++) {
+                iodev_id_t iodev = IODEV_USB0 + j;
+                if (!(iodev_get_usage(iodev) & USAGE_UARTPROXY))
+                    continue;
+                usb_iodev_vuart_setup(iodev);
+                iodev_handle_events(iodev);
+                if (iodev_can_write(iodev) || iodev_can_write(IODEV_USB_VUART)) {
+                    printf("J613 Stage 1: host grabbed proxy window\n");
+                    uartproxy_run(NULL);
+                    return;
+                }
+            }
+            mdelay(10);
+        }
+        printf("J613 Stage 1: window expired; loading ESP candidate\n");
+    }
+#endif
+
 #ifndef BRINGUP
-#ifdef EARLY_PROXY_TIMEOUT
+#if defined(EARLY_PROXY_TIMEOUT) && !defined(J613_ESP_STAGE1)
     int node = adt_path_offset(adt, "/chosen/asmb");
     u64 lp_sip0 = 0;
 
@@ -125,6 +159,9 @@ void run_actions(void)
         printf("Valid payload found\n");
         return;
     }
+#ifdef J613_ESP_STAGE1
+proxy_fallback:
+#endif
     fb_set_active(true);
 
     printf("No valid payload found\n");

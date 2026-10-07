@@ -51,6 +51,17 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     image_size += sepfw[1];
     image_size = ALIGN_UP(image_size, SZ_16K);
 
+#ifdef J613_ESP_STAGE1
+    /* Match the qualified proxy loader's optional preoslog preservation. */
+    u64 preoslog[2] = {0};
+    const void *log_prop = adt_getprop(adt, anode, "preoslog", NULL);
+    if (log_prop && ADT_GETPROP_ARRAY(adt, anode, "preoslog", preoslog) < 0)
+        return -1;
+    size_t preoslog_off = image_size;
+    image_size += preoslog[1];
+    image_size = ALIGN_UP(image_size, SZ_16K);
+#endif
+
     // Bootargs
     size_t bootargs_off = image_size;
     const size_t bootargs_size = SZ_16K;
@@ -88,6 +99,22 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
         free(new_image);
         return -1;
     }
+
+#ifdef J613_ESP_STAGE1
+    if (preoslog[1]) {
+        memcpy(new_image + preoslog_off, (void *)preoslog[0], preoslog[1]);
+        preoslog[0] = new_base + preoslog_off;
+        if (adt_setprop(adt, anode, "preoslog", preoslog, sizeof(preoslog)) < 0) {
+            free(new_image);
+            return -1;
+        }
+    }
+    u64 bootargs_map[2] = {new_base + bootargs_off, bootargs_size};
+    if (adt_setprop(adt, anode, "BootArgs", bootargs_map, sizeof(bootargs_map)) < 0) {
+        free(new_image);
+        return -1;
+    }
+#endif
 
     // Copy bootargs
     struct boot_args *new_boot_args = new_image + bootargs_off;
