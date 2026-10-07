@@ -22,6 +22,7 @@
 #include "pmgr.h"
 #include "sep.h"
 #include "smp.h"
+#include "soc.h"
 #include "string.h"
 #include "tps6598x.h"
 #include "uart.h"
@@ -139,6 +140,24 @@ void run_actions(void)
     uartproxy_run(NULL);
 }
 
+/* J613 bring-up: read-only DCP ASC CPU state, to see whether the DCP runs when stage 2 starts. */
+static void log_dcp_cpu(const char *when)
+{
+    if (chip_id != T8122)
+        return;
+    int before = exc_count;
+    exc_guard = GUARD_SKIP | GUARD_SILENT;
+    u32 control = read32(0x28ec00044);
+    u32 status = read32(0x28ec00048);
+    sysop("dsb sy");
+    sysop("isb");
+    exc_guard = GUARD_OFF;
+    if (exc_count != before)
+        printf("DCP: CPU state unreadable (%s)\n", when);
+    else
+        printf("DCP: CPU control 0x%x status 0x%x (%s)\n", control, status, when);
+}
+
 void m1n1_main(void)
 {
     printf("\n\nm1n1 %s\n", m1n1_version);
@@ -164,11 +183,13 @@ void m1n1_main(void)
 #ifdef USE_DEBUG_USB
     tps6598x_enable_debugusb();
 #endif
+    log_dcp_cpu("stage 2 start");
 #ifdef USE_FB
     display_init();
     // Kick DCP to sleep, so dodgy monitors which cause reconnect cycles don't cause us to lose the
     // framebuffer.
     display_shutdown(DCP_SLEEP_IF_EXTERNAL);
+    log_dcp_cpu("after display init");
     // On idevice we need to always clear, because otherwise it looks scuffed on white devices
     fb_init(!is_mac);
     fb_display_logo();
