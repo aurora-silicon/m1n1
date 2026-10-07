@@ -223,9 +223,19 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   returned to their original states, including ISPSENS0 state 4. A separate
   readback trial confirms ISP_SYS and ISPSENS0 reach active mode through the
   existing ADT parent traversal; missing parent power is not the cause in this
-  sequence. This does not qualify clock/reset prerequisites. Firmware
-  startup trials have not produced the initial firmware handshake. Channels,
-  heap requirements and camera operation remain unqualified.
+  sequence. A guarded proxy trial now receives the first firmware handshake
+  with full 42-bit SID0 mappings and native stream aliases: SIDs 1, 6, 7, 10
+  and 11 use TCR `0x80` on all three DARTs, with enable mask 1. The previous
+  trials left these streams in separate contexts with empty tables. The
+  firmware announces seven channels, queue offset `0xef40`, descriptor flags
+  2 and an extra-heap request of `0x6500000` bytes. Its bootstrap metadata
+  changes, with zero DART faults and CPU exceptions. Watchdog recovery returns
+  to macOS after a one-time m1n1 boot, or to CDC after m1n1 is selected as
+  default. The modern `0x290`-byte boot block is accepted. All seven channel
+  descriptors parse with 64-bit ring addresses in the owned IPC allocation,
+  and the requested `0x6500000`-byte heap is mapped on all three DARTs.
+  Type-0 ring initialization and the third boot handshake also pass, with
+  zero faults. Camera commands and frames remain unqualified.
   The captured boot firmware is `mBoot-18000.161.9` from macOS 26.6.1 (25G76).
   Its ISP UUID and segment ranges match that restore image; macOS 26.6.2 and
   the installed macOS 27.0 ISP image have different UUIDs. The version table
@@ -234,12 +244,14 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   Surface allocations now start beyond the fixed firmware mappings, preserving
   the configured IOVA bounds and a guard page. Captured J616s segment sizes
   combined with a synthetic legacy extra-heap request reproduce an overlap
-  with the old allocator start. The actual T6040 extra-heap request remains
-  unqualified. Required boot-argument and channel-message imports are explicit.
+  with the old allocator start. The live T6040 extra-heap request is larger
+  than that synthetic request. The guarded boot-block trial qualifies its
+  allocation and mapping; camera operation remains unqualified.
+  Required boot-argument and channel-message imports are explicit.
   Channel descriptors retain their 64-bit ring addresses at offset 0x50.
   The matching firmware writes that field with 64-bit stores in all seven
   0x100-byte records. Host tests cover legacy addresses and addresses above
-  1 TB; live channel parsing awaits successful firmware startup.
+  1 TB; live descriptor reads now confirm these high ring addresses.
 * No speaker output or speaker amplifier programming was performed. Only
   the input-only ADMAC prototype described above submitted an audio descriptor.
 
