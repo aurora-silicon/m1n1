@@ -25,19 +25,23 @@ maralcbr/omarchy-pkgs). It is not ours and not included; nothing here depends on
 - 25G83 stage 2: `make RELEASE=1 USE_CLANG=1` at the branch head (it was built from `30e01de` + `d5d2932`).
 - Stage 1: `make RELEASE=1 USE_CLANG=1 CHAINLOADING=1 J613_ESP_STAGE1=1` (built from `30e01de` + `f974c0f`). Then
   fill the configuration with Aurora's `tools/fill_stage1_config.py` from aurora-silicon/m1n1 `aed999725`:
-  `--esp-partuuid <ESP PARTUUID> --stage2-path <path on the ESP> --window-ms 15000`. An empty or CRC-invalid
-  configuration means proxy only. Install as a raw custom boot object (`kmutil configure-boot --raw --entry-point 2048
-  --lowest-virtual-address 0`) in the paired recoveryOS of a 26.6.2 volume group.
+  `--input build/m1n1.bin --output <file> --esp-partuuid <ESP PARTUUID> --stage2-path <path on the ESP>
+  --window-ms 15000`. An empty or CRC-invalid configuration means proxy only. Install as a raw custom boot object
+  (`kmutil configure-boot --raw --entry-point 2048 --lowest-virtual-address 0`) in the paired recoveryOS of a 26.6.2
+  volume group: step by step in [INSTALL.md](INSTALL.md).
 
 ## Tested on hardware vs compile-only
 
 - `51c0630`..`0eb2557`: J613 daily boot loader since late September (14.8.3).
 - `30e01de`, `d5d2932`: the stage 2 of the G54/G55 25G83 boots. The clock witness reads 712000000 Hz on this
   machine.
-- `f974c0f`: installed as the stage 1 of the 26.6.2 volume group on the J613. On 2026-10-07, with the host connected
-  but idle, the window expired and it booted the ESP stage 2 (G54 kernel on the NVMe root, appledrm, native Mesa
-  frames). The window and missing-file paths were tested with the same image loaded into RAM. **Not tested yet:** a
-  cold boot with no USB host attached.
+- `f974c0f`: installed with `kmutil` as the stage 1 of the 26.6.2 volume group on the J613 and booted by iBoot
+  (2026-10-07). With the host connected but idle, the window expired and it booted the ESP stage 2: first the G54
+  kernel on the NVMe root (appledrm, native Mesa frames), then the D3 daily candidate (display up by itself, native-GPU
+  SDDM greeter; D3's installed qualification passed, see `J613-NOTES.md` on `satchlj/j613-kernel-25g83`). A NOP and a
+  proxy reboot inside the window passed with the installed image. The missing-file path was tested with the same image
+  loaded into RAM. A proxy-only rollback installed the same way was verified as the object iBoot loads. **Not tested
+  yet:** a boot with no USB host attached, and a boot from full power-off.
 - Compile: the branch head builds on macOS/clang both as stage 2 and as stage 1 (1,196,032 bytes, the same size as
   the installed image). The only warnings are pre-existing, in files these commits don't touch.
 
