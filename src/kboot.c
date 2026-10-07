@@ -1994,6 +1994,8 @@ struct m3_dcp_board {
      */
     const char *handoff;
     const char *qualified_uuid; /* firmware whose PIODMA/scanout handoff is known */
+    u32 firmware_compat[3];
+    bool piodma_disabled; /* Disabled mapping-only profile; no gate authorization. */
     u64 disp0_dart;
     /* Exact SID0/SID4 region counts (J514S). */
     u32 regions[2];
@@ -2036,6 +2038,7 @@ static const struct m3_dcp_board m3_dcp_board_j613 = {
     .dcp_compatible = "apple,t8122-dcp",
     .display_compatible = "apple,t8122-display-subsystem",
     .handoff = "apple,t8122-handoff",
+    .firmware_compat = {14, 7, 0},
     .qualified_uuid = "90F849E1-B422-367E-B389-50246F8DEC47",
     .disp0_dart = 0x28d304000,
     /* Measured: SID0 maps segments 4 and 6, SID4 segment 5. Segment 3
@@ -2044,6 +2047,28 @@ static const struct m3_dcp_board m3_dcp_board_j613 = {
     .masks = {0x50, 0x20},
     .unmapped = 1U << 3,
     .notch_height = 64, /* 2560x1664 panel, 2560x1600 boot framebuffer */
+    .fatal = false,
+};
+
+/* 25G83 mapping handoff. This distinct marker never authorizes the 14.7
+ * display gate. The UUID/OS version and SID masks are measured on J613;
+ * protocol startup and panel driving require a separate kernel ABI record.
+ */
+static const struct m3_dcp_board m3_dcp_board_j613_25g83 = {
+    .name = "J613-25G83",
+    .chip = T8122,
+    .machine = "apple,j613",
+    .soc = "apple,t8122",
+    .dcp_compatible = "apple,t8122-dcp",
+    .display_compatible = "apple,t8122-display-subsystem",
+    .handoff = "apple,j613-25g83-mapping-handoff",
+    .qualified_uuid = "C042E95C-B9D8-3F0E-94B3-582A08AA6FDD",
+    .firmware_compat = {26, 6, 2},
+    .piodma_disabled = true,
+    .disp0_dart = 0x28d304000,
+    .masks = {0x50, 0x20},
+    .unmapped = 1U << 3,
+    .notch_height = 64,
     .fatal = false,
 };
 
@@ -2372,7 +2397,8 @@ static int m3_check_display_contract(const struct m3_dcp_board *board)
         bail("FDT: %s DCP, display or DISP0 DART is not disabled\n", board->name);
     /* ... but creates PIODMA only if it is available. */
     const char *status = fdt_getprop(dt, piodma, "status", NULL);
-    if (status && strcmp(status, "okay"))
+    if (board->piodma_disabled ? !m3_status_disabled(piodma) :
+                                  (status && strcmp(status, "okay")))
         bail("FDT: %s PIODMA is not available\n", board->name);
     if (fdt_getprop(dt, display, "memory-region", NULL) ||
         fdt_getprop(dt, piodma, "memory-region", NULL))
@@ -2381,11 +2407,12 @@ static int m3_check_display_contract(const struct m3_dcp_board *board)
     const char *uuid = fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
     if (!uuid || strcmp(uuid, board->qualified_uuid))
         bail("FDT: %s DCP firmware UUID is not the qualified one\n", board->name);
-    /* dcp.c prints the cells as "%d.%d.%d" and requires "14.7.0". */
+    /* Exact version; do not alias a different firmware ABI. */
     const fdt32_t *compat = fdt_getprop(dt, dcp, "apple,firmware-compat", &len);
-    if (!compat || len != 12 || fdt32_ld(compat) != 14 || fdt32_ld(compat + 1) != 7 ||
-        fdt32_ld(compat + 2) != 0)
-        bail("FDT: %s DCP firmware-compat is not 14.7.0\n", board->name);
+    if (!compat || len != 12 || fdt32_ld(compat) != board->firmware_compat[0] ||
+        fdt32_ld(compat + 1) != board->firmware_compat[1] ||
+        fdt32_ld(compat + 2) != board->firmware_compat[2])
+        bail("FDT: %s DCP firmware-compat does not match its profile\n", board->name);
     const fdt32_t *notch = fdt_getprop(dt, dcp, "apple,notch-height", &len);
     if (!notch || len != 4 || fdt32_ld(notch) != board->notch_height)
         bail("FDT: %s DCP notch-height is not %u\n", board->name, board->notch_height);
@@ -2495,6 +2522,10 @@ static int dt_set_t8122_display(void)
 {
     const struct m3_dcp_board *board = &m3_dcp_board_j613;
     int dcp = fdt_path_offset(dt, "dcp");
+    const char *stage = dcp < 0 ? NULL :
+        fdt_getprop(dt, dcp, "apple,j613-25g83-port-stage", NULL);
+    if (stage && !strcmp(stage, "topology-only"))
+        board = &m3_dcp_board_j613_25g83;
 
     if (dcp >= 0) {
         /* The handoff mutates the global FDT through the shared reserved-memory
@@ -2518,6 +2549,32 @@ static int dt_set_t8122_display(void)
         m3_walk_display_maps(board, fw.segments, fw.count, fw.dram_start, fw.dram_size, maps))
         printf("FDT: %s inherited display mappings do not qualify\n", board->name);
     return 0;
+}
+
+/* Read-only snapshots taken before PMGR, after PMGR, after display init. */
+extern u32 j613_dcp_cpu_snapshots[10];
+static int dt_set_j613_dcp_snapshots(void)
+{
+    if (chip_id != T8122 || os_firmware.version != V26_6_2)
+        return 0;
+    int chosen = fdt_path_offset(dt, "/chosen");
+    fdt32_t values[10];
+    for (unsigned i = 0; i < 10; i++)
+        values[i] = cpu_to_fdt32(j613_dcp_cpu_snapshots[i]);
+    return fdt_setprop(dt, chosen, "apple,j613-dcp-cpu-snapshots", values, sizeof(values));
+}
+
+int kboot_update_j613_dcp_snapshots(void)
+{
+    if (!dt || next_stage.args[0] != (u64)dt || chip_id != T8122 ||
+        os_firmware.version != V26_6_2)
+        return 0;
+    int chosen = fdt_path_offset(dt, "/chosen");
+    fdt32_t values[10];
+    for (unsigned i = 0; i < 10; i++)
+        values[i] = cpu_to_fdt32(j613_dcp_cpu_snapshots[i]);
+    return fdt_setprop_inplace(dt, chosen, "apple,j613-dcp-cpu-snapshots", values,
+                             sizeof(values));
 }
 
 static int dt_set_display(void)
@@ -3394,6 +3451,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_pcie_tunables())
         return -1;
     if (dt_set_display())
+        return -1;
+    if (dt_set_j613_dcp_snapshots())
         return -1;
     if (dt_set_gpu(dt))
         return -1;

@@ -34,7 +34,8 @@ SEGMENTS = [
     (0x103E5B64000, 2**64 - 1, 0x100019C8000, 0xC0000, 0x2),
     (0x103E1BF4000, 2**64 - 1, 0x10001A88000, 0x3F70000, 0x2),
 ]
-UUID = "90F849E1-B422-367E-B389-50246F8DEC47"
+PROFILE25 = os.environ.get("J613_25G83") == "1"
+UUID = "C042E95C-B9D8-3F0E-94B3-582A08AA6FDD" if PROFILE25 else "90F849E1-B422-367E-B389-50246F8DEC47"
 DRAM = (0x10000000000, 0x400000000)
 # Measured on J613: disp0 SID0 maps segments 4 and 6, SID4 segment 5, and
 # segment 3 is mapped by neither.
@@ -43,6 +44,11 @@ SID0, SID4, UNMAPPED = 0x50, 0x20, 0x08
 # framebuffer (10240-byte stride) with the 2560x1600 notchless part 64 rows in.
 VRAM = (0x103F0000000, 0x2000000)
 STRIDE, NOTCH, FB_HEIGHT = 10240, 64, 1600
+
+# Same-boot 25G83 capture; these are fixtures, never boot addresses.
+if PROFILE25:
+    SEGMENTS = [(1099513905152, 0, 1099605966848, 7110656, 1), (1116181184512, 7110656, 1099613077504, 2752512, 0), (1099559632896, 9863168, 1099559632896, 147456, 10), (1116251258880, 18446744073709551615, 1099521703936, 16777216, 2), (1116251242496, 18446744073709551615, 1099538644992, 16384, 2), (1116250456064, 18446744073709551615, 1099538661376, 786432, 2), (1116183937024, 18446744073709551615, 1099539447808, 66519040, 2)]
+    VRAM = (1116183937024, 66519040)
 
 # Shaped like the kernel's t8122-j613-dcp.dtsi.
 FIXTURE_DTSI = r"""
@@ -588,13 +594,18 @@ def main():
                                       "dt_device_add_mem_region", "dt_get_iommu_node",
                                       "dt_reserve_asc_firmware", "dt_transaction")]
     start = SOURCE.index("struct m3_dcp_board {")
-    functions.append(SOURCE[start:SOURCE.index("static int dt_set_display(void)", start)])
+    stop = SOURCE.index("/* Read-only snapshots", start) if "/* Read-only snapshots" in SOURCE[start:] else SOURCE.index("static int dt_set_display(void)", start)
+    functions.append(SOURCE[start:stop])
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         dtsi = os.environ.get("J613_DCP_DTSI")
         dtb = os.environ.get("J613_DTB")
-        (tmp / "dcp.dtsi").write_text(Path(dtsi).read_text() if dtsi else FIXTURE_DTSI)
+        fixture = Path(dtsi).read_text() if dtsi else FIXTURE_DTSI
+        if PROFILE25:
+            fixture = fixture.replace("dcp: dcp@28ec00000 {", 'dcp: dcp@28ec00000 { apple,j613-25g83-port-stage = "topology-only";')
+            fixture = fixture.replace("disp0_piodma: piodma {", 'disp0_piodma: piodma { status = "disabled";')
+        (tmp / "dcp.dtsi").write_text(fixture)
         (tmp / "board.dts").write_text(board_dts)
         pre = subprocess.run(["cc", "-E", "-P", "-nostdinc", "-undef", "-x", "assembler-with-cpp",
                               "-I", str(tmp), str(tmp / "board.dts")],
@@ -605,7 +616,23 @@ def main():
         if dtb:
             (tmp / "board.dtb").write_bytes(Path(dtb).read_bytes())
 
-        harness = HARNESS + "\n".join(functions) + MAIN
+        harness = HARNESS + "\n/* PRODUCTION_IMPLEMENTATION */\n" + MAIN
+        if PROFILE25:
+            harness = harness.replace('cpu_to_fdt32(14), cpu_to_fdt32(7), cpu_to_fdt32(0)',
+                                      'cpu_to_fdt32(26), cpu_to_fdt32(6), cpu_to_fdt32(2)')
+            harness = harness.replace('compat[0] = 14; compat[1] = 7; compat[2] = 0;',
+                                      'compat[0] = 26; compat[1] = 6; compat[2] = 2;')
+            harness = harness.replace('"apple,t8122-handoff"', '"apple,j613-25g83-mapping-handoff"')
+            harness = harness.replace('assert(!has("disp0_piodma", "status"));',
+                                      'assert(!strcmp(str("disp0_piodma", "status"), "disabled"));')
+            harness = harness.replace('case 19: assert(!fdt_setprop_string(dt, node("disp0_piodma"), "status", "disabled"));',
+                                      'case 19: assert(!fdt_setprop_string(dt, node("disp0_piodma"), "status", "okay"));')
+            harness = harness.replace('else if (mode == 19) assert(!strcmp(str("disp0_piodma", "status"), "disabled"));',
+                                      'else if (mode == 19) assert(!strcmp(str("disp0_piodma", "status"), "okay"));')
+            harness = harness.replace('assert(!has("dcp", MARKER) &&',
+                                      'assert(!has("dcp", "apple,t8122-handoff")); assert(!has("dcp", MARKER) &&')
+
+        harness = harness.replace("/* PRODUCTION_IMPLEMENTATION */", "\n".join(functions))
         defines = [
             "#define NSEG %d" % len(SEGMENTS),
             "static const struct adt_segment_ranges SEGS[] = {\n%s\n};" % segs,
@@ -619,7 +646,8 @@ def main():
         ]
         harness = harness.replace("static unsigned char dtb", "\n".join(defines) + "\nstatic unsigned char dtb", 1)
         (tmp / "test.c").write_text(harness)
-        subprocess.run(["cc", "-std=gnu11", "-Wall", "-Werror", str(tmp / "test.c"), "-lfdt",
+        subprocess.run(["cc", "-std=gnu11", "-Wall", "-Werror", "-include", "stdlib.h", str(tmp / "test.c"), "-I", str(ROOT / "src/libfdt"),
+                        *map(str, sorted((ROOT / "src/libfdt").glob("*.c"))),
                         "-o", str(tmp / "test")], check=True)
         out = subprocess.run(["stdbuf", "-oL", str(tmp / "test")], capture_output=True, text=True)
         if os.environ.get("J613_TEST_LOG"):

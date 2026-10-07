@@ -25,5 +25,6 @@ int kboot_set_chosen(const char *name, const char *value);
 int kboot_set_uboot(const char *name, const char *value);
 int kboot_prepare_dt(void *fdt);
 int kboot_boot(void *kernel);
+int kboot_update_j613_dcp_snapshots(void);
 
 #endif

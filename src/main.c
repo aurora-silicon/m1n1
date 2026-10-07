@@ -14,6 +14,7 @@
 #include "firmware.h"
 #include "gxf.h"
 #include "heapblock.h"
+#include "kboot.h"
 #include "mcc.h"
 #include "memory.h"
 #include "nvme.h"
@@ -141,7 +142,9 @@ void run_actions(void)
 }
 
 /* J613 bring-up: read-only DCP ASC CPU state, to see whether the DCP runs when stage 2 starts. */
-static void log_dcp_cpu(const char *when)
+u32 j613_dcp_cpu_snapshots[10] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+
+static void log_dcp_cpu(const char *when, unsigned index)
 {
     if (chip_id != T8122)
         return;
@@ -154,8 +157,11 @@ static void log_dcp_cpu(const char *when)
     exc_guard = GUARD_OFF;
     if (exc_count != before)
         printf("DCP: CPU state unreadable (%s)\n", when);
-    else
+    else {
+        j613_dcp_cpu_snapshots[2 * index] = control;
+        j613_dcp_cpu_snapshots[2 * index + 1] = status;
         printf("DCP: CPU control 0x%x status 0x%x (%s)\n", control, status, when);
+    }
 }
 
 void m1n1_main(void)
@@ -179,17 +185,18 @@ void m1n1_main(void)
 #endif
     wdt_disable();
 #ifndef BRINGUP
+    log_dcp_cpu("before pmgr init", 0);
     pmgr_init();
 #ifdef USE_DEBUG_USB
     tps6598x_enable_debugusb();
 #endif
-    log_dcp_cpu("stage 2 start");
+    log_dcp_cpu("stage 2 start", 1);
 #ifdef USE_FB
     display_init();
     // Kick DCP to sleep, so dodgy monitors which cause reconnect cycles don't cause us to lose the
     // framebuffer.
     display_shutdown(DCP_SLEEP_IF_EXTERNAL);
-    log_dcp_cpu("after display init");
+    log_dcp_cpu("after display init", 2);
     // On idevice we need to always clear, because otherwise it looks scuffed on white devices
     fb_init(!is_mac);
     fb_display_logo();
@@ -214,11 +221,16 @@ void m1n1_main(void)
 
     printf("Preparing to run next stage at %p...\n", next_stage.entry);
 
+    log_dcp_cpu("after boot preparation", 3);
+
     nvme_shutdown();
     exception_shutdown();
 #ifndef BRINGUP
     usb_iodev_shutdown();
     display_shutdown(DCP_SLEEP_IF_EXTERNAL);
+    log_dcp_cpu("after final display shutdown", 4);
+    if (kboot_update_j613_dcp_snapshots())
+        printf("DCP: final CPU snapshot publication failed\n");
 #ifdef USE_FB
     fb_shutdown(next_stage.restore_logo);
 #endif
