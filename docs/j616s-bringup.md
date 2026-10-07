@@ -229,6 +229,12 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   Its ISP UUID and segment ranges match that restore image; macOS 26.6.2 and
   the installed macOS 27.0 ISP image have different UUIDs. The version table
   recognizes 26.6.1; this does not qualify an ISP startup profile.
+  Host regressions cover initialization followed by shared-buffer allocation.
+  Surface allocations now start beyond the fixed firmware mappings, preserving
+  the configured IOVA bounds and a guard page. Captured J616s segment sizes
+  combined with a synthetic legacy extra-heap request reproduce an overlap
+  with the old allocator start. The actual T6040 extra-heap request remains
+  unqualified. Required boot-argument and channel-message imports are explicit.
 * No speaker output or speaker amplifier programming was performed. Only
   the input-only ADMAC prototype described above submitted an audio descriptor.
 

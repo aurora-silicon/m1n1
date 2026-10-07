@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 from ..common import *
 from ...utils import align
+from ...malloc import Heap
 from ...hw.dart import DART
 from ...hw.isp import *
 
@@ -10,6 +11,7 @@ import struct
 import time
 
 from .isp_chan import ISPChannelTable
+from . import ISPIPCBootArgs, ISPIPCChanTableDescEntry
 
 class ISPSurface:
     def __init__(self, index, phys, iova, size, name):
@@ -285,6 +287,9 @@ class ISP:
         self.regs.ISP_DPE_UNK_0 = 0xc03  # self.p.mask32(0x22c504000, 0xc01, 0xc03)
 
     def initialize_firmware(self):
+        allocator = self.dart.iova_allocator[0]
+        if any(used for _, used in allocator.blocks):
+            raise ValueError("ISP IOVA allocator is already in use")
 
         # Stage0
         # =============================================================================
@@ -351,12 +356,20 @@ class ISP:
         # Allocate IPC region
         ipc_iova = (heap_iova + heap_size) + 0x4000  # 0x1804000
         ipc_size = 0x1c000
+        extra_iova = (ipc_iova + ipc_size) + 0x4000  # 0x1824000
+        # Keep surface allocations clear of the fixed firmware mappings.
+        iova_start = max(allocator.offset,
+                         align(extra_iova + extra_size + self.PAGE_SIZE, self.PAGE_SIZE))
+        iova_end = allocator.offset + allocator.count * allocator.block
+        if iova_start >= iova_end:
+            raise ValueError("ISP firmware heap exceeds IOVA range")
+        self.dart.iova_allocator[0] = Heap(iova_start, iova_end, self.PAGE_SIZE)
+
         ipc_phys = self.u.heap.memalign(self.PAGE_SIZE, ipc_size)
         self.p.memset32(ipc_phys, 0, ipc_size)
         self.iomap_at(ipc_iova, ipc_phys, ipc_size)
 
         # Allocate extra heap requested by fw
-        extra_iova = (ipc_iova + ipc_size) + 0x4000  # 0x1824000
         extra_phys = self.u.heap.memalign(self.PAGE_SIZE, extra_size)
         self.p.memset32(extra_phys, 0, extra_size)
         self.iomap_at(extra_iova, extra_phys, extra_size)

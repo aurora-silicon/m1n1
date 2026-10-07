@@ -5,6 +5,7 @@ import struct
 from termcolor import colored
 import time
 from .isp_vid import ISPFrame
+from . import ISPChannel, ISPChannelMessage
 
 class ISPTerminalChannel(ISPChannel):
     def __init__(self, isp, x, **kwargs):
