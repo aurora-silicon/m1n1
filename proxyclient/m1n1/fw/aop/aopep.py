@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 import time
+from io import BytesIO
 from construct import *
 from ..afk.epic import *
 from .ipc import *
@@ -100,6 +101,16 @@ class AOPLASEndpoint(EPICEndpoint):
 class AOPAudioService(EPICService):
     NAME = "aop-audio"
     SHORT = "audio"
+    last_producer_report = None
+
+    def handle_report(self, category, type, seq, fd):
+        if int(type) != 0x20:
+            return super().handle_report(category, type, seq, fd)
+        payload = fd.read()
+        if len(payload) >= 0x68 and payload[:8] == b"iapl\x08\x00\x00\xc3":
+            self.last_producer_report = AudioProducerReport.parse(payload)
+            return True
+        return super().handle_report(category, type, seq, BytesIO(payload))
 
 class AOPAudioEndpoint(EPICEndpoint):
     SHORT = "audio"

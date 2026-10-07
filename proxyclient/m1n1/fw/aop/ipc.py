@@ -176,6 +176,16 @@ LASAngleReport = Struct(
     "unknown" / HexDump(GreedyBytes),
 )
 
+AudioProducerReport = Struct(
+    "devid" / FourCC,
+    "subtype" / Hex(Int32ul),
+    "unknown0" / Bytes(56),
+    "frame_count" / Int64ul,
+    "unknown1" / Bytes(24),
+    "write_offset" / Int64ul,
+    "unknown2" / GreedyBytes,
+)
+
 ALSLuxReport = Struct(
     "unk0" / Const(0xec, Hex(Int8ul)),
     "sequence" / Int32ul,
