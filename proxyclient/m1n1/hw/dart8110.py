@@ -270,7 +270,7 @@ class DART8110(Reloadable):
         dart = cls(u.iface, regs, u, **kwargs)
         return dart
 
-    def iomap_at(self, stream, iova, addr, size):
+    def iomap_at(self, stream, iova, addr, size, *, enable=True):
         if not 0 <= stream < 256:
             raise ValueError("Invalid DART stream")
         if size < 0:
@@ -349,7 +349,7 @@ class DART8110(Reloadable):
 
         # Publish a newly enabled stream only after its tables are populated.
         # Rejected requests must not change the hardware stream mask.
-        if not (self.enabled_streams & (1 << stream)):
+        if enable and not (self.enabled_streams & (1 << stream)):
             self.regs.ENABLE_STREAMS[stream // 32].val |= (1 << (stream % 32))
             self.enabled_streams |= (1 << stream)
 

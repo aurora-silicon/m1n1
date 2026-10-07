@@ -90,3 +90,20 @@ def test_tables_precede_stream_enable_and_reused_root_translates(four_levels):
     assert hw.next_page == before + 0x4000
     dart.invalidate_cache()
     assert dart.iotranslate(0, iova + (1 << 25), 16) == [(0x200008000, 16)]
+
+
+@pytest.mark.parametrize('four_levels', [False, True])
+def test_deferred_firmware_mappings_leave_stream_disabled(four_levels):
+    hw, dart = controller(four_levels)
+    iova = 0x10000000000 if four_levels else 0
+    dart.iomap_at(0, iova, 0x200000000, 0x4000, enable=False)
+    dart.iomap_at(0, iova + 0x4000, 0x200004000, 0x4000, enable=False)
+    assert hw.read32(0xc00) == 0
+    assert dart.enabled_streams == 0
+    assert not any(event[:2] == ('register', 0xc00) for event in hw.events)
+    dart.invalidate_cache()
+    assert dart.iotranslate(0, iova, 0x8000) == [(0x200000000, 0x8000)]
+    # Ordinary mapping can enable the stream once its firmware map is ready.
+    dart.iomap_at(0, iova + 0x8000, 0x200008000, 0x4000)
+    assert hw.read32(0xc00) == 1
+    assert dart.enabled_streams == 1
