@@ -102,6 +102,50 @@ class ISPModernProfile:
         return ISPBootLayout(ipc, self.ipc_size, args, command, self.command_size,
                              extra, extra_size, shared, 0x10000000 - shared)
 
+    def prepare_bootargs(self, *, ipc_iova, ipc_size, args_offset, extra_iova, extra_size,
+                         shared_base, shared_size, platform_id, camera_scheme,
+                         command_size=0x400):
+        for name, value in locals().copy().items():
+            if name == "self":
+                continue
+            if type(value) is not int or value < 0:
+                raise ValueError(f"Invalid {name}")
+        limit = self.dart_iova_limit
+        if not ipc_iova or ipc_iova % 0x4000 or not ipc_size or ipc_size % 0x4000:
+            raise ValueError("IPC allocation must be page aligned and nonempty")
+        if ipc_iova + ipc_size > limit:
+            raise ValueError("IPC allocation exceeds the DART address range")
+        if extra_size:
+            if not extra_iova or extra_iova % 0x4000 or extra_iova + extra_size > limit:
+                raise ValueError("Invalid extra allocation")
+            extra_end = extra_iova + ((extra_size + 0x3fff) & ~0x3fff)
+            if extra_end > limit:
+                raise ValueError("Extra allocation exceeds the DART address range")
+            if ipc_iova < extra_end and extra_iova < ipc_iova + ipc_size:
+                raise ValueError("IPC and extra allocations overlap")
+        elif extra_iova:
+            raise ValueError("Empty extra allocation has an address")
+        if not shared_base or not shared_size or shared_base + shared_size > 1 << 64:
+            raise ValueError("Invalid shared range")
+        if platform_id >= 1 << 32 or camera_scheme >= 1 << 64:
+            raise ValueError("Platform or camera scheme exceeds its field width")
+        if args_offset % 0x40 or not command_size:
+            raise ValueError("Invalid argument offset or command size")
+        args_iova = ipc_iova + args_offset + 0x40
+        command_iova = args_iova + self.boot_block_size + self.slot_size
+        if command_iova + command_size > ipc_iova + ipc_size:
+            raise ValueError("Boot arguments and command exceed the IPC allocation")
+
+        block = bytearray(self.boot_block_size)
+        struct.pack_into("<QQQQQ", block, 8, ipc_iova, shared_base, shared_size,
+                         extra_iova, extra_size)
+        struct.pack_into("<I", block, 0x30, platform_id)
+        struct.pack_into("<Q", block, 0x50, args_offset + 1)
+        struct.pack_into("<I", block, 0x68, 0x40)
+        struct.pack_into("<Q", block, 0x70 + 0x60, camera_scheme)
+        struct.pack_into("<Q", block, 0x70 + 0xb0, 1)
+        return args_iova, command_iova, bytes(block)
+
     def parse_channels(self, raw, *, table_iova, count, boot):
         if (type(count) is not int or
                 not 0 < count <= boot.ipc_size // self.channel_descriptor_size):

@@ -100,3 +100,49 @@ def test_channel_refuses_control_storage(region):
 def test_table_cannot_overlap_boot_storage(region):
     with pytest.raises(ValueError, match='table overlaps boot storage'):
         channels(table_iova=getattr(boot(), region))
+
+
+def test_captured_boot_block_bytes():
+    import hashlib
+    layout = boot()
+    args, command, block = PROFILE.prepare_bootargs(
+        ipc_iova=layout.ipc_iova, ipc_size=layout.ipc_size,
+        args_offset=FIXTURE['args_offset'], extra_iova=layout.extra_iova,
+        extra_size=layout.extra_size, shared_base=layout.shared_base,
+        shared_size=layout.shared_size, platform_id=FIXTURE['platform_id'],
+        camera_scheme=FIXTURE['camera_scheme'])
+    # Independent word array leaves every unspecified field zero.
+    words = [0] * (0x290 // 8)
+    words[1:6] = [layout.ipc_iova, layout.shared_base, layout.shared_size,
+                  layout.extra_iova, layout.extra_size]
+    words[6] = FIXTURE['platform_id']
+    words[10] = FIXTURE['args_offset'] + 1
+    words[13] = 64
+    words[26] = FIXTURE['camera_scheme']
+    words[36] = 1
+    assert block == struct.pack('<82Q', *words)
+    assert len(block) == 0x290
+    assert (args, command) == (layout.args_iova, layout.command_iova)
+    assert hashlib.sha256(block).hexdigest() == FIXTURE['boot_block_sha256']
+
+
+@pytest.mark.parametrize("change,match", [
+    ({"args_offset": 0x1bd40}, "exceed the IPC"),
+    ({"extra_iova": 0x10002018000}, "overlap"),
+    ({"extra_iova": (1 << 42) - 0x4000, "extra_size": 0x4001}, "Invalid extra"),
+    ({"ipc_iova": 1 << 42}, "DART address"),
+    ({"ipc_iova": 0x10002000001}, "page aligned"),
+    ({"shared_base": 0}, "shared range"),
+    ({"platform_id": 1 << 32}, "field width"),
+    ({"camera_scheme": 1 << 64}, "field width"),
+    ({"args_offset": 3}, "argument offset"),
+    ({"ipc_size": True}, "Invalid ipc_size"),
+])
+def test_boot_block_bad_layout_rejected(change, match):
+    arguments = dict(ipc_iova=0x10002000000, ipc_size=0x1c000, args_offset=0xef40,
+                     extra_iova=0x10002020000, extra_size=0x2200000,
+                     shared_base=0x1fec000, shared_size=0xe014000,
+                     platform_id=5, camera_scheme=16)
+    arguments.update(change)
+    with pytest.raises(ValueError, match=match):
+        PROFILE.prepare_bootargs(**arguments)
