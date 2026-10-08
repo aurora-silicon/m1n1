@@ -119,3 +119,17 @@ def test_unserviced_pump_acknowledges_after_callbacks(with_poll):
     assert not module.poll_control(lambda: events.append('service') or False,
         lambda: events.append('terminal'), poll, lambda: events.append('ack'))
     assert events == ['service', 'terminal'] + (['reports'] if with_poll else []) + ['ack']
+
+
+def test_owned_write_cleans_only_owned_cache_envelope():
+    transport, memory, _ = model()
+    transport.write(0x10000000081, b'abcd')
+    assert memory.data[129:133] == b'abcd'
+    assert memory.events == [('guard',), ('payload', 129), ('clean', 128, 128), ('read', 129, 4)]
+
+
+def test_owned_write_outside_mapping_has_no_write():
+    transport, memory, _ = model()
+    with pytest.raises(ValueError):
+        transport.write(0x100000000ff, b'abcd')
+    assert memory.events == [('guard',)]

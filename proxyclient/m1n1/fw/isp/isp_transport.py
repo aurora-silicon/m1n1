@@ -65,6 +65,16 @@ class ISPOwnedTransport:
         self.invalidate(pa, size)
         return self.iface.readmem(pa, size)
 
+    def write(self, iova, data):
+        self.guard()
+        pa = self.pa_for(iova, len(data))
+        self.iface.writemem(pa, data)
+        start = pa & ~127
+        end = (pa + len(data) + 127) & ~127
+        self.proxy.dc_cvac(start, end - start)
+        if self.iface.readmem(pa, len(data)) != data:
+            raise ValueError('Owned ISP payload readback differs')
+
     def publish(self, iova, words, expected):
         self.guard()
         if iova % 64 or len(words) != 8:
