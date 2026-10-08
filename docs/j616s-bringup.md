@@ -218,6 +218,11 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   recognizable speech and the actual sample clock remain unverified.
   This longer trial stops TX/RX and retains codec power until watchdog
   recovery, without repeating the failed bias restoration.
+  A later short capture restores MISC_DET_CTL in separate detection-mode
+  and bias updates (`0x1f -> 0x07 -> 0x03`). Both readbacks and all remaining
+  codec/controller restorations pass; the frontend reaches idle with no
+  DART fault. This qualifies one cold restoration cycle, not restart or
+  restoration after a longer capture.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored
