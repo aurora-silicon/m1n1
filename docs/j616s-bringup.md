@@ -257,7 +257,11 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   completion acknowledgment precedes reads, and two matching full reads
   precede resubmission. Metadata refill, CH_STOP, zero DART faults and zero
   CPU exceptions also pass. The private capture uses the shared profile,
-  boot-block encoder, buffer leases and owned transport. A subsequent
+  boot-block encoder, buffer leases and owned transport. The shared firmware
+  mapper also passes a six-frame live trial: 42-bit mappings, read-only TEXT,
+  stream aliases and table readbacks qualify before firmware startup. It
+  rejects a running processor before writes and retains resources on failure.
+  Power, DAPF and processor startup sequencing remain private. A subsequent
   40-generation trial timed out at CH_START before returning frames; its
   command payloads and first 96 allocation requests match the successful
   bounded run. Timing of host allocation service remains under investigation.
