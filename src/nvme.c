@@ -802,6 +802,11 @@ bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
     return true;
 }
 
+bool nvme_dma_uncertain(void)
+{
+    return ioq.failed;
+}
+
 bool nvme_read(u32 nsid, u64 lba, void *buffer)
 {
     return nvme_read_blocks(nsid, lba, buffer, 1);
