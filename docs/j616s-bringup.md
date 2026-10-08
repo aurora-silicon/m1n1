@@ -276,7 +276,9 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   P010 frame with CH_STOP, zero faults and proxy NOP passing.
   The shared IO command dispatcher and owned payload write then pass six
   full stable P010 frames, clean stop and fault checks. Named camera
-  configuration commands remain private. A subsequent
+  sensor discovery and preset queries now use the shared T6040/IMX958
+  sequence as well: 13 presets and six full stable frames pass live. Capture
+  pool and stream configuration remain private. A subsequent
   40-generation trial timed out at CH_START before returning frames; its
   command payloads and first 96 allocation requests match the successful
   bounded run. Timing of host allocation service remains under investigation.
