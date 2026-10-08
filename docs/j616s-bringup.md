@@ -212,6 +212,12 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   Codec restoration subsequently times out after restoring MISC_DET_CTL;
   the trial retains resources and watchdog recovery passes. This does not
   qualify a reusable headset capture client or clean codec shutdown.
+  A subsequent 2 MiB capture also completes with matching full copies after
+  programming the native constructor's candidate ADC gain value, `0x78`.
+  The earlier short preview contains only noise according to the user;
+  recognizable speech and the actual sample clock remain unverified.
+  This longer trial stops TX/RX and retains codec power until watchdog
+  recovery, without repeating the failed bias restoration.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored
