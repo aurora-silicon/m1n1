@@ -256,7 +256,13 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   three generations of both output surfaces. Fresh tags identify each lease;
   completion acknowledgment precedes reads, and two matching full reads
   precede resubmission. Metadata refill, CH_STOP, zero DART faults and zero
-  CPU exceptions also pass. Sustained streaming, colour calibration and a
+  CPU exceptions also pass. The private capture uses the shared profile,
+  boot-block encoder, buffer leases and owned transport. A subsequent
+  40-generation trial timed out at CH_START before returning frames; its
+  command payloads and first 96 allocation requests match the successful
+  bounded run. Timing of host allocation service remains under investigation.
+  Watchdog recovery returned the installed proxy with NOP passing.
+  Sustained streaming, colour calibration and a
   production startup profile remain unqualified. A combined RAW/YUV trial exceeds
   the retained shared-memory aperture and refuses the allocation before
   mapping it. Watchdog recovery remains required after these private probes.
