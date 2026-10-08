@@ -235,6 +235,16 @@ firmware startup, PIPE readiness or SuperSpeed enumeration. Crossbar selection
 used a fresh HPM status query (`0x1000b41d`, orientation bit set), rather than
 the older cable's saved orientation. No VDM or role command was sent.
 
+The native USB interface uses mode 4. A later mode-4 test added its nine
+fixed helper RMWs after the common/USB tables and reapplied the six AUSPLL
+records before crossbar setup. All nine fixed masked readbacks matched; the
+AUSPLL values were already unchanged. Modes 1 and 4 share the crossbar branch,
+but mode 4 releases only the orientation-selected lane. All 12 crossbar/common
+and selected-lane readbacks matched. Native RUN again produced a complete
+RTKit version-12 Hello, with clear CPU exception checks and NOP. The readiness
+bit remained clear throughout the one-second window (`0x881`), so this does
+not establish PLL lock, a ready PHY or a working SuperSpeed gadget.
+
 A subsequent cold RAM test applied the native MXWrap RUN request `0x10` to
 processor bank 1 offset `0x28`, after checking prepared control `0x2`, firmware
 enable `0xa0003` and both enabled/empty mailbox controls. RUN readback was
