@@ -189,6 +189,12 @@ sent. This does not establish a usable mailbox. Native outbox enable changes
 control bit 0; mailbox initialization, processor ownership, firmware startup
 and the subsequent PHY/PIPE transition still need qualification.
 
+A separate guarded native small-sleep request changed PHY reset control
+`0x4 -> 0x5` and status `0x100 -> 0x101`, with zero CPU exceptions and
+successful cold watchdog recovery. The clamp remained set. This qualifies
+that request/acknowledgment transition only; host observation latency does
+not establish the native one-millisecond poll timing or USB3 readiness.
+
 ## Other implementation boundaries
 
 CPU states 1/2, secondary MMU/dispatch and shared-memory coherence have live
