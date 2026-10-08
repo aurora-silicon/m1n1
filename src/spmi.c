@@ -161,13 +161,9 @@ static int raw_command(spmi_dev_t *dev, u8 addr, u8 opc, u16 extra, const u8 *da
         return -SPMI_ERR_UNKNOWN;
     }
 
-    for (size_t i = 0;
-         !(read32(dev->base + dev->regs->status_offset) & dev->regs->status_rx_empty_mask); i++) {
-        if (i >= 64) {
-            printf("spmi: stale RX FIFO did not drain\n");
-            return -SPMI_ERR_UNKNOWN;
-        }
-        printf("spmi: Leftover RX data: 0x%x\n", read32(dev->base + dev->regs->reply_offset));
+    if (!(read32(dev->base + dev->regs->status_offset) & dev->regs->status_rx_empty_mask)) {
+        printf("spmi: RX FIFO has unexpected replies\n");
+        return -SPMI_ERR_UNKNOWN;
     }
 
     // write command

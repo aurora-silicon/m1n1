@@ -210,6 +210,13 @@ status `0x3`, request word zero and successful cold recovery. These register
 transitions do not qualify subsequent PLL tunables, crossbar programming,
 firmware startup or PIPE/controller handoff.
 
+A guarded ACE3 query of HPM0 logical status register `0x1a` returned
+`0x1000b40d`: plug present and orientation bit 4 clear. Controller FIFOs were
+empty before and after, and CPU exceptions stayed zero. The query used only
+logical-register selection and reads, with no HPM wakeup/shutdown, role or VDM
+commands. Recheck orientation after a reconnect; this snapshot does not prove
+SuperSpeed cable capability.
+
 ## Other implementation boundaries
 
 CPU states 1/2, secondary MMU/dispatch and shared-memory coherence have live
