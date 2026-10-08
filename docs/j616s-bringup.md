@@ -2,8 +2,9 @@
 
 Tested on J616sAP (Mac16,7), board 6, with the ADT supplied by macOS build
 26A428. The branch is stacked on `j700` while the draft targets `aurora-wip`.
-The target is m1n1/proxy parity with M1, M2 and A18 Pro. Linux and U-Boot
-handoff are outside this bring-up's scope.
+Upstream Asahi M1/M2/M3 m1n1 and proxyclient behavior is the implementation
+standard; J700 is the feature-parity target. Linux and U-Boot handoff are
+outside this bring-up's scope.
 
 For implementation order, formats and ownership rules, start with the
 [driver contracts](j616s-driver-contracts.md).
@@ -61,6 +62,23 @@ M1N1DEVICE=/dev/ttyACM0 python proxyclient/experiments/t6040_amp.py
 ```
 
 The probe leaves secondaries running in WFE mode. Reboot before repeating it.
+
+## Memory controller
+
+The ADT identifies the controller as `mcc,t6041`, with four AMCC apertures
+and four planes per aperture. The current driver does not initialize it.
+One guarded read of controller 0, plane 0 at offset `0x2800` returned
+`0x8000000c`. A separate cold test read offset `0x2804` and returned
+`0x0c000c00`, consistent with upstream PR664's proposed encoding of 12 data
+ways and 12 tag ways. Both reads completed without CPU exceptions, followed
+by successful watchdog recovery to the installed proxy.
+
+These observations do not qualify other planes or cache-control writes.
+The ADT lock predicate uses offset `0x2800`, mask `0x1f` and expected value
+zero; it must not be interpreted as the way-count status at `0x2804`.
+PR664 defines the newer offsets but its enable routine still uses the older
+`0x1c00`/`0x1c04` offsets. Cache control and TZ register interpretation need
+further qualification before integrating that driver.
 
 ## Other devices
 
