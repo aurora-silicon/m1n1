@@ -569,11 +569,12 @@ int mcc_init_m4(int node, int *path)
     return 0;
 }
 
-static int mcc_init_t8140(int node, int *path)
+static int mcc_init_firmware_cache(int node, int *path)
 {
     u32 reg_idx;
     u64 count = 1, channels = 0, planes = 4, stride = T8103_PLANE_STRIDE;
     int lock_node = adt_path_offset(adt, "/chosen/lock-regs/amcc");
+    bool t6041 = adt_is_compatible(adt, node, "mcc,t6041");
 
     if (ADT_GETPROP(adt, node, "amcc-reg-idx", &reg_idx) < 0)
         return -1;
@@ -600,12 +601,18 @@ static int mcc_init_t8140(int node, int *path)
     if (!planes || planes > INT32_MAX || !stride || (stride & 3))
         return -1;
 
+    /* Restrict this path to the observed J616s layout. */
+    if (t6041 && (chip_id != T6040 || board_id != 6 || reg_idx != 12 || count != 4 ||
+                  channels != 4 || planes != 4 || stride != 0x40000))
+        return -1;
+
     mcc_count = count;
     for (int i = 0; i < mcc_count; i++) {
         u64 base, size;
         if (reg_idx > (u32)(INT32_MAX - i) ||
             adt_get_reg(adt, path, "reg", reg_idx + i, &base, &size) || !base ||
-            (planes - 1) > (UINT64_MAX - 4) / stride || (planes - 1) * stride + 4 > size)
+            (planes - 1) > (UINT64_MAX - 4) / stride || (planes - 1) * stride + 4 > size ||
+            (t6041 && (base != 0x220000000 + (u64)i * 0x2000000 || size != 0x200000)))
             return -1;
         mcc_regs[i].plane_base = base;
         mcc_regs[i].plane_stride = stride;
@@ -615,7 +622,20 @@ static int mcc_init_t8140(int node, int *path)
         mcc_regs[i].has_cache_control = false;
     }
 
-    printf("MCC: Initialized T8140 MCCs (%d instances, %d planes, %d channels)\n", mcc_count,
+    if (t6041) {
+        for (int i = 0; i < mcc_count; i++) {
+            for (int plane = 0; plane < mcc_regs[i].plane_count; plane++) {
+                u32 status = plane_read32(i, plane, 0x2804);
+                if ((status & 0x1f001f00) != 0x0c000c00) {
+                    printf("MCC: Unexpected cache status on MCC %d plane %d: 0x%x\n", i, plane,
+                           status);
+                    return -1;
+                }
+            }
+        }
+    }
+
+    printf("MCC: Initialized T%x MCCs (%d instances, %d planes, %d channels)\n", chip_id, mcc_count,
            mcc_regs[0].plane_count, mcc_regs[0].dcs_count);
     mcc_initialized = true;
     return 0;
@@ -644,7 +664,9 @@ int mcc_init(void)
     } else if (adt_is_compatible(adt, node, "mcc,t8132")) {
         return mcc_init_m4(node, path);
     } else if (adt_is_compatible(adt, node, "mcc,t8140")) {
-        return mcc_init_t8140(node, path);
+        return mcc_init_firmware_cache(node, path);
+    } else if (adt_is_compatible(adt, node, "mcc,t6041")) {
+        return mcc_init_firmware_cache(node, path);
     } else if (adt_is_compatible(adt, node, "mcc,t6030")) {
         return mcc_init_m3(node, path);
     } else if (adt_is_compatible(adt, node, "mcc,t6031")) {
