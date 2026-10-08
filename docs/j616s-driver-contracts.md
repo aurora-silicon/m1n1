@@ -115,7 +115,7 @@ Compose the existing [startup](../proxyclient/m1n1/fw/isp/isp_startup.py),
 the firmware/ADT layout. Check IMX958 identity and complete preset replies
 before selecting the render route.
 
-The qualified output is 1280x720 P010: two-plane YCbCr 4:2:0 with MSB-aligned
+The repeated-capture tests use 1280x720 P010: two-plane YCbCr 4:2:0 with MSB-aligned
 10-bit values in little-endian 16-bit words, stride 2560. Its aligned Y/UV
 extents are 1,851,392/933,888 bytes, totaling 2,785,280. Use the returned layout,
 not tightly packed width/height arithmetic. This is the driver's aligned
@@ -123,10 +123,12 @@ not tightly packed width/height arithmetic. This is the driver's aligned
 BT.709 video-range conversion in
 [isp_pixels.py](../proxyclient/m1n1/fw/isp/isp_pixels.py) produces a display PNG.
 
-1920x1080 configuration is implemented but its live capture remains pending.
-Its prepared P010 layout uses stride 3840 and aligned Y/UV extents
-0x3f8000/0x1fc000, totaling 0x5f4000. It must pass the same admission, mapping,
-allocation-budget and completion tests before being described as supported.
+A cold 1920x1080 test now receives one completed P010 frame. Its stride is
+3840 and aligned Y/UV extents are 0x3f8000/0x1fc000, totaling 0x5f4000.
+Both full reads match; CH_STOP, zero faults and NOP pass. The trial queues one
+owned output while retaining the native pool capacity of two and existing
+allocation limits. This qualifies a completed still frame, not continuous
+1080p or measured FPS. Repeated two-surface tests remain qualified at 720p.
 The current profile advertises a 256 MiB shared aperture; the broker separately
 limits retained allocations to 128 MiB, 128 allocations and 32 MiB per request.
 Increasing one budget does not establish that the other limits can be raised.

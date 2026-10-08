@@ -346,6 +346,14 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   The matching firmware writes that field with 64-bit stores in all seven
   0x100-byte records. Host tests cover legacy addresses and addresses above
   1 TB; live descriptor reads now confirm these high ring addresses.
+  A subsequent cold 1920x1080 P010 trial queues one owned pool-9 surface
+  while keeping native pool capacity two, the 256 MiB shared aperture and
+  retained-allocation budgets unchanged. One uniquely matched completed
+  report arrives; both full 6,242,304-byte reads match before CH_STOP.
+  The stride is 3840, with aligned Y/UV extents 0x3f8000/0x1fc000. All three
+  DART errors and CPU exceptions are zero; NOP and watchdog recovery pass.
+  This qualifies one completed 1080p frame, not continuous 1080p streaming,
+  restart, exposure/noise calibration or measured FPS.
 * No speaker output or speaker amplifier programming was performed. Only
   the input-only ADMAC prototype described above submitted an audio descriptor.
 
