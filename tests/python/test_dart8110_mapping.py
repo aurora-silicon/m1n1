@@ -107,3 +107,24 @@ def test_deferred_firmware_mappings_leave_stream_disabled(four_levels):
     dart.iomap_at(0, iova + 0x8000, 0x200008000, 0x4000)
     assert hw.read32(0xc00) == 1
     assert dart.enabled_streams == 1
+
+
+def test_new_four_level_stream_preserves_existing_stream_mapping():
+    hw, dart = controller(four_levels=True)
+    firmware_iova, firmware_pa = 0x10000000000, 0x10002000000
+    input_iova, input_pa = 0x10005000000, 0x10005000000
+    dart.iomap_at(0, firmware_iova, firmware_pa, 0x4000)
+    original_root = hw.values[0x1400]
+    original_pages = dict(hw.pages)
+    hw.values[0x1020] = 9  # Stream 8 uses four-level translation.
+    dart.iomap_at(8, input_iova, input_pa, 0x4000, enable=False)
+    assert hw.read32(0xc00) == 1
+    assert hw.values[0x1400] == original_root
+    assert all(hw.pages[address] == data for address, data in original_pages.items())
+    dart.invalidate_cache()
+    assert dart.iotranslate(0, firmware_iova, 0x4000) == [(firmware_pa, 0x4000)]
+    assert dart.iotranslate(8, input_iova, 0x4000) == [(input_pa, 0x4000)]
+    dart.iomap_at(8, input_iova, input_pa, 0x4000)
+    assert hw.read32(0xc00) == 0x101
+    assert hw.values[0x1400] == original_root
+    assert dart.iotranslate(0, firmware_iova, 0x4000) == [(firmware_pa, 0x4000)]
