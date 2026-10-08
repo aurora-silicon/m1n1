@@ -195,6 +195,10 @@ requests. PHY reset control changed `0x4 -> 0x5 -> 0x7` and status changed
 watchdog recovery. The clamp remained set. This qualifies those ordered
 request/acknowledgment transitions only; host observation latency does
 not establish the native one-millisecond poll timing or USB3 readiness.
+A subsequent cold test released the clamp, with control `0x7 -> 0x3`, both
+sleep acknowledgments retained and status still `0x103`. Readback and cold
+recovery passed without CPU exceptions. Reset-busy remained set; no reset
+request, firmware start or mailbox command was performed.
 
 ## Other implementation boundaries
 
