@@ -256,29 +256,20 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   three generations of both output surfaces. Fresh tags identify each lease;
   completion acknowledgment precedes reads, and two matching full reads
   precede resubmission. Metadata refill, CH_STOP, zero DART faults and zero
-  CPU exceptions also pass. The private capture uses the shared profile,
-  boot-block encoder, buffer leases and owned transport. The shared firmware
-  mapper also passes a six-frame live trial: 42-bit mappings, read-only TEXT,
-  stream aliases and table readbacks qualify before firmware startup. It
-  rejects a running processor before writes and retains resources on failure.
-  The explicit T6040 launch entrypoint now configures DAPF, verifies native
-  stream contexts, initializes GPIO and completes the first firmware
-  handshake in a six-frame live trial. It enforces phase order and refuses
-  repeated starts or changed CONTROL/GPIO before writes; faults and timeout
-  retain resources. The same entrypoint now completes the second handshake,
-  maps and publishes the boot block, and validates the channel table in
-  another six-frame live trial. Power/residency qualification and capture
-  configuration remain private. The shared allocation/terminal broker also
-  passes six full stable frames. It rejects allocation flags before forwarding,
-  retains retired storage, and prevents retry after an ambiguous handoff.
-  Shared command polling checks deadlines before and after reads, rejecting
-  late ACKs. A live run returns both processed reports and saves one full
-  P010 frame with CH_STOP, zero faults and proxy NOP passing.
-  The shared IO command dispatcher and owned payload write then pass six
-  full stable P010 frames, clean stop and fault checks. Named camera
-  sensor discovery and preset queries now use the shared T6040/IMX958
-  sequence as well: 13 presets and six full stable frames pass live. Capture
-  pool and stream configuration remain private. A subsequent
+  CPU exceptions also pass. The private capture consumes shared profile,
+  boot-block, lease, mapping, startup, broker and command components. The
+  mapper verifies 42-bit DART geometry, read-only TEXT, stream aliases and
+  table readbacks before launch. Startup configures DAPF and GPIO, completes
+  both handshakes, publishes the boot block and validates channel ownership.
+  Phase order, fresh CONTROL/GPIO checks and attempt latches prevent repeated
+  starts; failure retains resources. The broker rejects allocation flags
+  before forwarding and retains retired storage. Command submission validates
+  ownership and deadlines before publication, rejects late ACKs and captures
+  raw replies before status checks. Shared sensor discovery identifies IMX958
+  with 13 presets and bounds preset queries. A live capture through these
+  components returns six full stable P010 frames with clean stop and fault
+  checks. Power/residency qualification and capture pool/stream configuration
+  remain private. An earlier
   40-generation trial timed out at CH_START before returning frames; its
   command payloads and first 96 allocation requests match the successful
   bounded run. Timing of host allocation service remains under investigation.
@@ -296,14 +287,14 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   The captured boot firmware is `mBoot-18000.161.9` from macOS 26.6.1 (25G76).
   Its ISP UUID and segment ranges match that restore image; macOS 26.6.2 and
   the installed macOS 27.0 ISP image have different UUIDs. The version table
-  recognizes 26.6.1; this does not qualify an ISP startup profile.
+  recognizes 26.6.1; other ISP firmware profiles remain unqualified.
   Host regressions cover initialization followed by shared-buffer allocation.
   Surface allocations now start beyond the fixed firmware mappings, preserving
   the configured IOVA bounds and a guard page. Captured J616s segment sizes
   combined with a synthetic legacy extra-heap request reproduce an overlap
   with the old allocator start. The live T6040 extra-heap request is larger
   than that synthetic request. The guarded boot-block trial qualifies its
-  allocation and mapping; camera operation remains unqualified.
+  allocation and mapping; combined RAW/YUV capture remains unqualified.
   Required boot-argument and channel-message imports are explicit.
   Channel descriptors retain their 64-bit ring addresses at offset 0x50.
   The matching firmware writes that field with 64-bit stores in all seven
