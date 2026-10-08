@@ -97,7 +97,9 @@ unqualified.
 ## Other devices
 
 * CDC proxy and bulk reads work at USB high speed (480 Mb/s). SuperSpeed is
-  pending PHY/role bring-up and cable/port qualification.
+  pending firmware/PIPE bring-up and cable/port qualification. Guarded mode-1
+  tuning traversal and crossbar/sleep-control readbacks have passed; this does
+  not establish PHY readiness. See the driver contracts for limitations.
 * SIO completes RTKit startup with four-level, full 42-bit mappings of its
   ADT-described external firmware. Firmware text is mapped read-only. The
   standard system endpoints start, AP/IOP both acknowledge state 0x20,

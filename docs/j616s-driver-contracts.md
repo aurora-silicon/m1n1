@@ -217,6 +217,24 @@ logical-register selection and reads, with no HPM wakeup/shutdown, role or VDM
 commands. Recheck orientation after a reconnect; this snapshot does not prove
 SuperSpeed cable capability.
 
+A later guarded RAM test traversed all 164 compact records in the nine
+present native mode-1 tuning tables, then applied the three crossbar writes,
+common sleep override and eight override clears for each lane. All 20
+crossbar/sleep-control masked readbacks matched, with zero CPU exceptions and
+a responsive proxy. Cold watchdog recovery returned the installed proxy
+without a physical restart. Each sleep override used the native one-microsecond delay;
+extra proxy checks and readbacks mean this was not an exact native timing test.
+
+The tuning helper skips unchanged commands and does not check retained bits
+after writing. The experiment kept additional readback observations: 52
+commands were unchanged, 110 writes matched and two differed only in bit 31
+at AXI2AF offsets `0x40` and `0x48` (`0x80000016 -> 0x16`). These differences
+remain unexplained; they are not proof of a strobe or successful hardware
+configuration. Traversal completion does not establish PLL lock, processor
+firmware startup, PIPE readiness or SuperSpeed enumeration. Crossbar selection
+used a fresh HPM status query (`0x1000b41d`, orientation bit set), rather than
+the older cable's saved orientation. No VDM or role command was sent.
+
 ## Other implementation boundaries
 
 CPU states 1/2, secondary MMU/dispatch and shared-memory coherence have live
