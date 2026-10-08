@@ -235,6 +235,20 @@ firmware startup, PIPE readiness or SuperSpeed enumeration. Crossbar selection
 used a fresh HPM status query (`0x1000b41d`, orientation bit set), rather than
 the older cable's saved orientation. No VDM or role command was sent.
 
+A subsequent cold RAM test applied the native MXWrap RUN request `0x10` to
+processor bank 1 offset `0x28`, after checking prepared control `0x2`, firmware
+enable `0xa0003` and both enabled/empty mailbox controls. RUN readback was
+`0x10`, processor status was `0x14e` and one outbox message became available.
+One complete receive using upstream ASC word ordering decoded as endpoint 0
+RTKit Hello, supporting version 12 only. Both raw words were recorded; the
+outbox returned to empty, CPU exception checks stayed clear and NOP passed.
+No Hello acknowledgment or other firmware command was sent. PHY readiness
+at `0x383000260` remained `0x881` throughout the one-second polling window.
+This establishes first-message firmware communication, not full RTKit startup
+or SuperSpeed. Native IRQ-provider startup remains outside this polling test.
+Do not assign the standard crash-log client to endpoint 1 without checking
+the PHY firmware profile: the native CIO80 service matches `ACIOPHY0Endpoint1`.
+
 ## Other implementation boundaries
 
 CPU states 1/2, secondary MMU/dispatch and shared-memory coherence have live
