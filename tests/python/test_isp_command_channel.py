@@ -91,3 +91,12 @@ def test_expired_start_deadline_has_no_publication(during_read):
         dispatcher.send(0x1800, args, 12, lambda: None, timeout=30,
             start_deadline=deadline)
     assert not events and not transport.published
+
+
+def test_stale_prepared_opcode_rejected_before_publication():
+    dispatcher, transport, args, events = model()
+    transport.memory[0x1800] = struct.pack('<3I', 0, 4, 0)
+    with pytest.raises(ValueError, match='Prepared'):
+        dispatcher.send(0x1800, args, 12, lambda: None, timeout=5)
+    assert not transport.published and not events and dispatcher.cursor == 0
+    assert dispatcher.failed

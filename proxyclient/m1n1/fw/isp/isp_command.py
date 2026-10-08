@@ -102,6 +102,8 @@ class ISPCommandChannel:
             idle = struct.unpack('<8Q', self.transport.read(slot, 64))[0]
             if idle & 15 != 1:
                 raise ValueError('ISP command slot is not idle')
+            if self.transport.read(iova, size) != args:
+                raise ValueError('Prepared ISP command payload differs')
             if start_deadline is not None and start_deadline.expired():
                 raise TimeoutError('ISP startup command deadline')
             self.transport.publish(slot, (iova, size, outsize, 0, 0, 0, 0, 0), idle)
