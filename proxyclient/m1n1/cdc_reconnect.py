@@ -6,11 +6,13 @@ import hashlib
 from pathlib import Path
 import struct
 import time
+from types import SimpleNamespace
 
 from serial.tools import list_ports
 
 from .proxy import IODEV, M1N1Proxy, ProxyError, UartError, UartInterface, UartTimeout
 from .proxyutils import ProxyUtils, bootstrap_port
+from .tgtypes import BootArgs_r1, BootArgs_r2, BootArgs_r3
 
 
 CDC_VID = 0x1209
@@ -56,9 +58,10 @@ class CdcSession:
 
     def reconnect(self, *, timeout=30, log=lambda event: None,
                   speed_probe=lambda port: None):
-        """Discard the old handle and re-prove the primary on a new enumeration."""
+        """Re-prove the carrier while retaining this live image's allocation ledger."""
         self.iface.dev.close()
-        fresh = discover_cdc(self.identity, timeout=timeout, log=log, speed_probe=speed_probe)
+        fresh = discover_cdc(self.identity, timeout=timeout, log=log,
+                             speed_probe=speed_probe, utils=self.utils)
         fresh.reconnect_count = self.reconnect_count + 1
         log({"event": "cdc_reconnected", "count": fresh.reconnect_count,
              "adt_digest": fresh.identity.adt_digest})
@@ -141,7 +144,20 @@ def verify_identity(utils, identity):
         raise CdcIdentityMismatch("live build tag changed across carrier transition")
 
 
-def _open_primary(port, identity):
+def _identity_reader(proxy):
+    """Read live identity without allocating or changing the target heap limit."""
+    address, revision = proxy.get_bootargs_rev()
+    schema = {0: BootArgs_r1, 1: BootArgs_r1, 2: BootArgs_r2, 3: BootArgs_r3}.get(revision)
+    if schema is None:
+        raise CdcIdentityMismatch("unsupported live bootargs revision")
+    ba = proxy.iface.readstruct(address, schema)
+    adt_base = (ba.devtree - ba.virt_base + ba.phys_base) & 0xffffffffffffffff
+    return SimpleNamespace(iface=proxy.iface, base=proxy.get_base(),
+                           ba_addr=address, ba_rev=revision, ba=ba,
+                           get_adt=lambda: proxy.iface.readmem(adt_base, ba.devtree_size))
+
+
+def _open_primary(port, identity, *, utils=None):
     iface = UartInterface(port.device)
     session = None
     try:
@@ -151,8 +167,14 @@ def _open_primary(port, identity):
         if proxy.iodev_whoami() != IODEV.USB0:
             return None
         bootstrap_port(iface, proxy)
-        utils = ProxyUtils(proxy)
-        verify_identity(utils, identity)
+        reader = _identity_reader(proxy)
+        verify_identity(reader, identity)
+        if utils is not None:
+            if (reader.base != utils.base or reader.ba_addr != utils.ba_addr
+                    or reader.ba_rev != utils.ba_rev or reader.ba != utils.ba):
+                raise CdcIdentityMismatch("live image location or bootargs changed; retain old allocations")
+        else:
+            utils = ProxyUtils(proxy)
         session = CdcSession(port.device, port.interface, iface, proxy, utils, identity)
         return session
     finally:
@@ -161,30 +183,53 @@ def _open_primary(port, identity):
 
 
 def discover_cdc(identity, *, timeout=30, ports=list_ports.comports,
-                 probe=_open_primary, now=time.monotonic, sleep=time.sleep,
-                 log=lambda event: None, speed_probe=lambda port: None):
+                 probe=None, now=time.monotonic, sleep=time.sleep,
+                 log=lambda event: None, speed_probe=lambda port: None, utils=None):
     if timeout <= 0:
         raise ValueError("discovery timeout must be positive")
+    if utils is not None and utils.iface is not utils.proxy.iface:
+        raise ValueError("existing utilities and proxy must share one transport")
     deadline = now() + timeout
     last_error = None
     attempts = 0
     while now() < deadline:
         for port in eligible_cdc_ports(ports()):
             attempts += 1
+            session = None
             try:
-                session = probe(port, identity)
+                session = (_open_primary(port, identity, utils=utils) if probe is None
+                           else probe(port, identity))
                 if session is not None:
-                    speed = speed_probe(port)
-                    if isinstance(session, CdcSession):
-                        session.link_mbps = speed
-                    log({"event": "cdc_primary_verified", "attempts": attempts,
-                         "interface": str(port.interface or ""), "link_mbps": speed,
-                         "adt_digest": identity.adt_digest if isinstance(identity, CdcIdentity) else None})
+                    try:
+                        speed = speed_probe(port)
+                        if isinstance(session, CdcSession):
+                            session.link_mbps = speed
+                        log({"event": "cdc_primary_verified", "attempts": attempts,
+                             "interface": str(port.interface or ""), "link_mbps": speed,
+                             "adt_digest": identity.adt_digest if isinstance(identity, CdcIdentity) else None})
+                    except Exception:
+                        session.iface.dev.close()
+                        session = None
+                        raise
+                    if utils is not None:
+                        # Keep all driver references, bound methods and live allocations.
+                        old_iface = utils.iface
+                        for field in ("dev", "devpath", "baudrate", "is_kis",
+                                      "pted", "enabled_features"):
+                            if hasattr(session.iface, field):
+                                setattr(old_iface, field, getattr(session.iface, field))
+                        session.iface = old_iface
+                        session.proxy = utils.proxy
+                        session.utils = utils
                     return session
             except CdcIdentityMismatch:
+                if session is not None:
+                    session.iface.dev.close()
                 log({"event": "cdc_identity_mismatch", "attempts": attempts})
                 raise
             except (OSError, UartError, ProxyError) as exc:
+                if session is not None:
+                    session.iface.dev.close()
                 last_error = exc
                 log({"event": "cdc_candidate_retry", "attempts": attempts,
                      "error_type": type(exc).__name__})
@@ -210,4 +255,5 @@ def transition_to_cdc(proxy, utils, *, build_tag, immutable_ranges, artifact_dir
         raise CdcScheduleUncertain("KIS schedule reply timed out; transition state unknown") from exc
     log({"event": "kis_schedule_acknowledged", "delay_ms": delay_ms, "flags": flags})
     proxy.iface.dev.close()
-    return discover_cdc(identity, timeout=timeout, log=log, speed_probe=speed_probe)
+    return discover_cdc(identity, timeout=timeout, log=log, speed_probe=speed_probe,
+                        utils=utils)
