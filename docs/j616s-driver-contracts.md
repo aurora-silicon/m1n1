@@ -199,6 +199,12 @@ A subsequent cold test released the clamp, with control `0x7 -> 0x3`, both
 sleep acknowledgments retained and status still `0x103`. Readback and cold
 recovery passed without CPU exceptions. Reset-busy remained set; no reset
 request, firmware start or mailbox command was performed.
+A following cold test cleared bit 0 of PHY0 register 39 offset `0x28`
+(`0x383200028`), changing the request word `0x1 -> 0x0` and status
+`0x103 -> 0x3`. Both sleep acknowledgments remained set; request/control
+readback and cold recovery passed without CPU exceptions. This PHY register
+is distinct from the processor's bank-1 CPU run request. Firmware startup
+and USB3 readiness remain unqualified.
 
 ## Other implementation boundaries
 
