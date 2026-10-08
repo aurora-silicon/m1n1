@@ -7,7 +7,7 @@ use fatfs::SeekFrom;
 
 extern "C" {
     pub(crate) fn nvme_read(nsid: u32, lba: u64, buffer: *mut c_void) -> bool;
-    fn nvme_dma_uncertain() -> bool;
+    pub(crate) fn nvme_dma_uncertain() -> bool;
     fn nvme_read_blocks(nsid: u32, lba: u64, buffer: *mut c_void, count: u32) -> bool;
 }
 
@@ -329,6 +329,11 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
     static FREED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+    impl Drop for SectorBuffer {
+        fn drop(&mut self) {
+            FREED.lock().unwrap().push(self.0.as_ptr() as usize);
+        }
+    }
     impl Drop for WindowBuffer {
         fn drop(&mut self) {
             FREED.lock().unwrap().push(self.0.as_ptr() as usize);
@@ -500,6 +505,36 @@ mod tests {
             drop(storage);
             assert!(FREED.lock().unwrap().contains(&destination));
             FREED.lock().unwrap().clear();
+        }
+    }
+    #[test]
+    fn apfs_direct_read_retains_only_uncertain_destination() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        for (fail, uncertain) in [(true, true), (true, false), (false, false), (false, true)] {
+            reset(100, 1);
+            FREED.lock().unwrap().clear();
+            {
+                let mut mock = MOCK.lock().unwrap();
+                mock.fail = fail;
+                mock.uncertain = uncertain;
+            }
+            // Run the actual APFS scanner and unwind its owned partition on failure.
+            // A successful mock read contains zeroes, so its invalid superblock also errors.
+            assert!(crate::apfs::test_scan_volume(100).is_err());
+            let mock = MOCK.lock().unwrap();
+            assert_eq!(mock.reads, [(100, 1)]);
+            let destination = mock.destination;
+            drop(mock);
+            assert_ne!(destination, 0);
+            assert_eq!(
+                FREED.lock().unwrap().contains(&destination),
+                !(fail && uncertain)
+            );
+            if fail && uncertain {
+                // The host mock has now stopped DMA; reclaim the exact retained box.
+                unsafe { drop(Box::from_raw(destination as *mut SectorBuffer)) };
+                assert!(FREED.lock().unwrap().contains(&destination));
+            }
         }
     }
 }
