@@ -194,6 +194,14 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   all-zero-buffer result. Channel startup configuration and final peripheral
   teardown remain in the prototype; this change does not qualify stream
   restart or select the DART stream automatically.
+* Headset input `cin ` reaches `pwrd` with the exact 109-byte MCA profile.
+  Powered BASE control and RX2 register reads pass. A subsequent read-only
+  snapshot observes RX enable zero before and after all 13 zero carveouts;
+  raw RX SRAM size is `0x0d001e00`. The Asahi reference interprets its low
+  16 bits as 7680 bytes, matching the ADT endpoint. These sequential reads
+  qualify access and layout only, not exclusive ownership or PCM capture.
+  The frontend returns to `idle`, DART faults remain zero and NOP passes.
+  AOP shutdown still needs watchdog recovery; installed images are preserved.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored
