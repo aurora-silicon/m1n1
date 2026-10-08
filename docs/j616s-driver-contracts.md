@@ -205,6 +205,10 @@ A following cold test cleared bit 0 of PHY0 register 39 offset `0x28`
 readback and cold recovery passed without CPU exceptions. This PHY register
 is distinct from the processor's bank-1 CPU run request. Firmware startup
 and USB3 readiness remain unqualified.
+The native phase-A final control-bit write also passed: `0x3 -> 0xb`, with
+status `0x3`, request word zero and successful cold recovery. These register
+transitions do not qualify subsequent PLL tunables, crossbar programming,
+firmware startup or PIPE/controller handoff.
 
 ## Other implementation boundaries
 
