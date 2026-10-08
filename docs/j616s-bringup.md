@@ -5,6 +5,9 @@ Tested on J616sAP (Mac16,7), board 6, with the ADT supplied by macOS build
 The target is m1n1/proxy parity with M1, M2 and A18 Pro. Linux and U-Boot
 handoff are outside this bring-up's scope.
 
+For implementation order, formats and ownership rules, start with the
+[driver contracts](j616s-driver-contracts.md).
+
 ## CPU clocks
 
 `cpufreq_init()` validates the device identity, three translated CPM apertures,
