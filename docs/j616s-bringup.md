@@ -195,34 +195,34 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   teardown remain in the prototype; this change does not qualify stream
   restart or select the DART stream automatically.
 * Headset input `cin ` reaches `pwrd` with the exact 109-byte MCA profile.
-  Powered BASE control and RX2 register reads pass. A subsequent read-only
-  snapshot observes RX enable zero before and after all 13 zero carveouts;
-  raw RX SRAM size is `0x0d001e00`. The Asahi reference interprets its low
-  16 bits as 7680 bytes, matching the ADT endpoint. These sequential reads
-  qualify access and layout only, not exclusive ownership or PCM capture.
-  The frontend returns to `idle`, DART faults remain zero and NOP passes.
-  AOP shutdown still needs watchdog recovery; installed images are preserved.
-  A later private trial maps an owned 16 KiB buffer on DART stream 8 while
-  preserving stream 0, then submits one non-repeating RX2 descriptor with
-  codec TX1 enabled. Its report matches the descriptor ID with zero residue;
-  two full copies taken before stopping RX match and contain 1301 nonzero
-  words. The words fit the configured 24-bit input in 32-bit slots, but a
-  controlled acoustic test and sample-clock measurement remain pending.
-  RX2 stops and all six channel configuration fields restore exactly.
-  Codec restoration subsequently times out after restoring MISC_DET_CTL;
-  the trial retains resources and watchdog recovery passes. This does not
-  qualify a reusable headset capture client or clean codec shutdown.
-  A subsequent 2 MiB capture also completes with matching full copies after
-  programming the native constructor's candidate ADC gain value, `0x78`.
-  The earlier short preview contains only noise according to the user;
-  recognizable speech and the actual sample clock remain unverified.
-  This longer trial stops TX/RX and retains codec power until watchdog
-  recovery, without repeating the failed bias restoration.
-  A later short capture restores MISC_DET_CTL in separate detection-mode
-  and bias updates (`0x1f -> 0x07 -> 0x03`). Both readbacks and all remaining
-  codec/controller restorations pass; the frontend reaches idle with no
-  DART fault. This qualifies one cold restoration cycle, not restart or
-  restoration after a longer capture.
+  The working macOS profile matches these bytes, including `ms02`, `syn2`,
+  mono 24-bit samples in 32-bit slots and a nominal 48 kHz rate. Native
+  CS42L84 input uses a 32-bit TX word (`ASP_TX1_CTRL = 0x1f0001`).
+  Matching that word alone still produces static. Initializing the documented
+  `MIC_DET_CTL4.LATCH_TO_VP` bit before detection produces user-recognized
+  phone music in the proxy capture. The cold latch changes from 0 to 2 with
+  readback; other bits are preserved.
+  The private harness maps an owned 2 MiB buffer on DART stream 8 while
+  preserving stream 0 and submits one non-repeating RX2 descriptor. The
+  report matches its ID with zero residue. Two full copies taken before RX
+  stop match; all six RX2 configuration fields restore exactly. This
+  qualifies one cold acoustic capture, not restart, calibration or a measured
+  sample clock. The recording uses the nominal 48 kHz profile.
+  Separate detection-mode and bias restoration succeeds after the full
+  capture, followed by exact codec/controller restoration and frontend idle.
+  Earlier I2C FIFO timeouts occur with a growing DMA checkpoint serialized
+  between MMIO operations. Compact codec journals preserve pending-state
+  evidence and pass the longer restoration trial. Transport timing and
+  restart remain under qualification. AOP shutdown still needs watchdog
+  recovery;
+  installed images are preserved. Speaker and HQAI references were captured
+  under native macOS; proxy playback and HP microphone PCM remain unqualified.
+  The shared `CS42L84Input` class supplies the validated input-only codec
+  lifecycle through bounded caller-provided register access. It requires
+  receiver-start and receiver-stop gates, preserves unrelated register bits,
+  and retains uncertain state without further access. The board power/reset,
+  fresh MCA-profile check and owned DMA orchestration remain caller-owned.
+  A live capture using this shared class passes exact cleanup as above.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored
