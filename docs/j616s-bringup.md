@@ -268,7 +268,9 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   retain resources. The same entrypoint now completes the second handshake,
   maps and publishes the boot block, and validates the channel table in
   another six-frame live trial. Power/residency qualification and capture
-  configuration remain private. A subsequent
+  configuration remain private. The shared allocation/terminal broker also
+  passes six full stable frames. It rejects allocation flags before forwarding,
+  retains retired storage, and prevents retry after an ambiguous handoff. A subsequent
   40-generation trial timed out at CH_START before returning frames; its
   command payloads and first 96 allocation requests match the successful
   bounded run. Timing of host allocation service remains under investigation.
