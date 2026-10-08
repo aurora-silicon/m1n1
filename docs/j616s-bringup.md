@@ -104,7 +104,7 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   rebuilds both payloads exactly; property 212 also passes the typed response
   reader on a fresh live reply. The decoder reports latency 36, ratios
   10/5/3 and 386 coefficients. No new decoder is needed; setter behavior and
-  HP source configuration remain unqualified.
+  changes to HP source configuration remain unqualified.
   It accepts command envelopes carried by subtype 0xa0 while preserving typed
   notification replies, validates request and response buffer bounds, performs
   cache maintenance and clears pending state on failure. The live command
@@ -166,34 +166,30 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   mappings on every attempted handoff until validated watchdog cold recovery.
   Recordings, firmware and private probe harnesses are not included here.
 
-  A guarded prototype maps the ADT-selected ADMAC stream 10 with four-level
-  42-bit tables and submits one non-repeating 16 KiB RX descriptor only after
-  `hpai` reaches `pwrd`. The split RX bank at offset 0xc000, completion report,
-  zero residue and zero DART fault are observed; the sentinel buffer becomes
-  all zeros. RX stops and the frontend returns through `pw1 ` to `idle`; the
-  proxy remains responsive. This tests input DMA but does not establish live
-  microphone audio. Source configuration and PCM format remain unqualified.
-  `hppx`, `lcpx`, `mcpx` and `smpx` state queries track each tested frontend
-  transition, including `pwrd`. Attaching `hppx` succeeds, while attaching
-  `lACp` returns 0xe00002e2 (not permitted); that trial stops before power
-  or DMA requests.
-  With LP active, all 30 public `hppx` property queries pass across HP
-  attachment and power transitions. Properties 500, 501 and 600 change from
-  zero to one at `pwrd` and return to zero at `pw1 ` and `idle`, confirming
-  native AudioControl enable in this sequence. Property 502 remains zero;
-  property 503 remains two. Property 600 returns 224 bytes because its native
-  getter leaves the response length unchanged; only its four-byte Boolean
-  prefix is qualified. No HP DMA is submitted in this status probe, and these
-  results do not establish PCM delivery or preset application.
-  Cleanup must stop RX before returning the frontend to `idle`; an earlier
-  prototype accessed ADMAC again afterward and lost CDC.
-  The Python ADMAC driver selects split channel banks for `admac,t604x` while
-  preserving logical channel IDs, FIFO ports and global enable bits. A live
-  RX0 trial uses its bus-width, frame-size, carveout and burst-size accessors,
-  descriptor submission and report reader, with the same completion and
-  all-zero-buffer result. Channel startup configuration and final peripheral
-  teardown remain in the prototype; this change does not qualify stream
-  restart or select the DART stream automatically.
+  HP microphone capture also contains user-recognized audio. With LP report
+  readiness established, attach `hpai`, request `pw1 `, publish an owned
+  stream-10 mapping and start NS RX0 before requesting `pwrd`. The tested
+  channel uses the split RX bank and one non-repeating descriptor. Complete
+  2 MiB and 6 MiB captures pass fresh full-range translation, matching report
+  IDs, zero residue, zero DART faults and two identical full reads before RX
+  stop. The 6 MiB recording contains 524,288 three-channel Float32 frames at
+  the nominal 48 kHz rate, lasting 10.92 seconds; the tester confirms it works.
+
+  Both captures begin with 7,211 zero frames, about 150 ms. Earlier 16 KiB
+  captures were too short to cover that observed interval at this format.
+  Longer capture windows produce samples without changing the DMA provider,
+  clocks, coefficients or native stream-classification commands. Stop RX
+  before returning the frontend to `idle`; retain AOP, buffers and mappings
+  through watchdog recovery because ownership release remains unqualified.
+  This qualifies cold captures, not continuous streaming, restart, calibration
+  or measured sample-clock accuracy. The board capture harness remains private.
+
+  Existing LEAP tools decode the pinned Apple program and identify three float
+  outputs on port 41. The older Asahi driver supplies read-only execution
+  counters; a routine-enable readback alone does not prove execution. Neo's
+  tested capture provides useful timing and lifecycle evidence, but its DMA
+  provider differs from the NS provider advertised by J616s and is not a
+  transferable address assignment.
 * Headset input `cin ` reaches `pwrd` with the exact 109-byte MCA profile.
   The working macOS profile matches these bytes, including `ms02`, `syn2`,
   mono 24-bit samples in 32-bit slots and a nominal 48 kHz rate. Native
@@ -215,8 +211,8 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   evidence and pass the longer restoration trial. Transport timing and
   restart remain under qualification. AOP shutdown still needs watchdog
   recovery;
-  installed images are preserved. Speaker and HQAI references were captured
-  under native macOS; proxy playback and HP microphone PCM remain unqualified.
+  installed images are preserved. Speaker playback references were captured
+  under native macOS; proxy playback remains unqualified.
   The shared `CS42L84Input` class supplies the validated input-only codec
   lifecycle through bounded caller-provided register access. It requires
   receiver-start and receiver-stop gates, preserves unrelated register bits,
