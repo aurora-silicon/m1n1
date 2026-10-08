@@ -262,8 +262,14 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   command payloads and first 96 allocation requests match the successful
   bounded run. Timing of host allocation service remains under investigation.
   Watchdog recovery returned the installed proxy with NOP passing.
-  Sustained streaming, colour calibration and a
-  production startup profile remain unqualified. A combined RAW/YUV trial exceeds
+  A subsequent instrumented run completes 80 frames across 40 generations,
+  wrapping both buffer rings. All 80 returned surfaces pass two matching
+  4096-byte sample reads; the first and last generation of each surface also
+  pass two matching full reads. CH_STOP, zero DART faults, zero exceptions
+  and proxy NOP pass. Host request servicing consumes about 26 seconds of
+  the 30-second startup deadline, plus about three seconds of terminal
+  draining. Reliable startup timing, real-time frame rate, colour calibration
+  and a production startup profile remain unqualified. A combined RAW/YUV trial exceeds
   the retained shared-memory aperture and refuses the allocation before
   mapping it. Watchdog recovery remains required after these private probes.
   The captured boot firmware is `mBoot-18000.161.9` from macOS 26.6.1 (25G76).
