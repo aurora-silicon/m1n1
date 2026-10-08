@@ -265,8 +265,10 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   stream contexts, initializes GPIO and completes the first firmware
   handshake in a six-frame live trial. It enforces phase order and refuses
   repeated starts or changed CONTROL/GPIO before writes; faults and timeout
-  retain resources. Power qualification and the second handshake remain
-  private. A subsequent
+  retain resources. The same entrypoint now completes the second handshake,
+  maps and publishes the boot block, and validates the channel table in
+  another six-frame live trial. Power/residency qualification and capture
+  configuration remain private. A subsequent
   40-generation trial timed out at CH_START before returning frames; its
   command payloads and first 96 allocation requests match the successful
   bounded run. Timing of host allocation service remains under investigation.
@@ -278,7 +280,7 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   and proxy NOP pass. Host request servicing consumes about 26 seconds of
   the 30-second startup deadline, plus about three seconds of terminal
   draining. Reliable startup timing, real-time frame rate, colour calibration
-  and a production startup profile remain unqualified. A combined RAW/YUV trial exceeds
+  and the complete production camera interface remain unqualified. A combined RAW/YUV trial exceeds
   the retained shared-memory aperture and refuses the allocation before
   mapping it. Watchdog recovery remains required after these private probes.
   The captured boot firmware is `mBoot-18000.161.9` from macOS 26.6.1 (25G76).
