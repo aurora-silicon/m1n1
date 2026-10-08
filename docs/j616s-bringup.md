@@ -66,7 +66,11 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
 ## Memory controller
 
 The ADT identifies the controller as `mcc,t6041`, with four AMCC apertures
-and four planes per aperture. The current driver does not initialize it.
+and four planes per aperture. Initialization accepts the tested J616s layout,
+checks the way-count status on every plane and preserves firmware cache
+settings. A RAM-only candidate boot passed with zero CPU exceptions and
+exported both carveout ranges matching the fresh ADT. Failed initialization
+or unavailable carveout metadata stops startup on T6040.
 One guarded read of controller 0, plane 0 at offset `0x2800` returned
 `0x8000000c`. A separate cold test read offset `0x2804` and returned
 `0x0c000c00`, consistent with upstream PR664's proposed encoding of 12 data
@@ -79,8 +83,10 @@ These observations qualify status reads, not cache-control writes.
 The ADT lock predicate uses offset `0x2800`, mask `0x1f` and expected value
 zero; it must not be interpreted as the way-count status at `0x2804`.
 PR664 defines the newer offsets but its enable routine still uses the older
-`0x1c00`/`0x1c04` offsets. Cache control and TZ register interpretation need
-further qualification before integrating that driver.
+`0x1c00`/`0x1c04` offsets. This implementation uses the physical ranges in
+`/chosen/carveout-memory-map` rather than interpreting the unqualified TZ
+registers. Cache-control writes and TZ register interpretation remain
+unqualified.
 
 ## Other devices
 

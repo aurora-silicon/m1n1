@@ -250,8 +250,8 @@ void m1n1_main(void)
 #ifndef BRINGUP
     if (supports_gxf())
         gxf_init();
-    if (mcc_init() && chip_id == T8140)
-        panic("T8140 MCC initialization failed\n");
+    if (mcc_init() && (chip_id == T8140 || chip_id == T6040))
+        panic("MCC initialization failed\n");
     mmu_init();
     aic_init();
     smp_init();
