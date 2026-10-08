@@ -843,9 +843,15 @@ int smp_wait_timed(int cpu, u64 *retval, u32 timeout_ms)
 
 u64 smp_wait(int cpu)
 {
-    u64 retval = 0;
-    smp_wait_timed(cpu, &retval, 300000);
-    return retval;
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return 0;
+
+    struct spin_table *target = &spin_table[cpu];
+
+    while (target->target)
+        sysop("dmb sy");
+
+    return target->retval;
 }
 
 void smp_set_wfe_mode(bool new_mode)
