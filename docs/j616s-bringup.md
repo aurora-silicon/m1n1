@@ -269,7 +269,14 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   with 13 presets and bounds preset queries. A live capture through these
   components returns six full stable P010 frames with clean stop and fault
   checks. Power/residency qualification and capture pool/stream configuration
-  remain private. An earlier
+  remain private. Capture wire builders validate pool/plane fields, 42-bit
+  submitted addresses, opaque tags and report bounds. Their bytes match
+  saved live submissions; they do not establish mapping or lease ownership.
+  A later three-generation run returned four stable frames, then timed out
+  with both output leases submitted and the current completion slot idle.
+  Servicing control traffic during downloads received all six reports, but
+  the host time limit interrupted the final copy. Neither run qualifies
+  reliable streaming or a stall fix. An earlier
   40-generation trial timed out at CH_START before returning frames; its
   command payloads and first 96 allocation requests match the successful
   bounded run. Timing of host allocation service remains under investigation.
