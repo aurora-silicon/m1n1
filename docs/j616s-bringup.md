@@ -202,6 +202,16 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   qualify access and layout only, not exclusive ownership or PCM capture.
   The frontend returns to `idle`, DART faults remain zero and NOP passes.
   AOP shutdown still needs watchdog recovery; installed images are preserved.
+  A later private trial maps an owned 16 KiB buffer on DART stream 8 while
+  preserving stream 0, then submits one non-repeating RX2 descriptor with
+  codec TX1 enabled. Its report matches the descriptor ID with zero residue;
+  two full copies taken before stopping RX match and contain 1301 nonzero
+  words. The words fit the configured 24-bit input in 32-bit slots, but a
+  controlled acoustic test and sample-clock measurement remain pending.
+  RX2 stops and all six channel configuration fields restore exactly.
+  Codec restoration subsequently times out after restoring MISC_DET_CTL;
+  the trial retains resources and watchdog recovery passes. This does not
+  qualify a reusable headset capture client or clean codec shutdown.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored
