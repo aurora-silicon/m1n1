@@ -270,7 +270,10 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   another six-frame live trial. Power/residency qualification and capture
   configuration remain private. The shared allocation/terminal broker also
   passes six full stable frames. It rejects allocation flags before forwarding,
-  retains retired storage, and prevents retry after an ambiguous handoff. A subsequent
+  retains retired storage, and prevents retry after an ambiguous handoff.
+  Shared command polling checks deadlines before and after reads, rejecting
+  late ACKs. A live run returns both processed reports and saves one full
+  P010 frame with CH_STOP, zero faults and proxy NOP passing. A subsequent
   40-generation trial timed out at CH_START before returning frames; its
   command payloads and first 96 allocation requests match the successful
   bounded run. Timing of host allocation service remains under investigation.
