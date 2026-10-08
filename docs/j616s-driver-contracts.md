@@ -159,6 +159,36 @@ after CH_STOP. Retain leases on ambiguous failure.
 Intermittent streaming stalls, exposure/noise calibration and measured FPS
 remain open. Do not implement guessed opcodes to compensate for a stall.
 
+## PHY processor prerequisites
+
+T6040 SuperSpeed remains unqualified. The saved PHY0 ADT references phandle
+102, the RTBuddy-v2 nub under `/arm-io/acio-phy-cpu0`; its parent has phandle
+101 and compatible `iop,mxwrap`. Preloaded/running properties describe
+firmware metadata, not current execution or endpoint readiness.
+
+The captured native MXWrap implementation uses these register-bank offsets:
+
+| Register | ADT bank | Offset |
+| --- | --- | --- |
+| Inbox control | 0 | `0x110` |
+| Outbox control | 0 | `0x114` |
+| Inbox data, 16 bytes | 0 | `0x800` |
+| Outbox data, 16 bytes | 0 | `0x830` |
+| CPU run request | 1 | `0x28` |
+| CPU idle status | 1 | `0x44` |
+
+Bank 0 is `0x383148000`, bank 1 is `0x383140000`, each with a `0x4000`
+aperture. Standard ASC mailbox offsets based at bank 1 coincide with the
+native mailbox addresses, but its CPU-control/status layout differs.
+Do not use generic ASC boot/shutdown on this processor.
+
+One guarded passive snapshot found AFI, FAB2_SOC, ATC0_COMMON, ATC0_USB_AON
+and ATC0_PHYMXWRAP power dependencies active. Both mailbox control words
+returned zero without CPU exceptions; no FIFO data was consumed or message
+sent. This does not establish a usable mailbox. Native outbox enable changes
+control bit 0; mailbox initialization, processor ownership, firmware startup
+and the subsequent PHY/PIPE transition still need qualification.
+
 ## Other implementation boundaries
 
 CPU states 1/2, secondary MMU/dispatch and shared-memory coherence have live
