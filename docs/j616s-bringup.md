@@ -261,7 +261,12 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   mapper also passes a six-frame live trial: 42-bit mappings, read-only TEXT,
   stream aliases and table readbacks qualify before firmware startup. It
   rejects a running processor before writes and retains resources on failure.
-  Power, DAPF and processor startup sequencing remain private. A subsequent
+  The explicit T6040 launch entrypoint now configures DAPF, verifies native
+  stream contexts, initializes GPIO and completes the first firmware
+  handshake in a six-frame live trial. It enforces phase order and refuses
+  repeated starts or changed CONTROL/GPIO before writes; faults and timeout
+  retain resources. Power qualification and the second handshake remain
+  private. A subsequent
   40-generation trial timed out at CH_START before returning frames; its
   command payloads and first 96 allocation requests match the successful
   bounded run. Timing of host allocation service remains under investigation.
