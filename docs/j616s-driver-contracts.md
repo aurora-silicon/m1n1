@@ -246,8 +246,11 @@ No Hello acknowledgment or other firmware command was sent. PHY readiness
 at `0x383000260` remained `0x881` throughout the one-second polling window.
 This establishes first-message firmware communication, not full RTKit startup
 or SuperSpeed. Native IRQ-provider startup remains outside this polling test.
-Do not assign the standard crash-log client to endpoint 1 without checking
-the PHY firmware profile: the native CIO80 service matches `ACIOPHY0Endpoint1`.
+A later HelloAck and complete two-segment map exchange advertises wire
+endpoints 0, 1, 32, 33 and 34. The native service name `ACIOPHY0Endpoint1`
+refers to wire endpoint 32: its suffix is the wire number minus 31. It must
+not be confused with wire endpoint 1. CIO80 application startup and the roles
+of wire endpoints 33/34 remain unqualified.
 
 ## Other implementation boundaries
 
