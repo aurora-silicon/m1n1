@@ -268,7 +268,11 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   raw replies before status checks. Shared sensor discovery identifies IMX958
   with 13 presets and bounds preset queries. A live capture through these
   components returns six full stable P010 frames with clean stop and fault
-  checks. Power/residency qualification and capture pool/stream configuration
+  checks. Shared T6040 preview configuration validates the IMX958 replies
+  before issuing the tested P010 setup sequence and rejects retries after
+  an ambiguous failure. A live capture through this component returns six
+  full stable frames, clean stop, zero faults and a passing NOP.
+  Power/residency qualification and capture pool/stream orchestration
   remain private. Capture wire builders validate pool/plane fields, 42-bit
   submitted addresses, opaque tags and report bounds. Their bytes match
   saved live submissions; they do not establish mapping or lease ownership.

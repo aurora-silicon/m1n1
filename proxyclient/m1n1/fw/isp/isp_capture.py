@@ -74,3 +74,41 @@ def descriptor_batch(surfaces, pool, tag_base, tags=None):
     return bytes(data)
 
 
+class T6040PreviewConfiguration:
+    """Configure the tested IMX958 P010 route; startup and buffers are caller-owned."""
+    def __init__(self, query):
+        self.query = query
+        self.attempted = False
+
+    def configure(self, info, preset, width=1280, height=720):
+        if self.attempted:
+            raise ValueError('Preview configuration already attempted; cold recovery required')
+        geometry = output_geometry(width, height)
+        if (len(info) != 0x190 or len(preset) != 0x120
+                or struct.unpack_from('<3I', info) != (0, 0x10d, 0)
+                or struct.unpack_from('<4I', preset) != (0, 0x106, 0, 5)
+                or struct.unpack_from('<I', info, 0x20)[0] != 0x958
+                or not 6 <= struct.unpack_from('<I', info, 0x60)[0] <= 64
+                or struct.unpack_from('<2H', preset, 0x10) != (1920, 2160)
+                or info[0x138] != 0 or struct.unpack_from('<I', info, 0x68)[0] != 0x4d00):
+            raise ValueError('Unexpected IMX958 preset or render route')
+        self.attempted = True
+        query = self.query
+        query('FLICKER_SENSOR_SET', 0x24, 0xc, (0,), outsize=0)
+        query('CH_SBS_ENABLE', 0x13b, 0x10, (0, 1), outsize=0)
+        query('CH_CAMERA_CONFIG_SELECT', 0x107, 0x10, (0, 5), outsize=0)
+        query('CH_BUFFER_RECYCLE_MODE_SET', 0x10e, 0x10, (0, 1), outsize=0)
+        query('CH_BUFFER_RECYCLE_START', 0x10f, 0xc, (0,), outsize=0)
+        query('CH_CROP_SCL1_SET', 0x80c, 0x1c, (0, 0, 0, width, height), outsize=0)
+        query('CH_OUTPUT_CONFIG_SCL1_SET', 0xb09, 0x38,
+              (0, width, height, 1, 0x12, geometry['stride'], geometry['stride'],
+               0, 0, height, 0, width), outsize=0)
+        query('CH_AE_FRAME_RATE_MAX_SET', 0x208, 0x10, (0, 7680), outsize=0)
+        query('CH_AE_FRAME_RATE_MIN_SET', 0x20a, 0x10, (0, 3840), outsize=0)
+        query('CH_META_POOL_CONFIG_SET', 0x117, 0x9c, pool_parameters(0, 8, 0x8000, 0x8000))
+        query('CH_OUTPUT_POOL_CONFIG_SET', 0x117, 0x9c,
+              pool_parameters(9, 2, geometry['luma_size'], geometry['stride'], geometry['chroma_size']))
+        query('CH_LOCAL_RAW_BUFFER_ENABLE', 0x125, 0x10, (0, 1), outsize=0)
+        query('CH_PREVIEW_STREAM_SET', 0xb0d, 0x10, (0, 1), outsize=0)
+        query('CH_MASTER_SLAVE_SYNC_MODE_SET', 0x138, 0x10, (0, 0), outsize=0)
+        return geometry
