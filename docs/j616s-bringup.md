@@ -71,9 +71,11 @@ One guarded read of controller 0, plane 0 at offset `0x2800` returned
 `0x8000000c`. A separate cold test read offset `0x2804` and returned
 `0x0c000c00`, consistent with upstream PR664's proposed encoding of 12 data
 ways and 12 tag ways. Both reads completed without CPU exceptions, followed
-by successful watchdog recovery to the installed proxy.
+by successful watchdog recovery to the installed proxy. A further cold sweep
+read `0x2804` once on each of the 16 controller/plane pairs. Every word
+returned `0x0c000c00`, with no CPU exceptions.
 
-These observations do not qualify other planes or cache-control writes.
+These observations qualify status reads, not cache-control writes.
 The ADT lock predicate uses offset `0x2800`, mask `0x1f` and expected value
 zero; it must not be interpreted as the way-count status at `0x2804`.
 PR664 defines the newer offsets but its enable routine still uses the older
