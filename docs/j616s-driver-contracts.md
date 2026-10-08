@@ -241,8 +241,8 @@ records before crossbar setup. All nine fixed masked readbacks matched; the
 AUSPLL values were already unchanged. Modes 1 and 4 share the crossbar branch,
 but mode 4 releases only the orientation-selected lane. All 12 crossbar/common
 and selected-lane readbacks matched. Native RUN again produced a complete
-RTKit version-12 Hello, with clear CPU exception checks and NOP. The readiness
-bit remained clear throughout the one-second window (`0x881`), so this does
+RTKit version-12 Hello, with clear CPU exception checks and NOP. The firmware
+tunables-done flag remained clear throughout the one-second window (`0x881`), so this does
 not establish PLL lock, a ready PHY or a working SuperSpeed gadget.
 
 A subsequent cold RAM test applied the native MXWrap RUN request `0x10` to
@@ -252,8 +252,8 @@ enable `0xa0003` and both enabled/empty mailbox controls. RUN readback was
 One complete receive using upstream ASC word ordering decoded as endpoint 0
 RTKit Hello, supporting version 12 only. Both raw words were recorded; the
 outbox returned to empty, CPU exception checks stayed clear and NOP passed.
-No Hello acknowledgment or other firmware command was sent. PHY readiness
-at `0x383000260` remained `0x881` throughout the one-second polling window.
+No Hello acknowledgment or other firmware command was sent. The firmware tunables-done flag
+at `0x383000260` remained clear (`0x881`) throughout the one-second polling window.
 This establishes first-message firmware communication, not full RTKit startup
 or SuperSpeed. Native IRQ-provider startup remains outside this polling test.
 A later HelloAck and complete two-segment map exchange advertises wire
@@ -261,6 +261,15 @@ endpoints 0, 1, 32, 33 and 34. The native service name `ACIOPHY0Endpoint1`
 refers to wire endpoint 32: its suffix is the wire number minus 31. It must
 not be confused with wire endpoint 1. CIO80 application startup and the roles
 of wire endpoints 33/34 remain unqualified.
+
+The native timeout diagnostic names bit 10 at `0x383000260` as
+`ACIOPHY_TOP_BLK_UC_CTRL_REG.UC_TNBL_DONE`. It must not be treated as a general
+PHY-ready or PLL-lock indication. The native phase-C path can continue after
+that timeout when its debug-policy bit 31 is clear, releasing PHY reset by
+setting register 39 offset 0 bit 4 and delaying 100 microseconds. The live
+kernel policy value is not established under proxy; this continuation has
+not yet been tested. Recording a timeout and following that path would not
+establish firmware tunable completion.
 
 ## Other implementation boundaries
 
