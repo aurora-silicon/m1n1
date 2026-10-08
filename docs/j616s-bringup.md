@@ -71,6 +71,12 @@ checks the way-count status on every plane and preserves firmware cache
 settings. A RAM-only candidate boot passed with zero CPU exceptions and
 exported both carveout ranges matching the fresh ADT. Failed initialization
 or unavailable carveout metadata stops startup on T6040.
+An independent walk of the exported translation tables checked all 110,544
+page/alias positions across both carveouts and the identity, RWX EL0, RW EL0
+and RX EL1 aliases. Every position was unmapped. All 67 table snapshots
+matched a second read, with zero CPU exceptions; replaying the archived
+tables gave the same result. This verifies table contents, not independent
+TTBR/TLB enforcement.
 One guarded read of controller 0, plane 0 at offset `0x2800` returned
 `0x8000000c`. A separate cold test read offset `0x2804` and returned
 `0x0c000c00`, consistent with upstream PR664's proposed encoding of 12 data
