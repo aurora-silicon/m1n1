@@ -276,7 +276,14 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   with both output leases submitted and the current completion slot idle.
   Servicing control traffic during downloads received all six reports, but
   the host time limit interrupted the final copy. Neither run qualifies
-  reliable streaming or a stall fix. An earlier
+  reliable streaming or a stall fix. A follow-up services at most one
+  terminal message between pixel chunks while retaining the eight-message
+  quota for normal polling. It completes six full stable frames, CH_STOP,
+  zero DART faults and zero CPU exceptions, with NOP passing. Sustained
+  reuse with this schedule also completes 80 frames: every frame has two
+  matching 4096-byte sample reads, and the first/last surfaces have full
+  matching double reads. Both rings wrap; CH_STOP, zero faults and NOP pass.
+  This bounded run does not establish long-term reliability or sensor FPS. An earlier
   40-generation trial timed out at CH_START before returning frames; its
   command payloads and first 96 allocation requests match the successful
   bounded run. Timing of host allocation service remains under investigation.
