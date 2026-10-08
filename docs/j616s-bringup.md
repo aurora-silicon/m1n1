@@ -185,7 +185,8 @@ The probe leaves secondaries running in WFE mode. Reboot before repeating it.
   before returning the frontend to `idle`; retain AOP, buffers and mappings
   through watchdog recovery because ownership release remains unqualified.
   This qualifies cold captures, not continuous streaming, restart, calibration
-  or measured sample-clock accuracy. The board capture harness remains private.
+  or measured sample-clock accuracy. The public `aop_capture.py` command now qualifies both cold extents;
+  continuous streaming and restart remain outside its contract.
 
   Existing LEAP tools decode the pinned Apple program and identify three float
   outputs on port 41. The older Asahi driver supplies read-only execution

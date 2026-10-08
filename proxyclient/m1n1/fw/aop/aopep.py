@@ -102,6 +102,7 @@ class AOPAudioService(EPICService):
     NAME = "aop-audio"
     SHORT = "audio"
     last_producer_report = None
+    last_producer_report_payload = None
 
     def handle_report(self, category, type, seq, fd):
         if int(type) != 0x20:
@@ -109,6 +110,7 @@ class AOPAudioService(EPICService):
         payload = fd.read()
         if len(payload) >= 0x68 and payload[:8] == b"iapl\x08\x00\x00\xc3":
             self.last_producer_report = AudioProducerReport.parse(payload)
+            self.last_producer_report_payload = payload
             return True
         return super().handle_report(category, type, seq, BytesIO(payload))
 

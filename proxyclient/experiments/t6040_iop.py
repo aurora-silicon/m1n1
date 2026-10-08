@@ -11,7 +11,6 @@ import time
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
-from m1n1.setup import p, u
 from m1n1.hw.dart import DART
 from m1n1.hw.dart8110 import PTE
 from m1n1.fw.asc import StandardASC
@@ -26,7 +25,13 @@ def wait_until(condition, service=lambda: None, timeout=1):
         service()
 
 
-def probe_mtp(asc, keyboard, result, firmware=None, capture_seconds=2):
+def probe_mtp(asc, keyboard, result, firmware=None, capture_seconds=2, *, proxy=None, utils=None):
+    if (proxy is None) != (utils is None):
+        raise ValueError("Proxy and utilities must be supplied together")
+    if proxy is None:
+        from m1n1.setup import p, u
+    else:
+        p, u = proxy, utils
     from m1n1.hw.dockchannel import DockChannelDataRegs
     from m1n1.fw.mtp import (decode_packet, encode_packet, RXMessage, InitMsg,
                             prepare_firmware, check_control_reply)
@@ -249,7 +254,16 @@ def probe_mtp(asc, keyboard, result, firmware=None, capture_seconds=2):
     return result
 
 
-def probe(device, keyboard=False, firmware=None, capture_seconds=2):
+def probe(device, keyboard=False, firmware=None, capture_seconds=2, *,
+          proxy=None, utils=None, on_aop_ready=None):
+    if (proxy is None) != (utils is None):
+        raise ValueError("Proxy and utilities must be supplied together")
+    if proxy is None:
+        from m1n1.setup import p, u
+    else:
+        p, u = proxy, utils
+    if on_aop_ready is not None and device != 'aop':
+        raise ValueError("The ownership handoff is only supported for AOP")
     if p.get_chipid() != 0x6040 or u.adt['/chosen'].board_id != 6:
         raise ValueError("This probe is qualified only on J616s / board 6")
     if firmware is not None and device != 'mtp':
@@ -311,7 +325,8 @@ def probe(device, keyboard=False, firmware=None, capture_seconds=2):
         p.write32(dart_base + 0x80, 0x100)
         wait_until(lambda: not p.read32(dart_base + 0x80) & (1 << 31), timeout=.5)
 
-    result = {'device': device, 'mappings': [], 'pong_received': False}
+    result = {'device': device, 'mappings': [], 'pong_received': False,
+              'resources_retained': on_aop_ready is not None}
     asc = None
     boot_attempted = False
     error = None
@@ -368,6 +383,8 @@ def probe(device, keyboard=False, firmware=None, capture_seconds=2):
 
         asc.send = send
         asc.mgmt.msghandler[4] = lambda msg: result.update(pong_received=True) or True
+        if on_aop_ready is not None and hasattr(on_aop_ready, 'prepare_asc'):
+            on_aop_ready.prepare_asc(asc)
         if dapf_saved:
             result['dapf_init_return'] = p.dapf_init(dart_path, 1)
             if result['dapf_init_return'] != 0:
@@ -409,9 +426,11 @@ def probe(device, keyboard=False, firmware=None, capture_seconds=2):
             las = asc.epmap[0x26].serv_map['las']
             wait_until(lambda: las.last_report is not None, asc.work, timeout=2)
             result['lid_angle'] = las.last_report.angle
+            if on_aop_ready is not None:
+                on_aop_ready(asc, wrapper, result)
         if device == 'mtp':
             result['mtp'] = {}
-            probe_mtp(asc, keyboard, result['mtp'], firmware, capture_seconds)
+            probe_mtp(asc, keyboard, result['mtp'], firmware, capture_seconds, proxy=p, utils=u)
         result['dart_error'] = hex(dart.regs.ERROR.val)
         if dart.regs.ERROR.reg.FLAG:
             raise RuntimeError("IOP DART reported a fault")
@@ -419,83 +438,88 @@ def probe(device, keyboard=False, firmware=None, capture_seconds=2):
         error = exc
         result['error'] = str(exc)
     finally:
-        try:
-            if boot_attempted:
-                if (result.get('mtp', {}).get('touchpad_trial_active')
-                        and not result['mtp'].get('touchpad_off_acknowledged')):
-                    result['reboot_required'] = True
-                    result['touchpad_shutdown'] = 'Off not acknowledged; retaining DMA mappings'
-                else:
-                    if aop:
-                        result['endpoint_shutdown_acks'] = []
-                        for ep, obj in sorted(asc.epmap.items()):
-                            if ep < 0x20:
-                                continue
-                            obj.stop(timeout=5)
-                            result['endpoint_shutdown_acks'].append(ep)
-                    asc.mgmt.send(Mgmt_SetAPPower(STATE=0x10))
-                    wait_until(lambda: asc.mgmt.ap_power_state == 0x10, asc.work)
-                    if aop:
-                        # IOP sleep/quiescence crashes this firmware; retain its mappings.
+        if result['resources_retained']:
+            result.update(reboot_required=True,
+                          cleanup_skipped='Caller owns AOP resources; retain until watchdog recovery')
+            print(json.dumps(result, indent=2))
+        else:
+            try:
+                if boot_attempted:
+                    if (result.get('mtp', {}).get('touchpad_trial_active')
+                            and not result['mtp'].get('touchpad_off_acknowledged')):
                         result['reboot_required'] = True
-                        result['iop_shutdown'] = 'unqualified'
+                        result['touchpad_shutdown'] = 'Off not acknowledged; retaining DMA mappings'
                     else:
-                        asc.mgmt.send(Mgmt_SetIOPPower(STATE=0x10))
-                        wait_until(lambda: asc.mgmt.iop_power_state == 0x10, asc.work)
-                        result['quiesced'] = True
-            if not boot_attempted or result.get('quiesced'):
-                p.write32(base + 0x44, ctrl)
-                p.write32(dart_base + 0xc20, 1)
-                dart.regs.TTBR[0].val, dart.regs.TCR[0].val = ttbr, tcr
-                for idx, values in enumerate(dapf_saved):
-                    # Publish the original filter configuration after its range words.
-                    for off in (4, 8, 12, 16, 20, 32, 0):
-                        p.write32(dapf_base + idx * 0x40 + off, values[off])
-                if dapf_saved:
-                    result['dapf_restored'] = all(
-                        p.read32(dapf_base + idx * 0x40 + off) == value
-                        for idx, values in enumerate(dapf_saved) for off, value in values.items())
-                    if not result['dapf_restored']:
-                        raise RuntimeError("DAPF restoration failed")
-                if aop:
-                    u.iface.writemem(aop._bootargs_span[0], original_bootargs)
-                    p.dc_cvac(aop._bootargs_span[0], len(original_bootargs))
-                    result['bootargs_restored'] = aop.read_bootargs().to_bytes() == original_bootargs
-                    if not result['bootargs_restored']:
-                        raise RuntimeError("AOP boot argument restoration failed")
-                invalidate()
-                result['restored'] = {
-                    'cpu_control': hex(p.read32(base + 0x44)),
-                    'tcr': hex(dart.regs.TCR[0].val), 'ttbr': hex(dart.regs.TTBR[0].val),
-                    'enabled': hex(p.read32(dart_base + 0xc00)),
-                    'dart_error': hex(dart.regs.ERROR.val),
-                }
-                restored = result['restored']
-                if (restored['cpu_control'], restored['tcr'], restored['ttbr'],
-                    restored['enabled']) != (hex(ctrl), hex(tcr), hex(ttbr), '0x0'):
-                    raise RuntimeError("IOP/DART state restoration failed")
+                        if aop:
+                            result['endpoint_shutdown_acks'] = []
+                            for ep, obj in sorted(asc.epmap.items()):
+                                if ep < 0x20:
+                                    continue
+                                obj.stop(timeout=5)
+                                result['endpoint_shutdown_acks'].append(ep)
+                        asc.mgmt.send(Mgmt_SetAPPower(STATE=0x10))
+                        wait_until(lambda: asc.mgmt.ap_power_state == 0x10, asc.work)
+                        if aop:
+                            # IOP sleep/quiescence crashes this firmware; retain its mappings.
+                            result['reboot_required'] = True
+                            result['iop_shutdown'] = 'unqualified'
+                        else:
+                            asc.mgmt.send(Mgmt_SetIOPPower(STATE=0x10))
+                            wait_until(lambda: asc.mgmt.iop_power_state == 0x10, asc.work)
+                            result['quiesced'] = True
+                if not boot_attempted or result.get('quiesced'):
+                    p.write32(base + 0x44, ctrl)
+                    p.write32(dart_base + 0xc20, 1)
+                    dart.regs.TTBR[0].val, dart.regs.TCR[0].val = ttbr, tcr
+                    for idx, values in enumerate(dapf_saved):
+                        # Publish the original filter configuration after its range words.
+                        for off in (4, 8, 12, 16, 20, 32, 0):
+                            p.write32(dapf_base + idx * 0x40 + off, values[off])
+                    if dapf_saved:
+                        result['dapf_restored'] = all(
+                            p.read32(dapf_base + idx * 0x40 + off) == value
+                            for idx, values in enumerate(dapf_saved) for off, value in values.items())
+                        if not result['dapf_restored']:
+                            raise RuntimeError("DAPF restoration failed")
+                    if aop:
+                        u.iface.writemem(aop._bootargs_span[0], original_bootargs)
+                        p.dc_cvac(aop._bootargs_span[0], len(original_bootargs))
+                        result['bootargs_restored'] = aop.read_bootargs().to_bytes() == original_bootargs
+                        if not result['bootargs_restored']:
+                            raise RuntimeError("AOP boot argument restoration failed")
+                    invalidate()
+                    result['restored'] = {
+                        'cpu_control': hex(p.read32(base + 0x44)),
+                        'tcr': hex(dart.regs.TCR[0].val), 'ttbr': hex(dart.regs.TTBR[0].val),
+                        'enabled': hex(p.read32(dart_base + 0xc00)),
+                        'dart_error': hex(dart.regs.ERROR.val),
+                    }
+                    restored = result['restored']
+                    if (restored['cpu_control'], restored['tcr'], restored['ttbr'],
+                        restored['enabled']) != (hex(ctrl), hex(tcr), hex(ttbr), '0x0'):
+                        raise RuntimeError("IOP/DART state restoration failed")
+                    if dart.regs.ERROR.reg.FLAG:
+                        raise RuntimeError("IOP DART fault after quiescence")
+            except Exception as exc:
+                # Preserve mappings if shutdown was not acknowledged; recover by reboot.
+                result['cleanup_error'] = str(exc)
+                result['reboot_required'] = True
+                error = error or exc
+            try:
+                result['shutdown_dart_error'] = hex(dart.regs.ERROR.val)
                 if dart.regs.ERROR.reg.FLAG:
-                    raise RuntimeError("IOP DART fault after quiescence")
-        except Exception as exc:
-            # Preserve mappings if shutdown was not acknowledged; recover by reboot.
-            result['cleanup_error'] = str(exc)
-            result['reboot_required'] = True
-            error = error or exc
-        try:
-            result['shutdown_dart_error'] = hex(dart.regs.ERROR.val)
-            if dart.regs.ERROR.reg.FLAG:
-                raise RuntimeError("DART fault after shutdown attempt")
-        except Exception as exc:
-            result['dart_check_error'] = str(exc)
-            result['reboot_required'] = True
-            error = error or exc
-        try:
-            p.nop()
-            result['proxy_nop'] = 'passed'
-        except Exception as exc:
-            result['proxy_error'] = str(exc)
-            error = error or exc
-        print(json.dumps(result, indent=2))
+                    raise RuntimeError("DART fault after shutdown attempt")
+            except Exception as exc:
+                result['dart_check_error'] = str(exc)
+                result['reboot_required'] = True
+                error = error or exc
+            try:
+                p.nop()
+                result['proxy_nop'] = 'passed'
+            except Exception as exc:
+                result['proxy_error'] = str(exc)
+                error = error or exc
+            print(json.dumps(result, indent=2))
     # Preserve both failures when startup and cleanup fail independently.
     if error is not None:
         raise error

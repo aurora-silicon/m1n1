@@ -71,6 +71,21 @@ upload was required by the working HQ capture.
 
 ### HQ one-shot capture
 
+The public command is now qualified for both owned capture extents on the
+pinned cold profile. From a recent compatible RAM proxy with cold AOP state:
+
+```sh
+M1N1DEVICE=/dev/ttyACM0 python proxyclient/experiments/aop_capture.py /tmp/hqai.wav
+```
+
+The default is 6 MiB (nominally 10.92 seconds); `--bytes 0x200000` selects the
+qualified 3.64-second capture. It saves three-channel Float32 WAV, raw bytes,
+metadata and a normalized single-channel PCM16 preview. Existing output stems
+are refused before opening hardware. The preview records its gain/channel;
+normalization is not calibration or proof of recognizable sound. Wait for
+watchdog recovery before another capture. Changed firmware fingerprints,
+RTKit versions, service identities or layouts fail closed.
+
 Attach `hpai` and request `pw1 `. Require stream 10 to be unused and disabled
 before installing its owned mapping. Prepare one owned non-repeating NS RX0
 descriptor, start DMA, then request `hpai` `pwrd` with `unk2=1`. Check its

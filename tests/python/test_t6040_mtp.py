@@ -5,6 +5,15 @@ from types import SimpleNamespace
 
 import pytest
 
+@pytest.fixture(autouse=True)
+def forbid_hardware(monkeypatch):
+    import m1n1.proxy as proxy
+    def blocked(*args, **kwargs):
+        raise AssertionError('Host test attempted to open hardware')
+    monkeypatch.setattr(proxy, 'UartInterface', blocked)
+    monkeypatch.setattr(proxy, 'Serial', blocked)
+
+
 from m1n1.fw.mtp import encode_packet
 import m1n1.hw.dockchannel as dockchannel
 
@@ -57,7 +66,7 @@ def test_queued_reply_before_enable_preserves_evidence_and_sends_nothing(monkeyp
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), 'exec'), context)
     result = {}
     with pytest.raises(ValueError, match='replies remain queued'):
-        context['probe_mtp'](SimpleNamespace(work=lambda: None), True, result)
+        context['probe_mtp'](SimpleNamespace(work=lambda: None), True, result, proxy=SimpleNamespace(), utils=context['u'])
     assert result['initialization'][0]['name'] == 'keyboard'
     assert not result['keyboard_enable_ack']
     assert not result['keyboard_ready']
@@ -176,24 +185,24 @@ def test_touchpad_shutdown_requires_both_off_replies(monkeypatch, keyboard, reje
     asc = SimpleNamespace(work=lambda: None, ioalloc=lambda size: (0x100000, 0x200000))
     if not fresh_actuator_ready:
         with pytest.raises(TimeoutError, match='Actuator DeviceReady'):
-            context['probe_mtp'](asc, keyboard, result, 'firmware', 1)
+            context['probe_mtp'](asc, keyboard, result, 'firmware', 1, proxy=context['p'], utils=context['u'])
         assert not result['actuator_ready']
         assert 'touchpad_off_acknowledged' not in result
         assert 'firmware_upload_attempted' not in result
         return
     if isinstance(reject_off_phase, str):
         with pytest.raises(ValueError, match='dimensions'):
-            context['probe_mtp'](asc, keyboard, result, 'firmware', 1)
+            context['probe_mtp'](asc, keyboard, result, 'firmware', 1, proxy=context['p'], utils=context['u'])
         assert 'touchpad_off_acknowledged' not in result
         assert result['touchpad_trial_active']
         return
     if reject_off_phase is None:
-        context['probe_mtp'](asc, keyboard, result, 'firmware', 1)
+        context['probe_mtp'](asc, keyboard, result, 'firmware', 1, proxy=context['p'], utils=context['u'])
         assert result['touchpad_off_acknowledged']
         assert [request[4] for _, request in commands[-2:]] == [0, 1]
     else:
         with pytest.raises(RuntimeError):
-            context['probe_mtp'](asc, keyboard, result, 'firmware', 1)
+            context['probe_mtp'](asc, keyboard, result, 'firmware', 1, proxy=context['p'], utils=context['u'])
         assert 'touchpad_off_acknowledged' not in result
         assert commands[-1][1][4] == reject_off_phase
     assert result['touchpad_trial_active']
