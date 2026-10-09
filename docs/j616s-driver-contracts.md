@@ -12,7 +12,11 @@ version 2. Native macOS 27/build 26A428 captures are separate reference evidence
 do not assume their firmware or phandles match the proxy boot.
 
 Resolve registers, DMA parents, mapper streams and firmware segments through
-the current ADT. Use four-level 42-bit DART mappings and preserve other streams.
+the current ADT. Read the active DART mode before using an inherited context
+and preserve its tables and other streams. The tested new AOP/SIO mappings
+use four levels and 42-bit addresses; inherited DCP stream 23 uses three
+levels and 36-bit addresses. SoC capability does not authorize changing an
+active firmware context.
 Clean all new page tables, execute the publication barrier, invalidate the
 affected stream and verify the entire translation before enabling its DMA.
 Map firmware text read-only. These are owned mappings, not permission to map

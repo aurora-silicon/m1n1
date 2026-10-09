@@ -104,6 +104,16 @@ returns the installed proxy with its watchdog disabled. This is not a clean
 guest shutdown or a persistent Linux development session. Native boot, Linux
 SMP and peripheral drivers require separate qualification.
 
+Separate native RAM diagnostics reach the original Linux CPU setup, TTBR
+loads, MMU enable and early kernel mapping. Nonce-bound markers survive a
+warm return to the fully verified proxy. Fresh page-table walks verify the
+diagnostic code, marker and FDT mappings, plus the virtual address of
+`__primary_switched`. A further checkpoint reaches that virtual entry and
+verifies the kernel stack, task pointer and exception vectors before
+`finalise_el2`. Completed kernel startup and gadget traffic remain unqualified.
+Diagnostic code uses owned linker padding with verified permissions; guest
+tables and CPU context remain retained after the warm return.
+
 ## Memory controller
 
 The ADT identifies the controller as `mcc,t6041`, with four AMCC apertures
@@ -164,10 +174,16 @@ A separate bounded test sends one standard RTKit IOP power INIT request,
 without starting/resetting the CPU or changing DART. It receives Hello,
 negotiates protocol 12 and acknowledges the complete endpoint map, including
 endpoint 0x23 used by the existing iBoot service. DART errors remain zero and
-watchdog recovery passes. This establishes management communication, not AFK
-application startup, shared-buffer ownership, firmware-version queries or
-scanout control. The inherited DART context has three levels; the SoC's support
-for four levels does not authorize replacing that existing context.
+watchdog recovery passes. This establishes management communication.
+
+A later bounded test starts endpoint 0x23 and sends the initial AFK request.
+It receives INIT_ACK and GETBUF requesting 256 64-byte blocks (16 KiB), with
+tag 0xcafe. No buffer address is acknowledged and no DMA allocation, ring
+start or application query follows. Watchdog recovery passes. This establishes
+initial AFK control, not shared-buffer ownership, a running application queue,
+firmware-version queries or scanout. The inherited DART context has three
+levels; the SoC's support for four levels does not authorize replacing that
+existing context.
 
 ## Other devices
 
