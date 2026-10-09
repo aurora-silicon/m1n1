@@ -96,15 +96,17 @@ unqualified.
 
 ## Other devices
 
-* CDC proxy and bulk reads work at USB high speed (480 Mb/s). SuperSpeed is
-  pending firmware/PIPE bring-up and cable/port qualification. Guarded mode-1
-  tuning traversal and crossbar/sleep-control readbacks have passed; this does
-  not establish PHY readiness. A RAM-only candidate completed native mode-4
-  register preparation and passed its guarded PIPE admission, but the single
-  controller handoff did not re-enumerate before watchdog recovery. Recovery
-  restored the high-speed proxy without intervention. The firmware tunables-done
-  indication remained clear; SuperSpeed support is not established. See the
-  driver contracts for limitations.
+* CDC proxy and bulk reads work at USB high speed (480 Mb/s). RAM-only
+  controller halt/reset/reinitialization tests re-enumerate in the same image
+  and pass an exact 64 KiB transfer. SS-capable controller settings also return
+  through high-speed fallback when the ATC PHY is left in its initial state.
+  Native mode-4 PHY preparation, the complete ten-write PIPE sequence and all
+  immediate masked readbacks are qualified with high-speed operation. Tests
+  retain the installed image and recover through the hardware watchdog.
+  Requesting SS after PHY preparation still does not re-enumerate. The firmware
+  tunables-done indication remains clear in the tested sequence; this is not a
+  general PHY-ready flag. Physical SuperSpeed remains unqualified. See the
+  driver contracts for ownership and firmware limitations.
 * SIO completes RTKit startup with four-level, full 42-bit mappings of its
   ADT-described external firmware. Firmware text is mapped read-only. The
   standard system endpoints start, AP/IOP both acknowledge state 0x20,
