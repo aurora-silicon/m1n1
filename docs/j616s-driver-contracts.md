@@ -198,7 +198,7 @@ The measured active interval is 1.219 seconds for the one-second payload.
 
 The right diagnostic enables only slot 1 / `i2c3:3b`, with full protection on
 that amp and the other five left in verified shutdown 0x1a. Its finite transfer,
-cleanup and recovery pass; acoustic confirmation is pending. DVC 0x65 is about
+cleanup and recovery pass; a repeat has user-confirmed audible output. DVC 0x65 is about
 the midpoint of the documented inverted 201-step mixer range, not a calibrated
 macOS volume-slider percentage. Full-array setup still has intermittent I2C
 completion failures. Keep uncertain state for watchdog recovery and retain

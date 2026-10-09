@@ -296,8 +296,7 @@ unqualified.
   zero residue/DART faults, muted stop, amplifier/controller/GPIO restoration
   and watchdog recovery pass. Its measured active interval is 1.219 seconds.
   A separate right-woofer-only pulse at the codec control midpoint (DVC 0x65,
-  50.5 dB attenuation) also passes transport and cleanup; listening confirmation
-  is pending. The other five amps remain in their verified initial shutdown.
+  50.5 dB attenuation) also passes transport and cleanup and is user-confirmed audible. The other five amps remain in their verified initial shutdown.
   Repeated full-array configuration still exposes intermittent I2C completion
   timeouts. Native DMA format selection, feedback, all-six acoustic output and
   continuous playback remain unqualified.
@@ -434,7 +433,7 @@ unqualified.
   DART errors and CPU exceptions are zero; NOP and watchdog recovery pass.
   This qualifies one completed 1080p frame, not continuous 1080p streaming,
   restart, exposure/noise calibration or measured FPS.
-* One bounded left-woofer pulse is user-confirmed audible. Complete speaker
+* Bounded left/right first-woofer pulses are user-confirmed audible. Complete speaker
   playback, feedback and calibration remain unqualified; the separate headphone
   path also has user-confirmed finite output.
 
