@@ -3,8 +3,8 @@
 Tested on J616sAP (Mac16,7), board 6, with the ADT supplied by macOS build
 26A428. The branch is stacked on `j700` while the draft targets `aurora-wip`.
 Upstream Asahi M1/M2/M3 m1n1 and proxyclient behavior is the implementation
-standard; J700 is the feature-parity target. Linux and U-Boot handoff are
-outside this bring-up's scope.
+standard; J700 is the feature-parity target. Linux RAM boot preparation is
+now in scope, but no J616s Linux boot is qualified yet.
 
 For implementation order, formats and ownership rules, start with the
 [driver contracts](j616s-driver-contracts.md).
@@ -257,13 +257,31 @@ unqualified.
   restart remain under qualification. AOP shutdown still needs watchdog
   recovery;
   installed images are preserved. Speaker playback references were captured
-  under native macOS; proxy playback remains unqualified.
+  under native macOS; proxy speaker playback remains unqualified.
   The shared `CS42L84Input` class supplies the validated input-only codec
   lifecycle through bounded caller-provided register access. It requires
   receiver-start and receiver-stop gates, preserves unrelated register bits,
   and retains uncertain state without further access. The board power/reset,
   fresh MCA-profile check and owned DMA orchestration remain caller-owned.
   A live capture using this shared class passes exact cleanup as above.
+* Headphone playback through `cout` is now user-confirmed. Its live 109-byte
+  stereo MCA profile matches the native macOS profile. An owned, non-repeating
+  TX2 descriptor plays a two-second sequence with a 440 Hz left-channel tone
+  followed by an 880 Hz right-channel tone. The tester confirms audible output.
+  The nominal format is 48 kHz, 24-bit samples in 32-bit slots.
+
+  The native TX FIFO calculation requires the upper almost-full threshold to
+  exceed the lower transfer threshold. The tested full-depth policy uses
+  `0x03000180` for the owned 768-byte FIFO; the previous zero upper half stalled
+  TX. The matching completion report, zero residue, empty rings and zero DART
+  faults pass. TX configuration, codec controls, I2C controller/reset state and
+  frontend power restore successfully before watchdog cold recovery.
+
+  The test preserves voltage/impedance fields and uses a raw DAC gain of
+  -60 dB. Compact per-operation I2C journals retain pending-state evidence
+  while avoiding growing snapshots between FIFO bytes. Headset capture and
+  headphone playback are qualified separately; simultaneous duplex,
+  continuous playback, calibration and Linux audio remain unqualified.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored
