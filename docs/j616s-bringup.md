@@ -84,7 +84,21 @@ Deferring those checks until the next suspended handler fixes the captured
 opcode mismatch; byte-level regressions exercise the actual proxy framing.
 Normal prechecks, pending records and write-ownership bounds remain enforced.
 
-The bounded capture ends with a host timeout while the guest is running.
+A later 60-second console window accepts four marked commands separated by
+10-second waits. Every command returns status zero, uptime and timer interrupts
+advance, and the interrupt error count remains zero. The queue rejects echoed,
+unmatched or duplicate completion markers and never retries ambiguous input.
+An absolute deadline bounds both proxy reads and console dispatch; a 120-second
+hardware watchdog preserves recovery after the longer window.
+
+The current aurora-wip kernel also boots with USB/configfs ACM/ECM and network
+support compiled in, using the same RAM initramfs and minimal HV DT. Configfs
+mounts successfully and its gadget directory is present. No UDC is exposed by
+that DT, so this is kernel/configfs qualification, not Linux gadget operation.
+One config-query command fails because the initramfs lacks a zcat symlink;
+its BusyBox applet remains available by explicit invocation.
+
+The bounded captures end with a host timeout while the guest is running.
 Mappings and guest memory remain retained until hardware-watchdog recovery
 returns the installed proxy with its watchdog disabled. This is not a clean
 guest shutdown or a persistent Linux development session. Native boot, Linux
