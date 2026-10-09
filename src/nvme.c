@@ -402,6 +402,16 @@ bool nvme_init(void)
             printf("nvme: Error getting NVMe base address.\n");
             goto out_reset;
         }
+        /*
+         * The J700 ADT advertises only the first 64 KiB of this alias.
+         * Its linear queue registers live at +0x24908..+0x24910 in the
+         * same non-secure alias. The public T8140 Linux binding describes
+         * the full 0x30000 aperture. Admit only that measured SoC/layout;
+         * retain the normal bounds and overlap checks for every other BAR.
+         */
+        if (chip_id == T8140 && nvmmu_base == 0x38dcc0000 &&
+            nvme_base == 0x3cdcc0000 && nvme_size == 0x10000)
+            nvme_size = 0x30000;
         if (nvmmu_size < NVMMU_TCB_STAT + sizeof(u32) ||
             nvme_size < NVME_DB_LINEAR_IOSQ + sizeof(u32) || nvmmu_base > UINT64_MAX - nvmmu_size ||
             nvme_base > UINT64_MAX - nvme_size ||

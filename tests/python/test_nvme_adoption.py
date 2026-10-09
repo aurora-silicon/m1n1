@@ -31,6 +31,8 @@ typedef int sart_dev_t;
 #define PMGR_DIE_ID GENMASK(31, 28)
 #define USEC_PER_SEC 1000000
 #define ADT_GETPROP(...) (-1)
+#define T8140 0x8140
+static u32 chip_id = T8140;
 static void *adt;
 ''' + declarations + r'''
 static int failure, queue_frees, asc_frees, publications, commands;
@@ -56,6 +58,16 @@ static int adt_get_reg(void *a, int *path, const char *p, int i, u64 *base, u64 
 {
     *base = i == 3 ? 0x10000000 : 0x20000000;
     *size = failure == 6 && i == 9 ? NVME_BOOT_STATUS + 4 : 0x100000;
+    if (failure >= 10) {
+        *base = i == 3 ? 0x38dcc0000 : 0x3cdcc0000;
+        *size = i == 3 ? 0x60000 : 0x10000;
+        if (failure == 12 && i == 9)
+            *base += 0x10000;
+        if (failure == 13 && i == 9)
+            *size = 0x8000;
+        if (failure == 14 && i == 3)
+            *size = NVMMU_TCB_STAT;
+    }
     return 0;
 }
 static asc_dev_t *asc_init(const char *path) { return &asc; }
@@ -96,16 +108,19 @@ int main(int argc, char **argv)
 {
     assert(argc == 2);
     failure = atoi(argv[1]);
+    if (failure == 11)
+        chip_id = 0x8132;
     nvme_adopt_live_session = failure != 8;
     nvme_keep_running_for_linux = failure == 9;
     assert(nvme_shutdown());
-    assert(nvme_init() == (failure == 0 || failure == 7 || failure == 9));
-    if (failure == 1 || failure == 6) {
+    assert(nvme_init() == (failure == 0 || failure == 7 || failure == 9 || failure == 10));
+    if (failure == 1 || failure == 6 || failure >= 11) {
         /* Rejection before publication does not poison a later attempt. */
         assert(publications == 0);
         assert(queue_frees == (failure == 1 ? 2 : 0));
         assert(nvme_shutdown());
         failure = 0;
+        chip_id = T8140;
         assert(nvme_init());
         assert(nvme_shutdown());
     } else if ((failure >= 2 && failure <= 5) || failure == 8) {
@@ -147,5 +162,5 @@ int main(int argc, char **argv)
          "-Wno-unused-variable", "-Wno-format", "-x", "c", "-", "-o", str(binary)],
         input=harness, text=True, check=True,
     )
-    for failure in range(10):
+    for failure in range(15):
         subprocess.run([str(binary), str(failure)], check=True)

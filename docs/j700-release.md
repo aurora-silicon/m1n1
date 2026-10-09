@@ -101,3 +101,19 @@ the owner password. Keep the previous bare Stage 1 for rollback with the same
 
 No worker should access the target directly or run the old bench scripts. All
 target tests and recovery go through approved `aurora-ctl hw request` entries.
+
+## T8140 NVMe non-secure alias aperture
+
+On J700, the live ADT advertises `ans/reg[9]` as a 0x10000-byte window even
+though the linear queue control and doorbells are at +0x24908..+0x24910 in
+that non-secure alias. The public T8140 Linux device-tree binding describes
+its full 0x30000-byte aperture. Stage 2 must recognize that specific layout
+before applying its normal register bounds check.
+
+The compatibility rule is limited to T8140, translated NVMMU base
+0x38dcc0000, translated NVMe base 0x3cdcc0000 and the advertised 0x10000-byte
+NVMe window. Other SoCs, unexpected addresses, shorter windows, undersized
+NVMMU resources, overflow and overlapping resources retain their rejection
+paths. The ANS-adoption host regression exercises the observed aperture and
+negative layouts before any queue publication. Hardware qualification of
+this local change remains pending.
