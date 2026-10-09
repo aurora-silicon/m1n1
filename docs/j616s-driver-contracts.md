@@ -14,9 +14,11 @@ do not assume their firmware or phandles match the proxy boot.
 Resolve registers, DMA parents, mapper streams and firmware segments through
 the current ADT. Read the active DART mode before using an inherited context
 and preserve its tables and other streams. The tested new AOP/SIO mappings
-use four levels and 42-bit addresses; inherited DCP stream 23 uses three
-levels and 36-bit addresses. SoC capability does not authorize changing an
-active firmware context.
+use four levels and 42-bit addresses; inherited DCP stream 23 retains its
+36-bit mode and captured root/leaf tables. SoC capability does not authorize
+changing an active firmware context. A complete read-only capture covers its
+root and five leaves; this does not qualify cache publication or invalidation
+for that stream. Its parameter register reports version 2.2, not version 3.
 Clean all new page tables, execute the publication barrier, invalidate the
 affected stream and verify the entire translation before enabling its DMA.
 Map firmware text read-only. These are owned mappings, not permission to map

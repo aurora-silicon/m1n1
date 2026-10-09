@@ -132,6 +132,16 @@ separate guest register bank. Two complete static log captures match and show
 the machine model and reserved-memory ranges. Interrupt delivery and Linux
 gadget traffic remain unqualified.
 
+A subsequent diagnostic reaches the return from the original `init_IRQ`,
+after memory, per-CPU, scheduler and RCU initialization. The marker verifies
+the AIC IRQ/FIQ handler pointers and one possible CPU. The source reset path
+returns to the proxy and two complete static log captures match. Offline
+decoding validates 42 finalized records and one committed head record: the
+last AIC message has no newline, so printk has not finalized it. The initial
+decoder rejects this valid state; watchdog recovery passes. These results
+establish controller initialization, not timer or interrupt delivery, completed
+kernel startup or a Linux gadget shell.
+
 ## Memory controller
 
 The ADT identifies the controller as `mcc,t6041`, with four AMCC apertures
@@ -199,9 +209,18 @@ It receives INIT_ACK and GETBUF requesting 256 64-byte blocks (16 KiB), with
 tag 0xcafe. No buffer address is acknowledged and no DMA allocation, ring
 start or application query follows. Watchdog recovery passes. This establishes
 initial AFK control, not shared-buffer ownership, a running application queue,
-firmware-version queries or scanout. The inherited DART context has three
-levels; the SoC's support for four levels does not authorize replacing that
-existing context.
+firmware-version queries or scanout. Preserve the inherited DART mode rather
+than replacing it with another context based on SoC capability.
+
+A later read-only capture verifies the complete inherited stream-23 table
+closure: one root and five leaf tables, with 9,247 decoded mappings and no
+physical aliases. Each table is read twice and checked again after the walk;
+source, ADT, controller state and ownership checks remain around the reads.
+The current parameter register reports DART version 2.2 (`0x2a2a0202`), and
+TCR is 1. The source and metadata checks pass again before the watchdog is
+explicitly disabled. This establishes a stable CPU-visible table capture,
+not DART cache visibility, a publication sequence or permission to acknowledge
+the AFK buffer address. Those remain separate bring-up steps.
 
 ## Other devices
 
