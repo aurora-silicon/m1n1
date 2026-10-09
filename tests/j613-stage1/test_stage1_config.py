@@ -92,6 +92,11 @@ def main():
             ok, out = c_accepts(block_of(filled), f"{UUID};{target}")
             assert ok and out == f"{UUID};{target}|15000", out
 
+        zero = fill.fill(factory, UUID, "m1n1/boot.bin", 0)  # user default: no USB window
+        assert fill.DEFAULT_WINDOW_MS == 0
+        ok, out = c_accepts(block_of(zero), f"{UUID};m1n1/boot.bin")
+        assert ok and out == f"{UUID};m1n1/boot.bin|0", out
+
         # Chris's recipe filler writes the same block for the same inputs.
         good = block_of(fill.fill(factory, UUID, "m1n1/boot.bin", 15000))
         body = good[16:-4]

@@ -18,6 +18,10 @@ ESP (default /boot/efi) and checks that the stage-2 file is there:
 Elsewhere, give --esp-partuuid. --check prints what an image contains, with
 the size, MD5 and POSIX cksum that recoveryOS can verify (it has no shasum).
 
+The default USB proxy window is 0: stage 1 does not bring up USB and loads stage 2 at once.
+If it cannot (wrong board or macOS version, missing or bad file), it prints why on the screen and
+waits in the USB proxy; hold the power button to choose another system.
+
 The output is never the input, is never overwritten, and has the same size as
 the input. The block format is the one Aurora m1n1 (aurora-silicon/m1n1
 aed999725) and the m1n1-aurora 1.6.1.aurora15 recipe (patch 0054) use.
@@ -41,7 +45,7 @@ UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 TAG_VAR = re.compile(rb"chosen\.asahi,m1n1-stage1-version=([A-Za-z0-9._+-]+)\0")
 J613_MARK = b"J613 Stage 1: window expired; loading ESP candidate"
 DEFAULT_TARGET = "m1n1/boot.bin"
-DEFAULT_WINDOW_MS = 15000
+DEFAULT_WINDOW_MS = 0
 
 
 class ConfigError(ValueError):
@@ -177,7 +181,8 @@ def main() -> int:
     p.add_argument("--target", "--stage2-path", dest="target", default=DEFAULT_TARGET,
                    help=f"stage-2 file, relative to the ESP root (default {DEFAULT_TARGET})")
     p.add_argument("--window-ms", type=int, default=DEFAULT_WINDOW_MS,
-                   help=f"USB proxy window before loading stage 2 (default {DEFAULT_WINDOW_MS})")
+                   help="USB proxy window before loading stage 2, for developers with an m1n1 "
+                        "proxy host (default 0: no USB, straight to the ESP file)")
     p.add_argument("--allow-missing-target", action="store_true",
                    help="fill even though the stage-2 file is not on the mounted ESP yet")
     p.add_argument("--check", type=Path, metavar="IMAGE", help="print what IMAGE contains and exit")

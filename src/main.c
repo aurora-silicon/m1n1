@@ -87,7 +87,8 @@ void run_actions(void)
     /* A factory or invalid configuration is a proxy-only image: no payload scan. */
     if (!stage1_config_target())
         goto proxy_fallback;
-    {
+    /* A zero window skips USB entirely: straight to the ESP file, as a plain stage 1 does. */
+    if (stage1_config_window_ms()) {
         u32 window_ms = stage1_config_window_ms();
         usb_init();
         usb_iodev_init();
@@ -109,6 +110,8 @@ void run_actions(void)
             mdelay(10);
         }
         printf("J613 Stage 1: window expired; loading ESP candidate\n");
+    } else {
+        printf("J613 Stage 1: no USB window; loading ESP candidate\n");
     }
 #endif
 
@@ -168,6 +171,13 @@ proxy_fallback:
     fb_set_active(true);
 
     printf("No valid payload found\n");
+#ifdef J613_ESP_STAGE1
+    /* Shown on the panel: this is where a user without a USB host ends up. */
+    printf("\nJ613 Stage 1: could not start Linux from the EFI partition.\n"
+           "  Needs: MacBook Air 13\" M3 (J613), this volume's macOS exactly 26.6.2,\n"
+           "  and the stage-2 file named in this stage 1 (fill_stage1_config.py --check).\n"
+           "  Hold the power button to shut down, then hold it again to choose another system.\n");
+#endif
 
 #ifndef BRINGUP
     if (!usb_up) {
