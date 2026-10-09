@@ -227,6 +227,31 @@ static void j873g_run_proxy(void)
     uartproxy_run(NULL);
 }
 
+static bool prepare_next_stage(void)
+{
+    if (usb_dwc3_shutdown_failed())
+        return false;
+    if (chip_id != T8152 && !nvme_shutdown()) {
+        printf("NVMe handoff failed; returning to proxy\n");
+        uartproxy_run(NULL);
+        panic("NVMe handoff failed\n");
+    }
+    exception_shutdown();
+#ifndef BRINGUP
+    if (chip_id != T8152) {
+        if (!usb_iodev_shutdown())
+            return false;
+        display_shutdown(DCP_SLEEP_IF_EXTERNAL);
+    }
+#ifdef USE_FB
+    fb_shutdown(next_stage.restore_logo);
+#endif
+    mmu_shutdown();
+#endif
+
+    return true;
+}
+
 void m1n1_main(void)
 {
     printf("\n\nm1n1 %s\n", m1n1_version);
@@ -300,22 +325,12 @@ next_stage:
 
     printf("Preparing to run next stage at %p...\n", next_stage.entry);
 
-    if (chip_id != T8152 && !nvme_shutdown()) {
-        printf("NVMe handoff failed; returning to proxy\n");
-        uartproxy_run(NULL);
-        panic("NVMe handoff failed\n");
+    if (!prepare_next_stage()) {
+        next_stage.entry = NULL;
+        /* USB ownership is uncertain. Leave mappings and the watchdog intact. */
+        while (1)
+            sysop("wfe");
     }
-    exception_shutdown();
-#ifndef BRINGUP
-    if (chip_id != T8152) {
-        usb_iodev_shutdown();
-        display_shutdown(DCP_SLEEP_IF_EXTERNAL);
-    }
-#ifdef USE_FB
-    fb_shutdown(next_stage.restore_logo);
-#endif
-    mmu_shutdown();
-#endif
 
     printf("Vectoring to next stage...\n");
 

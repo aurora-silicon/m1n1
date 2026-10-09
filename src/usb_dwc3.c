@@ -31,6 +31,7 @@
 #define MAX_ENDPOINTS     16
 #define CDC_BUFFER_SIZE   SZ_1M
 #define CDC_IO_TIMEOUT_MS 3000
+static bool usb_shutdown_failed;
 #ifdef J700_CDC_PROXY
 #define CDC_LOOP_READY(dev, pipe) ((dev)->pipe[(pipe)].ready)
 #else
@@ -134,6 +135,7 @@ typedef struct dwc3_dev {
     u32 evt_buffer_offset;
     bool failed;
     bool dma_unsafe;
+    bool shutting_down;
 
     void *scratchpad;
     void *xferbuffer;
@@ -174,6 +176,22 @@ typedef struct dwc3_dev {
 #endif
 
 } dwc3_dev_t;
+
+/* An uncertain constructor has no iodev yet; retain its owner explicitly. */
+static dwc3_dev_t *usb_retained_dev;
+
+static void usb_dwc3_mark_unsafe(dwc3_dev_t *dev)
+{
+    usb_shutdown_failed = true;
+    if (!dev)
+        return;
+    if (!usb_retained_dev)
+        usb_retained_dev = dev;
+    dev->failed = true;
+    dev->dma_unsafe = true;
+    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
+        dev->pipe[i].ready = false;
+}
 
 static const struct usb_string_descriptor str_manufacturer =
     make_usb_string_descriptor("Asahi Linux");
@@ -451,29 +469,34 @@ static int usb_dwc3_ep_command(dwc3_dev_t *dev, u8 ep, u32 command, u32 par0, u3
         return -1;
     }
 
-    return DWC3_DEPCMD_STATUS(read32(dev->regs + DWC3_DEPCMD(ep)));
+    u32 raw = read32(dev->regs + DWC3_DEPCMD(ep));
+    if (dev->shutting_down)
+        return (raw >> 12) & 0xf;
+    return DWC3_DEPCMD_STATUS(raw);
 }
 
-#ifdef J700_CDC_PROXY
 static int usb_dwc3_end_transfer(dwc3_dev_t *dev, u8 ep)
 {
     dev->endpoints[ep].end_cmd_pending = true;
     u32 command = DWC3_DEPCMD_ENDTRANSFER | DWC3_DEPCMD_CMDIOC |
                   DWC3_DEPCMD_PARAM(dev->endpoints[ep].resource_index);
+#ifndef J700_CDC_PROXY
+    if (dev->shutting_down)
+        command |= DWC3_DEPCMD_HIPRI_FORCERM;
+#endif
     if (usb_dwc3_ep_command(dev, ep, command, 0, 0, 0)) {
         dev->endpoints[ep].end_cmd_pending = false;
         return -1;
     }
     u64 deadline = timeout_calculate(100000);
-    while (dev->endpoints[ep].end_cmd_pending && !timeout_expired(deadline))
+    while (dev->endpoints[ep].end_cmd_pending && !dev->failed && !timeout_expired(deadline))
         usb_dwc3_handle_events(dev);
-    if (dev->endpoints[ep].end_cmd_pending) {
+    if (dev->failed || dev->endpoints[ep].end_cmd_pending) {
         dev->endpoints[ep].end_cmd_pending = false;
         return -1;
     }
     return 0;
 }
-#endif
 
 static int usb_dwc3_ep_configure(dwc3_dev_t *dev, u8 ep, u8 type, u32 max_packet_len)
 {
@@ -652,11 +675,17 @@ static void usb_dwc3_fail_session(dwc3_dev_t *dev)
     dev->failed = true;
     for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
         dev->pipe[i].ready = false;
+    if (dev->shutting_down || dev->dma_unsafe) {
+        dev->dma_unsafe = true;
+        usb_shutdown_failed = true;
+        return;
+    }
     write32(dev->regs + DWC3_DEVTEN, 0);
     clear32(dev->regs + DWC3_DCTL, DWC3_DCTL_RUN_STOP);
     set32(dev->regs + DWC3_DCTL, DWC3_DCTL_CSFTRST);
     if (poll32(dev->regs + DWC3_DCTL, DWC3_DCTL_CSFTRST, 0, 250000)) {
         dev->dma_unsafe = true;
+        usb_shutdown_failed = true;
         usb_debug_printf("controller reset failed; preserving DMA mappings\n");
     }
 }
@@ -1266,9 +1295,11 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
     if (event.endpoint_number >= MAX_ENDPOINTS)
         return;
     if (event.endpoint_event == DWC3_DEPEVT_EPCMDCMPLT) {
-#ifdef J700_CDC_PROXY
-        dev->endpoints[event.endpoint_number].end_cmd_pending = false;
+#ifndef J700_CDC_PROXY
+        if (dev->shutting_down && ((event.parameters >> 8) & 0xf) != DWC3_DEPCMD_ENDTRANSFER)
+            return;
 #endif
+        dev->endpoints[event.endpoint_number].end_cmd_pending = false;
         return;
     }
 
@@ -1478,6 +1509,12 @@ static void usb_dwc3_handle_event_dev(dwc3_dev_t *dev, const struct dwc3_event_d
 
 static void usb_dwc3_handle_event(dwc3_dev_t *dev, const union dwc3_event event)
 {
+    if (dev->shutting_down) {
+        /* Only drain command completions; do not rearm traffic or handle resets. */
+        if (!event.type.is_devspec && event.depevt.endpoint_event == DWC3_DEPEVT_EPCMDCMPLT)
+            usb_dwc3_handle_event_ep(dev, event.depevt);
+        return;
+    }
     if (!event.type.is_devspec)
         usb_dwc3_handle_event_ep(dev, event.depevt);
     else if (event.type.type == DWC3_EVENT_TYPE_DEV)
@@ -1563,7 +1600,7 @@ static int usb_dwc3_reannounce(dwc3_dev_t *dev)
 
 static void usb_dwc3_maybe_reannounce(dwc3_dev_t *dev)
 {
-    if (dev->failed)
+    if (dev->failed || dev->shutting_down)
         return;
     if (!usb_cdc_recovery_due(&dev->recovery, ticks_to_msecs(get_ticks())))
         return;
@@ -1637,6 +1674,12 @@ void usb_dwc3_handle_events(dwc3_dev_t *dev)
 
 dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
 {
+    if (usb_shutdown_failed)
+        return NULL;
+    if (dart_has_failed(dart)) {
+        usb_dwc3_mark_unsafe(NULL);
+        return NULL;
+    }
 #ifdef J700_CDC_PROXY
     usb_cdc_ss_device_descriptor = usb_cdc_device_descriptor;
     usb_cdc_ss_device_descriptor.bcdUSB = 0x0310;
@@ -1644,19 +1687,23 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
     usb_cdc_ss_configuration_len = usb_cdc_ss_config(
         (const u8 *)&cdc_configuration_descriptor, sizeof(cdc_configuration_descriptor),
         usb_cdc_ss_configuration, sizeof(usb_cdc_ss_configuration));
-    if (!usb_cdc_ss_configuration_len)
+    if (!usb_cdc_ss_configuration_len) {
+        usb_dwc3_mark_unsafe(NULL);
         return NULL;
+    }
 #endif
     /* sanity check */
     u32 snpsid = read32(regs + DWC3_GSNPSID);
     if ((snpsid & DWC3_GSNPSID_MASK) != 0x33310000) {
-        debug_printf("no DWC3 core found at 0x%lx: %08x\n", regs, snpsid);
+        usb_dwc3_mark_unsafe(NULL);
         return NULL;
     }
 
     dwc3_dev_t *dev = calloc(1, sizeof(*dev));
-    if (!dev)
+    if (!dev) {
+        usb_dwc3_mark_unsafe(NULL);
         return NULL;
+    }
 
     memset(dev, 0, sizeof(*dev));
     for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
@@ -1712,7 +1759,7 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
     /* reset the device side of the controller */
     set32(dev->regs + DWC3_DCTL, DWC3_DCTL_CSFTRST);
     if (poll32(dev->regs + DWC3_DCTL, DWC3_DCTL_CSFTRST, 0, 1000)) {
-        usb_debug_printf("timeout while waiting for DWC3_DCTL_CSFTRST to clear.\n");
+        usb_dwc3_mark_unsafe(dev);
         goto error;
     }
 
@@ -1833,33 +1880,33 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
     return dev;
 
 error:
-    usb_dwc3_shutdown(dev);
+    /* No reset/cleanup retry: mapped or partially published state may be live. */
+    usb_dwc3_mark_unsafe(dev);
     return NULL;
 }
 
-void usb_dwc3_shutdown(dwc3_dev_t *dev)
+bool usb_dwc3_shutdown_failed(void)
+{
+    return usb_shutdown_failed;
+}
+
+bool usb_dwc3_shutdown(dwc3_dev_t *dev)
 {
     if (!dev)
-        return;
+        return true;
+    if (usb_shutdown_failed || dev->failed || dev->dma_unsafe)
+        goto unsafe;
+    dev->shutting_down = true;
     for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
         dev->pipe[i].ready = false;
 
     /* stop all ongoing transfers */
-#ifdef J700_CDC_PROXY
-    for (int i = 0; i < MAX_ENDPOINTS && !dev->failed; ++i) {
-#else
-    for (int i = 1; i < MAX_ENDPOINTS; ++i) {
-#endif
+    for (int i = 0; i < MAX_ENDPOINTS; ++i) {
         if (!dev->endpoints[i].xfer_in_progress)
             continue;
 
-#ifdef J700_CDC_PROXY
         if (usb_dwc3_end_transfer(dev, i))
-            usb_dwc3_fail_session(dev);
-#else
-        if (usb_dwc3_ep_command(dev, i, DWC3_DEPCMD_ENDTRANSFER, 0, 0, 0))
-            usb_debug_printf("ENDTRANSFER failed for EP %d during shutdown\n", i);
-#endif
+            goto unsafe;
     }
 
     /* disable events and all endpoints and stop the device controller */
@@ -1869,22 +1916,29 @@ void usb_dwc3_shutdown(dwc3_dev_t *dev)
 
     /* wait until the controller is shut down */
     if (poll32(dev->regs + DWC3_DSTS, DWC3_DSTS_DEVCTRLHLT, DWC3_DSTS_DEVCTRLHLT, 1000))
-        usb_debug_printf("timeout while waiting for DWC3_DSTS_DEVCTRLHLT during shutdown.\n");
+        goto unsafe;
 
     /* reset the device side of the controller just to be safe */
     set32(dev->regs + DWC3_DCTL, DWC3_DCTL_CSFTRST);
-    if (poll32(dev->regs + DWC3_DCTL, DWC3_DCTL_CSFTRST, 0, 1000)) {
-        dev->dma_unsafe = true;
-        usb_debug_printf("controller reset failed during shutdown; preserving DMA mappings\n");
-    }
-    if (dev->dma_unsafe)
-        return;
+    if (poll32(dev->regs + DWC3_DCTL, DWC3_DCTL_CSFTRST, 0, 1000))
+        goto unsafe;
 
     /* unmap and free dma buffers */
     dart_unmap(dev->dart, TRB_BUFFER_IOVA, TRB_BUFFER_SIZE);
+    if (dart_has_failed(dev->dart))
+        goto unsafe;
     dart_unmap(dev->dart, XFER_BUFFER_IOVA, XFER_BUFFER_SIZE);
+    if (dart_has_failed(dev->dart))
+        goto unsafe;
     dart_unmap(dev->dart, SCRATCHPAD_IOVA, max(DWC3_SCRATCHPAD_SIZE, SZ_16K));
+    if (dart_has_failed(dev->dart))
+        goto unsafe;
     dart_unmap(dev->dart, EVENT_BUFFER_IOVA, max(DWC3_EVENT_BUFFERS_SIZE, SZ_16K));
+    if (dart_has_failed(dev->dart))
+        goto unsafe;
+
+    if (!dart_shutdown_checked(dev->dart))
+        goto unsafe;
 
     free(dev->evtbuffer);
     free(dev->scratchpad);
@@ -1895,9 +1949,13 @@ void usb_dwc3_shutdown(dwc3_dev_t *dev)
         ringbuffer_free(dev->pipe[i].host2device);
     }
 
-    if (dev->dart)
-        dart_shutdown(dev->dart);
     free(dev);
+    return true;
+
+unsafe:
+    /* No further controller accesses, reset attempts or ownership release. */
+    usb_dwc3_mark_unsafe(dev);
+    return false;
 }
 
 u8 usb_dwc3_getbyte(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)

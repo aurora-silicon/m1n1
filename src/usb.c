@@ -167,6 +167,8 @@ static int usb_drd_get_regs(u32 idx, struct usb_drd_regs *regs)
 
 int usb_phy_bringup(u32 idx)
 {
+    if (usb_dwc3_shutdown_failed())
+        return -1;
     char path[24];
 
     if (idx >= USB_IODEV_COUNT)
@@ -217,12 +219,14 @@ int usb_phy_bringup(u32 idx)
 
 dwc3_dev_t *usb_iodev_bringup(u32 idx)
 {
-    dart_dev_t *usb_dart = usb_dart_init(idx);
-    if (!usb_dart)
+    if (usb_dwc3_shutdown_failed())
         return NULL;
-
     struct usb_drd_regs usb_reg;
     if (usb_drd_get_regs(idx, &usb_reg) < 0)
+        return NULL;
+
+    dart_dev_t *usb_dart = usb_dart_init(idx);
+    if (!usb_dart)
         return NULL;
 
     return usb_dwc3_init(usb_reg.drd_regs, usb_dart);
@@ -333,6 +337,8 @@ static int usb_init_one(char *hpm_path, tps6598x_dev_t *tps, void *unused)
 
 void usb_init(void)
 {
+    if (usb_dwc3_shutdown_failed())
+        return;
     if (usb_is_initialized)
         return;
 
@@ -401,6 +407,8 @@ void usb_hpm_restore_irqs(bool force)
 
 void usb_iodev_init(void)
 {
+    if (usb_dwc3_shutdown_failed())
+        return;
 #if defined(J700_CDC_PROXY) || defined(T8140_KIS_PROXY) || defined(J700_ESP_STAGE2)
     if (chip_id == T8140)
         return;
@@ -411,12 +419,18 @@ void usb_iodev_init(void)
         struct iodev *usb_iodev;
 
         opaque = usb_iodev_bringup(i);
-        if (!opaque)
+        if (!opaque) {
+            if (usb_dwc3_shutdown_failed())
+                return;
             continue;
+        }
 
         usb_iodev = memalign(SPINLOCK_ALIGN, sizeof(*usb_iodev));
-        if (!usb_iodev)
+        if (!usb_iodev) {
+            if (!usb_dwc3_shutdown(opaque))
+                return;
             continue;
+        }
 
         usb_iodev->ops = &iodev_usb_ops;
         usb_iodev->opaque = opaque;
@@ -428,17 +442,28 @@ void usb_iodev_init(void)
     }
 }
 
-void usb_iodev_shutdown(void)
+bool usb_iodev_shutdown(void)
 {
+    if (usb_dwc3_shutdown_failed())
+        return false;
     for (int i = FIRST_USB_IODEV; i < USB_IODEV_COUNT; i++) {
         struct iodev *usb_iodev = iodev_unregister_device(IODEV_USB0 + i);
         if (!usb_iodev)
             continue;
 
         printf("USB%d: shutdown\n", i);
-        usb_dwc3_shutdown(usb_iodev->opaque);
+        usb_iodev->usage = 0;
+        if (iodev_usb_vuart.opaque == usb_iodev->opaque) {
+            iodev_usb_vuart.usage = 0;
+            iodev_usb_vuart.opaque = NULL;
+        }
+        if (!usb_dwc3_shutdown(usb_iodev->opaque)) {
+            iodev_register_device(IODEV_USB0 + i, usb_iodev);
+            return false;
+        }
         free(usb_iodev);
     }
+    return true;
 }
 
 void usb_iodev_vuart_setup(iodev_id_t iodev)
@@ -451,6 +476,8 @@ void usb_iodev_vuart_setup(iodev_id_t iodev)
 
 int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
 {
+    if (usb_dwc3_shutdown_failed())
+        return -1;
 #ifndef J700_CDC_PROXY
     (void)set_step;
     (void)force_swapped;
@@ -481,8 +508,10 @@ int usb_cdc_link_start(void (*set_step)(unsigned step), bool force_swapped)
 
     set_step(5);
     if (usb_cdc_atc_switch_pipe()) {
+        device->usage = 0;
+        if (!usb_dwc3_shutdown(dwc))
+            return -1;
         iodev_unregister_device(IODEV_USB0);
-        usb_dwc3_shutdown(dwc);
         free(device);
         return -1;
     }

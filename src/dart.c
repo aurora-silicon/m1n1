@@ -113,6 +113,7 @@ struct dart_params {
 };
 
 struct dart_dev {
+    bool failed;
     bool locked;
     bool keep;
     uintptr_t regs;
@@ -128,6 +129,8 @@ struct dart_dev {
 
 static void dart_t8020_tlb_invalidate(dart_dev_t *dart)
 {
+    if (dart->failed)
+        return;
     write32(dart->regs + DART_T8020_STREAM_SELECT, BIT(dart->device));
 
     /* ensure that the DART can see the updated pagetables before invalidating */
@@ -135,11 +138,13 @@ static void dart_t8020_tlb_invalidate(dart_dev_t *dart)
     write32(dart->regs + DART_T8020_STREAM_COMMAND, DART_T8020_STREAM_COMMAND_INVALIDATE);
 
     if (poll32(dart->regs + DART_T8020_STREAM_COMMAND, DART_T8020_STREAM_COMMAND_BUSY, 0, 100))
-        printf("dart: DART_T8020_STREAM_COMMAND_BUSY did not clear.\n");
+        dart->failed = true;
 }
 
 static void dart_t8110_tlb_invalidate(dart_dev_t *dart)
 {
+    if (dart->failed)
+        return;
     /* ensure that the DART can see the updated pagetables before invalidating */
     dma_wmb();
     write32(dart->regs + DART_T8110_TLB_CMD,
@@ -147,7 +152,7 @@ static void dart_t8110_tlb_invalidate(dart_dev_t *dart)
                 FIELD_PREP(DART_T8110_TLB_CMD_STREAM, dart->device));
 
     if (poll32(dart->regs + DART_T8110_TLB_CMD, DART_T8110_TLB_CMD_BUSY, 0, 100))
-        printf("dart: DART_T8110_TLB_CMD_BUSY did not clear.\n");
+        dart->failed = true;
 }
 
 /* 26A428 SPTM gen3dart_write_tlbi_cmd_payload: a 128-bit aperture write,
@@ -382,10 +387,9 @@ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t
     return dart;
 
 error:
-    if (!dart->locked)
-        free(dart->l1);
-    free(dart);
-    return NULL;
+    /* A previous root may already be published. Retain the failed domain. */
+    dart->failed = true;
+    return dart;
 }
 
 dart_dev_t *dart_init_adt(const char *path, int instance, int device, bool keep_pts)
@@ -543,7 +547,7 @@ dart_dev_t *dart_init_fdt_locked(void *dt, u32 phandle, int device)
 
 int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_base)
 {
-    if (dart->locked)
+    if (dart->failed || dart->locked)
         return -1;
 
     int node = adt_path_offset(adt, path);
@@ -623,6 +627,8 @@ int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_
         }
 
         dart->params->tlb_invalidate(dart);
+        if (dart->failed)
+            return -1;
     }
 
     return 0;
@@ -680,7 +686,7 @@ static int dart_map_page(dart_dev_t *dart, uintptr_t iova, uintptr_t paddr, u32 
 
 int dart_map_flags(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len, u32 flags)
 {
-    if (dart->locked)
+    if (dart->failed || dart->locked)
         return -1;
 
     uintptr_t paddr = (uintptr_t)bfr;
@@ -705,7 +711,7 @@ int dart_map_flags(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len, u32 
     }
 
     dart->params->tlb_invalidate(dart);
-    return 0;
+    return dart->failed ? -1 : 0;
 }
 
 int dart_map(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len)
@@ -728,7 +734,7 @@ static void dart_unmap_page(dart_dev_t *dart, uintptr_t iova)
 
 void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
 {
-    if (dart->locked)
+    if (dart->failed || dart->locked)
         return;
 
     if (len % SZ_16K)
@@ -748,7 +754,7 @@ void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
 
 void dart_free_l2(dart_dev_t *dart, uintptr_t iova)
 {
-    if (dart->locked)
+    if (dart->failed || dart->locked)
         return;
 
     if (iova & ((1 << 25) - 1)) {
@@ -923,11 +929,13 @@ u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len)
     return DART_PTR_ERR;
 }
 
-void dart_shutdown(dart_dev_t *dart)
+bool dart_shutdown_checked(dart_dev_t *dart)
 {
+    if (!dart || dart->failed)
+        return false;
     if (dart->locked || dart->keep) {
         free(dart);
-        return;
+        return true;
     }
 
     write32(DART_TCR(dart), dart->params->tcr_disabled);
@@ -935,6 +943,10 @@ void dart_shutdown(dart_dev_t *dart)
     for (int i = 0; i < dart->params->ttbr_count; ++i)
         if (is_heap(dart->l1[i]))
             write32(DART_TTBR(dart, i), 0);
+
+    dart->params->tlb_invalidate(dart);
+    if (dart->failed)
+        return false;
 
     for (int ttbr = 0; ttbr < dart->params->ttbr_count; ++ttbr) {
         for (int i = 0; i < SZ_16K / 8; ++i) {
@@ -948,12 +960,21 @@ void dart_shutdown(dart_dev_t *dart)
         }
     }
 
-    dart->params->tlb_invalidate(dart);
-
     for (int i = 0; i < dart->params->ttbr_count; ++i)
         if (is_heap(dart->l1[i]))
             free(dart->l1[i]);
     free(dart);
+    return true;
+}
+
+void dart_shutdown(dart_dev_t *dart)
+{
+    (void)dart_shutdown_checked(dart);
+}
+
+bool dart_has_failed(dart_dev_t *dart)
+{
+    return !dart || dart->failed;
 }
 
 u64 dart_vm_base(dart_dev_t *dart)

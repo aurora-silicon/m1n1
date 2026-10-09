@@ -18,6 +18,8 @@ static struct { void *entry; } next_stage;
 static char image[16];
 static int load_error, copy_error, freed, copied;
 static bool shutdown_ok;
+static bool usb_failed;
+static bool usb_dwc3_shutdown_failed(void) { return usb_failed; }
 static bool nvme_init(void) { return true; }
 static bool nvme_has_live_post_m4_session(void) { return true; }
 static bool nvme_shutdown(void) { return shutdown_ok; }
@@ -43,16 +45,17 @@ static void rust_free_image(void *data, size_t size)
 ''' + source + r'''
 int main(void)
 {
-    for (int failure = 0; failure < 4; failure++) {
+    for (int failure = 0; failure < 5; failure++) {
         char *vars[1];
         size_t count = 0;
         freed = copied = 0;
         load_error = failure == 1 ? -1 : 0;
         copy_error = failure == 2 ? -1 : 0;
         shutdown_ok = failure != 3;
+        usb_failed = failure == 4;
         assert(chainload_load("test", vars, &count, 1) == (failure ? -1 : 0));
-        assert(freed == (failure != 1));
-        assert(copied == (failure != 1));
+        assert(freed == (failure != 1 && failure != 4));
+        assert(copied == (failure != 1 && failure != 4));
         assert(!!next_stage.entry == !failure);
     }
     return 0;

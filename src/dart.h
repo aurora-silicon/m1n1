@@ -17,6 +17,7 @@ enum dart_type_t {
     DART_GEN3,
 };
 
+/* Failed published domains are retained; check dart_has_failed before use. */
 dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t type);
 dart_dev_t *dart_init_adt(const char *path, int instance, int device, bool keep_pts);
 void dart_lock_adt(const char *path, int instance);
@@ -33,6 +34,8 @@ u64 dart_search(dart_dev_t *dart, void *paddr);
 u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len);
 u64 dart_search_range(dart_dev_t *dart, u64 paddr, size_t len);
 void dart_shutdown(dart_dev_t *dart);
+bool dart_shutdown_checked(dart_dev_t *dart);
+bool dart_has_failed(dart_dev_t *dart);
 u64 dart_vm_base(dart_dev_t *dart);
 
 #endif

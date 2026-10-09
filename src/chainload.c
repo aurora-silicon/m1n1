@@ -10,6 +10,7 @@
 #include "nvme.h"
 #include "string.h"
 #include "types.h"
+#include "usb.h"
 #include "utils.h"
 #include "xnuboot.h"
 
@@ -32,6 +33,8 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
 
     printf("chainload: Preparing image...\n");
     next_stage.entry = NULL;
+    if (usb_dwc3_shutdown_failed())
+        return -1;
     if (!image || !size || (chip_id == T8140 && ro_status != 1) ||
         cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size)
         return -1;
@@ -166,6 +169,11 @@ int chainload_load(const char *spec, char **vars, size_t *var_cnt, size_t var_ca
     void *image;
     size_t size;
     int ret;
+
+    if (usb_dwc3_shutdown_failed()) {
+        next_stage.entry = NULL;
+        return -1;
+    }
 
     if (!nvme_init()) {
         printf("chainload: NVME init failed\n");

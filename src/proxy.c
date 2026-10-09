@@ -107,6 +107,11 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
                                      request->args[3], request->args[4]);
             break;
         case P_VECTOR:
+            if (usb_dwc3_shutdown_failed()) {
+                next_stage.entry = NULL;
+                reply->retval = -1;
+                break;
+            }
             // forcefully restore tps6598x IRQs
             usb_hpm_restore_irqs(1);
             iodev_console_flush();
@@ -429,7 +434,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_KBOOT_BOOT:
-            if (kboot_boot((void *)request->args[0]) == 0)
+            reply->retval = kboot_boot((void *)request->args[0]);
+            if (reply->retval == 0)
                 return 1;
             break;
         case P_KBOOT_SET_CHOSEN:

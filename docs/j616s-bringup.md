@@ -135,6 +135,24 @@ PR664 defines the newer offsets but its enable routine still uses the older
 registers. Cache-control writes and TZ register interpretation remain
 unqualified.
 
+## Native USB retirement
+
+Generic DWC3 shutdown now ends every active endpoint, including control OUT,
+using its recorded resource index and a forced ENDTRANSFER command. It waits
+for the matching command-completion event before checking controller halt,
+reset and DART invalidation. Constructor or retirement failures retain DMA
+memory and tables, latch the failed owner and prevent another initialization
+or native entry. The caller must provide recovery after an uncertain stop.
+
+A guarded RAM test with this C implementation boots a candidate and vectors
+back to a recovery image. Both new USB generations pass complete relocated
+executable checks and preserve the caller's 45-second watchdog. The final
+verified recovery explicitly disables it. The earlier checked implementation
+failed this transition; adding the resource, force and completion handling
+made it pass. Test-only watchdog startup and RAM diagnostics stay outside
+the production changes. Native Linux gadget traffic and SuperSpeed remain
+unqualified.
+
 ## DCP management
 
 A guarded inherited-state test checks the current 25G76 firmware UUID, exact

@@ -4098,6 +4098,10 @@ int kboot_prepare_dt(void *fdt)
 
 int kboot_boot(void *kernel)
 {
+    if (usb_dwc3_shutdown_failed()) {
+        next_stage.entry = NULL;
+        return -1;
+    }
     int ret = mcc_enable_cache();
     if (ret && chip_id == T8140) {
         printf("kboot: refusing T8140 handoff after MCC cache failure\n");
