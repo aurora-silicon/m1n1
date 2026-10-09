@@ -119,7 +119,13 @@ VHE EL2 with the kernel MMU enabled. A separately compiled copy of Linux's
 upstream reset routine runs through its verified physical identity mapping,
 disables translation and returns to the verified proxy. This establishes the
 early VHE transition and bounded recovery, not complete reset-register
-qualification or execution of `start_kernel`.
+qualification or completed kernel startup.
+
+The next checkpoint reaches the original `start_kernel` prefix and records
+the physical CPU identification and Linux version banner. The stopped
+writer's bounded printk snapshot is cache-published before recovery; two
+complete captures match and their record IDs, sequence and text bounds pass.
+`setup_arch`, interrupt delivery and Linux gadget traffic remain unqualified.
 
 ## Memory controller
 
