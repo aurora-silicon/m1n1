@@ -286,9 +286,13 @@ unqualified.
   protected configuration test while remaining in shutdown. The test completes
   534 byte writes, checks page 0, mode 0x82, identity 0x30 and digital volume
   0xc9 on each amp, and restores both I2C controllers and the shared reset GPIO.
-  No speaker DMA or output is enabled. Native `spkr`/`ms00` playback uses six
-  24-bit samples in 32-bit slots; its ADMAC framing, feedback and audible output
-  remain unqualified. See the driver contracts for initialization order.
+  No output is enabled during that test. Native `spkr`/`ms00` playback uses six
+  24-bit samples in 32-bit slots. A separate cold test checks its exact profile
+  and power transitions, then completes one 1,152,000-byte zero-data TX0
+  descriptor with all amps held in reset. Its report, zero residue/DART faults,
+  configuration and frontend restoration, and watchdog recovery pass.
+  Native DMA format selection, feedback and audible output remain unqualified.
+  See the driver contracts for initialization order and the tested AP policy.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored

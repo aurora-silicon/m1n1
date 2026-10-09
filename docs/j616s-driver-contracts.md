@@ -172,8 +172,19 @@ The native `spkr` / `spS ` profile uses MCA group 0 and `ms00`: six 24-bit
 playback samples in 32-bit slots, nominally 48 kHz. Feedback uses twelve
 16-bit slots; its native sample-width field is zero, so the decoded sample
 format remains unqualified. The ADT selects ADMAC TX0/RX1 and mapper stream
-8. Qualify their ownership and six-channel framing before submitting DMA;
-the tested stereo headphone channel cannot supply that proof.
+8. A subsequent cold control test attaches `spkr`, checks its exact 109-byte
+profile before and after power changes, and returns it through `pw1 `,
+`pwrd` with output flag 2, `pw1 ` and `idle`. All state readbacks match.
+
+A finite zero-data TX0 test then completes 1,152,000 bytes using a dedicated
+2 MiB stream-8 allocation at IOVA 0x80000000. Both complete payload reads are
+zero before submission. The AP policy selects the supplied 32-bit DMA record,
+preserves FRAME and the firmware-published adapter settings, and uses an owned
+0x480-byte FIFO with 0x240/0x480 transfer/almost-full thresholds. The matching
+report, zero residue, empty rings, zero DART faults, TX configuration restore,
+frontend idle and watchdog recovery pass. All amps remain held in reset.
+This qualifies finite silent DMA; audible output and feedback remain untested.
+Audio channel count alone does not establish an ADMAC FRAME encoding.
 
 ## ISP completed colour frames
 
