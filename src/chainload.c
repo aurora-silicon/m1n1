@@ -57,6 +57,13 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     const void *log_prop = adt_getprop(adt, anode, "preoslog", NULL);
     if (log_prop && ADT_GETPROP_ARRAY(adt, anode, "preoslog", preoslog) < 0)
         return -1;
+    if (preoslog[1] &&
+        (preoslog[0] < cur_boot_args.phys_base || preoslog[1] > cur_boot_args.mem_size ||
+         preoslog[0] - cur_boot_args.phys_base > cur_boot_args.mem_size - preoslog[1] ||
+         preoslog[1] > SIZE_MAX - image_size - SZ_16K)) {
+        printf("chainload: preoslog 0x%lx+0x%lx is outside RAM\n", preoslog[0], preoslog[1]);
+        return -1;
+    }
     size_t preoslog_off = image_size;
     image_size += preoslog[1];
     image_size = ALIGN_UP(image_size, SZ_16K);
@@ -72,6 +79,10 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     size_t stub_size = _chainload_stub_end - _chainload_stub_start;
 
     void *new_image = malloc(image_size + stub_size);
+    if (!new_image) {
+        printf("chainload: cannot allocate 0x%lx bytes\n", image_size + stub_size);
+        return -1;
+    }
 
     // Copy m1n1
     memcpy(new_image, image, size);

@@ -84,7 +84,10 @@ void run_actions(void)
         printf("J613 Stage 1: board/25G83 guard rejected; proxy only\n");
         goto proxy_fallback;
     }
-    if (stage1_config_target()) {
+    /* A factory or invalid configuration is a proxy-only image: no payload scan. */
+    if (!stage1_config_target())
+        goto proxy_fallback;
+    {
         u32 window_ms = stage1_config_window_ms();
         usb_init();
         usb_iodev_init();

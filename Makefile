@@ -69,6 +69,9 @@ CFLAGS := $(BASE_CFLAGS) -mgeneral-regs-only
 
 CFG :=
 ifeq ($(J613_ESP_STAGE1),1)
+ifneq ($(CHAINLOADING),1)
+$(error J613_ESP_STAGE1 requires CHAINLOADING=1)
+endif
 CFG += J613_ESP_STAGE1
 endif
 ifeq ($(RELEASE),1)
