@@ -72,6 +72,18 @@ must put Image or Image.gz, the matching DTB, and a gzip or cpio initramfs at
 the named paths. Do not mix a kernel Image and modules from different build
 output folders.
 
+For an EFI boot manager such as U-Boot, use `-` as the fourth field:
+
+```sh
+printf '%s\n' 'boot=<ESP PARTUUID>;aurora/boot/u-boot.bin;aurora/boot/t8140-j700.dtb;-' >> stage2-for-esp.bin
+```
+
+This loads only the image and DTB, without publishing a loader initramfs.
+The selected EFI OS image supplies its own initramfs. Do not substitute an
+empty cpio archive: Linux gives `linux,initrd-*` in the device tree priority
+over the EFI initramfs, so an empty archive can hide the OS's storage modules
+and `/init`. The three-file direct Linux route remains unchanged.
+
 ## Qualification and installation
 
 The J700 CDC transition arms a 170 second watchdog while waiting for
