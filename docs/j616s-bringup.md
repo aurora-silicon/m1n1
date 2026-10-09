@@ -283,8 +283,8 @@ unqualified.
   evidence and pass the longer restoration trial. Transport timing and
   restart remain under qualification. AOP shutdown still needs watchdog
   recovery;
-  installed images are preserved. Speaker playback references were captured
-  under native macOS; proxy speaker playback remains unqualified.
+  installed images are preserved. Native macOS speaker traces supplied the
+  protection and transport references for the separate playback tests below.
   The shared `CS42L84Input` class supplies the validated input-only codec
   lifecycle through bounded caller-provided register access. It requires
   receiver-start and receiver-stop gates, preserves unrelated register bits,
@@ -330,9 +330,24 @@ unqualified.
   and DART faults; both amps mute before TX stops and restores its fields.
   An I2C timeout during the later amplifier shutdown wrapper prevents complete
   cleanup. Mappings remain retained until successful watchdog recovery.
-  Repeated full-array configuration still exposes intermittent I2C completion
-  timeouts. Native DMA format selection, feedback, all-six acoustic output and
-  continuous playback remain unqualified.
+  A subsequent observed-status-clear sequence completes all 534 shutdown
+  writes with exact controller/GPIO restoration in 7.1 seconds. The second
+  left/right woofers and both tweeters then each pass an individual one-second
+  pulse, matching TX completion, zero residue/DART faults, muted stop, full
+  amplifier/controller/GPIO restoration and watchdog recovery. The user
+  confirms tones from every driver. Woofers use 300 Hz; tweeters use 2 kHz.
+  The second woofers and left tweeter use DVC 0x65, while the right tweeter
+  uses the requested lower setting, DVC 0x78 (60 dB attenuation). These tests
+  qualify all six individually, not simultaneous full-array playback.
+
+  Python I2C status clearing now writes the observed status word and refuses
+  an active transfer. This follows native and upstream Linux handling;
+  undefined status bits remain intact in the snapshot. Eight host regressions
+  and direct live calls on both idle speaker buses pass. The bounded private
+  amp trials keep their existing error and XEN/no-XIP completion gates.
+  These successful runs do not prove that intermittent timeouts are cured.
+  Native DMA format selection, feedback, calibration and continuous playback
+  remain unqualified.
   See the driver contracts for initialization order and the tested AP policy.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
@@ -466,9 +481,9 @@ unqualified.
   DART errors and CPU exceptions are zero; NOP and watchdog recovery pass.
   This qualifies one completed 1080p frame, not continuous 1080p streaming,
   restart, exposure/noise calibration or measured FPS.
-* Bounded left/right first-woofer pulses are user-confirmed audible. Complete speaker
-  playback, feedback and calibration remain unqualified; the separate headphone
-  path also has user-confirmed finite output.
+* All six speakers have user-confirmed individual tone output. Feedback,
+  calibration, simultaneous full-array and continuous playback remain
+  unqualified; the separate headphone path also has finite output.
 
 The experimental stage 2 was chainloaded into RAM. Installed boot images,
 boot policy and partitions were not changed. Preserve a working CDC recovery

@@ -213,6 +213,27 @@ shutdown wrapper prevents complete cleanup; resources remain retained until
 watchdog recovery. This qualifies paired playback, not reliable repeated
 cleanup, all-six output, continuous streaming or feedback calibration.
 
+All six drivers now have user-confirmed individual tone output. The second
+left/right woofers use their native RX slots 2/3 and 300 Hz; the left/right
+tweeters use slots 4/5 and 2 kHz. Every new test is limited to one second with
+peak 0.125 and 20 ms fades. Full protection is reapplied to the selected amp;
+the other five remain in their freshly verified factory shutdown state.
+Matching TX reports, zero residue/DART faults, mute before TX stop, protected
+shutdown, exact controller/GPIO restoration and watchdog recovery all pass.
+DVC is 0x65 for the second woofers and left tweeter, 0x78 for the right tweeter.
+These levels are finite test settings, not calibrated system volume.
+
+The Python I2C helper clears only the observed status snapshot and rejects XIP
+before writing it. Its direct calls are qualified on both idle speaker buses;
+private bounded amp trials use the same clear policy with their stronger
+ownership, error and XEN/no-XIP completion gates unchanged. The existing generic
+transfer methods still reset FIFOs before this check, so the helper change
+alone does not make their entire operation safe for concurrent clients.
+Successful shutdown and four new playback cleanups do not establish that the
+intermittent STOP fault is resolved. I/V decoding, feedback framing, acoustic
+calibration, simultaneous all-six and continuous operation remain unfinished.
+
+
 ## ISP completed colour frames
 
 Compose the existing [startup](../proxyclient/m1n1/fw/isp/isp_startup.py),
