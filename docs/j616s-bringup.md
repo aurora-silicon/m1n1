@@ -4,7 +4,9 @@ Tested on J616sAP (Mac16,7), board 6, with the ADT supplied by macOS build
 26A428. The branch is stacked on `j700` while the draft targets `aurora-wip`.
 Upstream Asahi M1/M2/M3 m1n1 and proxyclient behavior is the implementation
 standard; J700 is the feature-parity target. Linux RAM boot preparation is
-now in scope, but no J616s Linux boot is qualified yet.
+now in scope. A bounded one-CPU hypervisor Linux boot reaches a RAM-only
+BusyBox shell; native boot, persistent operation and Linux peripherals remain
+unqualified.
 
 For implementation order, formats and ownership rules, start with the
 [driver contracts](j616s-driver-contracts.md).
@@ -54,7 +56,7 @@ calling through the RX alias and keeps its scratch code unchanged until all
 workers return. Earlier trials violated these assumptions and are invalid
 qualification evidence. No new SMP/AMP driver code was needed.
 
-Deep sleep, hotplug, hypervisor operation and sustained thermal load remain
+Deep sleep, hotplug, multicore hypervisor operation and sustained thermal load remain
 unqualified. Reproduce the cold independent-workload test with:
 
 ```sh
@@ -62,6 +64,31 @@ M1N1DEVICE=/dev/ttyACM0 python proxyclient/experiments/t6040_amp.py
 ```
 
 The probe leaves secondaries running in WFE mode. Reboot before repeating it.
+
+## Minimal Linux RAM boot
+
+A guarded direct-entry test boots Linux 7.1.12+ through m1n1's hypervisor on
+one CPU with an owned 64 MiB guest allocation. Image, FDT and initramfs are
+read back twice and cache-published before entry. The guest maps only its RAM,
+the physical AIC and an intercepted UART console on the second CDC interface.
+Its CPU node uses the observed architectural affinity 0x10100.
+
+The RAM initramfs reaches a BusyBox shell and accepts a diagnostic command:
+kernel version, CPU online 0, uptime advancing across a two-second sleep,
+kernel configuration hash and RAM-only mounts all return. Timer interrupts
+advance and the interrupt error count remains zero. No block device is mounted.
+
+An initial run exposed a host reply-ordering defect: register postchecks after
+the exception proxy's EXIT command race the resumed guest's next notification.
+Deferring those checks until the next suspended handler fixes the captured
+opcode mismatch; byte-level regressions exercise the actual proxy framing.
+Normal prechecks, pending records and write-ownership bounds remain enforced.
+
+The bounded capture ends with a host timeout while the guest is running.
+Mappings and guest memory remain retained until hardware-watchdog recovery
+returns the installed proxy with its watchdog disabled. This is not a clean
+guest shutdown or a persistent Linux development session. Native boot, Linux
+SMP and peripheral drivers require separate qualification.
 
 ## Memory controller
 
