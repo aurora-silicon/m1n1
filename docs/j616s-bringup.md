@@ -142,6 +142,15 @@ decoder rejects this valid state; watchdog recovery passes. These results
 establish controller initialization, not timer or interrupt delivery, completed
 kernel startup or a Linux gadget shell.
 
+A later diagnostic completes the original timer initialization, global IRQ
+enable and console initialization. The selected timer's IRQ 36 count advances
+from zero to one over 3,730,061 counter ticks at the reported 1 GHz frequency
+(3.730061 ms). The console is the dummy 80-by-25 console. Two complete log
+captures match and validate 50 finalized records. Recovery returns to the
+verified proxy and explicitly disables the watchdog. This establishes native
+timer interrupt delivery; device initialization and a gadget shell remain
+unqualified.
+
 ## Memory controller
 
 The ADT identifies the controller as `mcc,t6041`, with four AMCC apertures
