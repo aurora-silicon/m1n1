@@ -121,6 +121,27 @@ input-only codec lifecycle. The caller owns board power/reset, the fresh
 matching the 32-bit TX framing alone was insufficient. Stop TX and RX before
 restoring codec/controller state. This does not qualify playback or speakers.
 
+### Headphone output reference
+
+Native macOS 27 build 26A428 uses the separate `audio-codec-output` node
+(phandle 442, DMA parent 455). Its current `coS ` profile selects `ms02` TX,
+rising edge, delay 1, two channels with mask 3, 24-bit samples in 32-bit slots,
+48 kHz and a 3.072 MHz clock. The TX routing mask is 4. This is a native
+reference; proxy playback and simultaneous input/output remain unqualified.
+
+The native CS42L84 setup routes `BUS_DAC_SRC` at 0x4001 to 0xed: DAC A takes
+ASP RX channel 1 and DAC B takes channel 2. It enables both ASP RX channels
+at 0x5020. The output DMA records use ID 4; input records use ID 5. Bind the
+controller's direction and channel selection before submitting output DMA.
+
+The native `PrepareIo` output branch switches away from RCO, configures the
+common TDM bus, configures headphone routing and slots, then powers the
+headphone path. Its post-DAC call through hardware field 0x48 notifies Mikey
+headset detection (`mikeyChangingHPOUTEnabled`); it is not an IIS clock-enable
+call. Preserve shared clock ownership when testing input and output together.
+Qualify left and right separately with a recorded acoustic loopback, then
+verify stop and restoration. Microphone capture alone does not qualify output.
+
 ## ISP completed colour frames
 
 Compose the existing [startup](../proxyclient/m1n1/fw/isp/isp_startup.py),
