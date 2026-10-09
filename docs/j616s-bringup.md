@@ -135,6 +135,22 @@ PR664 defines the newer offsets but its enable routine still uses the older
 registers. Cache-control writes and TZ register interpretation remain
 unqualified.
 
+## DCP management
+
+A guarded inherited-state test checks the current 25G76 firmware UUID, exact
+clock ancestry, absence of a target-side DCP client and existing stream-23
+translation before mailbox access. The CPU is running and both mailboxes are
+healthy and empty; no unsolicited Hello is pending.
+
+A separate bounded test sends one standard RTKit IOP power INIT request,
+without starting/resetting the CPU or changing DART. It receives Hello,
+negotiates protocol 12 and acknowledges the complete endpoint map, including
+endpoint 0x23 used by the existing iBoot service. DART errors remain zero and
+watchdog recovery passes. This establishes management communication, not AFK
+application startup, shared-buffer ownership, firmware-version queries or
+scanout control. The inherited DART context has three levels; the SoC's support
+for four levels does not authorize replacing that existing context.
+
 ## Other devices
 
 * CDC proxy and bulk reads work at USB high speed (480 Mb/s). RAM-only
