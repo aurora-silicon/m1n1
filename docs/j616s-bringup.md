@@ -125,7 +125,12 @@ The next checkpoint reaches the original `start_kernel` prefix and records
 the physical CPU identification and Linux version banner. The stopped
 writer's bounded printk snapshot is cache-published before recovery; two
 complete captures match and their record IDs, sequence and text bounds pass.
-`setup_arch`, interrupt delivery and Linux gadget traffic remain unqualified.
+A later checkpoint completes the original `setup_arch`, including removal of
+the initial identity map. Recovery calls Linux's original identity-map install
+routine, uses reset code in the new map's executable page and preserves the
+separate guest register bank. Two complete static log captures match and show
+the machine model and reserved-memory ranges. Interrupt delivery and Linux
+gadget traffic remain unqualified.
 
 ## Memory controller
 
