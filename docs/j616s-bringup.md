@@ -291,7 +291,16 @@ unqualified.
   and power transitions, then completes one 1,152,000-byte zero-data TX0
   descriptor with all amps held in reset. Its report, zero residue/DART faults,
   configuration and frontend restoration, and watchdog recovery pass.
-  Native DMA format selection, feedback and audible output remain unqualified.
+  A later bounded left-woofer pulse is user-confirmed audible: one second of
+  300 Hz, peak 0.125 and DVC attenuation of 60 dB. Matching TX completion,
+  zero residue/DART faults, muted stop, amplifier/controller/GPIO restoration
+  and watchdog recovery pass. Its measured active interval is 1.219 seconds.
+  A separate right-woofer-only pulse at the codec control midpoint (DVC 0x65,
+  50.5 dB attenuation) also passes transport and cleanup; listening confirmation
+  is pending. The other five amps remain in their verified initial shutdown.
+  Repeated full-array configuration still exposes intermittent I2C completion
+  timeouts. Native DMA format selection, feedback, all-six acoustic output and
+  continuous playback remain unqualified.
   See the driver contracts for initialization order and the tested AP policy.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
@@ -425,9 +434,9 @@ unqualified.
   DART errors and CPU exceptions are zero; NOP and watchdog recovery pass.
   This qualifies one completed 1080p frame, not continuous 1080p streaming,
   restart, exposure/noise calibration or measured FPS.
-* Speaker output remains unqualified. Amplifier communication and protected
-  shutdown configuration passed; the separately qualified headphone path
-  submitted a finite output descriptor.
+* One bounded left-woofer pulse is user-confirmed audible. Complete speaker
+  playback, feedback and calibration remain unqualified; the separate headphone
+  path also has user-confirmed finite output.
 
 The experimental stage 2 was chainloaded into RAM. Installed boot images,
 boot policy and partitions were not changed. Preserve a working CDC recovery

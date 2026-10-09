@@ -183,8 +183,26 @@ preserves FRAME and the firmware-published adapter settings, and uses an owned
 0x480-byte FIFO with 0x240/0x480 transfer/almost-full thresholds. The matching
 report, zero residue, empty rings, zero DART faults, TX configuration restore,
 frontend idle and watchdog recovery pass. All amps remain held in reset.
-This qualifies finite silent DMA; audible output and feedback remain untested.
+This qualifies finite silent DMA. A subsequent left-woofer pulse has audible
+user confirmation; feedback remains untested.
 Audio channel count alone does not establish an ADMAC FRAME encoding.
+
+The tested left pulse enables only native slot 0 / `i2c1:38`, using 300 Hz,
+peak 0.125, 20 ms fades and DVC 0x78 (60 dB attenuation). The native protection
+configuration precedes muted mode 0x81 and a measured minimum 33 ms dwell.
+Fresh profile, power, owned payload/translation and DMA-readiness checks precede
+active mode 0x80. The matching completed report triggers mute before TX stops
+or restores its fields. Cleanup restores minimum volume, uses the native
+test-page 0x64 shutdown wrapper and 1 ms dwell, then restores controllers/GPIO.
+The measured active interval is 1.219 seconds for the one-second payload.
+
+The right diagnostic enables only slot 1 / `i2c3:3b`, with full protection on
+that amp and the other five left in verified shutdown 0x1a. Its finite transfer,
+cleanup and recovery pass; acoustic confirmation is pending. DVC 0x65 is about
+the midpoint of the documented inverted 201-step mixer range, not a calibrated
+macOS volume-slider percentage. Full-array setup still has intermittent I2C
+completion failures. Keep uncertain state for watchdog recovery and retain
+XEN completion/error checks; unknown status bit 29 is not an acknowledgement.
 
 ## ISP completed colour frames
 
