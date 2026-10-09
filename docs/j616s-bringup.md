@@ -114,6 +114,13 @@ verifies the kernel stack, task pointer and exception vectors before
 Diagnostic code uses owned linker padding with verified permissions; guest
 tables and CPU context remain retained after the warm return.
 
+A later checkpoint also completes the original `finalise_el2` transition to
+VHE EL2 with the kernel MMU enabled. A separately compiled copy of Linux's
+upstream reset routine runs through its verified physical identity mapping,
+disables translation and returns to the verified proxy. This establishes the
+early VHE transition and bounded recovery, not complete reset-register
+qualification or execution of `start_kernel`.
+
 ## Memory controller
 
 The ADT identifies the controller as `mcc,t6041`, with four AMCC apertures
