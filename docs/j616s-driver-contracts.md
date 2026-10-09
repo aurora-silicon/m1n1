@@ -126,8 +126,9 @@ restoring codec/controller state. This does not qualify playback or speakers.
 Native macOS 27 build 26A428 uses the separate `audio-codec-output` node
 (phandle 442, DMA parent 455). Its current `coS ` profile selects `ms02` TX,
 rising edge, delay 1, two channels with mask 3, 24-bit samples in 32-bit slots,
-48 kHz and a 3.072 MHz clock. The TX routing mask is 4. This is a native
-reference; proxy playback and simultaneous input/output remain unqualified.
+48 kHz and a 3.072 MHz clock. The TX routing mask is 4. A finite proxy test
+completed stereo DMA and the user heard the separate left/right tones.
+Simultaneous input/output and continuous playback remain unqualified.
 
 The native CS42L84 setup routes `BUS_DAC_SRC` at 0x4001 to 0xed: DAC A takes
 ASP RX channel 1 and DAC B takes channel 2. It enables both ASP RX channels
@@ -139,8 +140,40 @@ common TDM bus, configures headphone routing and slots, then powers the
 headphone path. Its post-DAC call through hardware field 0x48 notifies Mikey
 headset detection (`mikeyChangingHPOUTEnabled`); it is not an IIS clock-enable
 call. Preserve shared clock ownership when testing input and output together.
-Qualify left and right separately with a recorded acoustic loopback, then
-verify stop and restoration. Microphone capture alone does not qualify output.
+Qualify left and right separately, then verify stop and restoration. The
+tested two-second transfer used left 440 Hz and right 880 Hz, 20 ms fades,
+PCM peak 0.25 and DAC attenuation of 60 dB. The matching report, zero residue
+and DART status, muted DAC stop and codec/controller restoration all passed.
+The user confirmed audible output; no acoustic calibration follows from it.
+
+### Speaker amplifiers
+
+The master `audio-speaker` node links six SN012776 amplifiers. Provider order
+is left woofer 1, right woofer 1, left woofer 2, right woofer 2, left tweeter,
+right tweeter. Their bus/address pairs are `i2c1:38`, `i2c3:3b`, `i2c1:39`,
+`i2c3:3c`, `i2c1:3a`, `i2c3:3d`. All six returned page 0, shutdown mode
+0x1a and identity 0x30 after releasing the shared AP GPIO reset at pin 0x36.
+
+A bounded proxy test configured all six while keeping them shut down. Native
+configuration includes DC blocking, over-power protection, board BOP bytes,
+test-page writes, per-amp RX/I/V slots and TX zero-drive masks. The first
+shutdown transition includes the native test-page 0x64 wrapper and a 1 ms
+dwell. Configure calls `setOperationalMode(false, true)`, which selects
+protected shutdown 0x82. It does not select muted operation 0x81.
+
+The test set digital volume to 0xc9 before configuration and expanded native
+broadcasts one amp at a time. All 534 byte writes completed. Final page,
+mode, identity and volume readbacks matched 0/0x82/0x30/0xc9 on each amp;
+each I2C controller and the shared reset GPIO were restored. No speaker DMA
+or output was enabled. These results qualify communication and configuration,
+not protection efficacy, feedback decoding or audible playback.
+
+The native `spkr` / `spS ` profile uses MCA group 0 and `ms00`: six 24-bit
+playback samples in 32-bit slots, nominally 48 kHz. Feedback uses twelve
+16-bit slots; its native sample-width field is zero, so the decoded sample
+format remains unqualified. The ADT selects ADMAC TX0/RX1 and mapper stream
+8. Qualify their ownership and six-channel framing before submitting DMA;
+the tested stereo headphone channel cannot supply that proof.
 
 ## ISP completed colour frames
 

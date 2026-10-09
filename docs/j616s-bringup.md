@@ -282,6 +282,13 @@ unqualified.
   while avoiding growing snapshots between FIFO bytes. Headset capture and
   headphone playback are qualified separately; simultaneous duplex,
   continuous playback, calibration and Linux audio remain unqualified.
+* All six SN012776 speaker amplifiers pass native identity reads and a bounded
+  protected configuration test while remaining in shutdown. The test completes
+  534 byte writes, checks page 0, mode 0x82, identity 0x30 and digital volume
+  0xc9 on each amp, and restores both I2C controllers and the shared reset GPIO.
+  No speaker DMA or output is enabled. Native `spkr`/`ms00` playback uses six
+  24-bit samples in 32-bit slots; its ADMAC framing, feedback and audible output
+  remain unqualified. See the driver contracts for initialization order.
 * MTP completes RTKit startup, answers a management ping and acknowledges
   AP/IOP quiescence. The ADT selects DART stream 0, unlike the older MTP
   experiment's stream 1. Four-level mappings and ADT DAPF ranges are restored
@@ -414,8 +421,9 @@ unqualified.
   DART errors and CPU exceptions are zero; NOP and watchdog recovery pass.
   This qualifies one completed 1080p frame, not continuous 1080p streaming,
   restart, exposure/noise calibration or measured FPS.
-* No speaker output or speaker amplifier programming was performed. Only
-  the input-only ADMAC prototype described above submitted an audio descriptor.
+* Speaker output remains unqualified. Amplifier communication and protected
+  shutdown configuration passed; the separately qualified headphone path
+  submitted a finite output descriptor.
 
 The experimental stage 2 was chainloaded into RAM. Installed boot images,
 boot policy and partitions were not changed. Preserve a working CDC recovery
