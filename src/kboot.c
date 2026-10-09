@@ -1631,6 +1631,8 @@ static int dt_disable_pcie_mappers(int parent)
 
 static int dt_disable_t8140_pcie(void)
 {
+    if (pcie_t8140_disable_piodma(dt))
+        return -1;
     int nodes[64];
     int count = 0;
     int node = -1;
@@ -4126,6 +4128,11 @@ int kboot_boot(void *kernel)
                 return -1;
         } else {
             printf("kboot: T8140 APCIe initialized; retaining PCIe consumers\n");
+            ret = pcie_t8140_handoff(dt);
+            if (ret < 0)
+                return -1;
+            if (ret > 0 && dt_disable_t8140_pcie())
+                return -1;
         }
         if (fdt_pack(dt))
             bail("FDT: fdt_pack() failed\n");

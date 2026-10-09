@@ -179,3 +179,12 @@ int smc_write_u32(smc_dev_t *smc, u32 key, u32 value)
 
     return smc_cmd(smc, msg);
 }
+
+int smc_write_u64(smc_dev_t *smc, u32 key, u64 value)
+{
+    memcpy(smc->shmem, &value, sizeof(value));
+    u64 msg = FIELD_PREP(SMC_MSG_TYPE, SMC_WRITE_KEY);
+    msg |= FIELD_PREP(SMC_WRITE_KEY_SIZE, sizeof(value));
+    msg |= FIELD_PREP(SMC_WRITE_KEY_KEY, key);
+    return smc_cmd(smc, msg);
+}
