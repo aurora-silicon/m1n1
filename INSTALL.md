@@ -17,11 +17,16 @@ After this, booting that volume goes iBoot → stage 1 → 15 s USB proxy window
 ## Build
 
 ```sh
-make RELEASE=1 USE_CLANG=1 CHAINLOADING=1 J613_ESP_STAGE1=1
-# Aurora's tool, from aurora-silicon/m1n1 aed999725:
-python3 tools/fill_stage1_config.py --input build/m1n1.bin --output m1n1-stage1-j613.bin \
-  --esp-partuuid <ESP PARTUUID> --stage2-path <dir>/stage2.bin --window-ms 15000
+tools/j613-stage1/build.sh            # factory image, tag v1.6.1-j613s1-g<commit>, manifest + SHA256SUMS
+# On the Mac, from Linux (reads the ESP PARTUUID from /boot/efi and checks the target exists):
+sudo python3 tools/j613-stage1/fill_stage1_config.py build/j613-stage1/m1n1-j613-stage1-<tag>.bin \
+  /boot/efi/j613-stage1.bin --target <path on the ESP>     # default m1n1/boot.bin (Aurora boot.bin)
+python3 tools/j613-stage1/fill_stage1_config.py --check /boot/efi/j613-stage1.bin   # size, MD5, cksum
 ```
+
+The 2026-10-07 installed image was built with plain `make … CHAINLOADING=1 J613_ESP_STAGE1=1` and
+filled by Aurora's `tools/fill_stage1_config.py` (aurora-silicon/m1n1 aed999725); the block format
+is the same.
 
 `--stage2-path` is relative to the ESP root. The configuration is a 260-byte CRC-checked block inside the image: filling it does not change the size (ours is
 1,196,032 bytes). An empty or CRC-invalid block means proxy only. Stage 2 is a normal m1n1 stage 2 with DTB, kernel

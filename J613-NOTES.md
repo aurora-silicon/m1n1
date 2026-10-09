@@ -62,3 +62,25 @@ maralcbr/omarchy-pkgs). It is not ours and not included; nothing here depends on
 - `30e01de` kboot: J613 25G83 (macOS 26.6.2) DCP mapping handoff
 - `f974c0f` J613 stage 1: 15 s USB proxy window, then stage 2 from an ESP file
 - `d5d2932` kboot: export J613's same-boot ADT display clock on 25G83
+
+## Publish branch `satchlj/j613-stage1-publish` (2026-10-09)
+
+For iconidentify/aurora-linux's `--m3-profile=j613-25g83` route: J613 users boot Linux through
+their own macOS 26.6.2 volume with this stage 1 chainloading the Aurora `m1n1/boot.bin`.
+
+- `23c2196`: stage 1 bounds `preoslog`, checks the image allocation, goes straight to the proxy
+  on an empty configuration, and requires `CHAINLOADING=1`, as in patch 0054 of the
+  m1n1-aurora 1.6.1.aurora15 recipe (which carries this stage 1).
+- `05c8fb8`: `tools/j613-stage1/build.sh` (version tag `v1.6.1-j613s1-g<12-hex commit>`),
+  `tools/j613-stage1/fill_stage1_config.py` (reads the ESP PARTUUID on Linux; target defaults to
+  `m1n1/boot.bin`), `tests/j613-stage1/test_stage1_config.py`.
+- Factory image from `05c8fb8`: `m1n1-j613-stage1-v1.6.1-j613s1-g05c8fb886667.bin`, 1,196,032
+  bytes, SHA-256 `3816a065ce9f820495d594f71abc4f39475d6044fd23e9da916b0abcf844dd1e`; two builds
+  (Rust 1.89.0, clang/lld 18.1.3) in different directories are identical.
+- Size matters: iBoot puts the panel DCP's live `__OS_LOG` (144 KiB) right after the installed
+  raw object, and stage 1 copies stage 2 over that address. At 0x124000 bytes the log falls in
+  Aurora m1n1's zero .bss (its payload starts at 0x3e0000). `build.sh` refuses sizes outside
+  0x114000..0x3bc000. The aurora15 tree built as stage 1 is 0x3f0000 bytes: too large.
+- Not tested on hardware yet: this commit's image, chainloading the Aurora `boot.bin`, U-Boot on
+  26.6.2. The test plan is in mac-aurora-omarchy
+  `machines/m3-air/research/2026-10-09-25g83-stage1-publish/`.
