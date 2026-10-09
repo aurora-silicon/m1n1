@@ -296,7 +296,13 @@ unqualified.
   zero residue/DART faults, muted stop, amplifier/controller/GPIO restoration
   and watchdog recovery pass. Its measured active interval is 1.219 seconds.
   A separate right-woofer-only pulse at the codec control midpoint (DVC 0x65,
-  50.5 dB attenuation) also passes transport and cleanup and is user-confirmed audible. The other five amps remain in their verified initial shutdown.
+  50.5 dB attenuation) also passes transport and cleanup and is user-confirmed
+  audible. The other five amps remain in their verified initial shutdown.
+  A subsequent paired first-woofer test is user-confirmed audible for five
+  seconds. Its finite 5,760,000-byte TX0 descriptor completes with zero residue
+  and DART faults; both amps mute before TX stops and restores its fields.
+  An I2C timeout during the later amplifier shutdown wrapper prevents complete
+  cleanup. Mappings remain retained until successful watchdog recovery.
   Repeated full-array configuration still exposes intermittent I2C completion
   timeouts. Native DMA format selection, feedback, all-six acoustic output and
   continuous playback remain unqualified.

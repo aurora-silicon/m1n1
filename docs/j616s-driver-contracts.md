@@ -198,11 +198,20 @@ The measured active interval is 1.219 seconds for the one-second payload.
 
 The right diagnostic enables only slot 1 / `i2c3:3b`, with full protection on
 that amp and the other five left in verified shutdown 0x1a. Its finite transfer,
-cleanup and recovery pass; a repeat has user-confirmed audible output. DVC 0x65 is about
+cleanup and recovery pass; a repeat has user-confirmed audible output. DVC 0x65
+is about
 the midpoint of the documented inverted 201-step mixer range, not a calibrated
 macOS volume-slider percentage. Full-array setup still has intermittent I2C
 completion failures. Keep uncertain state for watchdog recovery and retain
 XEN completion/error checks; unknown status bit 29 is not an acknowledgement.
+
+A five-second paired first-woofer test at that codec setting is user-confirmed
+audible. It uses an owned 6 MiB output allocation for 5,760,000 payload bytes.
+The matching report, zero residue/DART faults, both post-report mute writes and
+TX configuration restoration pass. A later I2C timeout in the amplifier
+shutdown wrapper prevents complete cleanup; resources remain retained until
+watchdog recovery. This qualifies paired playback, not reliable repeated
+cleanup, all-six output, continuous streaming or feedback calibration.
 
 ## ISP completed colour frames
 
