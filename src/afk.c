@@ -647,7 +647,7 @@ static int afkv2_copy_response(afk_epic_ep_t *epic, void *payload, size_t size,
 }
 
 /* Until the native PHY callbacks are implemented, complete peer commands with
- * kIOReturnUnsupported. AFKEPCommandLocal accepts an empty response; for OOB
+ * kIOReturnUnsupported. The firmware accepts an empty response; for OOB
  * commands retain the descriptor addresses but return zero bytes. Never map or
  * dereference a firmware-supplied address merely to reject an operation. */
 static int afkv2_reject_command(afk_epic_ep_t *epic, const struct afkv2_hdr *hdr,
@@ -781,7 +781,7 @@ static int afkv2_command(afk_epic_ep_t *epic, int channel, u16 type, void *txbuf
             return -1;
         }
         /* Firmware supplies its own token/timestamp in responses. Correlate
-         * by interface, subtype and command ID, as AFKEPInterfaceV2 does. */
+         * by interface, subtype and command ID, as the firmware's V2 interface does. */
         if (hdr->interface == channel && msg->category == AFKV2_RESPONSE &&
             msg->type == type) {
             ret = afkv2_copy_response(epic, payload, size, packet.cmd.id, rxbuf, rxsize);

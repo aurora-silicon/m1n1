@@ -542,7 +542,7 @@ const struct feat_t *cpufreq_get_features(void)
     }
 }
 
-/* T8152ACC::setPerfState in matching 26A428 firmware uses logical offset
+/* On T8152 (26A428 firmware) a perf-state request uses logical offset
  * 0xe20020. E/P ACC maps resolve that to RegMap 0x20/0x40 + 0x20. The ADT
  * supplies the physical apertures and the hardware-index bias (2 on J873g).
  * Do not apply earlier-generation voltage/PLL/chicken-bit initialization. */
