@@ -10,9 +10,6 @@ def test_t8140_pcie_nodes_disabled(tmp_path):
     start = source.index("static int dt_add_pcie_iommu(")
     end = source.index("static int dt_get_iommu_node(", start)
     helper = source[start:end]
-    radio = (repo / "src/pcie_t8140.c").read_text()
-    piodma = radio[radio.index("int pcie_t8140_disable_piodma("):
-                   radio.index("static int radio_delprop(")]
     harness = r'''
 #include <assert.h>
 #include <stdio.h>
@@ -20,7 +17,7 @@ def test_t8140_pcie_nodes_disabled(tmp_path):
 #include "libfdt.h"
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 static void *dt;
-''' + piodma + helper + r'''
+''' + helper + r'''
 static void add_node(int parent, const char *name)
 {
     assert(fdt_add_subnode(dt, parent, name) >= 0);
@@ -70,12 +67,6 @@ int main(void)
     add_node(fdt_path_offset(dt, "/iommu@390000000"), "piodma@1");
     add_node(0, "iommu@391000000");
     add_node(0, "iommu@other");
-    add_node(0, "dma-controller@390030000");
-    add_node(0, "dma-controller@other");
-    assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/dma-controller@390030000"),
-                              "compatible", "apple,t8140-piodma-diagnostic"));
-    assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/dma-controller@other"),
-                              "compatible", "other,dma"));
     set_node("/serial@0", "serial");
     set_node("/pcie@1", "pci");
     set_node("/pcie@1/port@0", "pci");
@@ -111,8 +102,6 @@ int main(void)
     expect_status("/iommu@391000000", "disabled");
     expect_status("/iommu@other", "okay");
     expect_status("/serial@0", "okay");
-    expect_status("/dma-controller@390030000", "disabled");
-    assert(!fdt_getprop(dt, fdt_path_offset(dt, "/dma-controller@other"), "status", NULL));
     assert(fdt_pack(dt) == 0);
     assert(fdt_check_header(dt) == 0);
 

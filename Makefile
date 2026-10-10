@@ -225,7 +225,6 @@ OBJECTS := \
 	nvme.o \
 	payload.o \
 	pcie.o \
-	pcie_t8140.o \
 	pmgr.o \
 	proxy.o \
 	ringbuffer.o \
