@@ -1510,7 +1510,14 @@ static void usb_dwc3_handle_event_dev(dwc3_dev_t *dev, const struct dwc3_event_d
 static void usb_dwc3_handle_event(dwc3_dev_t *dev, const union dwc3_event event)
 {
     if (dev->shutting_down) {
-        /* Only drain command completions; do not rearm traffic or handle resets. */
+        /* Retire terminal transfers without rearming traffic or handling resets. */
+        if (!event.type.is_devspec && event.depevt.endpoint_number < MAX_ENDPOINTS &&
+            event.depevt.endpoint_event == DWC3_DEPEVT_XFERCOMPLETE &&
+            !(event.depevt.status & DEPEVT_STATUS_BUSERR)) {
+            u8 ep = event.depevt.endpoint_number;
+            dev->endpoints[ep].xfer_in_progress = false;
+            dev->endpoints[ep].resource_index = 0;
+        }
         if (!event.type.is_devspec && event.depevt.endpoint_event == DWC3_DEPEVT_EPCMDCMPLT)
             usb_dwc3_handle_event_ep(dev, event.depevt);
         return;

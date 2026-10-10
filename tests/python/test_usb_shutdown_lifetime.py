@@ -433,18 +433,23 @@ def test_shutdown_event_drain_never_rearms_traffic_or_reannounces(tmp_path):
 #include <stddef.h>
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define DWC3_DEPEVT_EPCMDCMPLT 7
+#define DWC3_DEPEVT_XFERCOMPLETE 1
+#define DEPEVT_STATUS_BUSERR 1
+#define MAX_ENDPOINTS 16
+typedef uint8_t u8;
 #define DWC3_EVENT_TYPE_DEV 0
 static void ignore_debug(const char *format, ...) {}
 #define usb_debug_printf(...) ignore_debug(__VA_ARGS__)
 typedef struct {
     bool failed, shutting_down;
+    struct { bool xfer_in_progress, end_cmd_pending; unsigned resource_index; } endpoints[MAX_ENDPOINTS];
     struct { bool pending; unsigned attempts; } recovery;
 } dwc3_dev_t;
 union dwc3_event {
     uint32_t raw;
     struct { unsigned is_devspec : 1; unsigned type : 7; unsigned rest : 24; } type;
-    struct { unsigned one : 1; unsigned ep : 5; unsigned endpoint_event : 4;
-             unsigned rest : 22; } depevt;
+    struct { unsigned one : 1; unsigned endpoint_number : 5; unsigned endpoint_event : 4;
+             unsigned reserved : 2; unsigned status : 4; unsigned parameters : 16; } depevt;
     unsigned devt;
 };
 static unsigned ep_calls, dev_calls, recovery_calls;
