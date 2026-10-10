@@ -469,10 +469,7 @@ static int usb_dwc3_ep_command(dwc3_dev_t *dev, u8 ep, u32 command, u32 par0, u3
         return -1;
     }
 
-    u32 raw = read32(dev->regs + DWC3_DEPCMD(ep));
-    if (dev->shutting_down)
-        return (raw >> 12) & 0xf;
-    return DWC3_DEPCMD_STATUS(raw);
+    return DWC3_DEPCMD_STATUS(read32(dev->regs + DWC3_DEPCMD(ep)));
 }
 
 static int usb_dwc3_end_transfer(dwc3_dev_t *dev, u8 ep)
