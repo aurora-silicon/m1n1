@@ -522,13 +522,15 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_HV_INIT:
-            hv_init();
+            if (hv_init())
+                reply->status = S_ERROR;
             break;
         case P_HV_MAP:
             hv_map(request->args[0], request->args[1], request->args[2], request->args[3]);
             break;
         case P_HV_START:
-            hv_start((void *)request->args[0], &request->args[1]);
+            if (hv_start((void *)request->args[0], &request->args[1]))
+                reply->status = S_ERROR;
             break;
         case P_HV_TRANSLATE:
             reply->retval = hv_translate(request->args[0], request->args[1], request->args[2],

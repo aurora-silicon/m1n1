@@ -89,6 +89,7 @@ static void apply_mitigations(void)
 
 int mitigations_perform(void)
 {
+    bool failed = false;
     apply_mitigations();
     for (int i = 0; i < MAX_CPUS; i++) {
         if (i == boot_cpu_idx)
@@ -96,7 +97,7 @@ int mitigations_perform(void)
         if (smp_is_alive(i)) {
             if (smp_call0(i, apply_mitigations) || smp_wait(i, NULL)) {
                 printf("Mitigations: CPU %d initialization failed\n", i);
-                return -1;
+                failed = true;
             }
         }
     }
@@ -105,8 +106,10 @@ int mitigations_perform(void)
     for (unsigned i = 0; i < ARRAY_SIZE(mitigations); i++) {
         const struct mitigation *p = &mitigations[i];
         printf("  %4s: %s\n", p->name,
-               p->vulnerable ? (p->mitigated ? "Mitigated" : "Vulnerable") : "Not vulnerable");
+               failed          ? "Unknown (CPU initialization incomplete)"
+               : p->vulnerable ? (p->mitigated ? "Mitigated" : "Vulnerable")
+                               : "Not vulnerable");
     }
     printf("\n");
-    return 0;
+    return failed ? -1 : 0;
 }

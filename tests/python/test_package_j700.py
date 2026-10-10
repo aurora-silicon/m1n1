@@ -40,3 +40,9 @@ def test_package_includes_fatfs_license(tmp_path, monkeypatch):
     logo_license = package_j700.REPO / "3rdparty_licenses/LICENSE.AURORA-LOGO"
     assert (output / "3rdparty_licenses/LICENSE.AURORA-LOGO").read_bytes() == \
         logo_license.read_bytes()
+
+    guide = output / "ESP-AND-INSTALL.md"
+    assert guide.read_bytes() == (package_j700.REPO / "docs/j700-install.md").read_bytes()
+    digest = hashlib.sha256(guide.read_bytes()).hexdigest()
+    assert f"{digest}  ESP-AND-INSTALL.md" in \
+        (output / "SHA256SUMS").read_text().splitlines()

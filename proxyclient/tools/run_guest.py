@@ -145,9 +145,15 @@ for i in args.command:
 if args.shell:
     run_shell(hv.shell_locals, "Entering hypervisor shell. Type ^D to start the guest.")
 
-hv.start()
+try:
+    hv.start()
+except ProxyRemoteError as exc:
+    print(f"Hypervisor failed: {exc}. Target state retained for inspection.")
 
 run_shell(hv.shell_locals, "Hypervisor exited. Entering shell.")
 
-p.smp_stop_secondaries(True)
+try:
+    p.smp_stop_secondaries(True)
+except ProxyRemoteError as exc:
+    print(f"Secondary shutdown incomplete: {exc}. Continuing best-effort sleep.")
 p.sleep(True)

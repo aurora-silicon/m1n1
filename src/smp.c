@@ -65,6 +65,12 @@ static bool smp_initialized = false;
 static u64 cpu_start_base;
 static struct cpu_info cpu_info[MAX_CPUS];
 
+static struct {
+    bool pending;
+    bool deep_sleep;
+    u64 flag;
+} cpu_stop_state[MAX_CPUS];
+
 u64 smp_started_mask;
 u64 smp_start_fail_mask;
 
@@ -373,22 +379,44 @@ static int smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
 
     if (!spin_table[index].flag)
         return 0;
-    if (spin_table[index].target)
-        return -1;
 
-    printf("Stopping CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
+    if (!cpu_stop_state[index].pending) {
+        /* Do not overwrite an in-flight call. Give it a chance to complete
+         * before publishing the PMGR stop request. */
+        if (spin_table[index].target && smp_wait(index, NULL)) {
+            printf("SMP: CPU %d still has a pending call\n", index);
+            return -1;
+        }
 
-    u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
+        printf("Stopping CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
+        u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
+        cpu_stop_state[index].flag = spin_table[index].flag;
+        cpu_stop_state[index].deep_sleep = deep_sleep;
+        cpu_stop_state[index].pending = true;
 
-    // Request CPU stop
-    write32(start_base + 0x0, cpu_start_bit(index, cpu));
-
-    u64 dsleep = deep_sleep;
-    // Put the CPU to sleep
-    if (smp_call1(index, cpu_sleep, dsleep)) {
-        printf("SMP: CPU %d did not accept the stop request\n", index);
-        return -1;
+        // Request CPU stop before the CPU enters its sleep routine.
+        write32(start_base + 0x0, cpu_start_bit(index, cpu));
+        int ret = smp_call1(index, cpu_sleep, deep_sleep);
+        if (ret && ret != SMP_TIMEOUT) {
+            cpu_stop_state[index].pending = false;
+            printf("SMP: CPU %d rejected the stop request\n", index);
+            return ret;
+        }
     }
+
+    /* A timed-out acknowledgement leaves the stop request queued. On retry,
+     * observe that request rather than dispatching over it or clearing it. */
+    for (i = 0; i < 50; i++) {
+        sysop("dmb ld");
+        if (spin_table[index].flag != cpu_stop_state[index].flag)
+            break;
+        udelay(1000);
+    }
+    if (i >= 50) {
+        printf("SMP: CPU %d has not acknowledged the stop request\n", index);
+        return SMP_TIMEOUT;
+    }
+    deep_sleep = cpu_stop_state[index].deep_sleep;
 
     // If going into deep sleep, powering off the last core in a cluster kills our register
     // access, so just wait a bit.
@@ -396,6 +424,7 @@ static int smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
         udelay(10000);
         printf("  Presumed stopped.\n");
         memset(&spin_table[index], 0, sizeof(struct spin_table));
+        cpu_stop_state[index].pending = false;
         return 0;
     }
 
@@ -414,6 +443,7 @@ static int smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
         printf("  Stopped.\n");
 
         memset(&spin_table[index], 0, sizeof(struct spin_table));
+        cpu_stop_state[index].pending = false;
     }
     return 0;
 }
@@ -767,6 +797,7 @@ int smp_stop_secondaries(bool deep_sleep)
 
     smp_set_wfe_mode(true);
 
+    int ret = 0;
     for (int i = 0; i < MAX_CPUS; i++) {
         struct cpu_info *cpu = &cpu_info[i];
 
@@ -774,9 +805,9 @@ int smp_stop_secondaries(bool deep_sleep)
             continue;
 
         if (smp_stop_cpu(i, cpu, deep_sleep))
-            return -1;
+            ret = -1;
     }
-    return 0;
+    return ret;
 }
 
 void smp_send_ipi(int cpu)

@@ -98,6 +98,9 @@ ifeq ($(J700_ESP_STAGE2),1)
 ESP_STAGE2 := 1
 endif
 
+# Select an ESP-loaded image and omit the embedded Stage 1 configuration.
+# Transport and handoff special cases remain scoped to their supported chips;
+# the option does not imply hardware qualification on every platform.
 ifeq ($(ESP_STAGE2),1)
 ifneq ($(CHAINLOADING),1)
 $(error ESP_STAGE2 requires CHAINLOADING=1 for boot=)
