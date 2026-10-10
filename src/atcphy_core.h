@@ -169,13 +169,10 @@ typedef enum {
 #define ATCPHY_PIPEHANDLER_LOCK_ACK  0x14u /* atc.c:450 */
 #define ATCPHY_PIPEHANDLER_LOCK_EN   (1u << 0)
 #define ATCPHY_PIPEHANDLER_LOCK_ACK_TIMEOUT_US 1000u /* atc.c:462 */
-/* The ROUTED-USB4 mux commit uses Apple's own macOS budget, not atc.c's.
- * Decoded from AppleT8142USBXHCI::setUSB3Mode's USB4 branch (T6050 BootKC
- * com.apple.driver.usb.AppleSynopsysUSB40XHCI): both LOCK_PIPE_IF_ACK polls
- * are clock_interval_to_deadline(6, NSEC_PER_MSEC) = 6 ms, stepped at
- * IODelay(500) = 500 us (kc addrs 0xb0a94f0/0xb0a9550 set-poll and
- * 0xb0aaba4/0xb0aac04 clear-poll).  atc.c's 1 ms is the dummy/USB3 value; the
- * routed path is a separate, longer Apple budget and gets its own constant. */
+/* The ROUTED-USB4 mux commit uses macOS's own budget, not atc.c's: both
+ * LOCK_PIPE_IF_ACK polls allow 6 ms, stepped at 500 us.  atc.c's 1 ms is
+ * the dummy/USB3 value; the routed path is a separate, longer budget and
+ * gets its own constant. */
 #define ATCPHY_PIPEHANDLER_LOCK_ACK_ROUTED_TIMEOUT_US 6000u
 
 #define ATCPHY_PIPEHANDLER_AON_GEN                       0x1Cu

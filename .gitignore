@@ -20,4 +20,3 @@ __pycache__
 .vscode/
 /.venv/
 null.d
-/tools/ghidra/*-decomp.txt

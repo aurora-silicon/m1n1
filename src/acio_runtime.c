@@ -136,37 +136,29 @@ static int acio_control_disable(acio_type5_runtime_t *runtime)
     return result;
 }
 
-/* Apple-equivalent of the ADT platform function `Fact` on
- * /arm-io/dart-acioN, i.e. `function-dart_force_active`.
+/* Equivalent of the ADT platform function `Fact` on /arm-io/dart-acioN,
+ * i.e. `function-dart_force_active`.
  *
- * Decoded: `Fact` is a FourCC selector, not an ADT op-stream.
- * IODART::callPlatformFunction matches 'Fact' (0x46616374) on an
- * exactly-8-byte property and dispatches to
- * AppleT8110DART::_forceAvailable(bool) with the bool taken as
- * `*(u32 *)arg != 0`.  That method sets a software force-available flag and
- * then, through _updateAvailability -> _powerUp/_powerDown, votes the
- * DART's OWN PMGR clock gate: AppleARMIODevice::enableDeviceClock(enable,
- * index 0) against the DART node's `clock-gates[0]`, reaching
- * ApplePMGR::_enableDevice with action (enable, auto=0) -> PMGR target
+ * `Fact` is a FourCC selector (0x46616374) on an exactly-8-byte property,
+ * not an ADT op-stream; its argument is a bool (`*(u32 *)arg != 0`).
+ * Forcing the DART active sets a software force-available flag and votes
+ * the DART's OWN PMGR clock gate (the DART node's `clock-gates[0]`) to
  * ACTIVE 0xf when enabling and PWRGATE 0 when disabling.
  *
- * It writes NO DART MMIO register.  Its `power-gates` leg is a proven
- * no-op: ApplePMGRFunctionPowerGate::callFunction drops the enable argument
- * and only queries _wasDeviceDisabled, and Apple passes a NULL out-pointer.
+ * It writes NO DART MMIO register, and its `power-gates` leg does nothing.
  *
- * The software half exists solely to suppress _updateAvailability's
- * mapper-driven auto-gating.  m1n1 has no such policy engine, so nothing
+ * The software flag exists solely to stop automatic power gating of the
+ * DART while mappers use it.  m1n1 has no such policy engine, so nothing
  * here will ever gate the DART underneath a live NHI DMA stream.  The clock
  * vote is therefore the entire equivalent, and it is idempotent when iBoot
  * has already left the gate ACTIVE.
  *
  * The ordering constraint that actually matters is clock-ACTIVE BEFORE
- * TCR/TTBR programming, not Apple's placement at the end of setHWState(2).
+ * TCR/TTBR programming, not the late point at which macOS issues it.
  * m1n1 may legally issue it earlier, immediately before dart_init_adt().
  *
- * Rollback is only safe once DMA is quiesced: Apple's force-inactive flag
- * makes _updateAvailability skip the "is any mapper still enabled?" scan
- * and gate unconditionally. */
+ * Rollback is only safe once DMA is quiesced: forcing the DART inactive
+ * gates it unconditionally, without checking for enabled mappers. */
 static int acio_dart_force_active(acio_type5_runtime_t *runtime,
                                   const char *dart_path, bool enable)
 {
@@ -178,13 +170,12 @@ static int acio_dart_force_active(acio_type5_runtime_t *runtime,
 
     /* MEASURED on the live J414s ADT: /arm-io/dart-acio{0,1,2} carry
      * `manual-availability = 1` but have NO `clock-gates` and NO
-     * `power-gates` property at all.  So on this machine Apple's own
-     * _powerUp -> enableDeviceClock(1, index 0) fails its bounds check and
-     * returns kIOReturnBadArgument, which _powerUp discards.
+     * `power-gates` property at all.  So on this machine the clock vote has
+     * no gate to act on and is ignored.
      *
      * In other words `Fact(1)` performs NO PMGR action here; only the
      * software force-available flag is set, and that flag exists purely to
-     * suppress _updateAvailability's mapper-driven auto-gating, which m1n1
+     * suppress automatic DART power gating, which m1n1
      * has no counterpart for.  Absence is therefore the expected case and
      * must NOT fail the bring-up -- an earlier revision treated it as an
      * error and would have aborted the control ring on real hardware.
@@ -326,8 +317,7 @@ static int acio_control_start(acio_type5_runtime_t *runtime)
     write32(rx + 0x00, (u32)rx_iova);
     write32(rx + 0x04, (u32)(rx_iova >> 32));
     /* RX +0x0C is NOT a plain count: it is
-     * {[27:16] buffer size, [15:0] ring size}, built by
-     * `ldrh w22,[x19,#0x38]; ldr w8,[x19,#0x40]; bfi w22,w8,#0x10,#0xc`.
+     * {[27:16] buffer size, [15:0] ring size}.
      * Writing a bare count leaves the per-descriptor buffer size at zero,
      * so the engine has no bound on how much it may write per descriptor. */
     write32(rx + ACIO_TYPE5_RING_COUNT_OFFSET,
@@ -337,9 +327,8 @@ static int acio_control_start(acio_type5_runtime_t *runtime)
     /* RX +0x14 = {[31:16] SOF PDF bitmask, [15:0] EOF PDF bitmask}.  The
      * PDF is the descriptor's EOF nibble and each mask is a bitmap over the
      * 16 possible nibble values, so 0xffff/0xffff is the promiscuous
-     * control-ring policy Apple's ControlPath::createReceiver installs.
-     * Type5 calls the base implementation first and then mirrors the
-     * identical word into register range 1 at +0x4000*hop, so BOTH writes
+     * control-ring receive policy.  On Type5 the identical word is also
+     * mirrored into register range 1 at +0x4000*hop, so BOTH writes
      * are required. */
     write32(rx + 0x14, 0xffffffff);
     write32(resources->pdf_base + ACIO_TYPE5_CONTROL_RING * ACIO_TYPE5_RING_STRIDE,
@@ -397,10 +386,10 @@ static u32 acio_get_be32(const u8 *in)
 }
 
 /* Return one consumed RX frame to the ring: re-seed it, advance both the
- * completion and posted cursors, and ring the RX doorbell.  Apple's receive
- * path ALWAYS resubmits the receive command, whether or not the frame was
+ * completion and posted cursors, and ring the RX doorbell.  The receive
+ * is ALWAYS resubmitted, whether or not the frame was
  * claimed by a pending config command, so the ring never stalls on a frame
- * that is not ours (IOThunderboltControlPath::rxCommandCallback). */
+ * that is not ours. */
 static int acio_control_rx_recycle(acio_type5_runtime_t *runtime,
                                    acio_type5_control_transport_t *control,
                                    acio_type5_descriptor_t *rx_descriptor)
@@ -536,8 +525,8 @@ static int acio_control_transaction(acio_type5_runtime_t *runtime,
      * response" is wrong for EVERY transaction; it merely stayed invisible
      * until a device was attached and the event generator armed.
      *
-     * Apple's IOThunderboltConfigCommand::processResponse returns 0 ("not
-     * mine") for EOF 5/6/7 BEFORE any other check, and the receive command is
+     * A config command never claims a frame with EOF 5/6/7 -- that check
+     * comes BEFORE any other -- and the receive is
      * always resubmitted.  Mirror that exactly: consume such a frame, hand
      * the slot back to the ring, and keep waiting inside the same timeout.
      *
@@ -808,8 +797,7 @@ static const char *acio_adapter_kind_name(enum acio_type5_adapter_kind kind)
     }
 }
 
-/* Apple's ~1 s training budget (`0x3B9ACA01` ns) polled at its 10 ms
- * `IOThunderboltSleepUngated` cadence. */
+/* A ~1 s link-training budget polled every 10 ms, as macOS does. */
 #define ACIO_LANE_LINK_TIMEOUT_US 1000000u
 #define ACIO_LANE_LINK_INTERVAL_US 10000u
 #define ACIO_LANE_CAP_MAX_STEPS 32u
@@ -830,8 +818,8 @@ static const char *acio_adapter_kind_name(enum acio_type5_adapter_kind kind)
  *
  * UNPROVEN, and inherited from the existing lane walk: that the list head is
  * ADP_CS_0[7:0]. That is the USB4 spec layout and matches the capability header
- * format proven from the kernelcache ([7:0] next, [15:8] ID), but Apple's
- * findCapability seed for ADAPTER space was not decoded. Relying on it is safe
+ * format ([7:0] next, [15:8] ID), but where the walk starts for ADAPTER space
+ * has not been established. Relying on it is safe
  * only because being wrong fails closed here. */
 static int acio_find_adapter_capability(acio_type5_runtime_t *runtime, u32 index,
                                         u64 route, u8 adapter, u32 mask, u32 value,
@@ -1197,8 +1185,8 @@ int acio_type5_usb3_tunnel_device_up(u32 index, u8 host_lane_adapter,
                               ACIO_TYPE5_CREDITS_DEVICE_SIDE, true) < 0)
         return -1;
 
-    /* Apple's order, and it is NOT symmetric with PCIe: UP first, 100 ms,
-     * then DOWN (activateInternal @0xfffffe0009d568ec/68/9b8). */
+    /* macOS's order, and it is NOT symmetric with PCIe: UP first, 100 ms,
+     * then DOWN. */
     if (acio_usb3_adapter_enable(runtime, index, device_route, usb3_up,
                                  device_cap, true) < 0)
         return -1;
@@ -1394,13 +1382,9 @@ int acio_type5_router_configure(u32 index, u64 route, bool all_parents_support_u
 
 /* T6020 CIO reconfiguration pulse.
  *
- * PROVENANCE, and why the constants here are NOT the ones in the T6050
- * BootKC: IOKit `IONameMatch` is an exact string, not a family match.
- * AppleT6050PMGR matches "pmgr1,t6050" and AppleT6020PMGR matches
- * "pmgr1,t6020", so a T6020 platform never instantiates the T6050 class and
- * its register map does not transfer.  Decoded from
- * AppleT6020PMGR::enableCioReconfig in a genuine RELEASE_ARM64_T6020
- * kernelcache:
+ * The constants here are NOT the T6050 ones: the PMGR is matched by its
+ * exact compatible ("pmgr1,t6050" vs "pmgr1,t6020"), so a T6020 platform
+ * never uses the T6050 register map.  On T6020:
  *
  *   die       = index > 3
  *   slot      = index - 4 * die
@@ -1408,8 +1392,7 @@ int acio_type5_router_configure(u32 index, u64 route, bool all_parents_support_u
  *   done_mask = 1 << (16 + slot)         (T6050 used 2 << (2*slot))
  *   register  = PMGR RegMap 0 + 0xa02c   (T6050 used 0x20060)
  *
- * RegMap 0 is ADT `/arm-io/pmgr` reg index 0, from
- * AppleT6020PMGR::initRegMaps registering (adt_reg_index 0, RegMap 0) first.
+ * RegMap 0 is ADT `/arm-io/pmgr` reg index 0.
  *
  * Sequence: wait for done_mask to CLEAR, plain-store req_bit (not a
  * read-modify-write -- 0xa02c is absent from the forced-wake workaround
@@ -1506,7 +1489,7 @@ static int acio_runtime_power_initial(u32 index)
 {
     char path[32];
     snprintf(path, sizeof(path), "/arm-io/acio%u", index);
-    /* NHI logically requests indices 0, 1 and 2, but ApplePMGR vote/dependency
+    /* NHI logically requests indices 0, 1 and 2, but PMGR vote/dependency
      * accounting keeps parent CIO (0) up until CIO_PCIE (1) and CIO_USB (2)
      * have dropped. Its effective TARGET/ACTUAL order is therefore 1, 2, 0.
      * m1n1 has no vote engine, so issue that proven physical order explicitly.
@@ -1527,14 +1510,14 @@ static int acio_runtime_power_running(u32 index)
 {
     char path[32];
     snprintf(path, sizeof(path), "/arm-io/acio%u", index);
-    /* AppleARMIODevice state 7 maps to action 1 and PMGR target ACTIVE.
-     * enableEmbeddedCPU issues indices 0, 1, 2 and logical index 4. On the
+    /* Power-up raises indices 0, 1, 2 and logical index 4 to PMGR target
+     * ACTIVE. On the
      * J414s ADT there are four clock-gates, so index 4 is deliberately OOB;
      * its unsupported result is discarded. It is not ADT entry 3 and does
-     * not itself name CIO_RECONFIG. Apple's separate SoCTuner notification
+     * not itself name CIO_RECONFIG. The separate tuner notification
      * consequence must be matched at the PMGR boundary, not by aliasing this
-     * index. Apple preserves only index 0's result and discards the results
-     * for 1, 2 and 4. */
+     * index. Only index 0's result counts; the results
+     * for 1, 2 and 4 are discarded. */
     int result = pmgr_adt_power_enable_index(path, 0);
     pmgr_adt_power_enable_index(path, 1);
     pmgr_adt_power_enable_index(path, 2);
@@ -1550,7 +1533,7 @@ static int acio_runtime_power_off(u32 index)
     char path[32];
     int result = 0;
     snprintf(path, sizeof(path), "/arm-io/acio%u", index);
-    /* Match ApplePMGR's child-first physical down-transition order. */
+    /* Match the PMGR's child-first physical down-transition order. */
     static const u8 order[] = {1, 2, 0};
     for (u32 i = 0; i < ARRAY_SIZE(order); i++)
         if (pmgr_adt_power_disable_index(path, order[i]) < 0)

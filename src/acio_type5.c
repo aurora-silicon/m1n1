@@ -383,8 +383,8 @@ int acio_type5_ring_doorbell(enum acio_type5_ring_direction direction, u8 ring, 
     u32 base;
     if (!offset || !value || acio_type5_ring_base(direction, ring, &base) < 0)
         return -1;
-    /* T6020's AppleARMIODevice provider unconditionally selects the grade-A
-     * 32-bit doorbell encoding. The caller owns the required dmb ish. */
+    /* T6020 always uses the 32-bit doorbell encoding. The caller owns the
+     * required dmb ish. */
     *offset = base + 8;
     *value = direction == ACIO_TYPE5_RING_TX ? (u32)index << 16 : index;
     return 0;
@@ -471,18 +471,13 @@ int acio_type5_config_packet_pack(const acio_type5_config_request_t *request, u8
         for (size_t offset = 0; offset < payload_size; offset += sizeof(u32))
             put_be32(packet + 12 + offset, words[offset / sizeof(u32)]);
     }
-    /* Grade-A against ConfigWriteCommand::prepareForExecution
-     * @0xfffffe000ad3e154..0xad3e190 and the identical ConfigReadCommand
-     * path.  Apple computes `length = (dwords << 2) + 0xc`, i.e. the CRC
-     * covers the 12-byte route/address header plus the payload and excludes
-     * the CRC field itself; calls the plain byte-sequential
-     * _IOThunderboltCRC32 @0xfffffe000ad22650 (NOT the byte-swapped-word
-     * variant at 0xad226a0); byte-swaps the result with `rev`; and stores it
+    /* The CRC covers the 12-byte route/address header plus the payload
+     * (`length = (dwords << 2) + 0xc`) and excludes the CRC field itself; it
+     * is computed byte-sequentially, byte-swapped, and stored
      * at `(dwords + 3) << 2` == 12 + payload.  Total frame is 16 + payload.
      *
-     * The CRC itself is CRC32C/Castagnoli: the 256-entry table in the
-     * kernelcache reconstructs exactly from reflected polynomial
-     * 0x82F63B78 (and not from 0xEDB88320), with init 0xFFFFFFFF and a
+     * The CRC itself is CRC32C/Castagnoli: reflected polynomial
+     * 0x82F63B78 (not 0xEDB88320), with init 0xFFFFFFFF and a
      * final inversion. */
     put_be32(packet + 12 + payload_size,
              acio_type5_crc32c(packet, 12 + payload_size, NULL));
@@ -545,10 +540,9 @@ int acio_type5_config_response_parse_n(const acio_type5_config_request_t *reques
      *
      * An earlier revision REQUIRED bit 31 here as a "response marker" and
      * rejected the frame without it.  That requirement is unproven and
-     * dangerous: Apple never re-parses the route on receive at all -- it
-     * matches the inbound frame against the outstanding command object --
-     * and an exhaustive scan of IOThunderboltFamily's __text found no
-     * 22-bit route-high mask anywhere.  If the hardware does not set that
+     * dangerous: macOS never re-parses the route on receive at all -- it
+     * matches the inbound frame against the outstanding command -- and
+     * no 22-bit route-high mask is applied anywhere.  If the hardware does not set that
      * bit, requiring it rejects EVERY valid reply, which would present as a
      * dead config channel rather than as a parser bug.
      *
@@ -578,14 +572,10 @@ int acio_type5_config_response_parse_n(const acio_type5_config_request_t *reques
      * rather than as a parser bug: exactly the failure mode the bit-31
      * note above describes, one field over.
      *
-     * Apple does the same carve-out explicitly.  In
-     * IOThunderboltConfigReadCommand::processResponse the response's
-     * Adapter Num is stored but never compared, and the port comparison is
-     * branched around when the Configuration Space is ROUTER:
-     *     cmp  w21, #0x2      ; space == ROUTER?
-     *     b.eq <skip>         ; yes -> do not compare the port
-     * By contrast IOThunderboltConfigWriteCommand::processResponse compares
-     * it unconditionally, so the exemption is specific to READ responses.
+     * macOS makes the same carve-out: for a config READ response the
+     * Adapter Num is not compared when the Configuration Space is ROUTER,
+     * while a WRITE response's port is always compared, so the
+     * exemption is specific to READ responses.
      * Linux agrees in drivers/thunderbolt/ctl.c check_config_address():
      * the port cannot be checked because it is set to the sender's upstream
      * port.  Hence: enforce the echo on writes, ignore it on router reads. */
@@ -607,9 +597,9 @@ int acio_type5_config_response_parse_n(const acio_type5_config_request_t *reques
     return 0;
 }
 
-/* One 16-byte PDF-3 plug-event ack frame.  See the provenance block over the
- * constants in acio.h; the layout is grade-A from sendPlugEventAck +
- * ConfigErrorCommand::prepareForExecution, the pg VALUES are provisional
+/* One 16-byte PDF-3 plug-event ack frame.  See the notes over the
+ * constants in acio.h; the layout is the ConfigError frame that Linux's
+ * tb_cfg_ack_plug() also builds, the pg VALUES are provisional
  * (Linux-derived).  Route uses the same 22-bit-high/32-bit-low split as
  * config packets; the caller echoes route and port from the received event
  * frame, never from configuration. */
@@ -745,8 +735,8 @@ int acio_type5_nfc_next(acio_type5_nfc_cas_t *cas, u32 observed_cs4)
     u32 total = (observed_cs4 >> ACIO_TYPE5_TOTAL_BUF_SHIFT) & ACIO_TYPE5_TOTAL_BUF_MASK;
     u32 next = current + cas->credits;
 
-    /* Apple bounds the 20-bit field against Total Buffers and returns
-     * kIOReturnNoResources rather than wrapping. */
+    /* The 20-bit field is bounded against Total Buffers; exceeding it is
+     * refused rather than wrapped. */
     if (next > ACIO_TYPE5_NFC_MASK || next > total)
         return -1;
 
@@ -778,7 +768,7 @@ int acio_type5_counter_clear_offset(u16 counter_id, u32 max_counters, u16 *offse
  * LSB byte first (the hop nearest the host), so a device directly attached
  * to the host router on adapter N has route == N at depth 1.
  *
- * Depth is bounded at 6 by childDeviceScanForPort (`cmp w8,#6 ; b.lo`), so
+ * Depth is bounded at 6 (USB4's maximum, Linux TB_SWITCH_MAX_DEPTH), so
  * only bytes 0..5 are ever populated. */
 int acio_type5_route_child(u64 parent_route, u32 parent_depth, u8 adapter,
                            u64 *child_route, u32 *child_depth)
@@ -866,15 +856,9 @@ int acio_type5_router_complete(acio_type5_router_sm_t *sm, int status, u32 value
         /* ROUTER_CS_6 bit 24 = router ready. */
         if ((value & 0x01000000u) != 0x01000000u)
             return -1;
-        /* THE HOST ROUTER STOPS HERE.  IOThunderboltSwitchUSB4::configureRouter
-         * gates everything after this first poll on `depth != 0`:
-         *
-         *   ldr  w8, [x19, #0x10c]   ; fThunderboltDepth
-         *   cmp  w8, #0
-         *   ccmp w20, #0, #0, ne     ; depth==0 -> Z=0
-         *   b.ne <return>            ; always taken for the host router
-         *
-         * So for route 0 the whole sequence is "poll CS_6 bit 24, return".
+        /* THE HOST ROUTER STOPS HERE.  Everything after this first poll
+         * applies only to routers at depth != 0, so for route 0 the whole
+         * sequence is "poll CS_6 bit 24, return".
          * The CS_5 read, the 0x03000000/0x05000000 write, the CV (bit 31)
          * commit and the CS_6 bit 25 poll are the DEVICE-router path and must
          * NOT be issued against the host router.  This mirrors Linux's

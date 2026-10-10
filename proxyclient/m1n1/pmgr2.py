@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Read-only PMGR2 ADT records. This module never accesses MMIO or sends PMS requests.
 
-Layouts are derived from AppleT8152PMGR in macOS 27 build 26A428; see
-docs/j873.md. Unknown bytes remain available in each record's raw field.
+Layouts follow the PMGR2 ADT records described in docs/j873.md.
+Unknown bytes remain available in each record's raw field.
 """
 
 from dataclasses import dataclass

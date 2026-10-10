@@ -1664,12 +1664,9 @@ static int pcie_init_controller(int controller, const char *path, u32 allowed_po
          * is NOT a "skip this port" marker and it says nothing about whether
          * firmware already brought the port up.
          *
-         * Determined from AppleEmbeddedPCIE.kext: AppleEmbeddedPCIEPort::
-         * autoEnable() enables the port either way.  Without manual-enable it
-         * enables with flags 0x8 and returns true, so AppleEmbeddedPCIE::
-         * configure() adds the port to its wait-for-link-up mask; with
-         * manual-enable it enables with flags 0x8|0x2 and returns false, so
-         * macOS scans the port but does not block on its link.  The only
+         * macOS enables the port either way.  Without manual-enable it also
+         * waits for the port's link to come up; with manual-enable it
+         * scans the port but does not block on its link.  The only
          * property that actually defers a scan is the separate
          * `manual-enable-defer-scan`, which no published Apple Silicon ADT
          * carries.  Both J414s ports declare manual-enable, and both must be

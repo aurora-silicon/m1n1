@@ -9,7 +9,7 @@ int main(void)
     size_t count = 0;
     const atcphy_seq_op_t *ops = atcphy_seq_pipehandler_usb4_routed(&count);
     assert(ops != NULL);
-    /* Apple's setUSB3Mode USB4 branch: 2 lead-in overrides, lock req + ack
+    /* The routed USB4 mux sequence: 2 lead-in overrides, lock req + ack
      * poll, three back-to-back MUX_CTRL writes (NO settle delays), two
      * override releases, unlock req + ack poll. Ten ops, no NONSELECTED
      * (+0x20) write. */

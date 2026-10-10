@@ -4020,8 +4020,8 @@ static bool hv_handle_t8142_undef_trampoline(struct exc_info *ctx)
 
 /*
  * EPROCESS field offsets for the kernel under test, taken from its own exported
- * accessors: PsGetProcessId is `ldr x0, [x0, #0x1c0]` and
- * PsGetProcessImageFileName is `add x0, x0, #0x328`.  Build-specific, and only
+ * accessors (PsGetProcessId reads +0x1c0, PsGetProcessImageFileName returns
+ * +0x328).  Build-specific, and only
  * ever used to annotate a bugcheck that already happened.
  */
 #define HV_NT_EPROCESS_PID_OFF    0x1c0
@@ -4577,9 +4577,9 @@ void hv_track_t8142_undef_vector(struct exc_info *ctx)
          * The kernel's own current-EL slots stay untouched, but not for the
          * reason recorded here previously.
          *
-         * NT's table was disassembled to settle it.  Slot +0x000 is the live
-         * synchronous EL1t vector and opens "mrs x18, sp_el0 / and sp, x18,
-         * #~0xf" -- it recovers the interrupted kernel stack and installs it.
+         * Reading NT's vector table settled it.  Slot +0x000 is the live
+         * synchronous EL1t vector; it starts by recovering the interrupted
+         * kernel stack from SP_EL0 and installing it.
          * Redirecting that slot used to produce bugcheck 0x2B, which was
          * attributed to a virtual IRQ taken from EL1h landing in +0x280's
          * hard-wired PANIC_STACK_SWITCH branch.  That explanation was wrong:

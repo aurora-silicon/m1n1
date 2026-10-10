@@ -948,64 +948,58 @@ const atcphy_seq_op_t *atcphy_seq_pipehandler_usb3_host_bist(size_t *count)
 }
 
 /*
- * USB4 routed backend -- now transcribed from APPLE's real sequence, not
- * guessed.  Apple's macOS owner of this mux is the xHCI/dwc3 driver, NOT the
- * PHY or Thunderbolt stack: AppleT8142USBXHCI::setUSB3Mode (T6050 BootKC
- * com.apple.driver.usb.AppleSynopsysUSB40XHCI, fn @0xfffffe000b0a3df8; USB4
- * branch @0xfffffe000b0a9ea4) drives the pipehandler (mapDeviceMemoryWithIndex
- * (3), i.e. usb-drdN reg[3]) directly.  T6050 uses PIPE_CLK_EN = GENMASK(6,4)
- * and T6020 uses GENMASK(5,3); the VALUES are identical, so Apple's T6050
+ * USB4 routed backend.  On macOS the owner of this mux is the xHCI/dwc3
+ * driver, NOT the PHY or Thunderbolt stack, and it drives the pipehandler
+ * (usb-drdN reg[3]) directly.  T6050 uses PIPE_CLK_EN = GENMASK(6,4)
+ * and T6020 uses GENMASK(5,3); the VALUES are identical, so the T6050
  * "MODE|=1 then CLK_EN|=0x20" (whole-register 0x21) is exactly this file's
  * T6020 CLK_USB4|DATA_USB4 = 0x11.
  *
- * Three corrections vs. the earlier Aurora reconstruction, each grade-A from
- * the decode:
- *   1. NO fixed settle delay between the three MUX_CTRL writes -- Apple writes
- *      CLK-off -> DATA -> CLK back-to-back (kc 0xb0a9f34/0xb0aa160/0xb0aa390),
- *      only its own os_log between them.  The three 10 us delays are removed.
- *   2. The LOCK_PIPE_IF_ACK polls use Apple's 6 ms routed budget
+ * Three corrections vs. the earlier Aurora reconstruction:
+ *   1. NO fixed settle delay between the three MUX_CTRL writes -- they go
+ *      CLK-off -> DATA -> CLK back-to-back.  The three 10 us delays are removed.
+ *   2. The LOCK_PIPE_IF_ACK polls use the 6 ms routed budget
  *      (ATCPHY_PIPEHANDLER_LOCK_ACK_ROUTED_TIMEOUT_US), not atc.c's 1 ms.
- *   3. NO NONSELECTED_OVERRIDE (+0x20) write in the USB4 branch.  Apple's +0x20
- *      RMWs live in the DUMMY (0xb0a69c8) and USB3 (0xb0aaf3c) branches only;
- *      the USB4 branch jumps straight to the function tail.  The two trailing
- *      NATIVE_POWER_DOWN/NATIVE_RESET writes are removed.
+ *   3. NO NONSELECTED_OVERRIDE (+0x20) write in the USB4 mode: the +0x20
+ *      read-modify-writes belong to the DUMMY and USB3 modes only.  The two
+ *      trailing NATIVE_POWER_DOWN/NATIVE_RESET writes are removed.
  *
- * No DWC3 reset, GCTL/GUSB3PIPECTL, AON_GEN or BIST touch appears in Apple's
- * USB4 branch: the running MAC is quiesced entirely by the LOCK_PIPE_IF
+ * No DWC3 reset, GCTL/GUSB3PIPECTL, AON_GEN or BIST touch is needed in the
+ * USB4 mode: the running MAC is quiesced entirely by the LOCK_PIPE_IF
  * handshake plus the forced rx_valid/receiver_detect overrides below.
  */
 static const atcphy_seq_op_t atcphy_seq_pipehandler_usb4_routed_ops[] = {
     {ATCPHY_BLOCK_PIPEHANDLER, ATCPHY_OP_CLEAR, ATCPHY_PIPEHANDLER_OVERRIDE_VALUES,
      ATCPHY_PIPEHANDLER_OVERRIDE_VAL_RXDETECT0 | ATCPHY_PIPEHANDLER_OVERRIDE_VAL_RXDETECT1,
-     0, "setUSB3Mode: clear RXDETECT override values (kc 0xb0a810c/0xb0a814c)"},
+     0, "usb4 mux: clear RXDETECT override values"},
     {ATCPHY_BLOCK_PIPEHANDLER, ATCPHY_OP_SET, ATCPHY_PIPEHANDLER_OVERRIDE,
      ATCPHY_PIPEHANDLER_OVERRIDE_RXVALID | ATCPHY_PIPEHANDLER_OVERRIDE_RXDETECT,
-     0, "setUSB3Mode: force RXVALID + RECEIVER_DETECT overrides (kc 0xb0a8330)"},
+     0, "usb4 mux: force RXVALID + RECEIVER_DETECT overrides"},
     {ATCPHY_BLOCK_PIPEHANDLER, ATCPHY_OP_SET, ATCPHY_PIPEHANDLER_LOCK_REQ,
-     ATCPHY_PIPEHANDLER_LOCK_EN, 0, "setUSB3Mode: LOCK_PIPE_IF_REQ (kc 0xb0a8564)"},
+     ATCPHY_PIPEHANDLER_LOCK_EN, 0, "usb4 mux: LOCK_PIPE_IF_REQ"},
     {ATCPHY_BLOCK_PIPEHANDLER, ATCPHY_OP_POLL_SET, ATCPHY_PIPEHANDLER_LOCK_ACK,
      ATCPHY_PIPEHANDLER_LOCK_EN, ATCPHY_PIPEHANDLER_LOCK_ACK_ROUTED_TIMEOUT_US,
-     "setUSB3Mode: poll LOCK_PIPE_IF_ACK set, 6 ms (kc 0xb0a9550)"},
+     "usb4 mux: poll LOCK_PIPE_IF_ACK set, 6 ms"},
     {ATCPHY_BLOCK_PIPEHANDLER, ATCPHY_OP_MASK, ATCPHY_PIPEHANDLER_MUX_CTRL,
      ATCPHY_PIPEHANDLER_MUX_CLK_MASK,
      ATCPHY_PIPEHANDLER_MUX_CLK_OFF << ATCPHY_PIPEHANDLER_MUX_CLK_SHIFT,
-     "setUSB3Mode: PIPE_CLK_EN = OFF (kc 0xb0a9f34/0xb0a9f74)"},
+     "usb4 mux: PIPE_CLK_EN = OFF"},
     {ATCPHY_BLOCK_PIPEHANDLER, ATCPHY_OP_MASK, ATCPHY_PIPEHANDLER_MUX_CTRL,
      ATCPHY_PIPEHANDLER_MUX_DATA_MASK,
      ATCPHY_PIPEHANDLER_MUX_DATA_USB4 << ATCPHY_PIPEHANDLER_MUX_DATA_SHIFT,
-     "setUSB3Mode: PIPE_MODE = USB4 (kc 0xb0aa160/0xb0aa1a4)"},
+     "usb4 mux: PIPE_MODE = USB4"},
     {ATCPHY_BLOCK_PIPEHANDLER, ATCPHY_OP_MASK, ATCPHY_PIPEHANDLER_MUX_CTRL,
      ATCPHY_PIPEHANDLER_MUX_CLK_MASK,
      ATCPHY_PIPEHANDLER_MUX_CLK_USB4 << ATCPHY_PIPEHANDLER_MUX_CLK_SHIFT,
-     "setUSB3Mode: PIPE_CLK_EN = USB4 (kc 0xb0aa390/0xb0aa3d4)"},
+     "usb4 mux: PIPE_CLK_EN = USB4"},
     {ATCPHY_BLOCK_PIPEHANDLER, ATCPHY_OP_CLEAR, ATCPHY_PIPEHANDLER_OVERRIDE,
      ATCPHY_PIPEHANDLER_OVERRIDE_RXVALID | ATCPHY_PIPEHANDLER_OVERRIDE_RXDETECT,
-     0, "setUSB3Mode: release RXVALID + RECEIVER_DETECT overrides (kc 0xb0aa5c0)"},
+     0, "usb4 mux: release RXVALID + RECEIVER_DETECT overrides"},
     {ATCPHY_BLOCK_PIPEHANDLER, ATCPHY_OP_CLEAR, ATCPHY_PIPEHANDLER_LOCK_REQ,
-     ATCPHY_PIPEHANDLER_LOCK_EN, 0, "setUSB3Mode: clear LOCK_PIPE_IF_REQ (kc 0xb0aaa0c)"},
+     ATCPHY_PIPEHANDLER_LOCK_EN, 0, "usb4 mux: clear LOCK_PIPE_IF_REQ"},
     {ATCPHY_BLOCK_PIPEHANDLER, ATCPHY_OP_POLL_CLEAR, ATCPHY_PIPEHANDLER_LOCK_ACK,
      ATCPHY_PIPEHANDLER_LOCK_EN, ATCPHY_PIPEHANDLER_LOCK_ACK_ROUTED_TIMEOUT_US,
-     "setUSB3Mode: poll LOCK_PIPE_IF_ACK clear, 6 ms (kc 0xb0aac04)"},
+     "usb4 mux: poll LOCK_PIPE_IF_ACK clear, 6 ms"},
 };
 
 const atcphy_seq_op_t *atcphy_seq_pipehandler_usb4_routed(size_t *count)

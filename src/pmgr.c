@@ -20,14 +20,11 @@
  * wait = 0x2ee00 us".  That justification is wrong twice over and is
  * corrected here rather than propagated:
  *
- *  - Apple's 0x2ee00 is a raw mach-tick delta, not microseconds.
- *    ApplePMGR::waitReg32 does `deadline = mach_absolute_time() + timeout`
- *    with no unit conversion, so at the 24 MHz timebase 0x2ee00 ticks is
+ *  - 0x2ee00 is a raw 24 MHz tick count, not microseconds, so it is
  *    ~8 ms, not 192 ms.
- *  - 0x2ee00 is ApplePMGR's house-standard constant seen in
- *    enableCioReconfig's pre-wait (and configISPRefClock / enableTVM), not
- *    in the PS TARGET/ACTUAL convergence poll, which uses its own
- *    mach_absolute_time loop.
+ *  - It is the wait used before a CIO reconfiguration (and a few other
+ *    PMGR operations), not the PS TARGET/ACTUAL convergence poll, which
+ *    has its own loop.
  *
  * The numeric value is deliberately kept: 192 ms is ~24x Apple's bound, so
  * it is strictly more permissive and cannot cause a spurious timeout.  It

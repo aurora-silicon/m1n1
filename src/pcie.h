@@ -212,10 +212,9 @@ int pcie_t602x_bcm4388_setup_port0(const struct pcie_t602x_mmio_ops *ops, void *
  *                      (1) pcie-apple.c implements exactly this step with
  *                          usleep_range(100, 200) and cites that clause;
  *                          U-Boot's pcie_apple.c uses udelay(100).
- *                      (2) In Apple's AppleEmbeddedPCIE.kext, the value is
- *                          consumed by APCIECoreRCGen4Port::
- *                          initializeRefclkBuffer() as IODelay(
- *                          getTRefclkToPerst()); IODelay() takes microseconds.
+ *                      (2) macOS applies the value as a delay in
+ *                          microseconds between a stable refclk and
+ *                          PERST# deassertion.
  *                      (3) iMac21,1 pci-bridge1 (an ASMedia ASM3142 xHCI with
  *                          a power-enable GPIO) declares 200000, which is a
  *                          sensible 200 ms but an absurd 200 s.  That machine
@@ -228,11 +227,9 @@ int pcie_t602x_bcm4388_setup_port0(const struct pcie_t602x_mmio_ops *ops, void *
  *                      specified as 100 ms by PCIe Base r5.0 section 6.6.1.
  *                      pcie-apple.c implements exactly this step with
  *                      msleep(100) and cites that clause; U-Boot uses
- *                      udelay(100 * 1000).  In AppleEmbeddedPCIE.kext,
- *                      AppleEmbeddedPCIEPort::handleLinkUp() converts the time
- *                      since PERST# deassert to milliseconds (ns / 1000000),
- *                      compares it against getPerstToConfig() and passes the
- *                      remainder to IOSleep(), which takes milliseconds.
+ *                      udelay(100 * 1000).  macOS waits until this many
+ *                      milliseconds have passed since PERST# deassertion
+ *                      before the first configuration request.
  *                      Every published Apple Silicon ADT declares 100.
  *
  * Because a misread unit is only dangerous in the "too fast" direction, the

@@ -27,8 +27,8 @@
 #define ACE3_TASK_REJECTED 3
 
 /*
- * System power states for the "SSPS" command, as used by macOS'
- * AppleHPMInterface::setPowerState (which passes 3 on its sleep path).
+ * System power states for the "SSPS" command, as used by macOS
+ * (which passes 3 on its sleep path).
  */
 #define ACE3_SYSTEM_POWER_STATE_S0    0
 #define ACE3_SYSTEM_POWER_STATE_SLEEP 3

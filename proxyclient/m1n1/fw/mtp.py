@@ -81,12 +81,10 @@ class DeviceResetMsg(ConstructClass):
     """Apple's "power method 2" interface power transition.
 
     9 bytes, not the 4 the older form used.  The J813 firmware's 0x40 handler
-    checks, in this order:
-        ldrh w1, [msg+2]; cmp #9        -- total length must be 9
-        ldrb w1, [msg+1]; cmp #2        -- method must be 2 (old form sent 1)
-        ldrb w1, [msg+3]; cmp #6, b.lo  -- state must be < 6
+    checks, in this order: the total length must be 9, the method must be 2
+    (the old form sent 1), and the state must be < 6.
     Because the length test comes first, a 4-byte message is rejected with
-    0xe00002c2 (kIOReturnBadArgument) before any field is read -- so sweeping
+    0xe00002c2 before any field is read -- so sweeping
     the fields of a 4-byte message returns that same error for every
     combination, which looks like a parameter problem and is not one.
 

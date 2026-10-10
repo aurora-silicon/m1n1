@@ -275,8 +275,8 @@ int tps6598x_read_link_state(tps6598x_dev_t *dev, tps6598x_link_state_t *state)
     return 0;
 }
 
-/* Apple waits for the HPM to wake before its first access
- * (HALGenericACIO::waitForAppleHPMWake); m1n1 issued a single read and gave
+/* macOS waits for the HPM to wake before its first access;
+ * m1n1 issued a single read and gave
  * up on the first NAK.  Measured on J414s: at boot every one of hpm0/1/2/5
  * failed identically with `i2c: timeout while reading (got 0, expected 1
  * bytes)`, yet the very same registers read cleanly from the proxy seconds

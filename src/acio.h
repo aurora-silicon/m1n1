@@ -18,7 +18,7 @@ typedef uint64_t u64;
 #define ACIO_NHI_IRQ_COUNT  (ACIO_NHI_RING_COUNT * 2)
 #define ACIO_SRAM_IOVA_BASE 0x10000000ULL
 
-/* T6020 Type5 register contract from the local BootKC RE corpus.  These are
+/* T6020 Type5 register contract.  These are
  * not the packed 0x20-stride t8103 NHI registers. */
 #define ACIO_TYPE5_TX_RING_BASE       0x10000u
 #define ACIO_TYPE5_RX_RING_BASE       0x80000u
@@ -42,21 +42,17 @@ typedef uint64_t u64;
  * excludes ring 0, so ring 0 must be reserved for the acio-cpu coprocessor.
  * That inference was BACKWARDS.
  *
- * IOThunderboltControlPath::createTransmitter calls setFlags(1), and
- * ...RingManager::allocateTransmitRing @0xfffffe0009ce5c6c branches on that
- * flag with `tbnz w23,#0` straight to getObject(0) -- bypassing the mask
- * entirely.  RX is symmetric.  So the control path is HARD-WIRED to ring 0,
- * and the mask excludes ring 0 from the *generic* allocator precisely
+ * The control path is HARD-WIRED to ring 0 in both directions, and the
+ * enabled-ring mask excludes ring 0 from the *generic* allocator precisely
  * because the control path has already claimed it.  There is no coprocessor
  * ownership of hop 0 anywhere in the host driver.
  *
- * createReceiver independently confirms the rest of our geometry: ring size
- * 0x11 = 17 entries, max frame 0x100 = 256 bytes. */
+ * The control ring is 0x11 = 17 entries with a max frame of 0x100 = 256
+ * bytes. */
 #define ACIO_TYPE5_CONTROL_RING       0u
 /* TX +0x14 shared-buffer allocation, a RAW SCALAR -- confirmed not a packed
- * word.  configureSharedBuffer @0xfffffe0009d0c8b0 writes the zero-extended
- * u16 ring[0xd8] with no shift or mask.  allocateSharedBuffer splits a
- * 232-credit pool with a floor of 2 and ring 0 pre-deducted:
+ * word: the zero-extended u16 credit count, with no shift or mask.  The
+ * 232-credit pool is split with a floor of 2 and ring 0 pre-deducted:
  *   nBig  = min((230 - 2L)/(H-2), L)   with L = paths-1, H = 40
  *   ring 0 -> 2 ; rings 1..5 -> 40 ; rings 6..11 -> 5   (total 232)
  * The split is independent of how many rings are enabled, so hop 0's share
@@ -101,14 +97,12 @@ enum acio_type5_pdf {
     ACIO_TYPE5_PDF_CONFIG_WRITE = 2,
     ACIO_TYPE5_PDF_CONFIG_ERROR = 3,
     ACIO_TYPE5_PDF_NOTIFY_ACK = 4,
-    /* RECEIVE-ONLY.  No transmit command class in IOThunderboltFamily uses
-     * PDF 5 -- an exhaustive scan of all 28 config command classes shows
-     * SOF/EOF only ever in {1,2,3,4,6,7,8,9,13}.  5 is the unsolicited
-     * hot-plug event the router pushes onto the control ring
-     * (IOThunderboltControlPath::fakePlugEvent carries route + port +
-     * unplug).  It was missing from this enum because we only ever modelled
-     * the transmit side, which is exactly why an inbound event was mistaken
-     * for a malformed config reply. */
+    /* RECEIVE-ONLY.  No transmitted command uses PDF 5: transmit frames
+     * only ever use SOF/EOF in {1,2,3,4,6,7,8,9,13}.  5 is the unsolicited
+     * hot-plug event the router pushes onto the control ring (it carries
+     * route + port + unplug).  It was missing from this enum because we only
+     * ever modelled the transmit side, which is exactly why an inbound event
+     * was mistaken for a malformed config reply. */
     ACIO_TYPE5_PDF_EVENT = 5,
     ACIO_TYPE5_PDF_XDOMAIN_REQUEST = 6,
     ACIO_TYPE5_PDF_XDOMAIN_RESPONSE = 7,
@@ -358,21 +352,15 @@ int acio_type5_router_topology_pack(const u32 *cs0_4, u8 cm_version, u32 out[4])
  * MEASURED on J414s: an unacked PDF-5 plug event is retried by the router
  * indefinitely and the router withholds pending config responses while it
  * retries, so consuming events without acking starves the config channel
- * (cfg-rx-timeout with the RX descriptor still SW-seeded).  The kernelcache
- * corroborates a retry engine: IOThunderboltSwitchLC/Type1::enablePlugEvents
- * log "set notify retry, packet = 0x%08x".
+ * (cfg-rx-timeout with the RX descriptor still SW-seeded).
  *
- * Apple's ack is a PDF-3 ConfigError frame, NOT PDF-4 NOTIFY_ACK:
- * IOThunderboltSwitch::sendPlugEventAck(plug_port, ack_type) fills its
- * pre-allocated ConfigErrorCommand with error code 7 (`mov w1,#0x7` @
- * 0xfffffe000ad74840), the event's port, and ack_type, then submits it.
- * ConfigErrorCommand::prepareForExecution @0xfffffe000ae71fb0..0xae71fb8
- * packs dword2 as {[3:0] error code, [13:8] port (`bfi w8,w9,#0x8,#0x6`),
- * [31:30] pg (`orr w8,w8,w9,lsl #0x1e`)}; SOF=EOF=3; 16-byte frame; no
- * response is ever sent to an error packet.
+ * The ack is a PDF-3 ConfigError frame, NOT PDF-4 NOTIFY_ACK: error code 7,
+ * the event's port and the ack type, with dword2 packed as
+ * {[3:0] error code, [13:8] port, [31:30] pg}; SOF=EOF=3; 16-byte frame; no
+ * response is ever sent to an error packet.  Linux's tb_cfg_ack_plug()
+ * (drivers/thunderbolt/ctl.c) builds the same frame.
  *
- * The PG VALUES are PROVISIONAL: Apple passes ack_type through opaquely and
- * its origin was not decoded, so 2=plug / 3=unplug come from Linux's
+ * The PG VALUES are PROVISIONAL: 2=plug / 3=unplug come from Linux's
  * TB_CFG_ERROR_PG_HOT_PLUG / _HOT_UNPLUG (drivers/thunderbolt/tb_msgs.h),
  * which interoperate with TBT3/USB4 routers.  If repeats continue after an
  * ack on hardware, suspect these two literals FIRST. */
@@ -385,22 +373,13 @@ int acio_type5_capability_step(u16 current, u32 header, u32 mask, u32 value, boo
 
 /* --- Lane adapter link state: LANE_ADP_CS_1[29:26] -------------------------
  *
- * Apple's gate in `IOThunderboltSwitch::childDeviceScanForPort` reads the
- * LANE_ADP capability (ID 0x01) at `capOffset + 1` in ADAPTER config space,
- * extracts bits [29:26], and branches on `state in {2,3,4,5,6}`.  Resolved
- * three independent ways from the kernelcache:
+ * Before scanning behind a port, the host reads the LANE_ADP capability
+ * (ID 0x01) at `capOffset + 1` in ADAPTER config space, extracts bits
+ * [29:26], and treats `state in {2,3,4,5,6}` as link up:
  *
- *   - taken   -> os_log "childDeviceScanForPort - link is up!", no sleep, no
- *                loop-back, falls straight into the scan work;
- *   - untaken -> "link training not done - attempt %d...", "wait %u
- *                milliseconds for training on port %d", a 10 ms ungated
- *                sleep, and a BACKWARD branch to the config re-read;
- *   - expiry  -> "timed out waiting for link training" and the function
- *                returns `kIOReturnNotReady` (0xE00002D8).
- *
- * The earlier analysis stalled because both immediate arms set the return
- * register to 0; what discriminates them is that the timeout arm overwrites it
- * later.  Polarity is therefore settled, not inferred.
+ *   - up      -> no sleep, straight into the scan work;
+ *   - not up  -> a 10 ms sleep, then the config dword is read again;
+ *   - expiry  -> the scan gives up and reports the port as not ready.
  *
  * It is a WHITELIST, not a blacklist.  Reserved values 8..15, and any state we
  * fail to read at all, fall through to "not up".  There is deliberately no
@@ -408,8 +387,8 @@ int acio_type5_capability_step(u16 current, u32 header, u32 mask, u32 value, boo
  * link, in exactly the way that a boolean whose false value is a physical
  * claim must not have a default.
  *
- * The individual state NAMES are UNPROVEN -- no string in the kernelcache
- * names them.  What is proven is the partition.  The public USB4 naming
+ * The individual state NAMES are UNPROVEN; what is proven is the partition.
+ * The public USB4 naming
  * (0 Disabled, 1 Training, 2 CL0, 3 TX CL0s, 4 RX CL0s, 5 CL1, 6 CL2, 7 CLd)
  * is CONSISTENT with that partition, which is why it appears here as prose and
  * never as an identifier.
@@ -441,15 +420,14 @@ int acio_type5_hop_pack(const acio_type5_hop_descriptor_t *descriptor, u8 packet
 #define ACIO_TYPE5_NFC_MASK        0x000fffffu
 #define ACIO_TYPE5_TOTAL_BUF_SHIFT 20u
 #define ACIO_TYPE5_TOTAL_BUF_MASK  0x3ffu
-/* "unspecified" sentinel returned by getNFCCreditsForPathTableIndex */
+/* "unspecified" NFC credit sentinel */
 #define ACIO_TYPE5_NFC_UNSPECIFIED 0xffffu
 
 /* DECODED: for a USB3 tunnel the NFC credit step is a provable no-op.
- * IOThunderboltAbstractPath::init leaves NonFlowControlledCredits (+0x84) = 0
- * and Source/DestinationNonFlowControlledCredits (+0xa8/+0xac) = 0xFFFF
- * ("unspecified"), and USB3's createPaths never calls any of the three
- * setters.  getNFCCreditsForPathTableIndex therefore returns literal 0 at
- * every path-table index for both the TX and RX path, so every compare-swap
+ * A USB3 path is created with zero non-flow-controlled credits and with
+ * its source/destination NFC credits "unspecified" (0xFFFF), and nothing
+ * sets them afterwards, so the NFC credit is 0 at every path-table index
+ * of both the TX and RX path, and every compare-swap
  * would write back exactly what it read.
  *
  * The CAS machinery is kept because it is correct and other path types do
@@ -457,27 +435,23 @@ int acio_type5_hop_pack(const acio_type5_hop_descriptor_t *descriptor, u8 packet
  * control packets per adapter to add zero. */
 #define ACIO_TYPE5_NFC_CREDITS_USB3 0u
 
-/* Apple's static initial-credit fallback: 2 on the host side, 14 on the
- * device side.  Router Operation 0x33 ("Buffer Allocation Request", the
- * firmware-recommended credits selected by CreditOptions bit 2) is
- * deliberately NOT implemented: Apple ships a boot-arg
- * `tb-port-disable-usb4-allocation` that branches over the entire block,
- * its result is discarded by its caller, and every failure path falls back
- * to exactly these literals.  A vendor would not ship a switch that breaks
- * USB3 tunnelling, so 0x33 is optional and we land on the same values. */
+/* Static initial credits: 2 on the host side, 14 on the device side, the
+ * values macOS falls back to.  Router Operation 0x33 ("Buffer Allocation
+ * Request", the firmware-recommended credits selected by CreditOptions
+ * bit 2) is deliberately NOT implemented: macOS can run with it switched
+ * off and then uses exactly these literals, so 0x33 is optional and we
+ * land on the same values. */
 /* USB3 tunnels use hop 8 in both directions; adapter enable is bits 31:30
  * of the adapter's config dword 0; the settle between the two adapter
- * enables is 100 ms (Apple's IOSleep(0x64)). */
+ * enables is 100 ms. */
 #define ACIO_TYPE5_USB3_HOP       8u
 #define ACIO_TYPE5_USB3_ENABLE    0xc0000000u
 #define ACIO_TYPE5_USB3_SETTLE_MS 100u
 /* The enable is a READ-MODIFY-WRITE at the DISCOVERED protocol-adapter
- * capability, NOT a blind write to ADAPTER-space offset 0.
- * `AppleThunderboltUSBUpAdapter::enableAdapter` @0xfffffe0009d5a8f4 does:
- *   findCapability(route, port, space=1, mask=0xff00, value=0x400, &cap)
- *   configModifyDWordWithMask(route, port, space=1, offset=cap,
- *                             data=enable?0xC0000000:0x40000000,
- *                             mask=0xC0000000)
+ * capability, NOT a blind write to ADAPTER-space offset 0: find the
+ * capability with (header & 0xff00) == 0x0400 in adapter config space
+ * (space 1), then modify its dword under mask 0xC0000000, writing
+ * 0xC0000000 to enable or 0x40000000 to disable,
  * i.e. capability ID 0x04 in adapter config space, bit 31 = enable and bit 30
  * written 1 in both cases.  Writing 0xC0000000 to offset 0 instead lands on
  * ADP_CS_0, whose [23:0] is the adapter TYPE -- the router acknowledges it and
@@ -502,7 +476,7 @@ typedef struct acio_type5_nfc_cas {
 int acio_type5_nfc_begin(acio_type5_nfc_cas_t *cas, u32 credits);
 /* Fold an observed ADP_CS_4 into the next attempt.  Returns 0 when a write
  * should be issued, -1 when the request cannot be satisfied (the new NFC
- * value would exceed Total Buffers -- Apple's kIOReturnNoResources). */
+ * value would exceed Total Buffers -- the request is refused). */
 int acio_type5_nfc_next(acio_type5_nfc_cas_t *cas, u32 observed_cs4);
 
 /* --- counters -------------------------------------------------------------

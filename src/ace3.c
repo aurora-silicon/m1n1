@@ -232,8 +232,8 @@ int ace3_set_system_power_state(spmi_dev_t *dev, u8 sid, u8 state)
         return -1;
 
     /*
-     * Skip the command when the controller already agrees, mirroring macOS'
-     * AppleHPMInterface::setPowerStateHPM, which reads this register first and
+     * Skip the command when the controller already agrees, mirroring macOS,
+     * which reads this register first and
      * only issues SSPS when it differs.  Say so rather than returning quietly:
      * a chainload leaves the ACE3 running, so an already-correct port is the
      * normal case on a warm restart and an unexplained gap in the boot log

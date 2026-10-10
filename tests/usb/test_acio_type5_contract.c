@@ -207,10 +207,10 @@ static void test_config_and_capabilities(void)
     assert(response_value == 0x12345678);
     /* CORRECTION: bit 31 of dword0 must be TOLERATED in either state.
      * This test previously required it as a "response marker" and asserted a
-     * frame without it was rejected. That requirement is unproven -- Apple
+     * frame without it was rejected. That requirement is unproven -- macOS
      * never re-parses the route on receive, it matches against the
-     * outstanding command object, and no 22-bit route-high mask exists
-     * anywhere in IOThunderboltFamily's __text. Requiring the bit would
+     * outstanding command, and no 22-bit route-high mask is applied
+     * anywhere. Requiring the bit would
      * reject EVERY valid reply if the hardware does not set it, presenting
      * as a dead config channel rather than a parser bug.
      *
@@ -539,7 +539,7 @@ static void test_nfc_credits(void)
     assert(acio_type5_nfc_next(&cas, (64u << ACIO_TYPE5_TOTAL_BUF_SHIFT) | 4u) == 0);
     assert((cas.write & ACIO_TYPE5_NFC_MASK) == 64);
 
-    /* Exceeding it must fail rather than wrap -- Apple's kIOReturnNoResources. */
+    /* Exceeding it must fail rather than wrap. */
     assert(acio_type5_nfc_begin(&cas, 61) == 0);
     assert(acio_type5_nfc_next(&cas, (64u << ACIO_TYPE5_TOTAL_BUF_SHIFT) | 4u) < 0);
 
@@ -698,8 +698,8 @@ static void test_router(void)
     assert(acio_type5_router_next(&sm, &action) == 0 && action.kind == ACIO_TYPE5_ROUTER_DONE);
 
     /* The HOST router (route 0, depth 0) must stop after the single
-     * ROUTER_CS_6 bit-24 readiness poll.  IOThunderboltSwitchUSB4::
-     * configureRouter gates everything after that poll on `depth != 0`, so
+     * ROUTER_CS_6 bit-24 readiness poll.  Everything after that poll
+     * applies only to routers at depth != 0, so
      * the CS_5 read, the 0x03000000/0x05000000 write, the Configuration
      * Valid commit and the CS_6 bit-25 poll are the DEVICE-router path only.
      * Running them against route 0 would write a tunnelling-configuration
@@ -748,8 +748,8 @@ static void test_usb3(void)
 }
 
 /* PDF-3 plug-event ack frame.  dword2 layout {[3:0] error code 7, [13:8]
- * port, [31:30] pg} is grade-A (sendPlugEventAck + ConfigErrorCommand::
- * prepareForExecution); the pg VALUES 2/3 are provisional Linux-derived
+ * port, [31:30] pg} matches the ConfigError frame Linux's tb_cfg_ack_plug()
+ * builds; the pg VALUES 2/3 are provisional Linux-derived
  * constants, and this test pins them so a silent change fails loudly. */
 static void test_plug_ack_pack(void)
 {
@@ -788,7 +788,7 @@ static void test_plug_ack_pack(void)
 
 int main(void)
 {
-    /* Grade-A T6020 Type5 offsets from the pinned local BootKC RE corpus.
+    /* T6020 Type5 offsets.
      * These assertions prevent a t8103 0x20-stride NHI layout from silently
      * being reused for J414s. */
     assert(ACIO_NHI_RING_COUNT == 12);

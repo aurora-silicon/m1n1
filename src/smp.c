@@ -84,7 +84,7 @@
 #define T8142_MISC_CORES_REG_INDEX  41
 
 //
-// T8142: drive the secondary release through ApplePMGR::MISC_CORES in addition
+// T8142: drive the secondary release through the PMGR MISC_CORES block in addition
 // to the PMGR start bank.
 //
 // DISABLED, and neither written nor read while disabled. Evidence from J813:
@@ -134,9 +134,9 @@
 // an IMPDEF cross-core IPI at a core that is mid-reset is a far better candidate
 // for wedging it than for waking it.
 //
-// Apple's own code supports leaving this off: ApplePMGR::enableCPUCore ->
-// enableCPUCores -> configMiscCores contains no cpu0 special case whatsoever,
-// and releases core 0 with the same two register writes as every other core.
+// macOS supports leaving this off: its core release has no cpu0 special case
+// whatsoever, and releases core 0 with the same two register writes as every
+// other core.
 //
 #define T8142_SIGNAL_PARKED_CPU0 0
 
@@ -635,8 +635,8 @@ static bool smp_prepare_cpu(int index, int die, int cluster, int core, u64 impl)
 }
 
 // CPU 0 is not in the same cold-off state as the other T8142 secondaries.
-// AppleARMCPU::startCPU() first releases a core through ApplePMGR, and the
-// non-boot init path then calls ml_cpu_signal().  On J813 the PMGR release is
+// macOS first releases a core through the PMGR, and its non-boot init path
+// then signals the core.  On J813 the PMGR release is
 // sufficient for cpu1..5 and cpu7..9, while cpu0 keeps reporting a live/parked
 // status and never refetches RVBAR.  Mirror the missing architectural wake here
 // after the reset vector and per-CPU stack are ready.
@@ -844,8 +844,8 @@ void smp_start_secondaries(void)
     //
     if (T8142_MISC_CORES_RELEASE && chip_id == T8142) {
         /*
-         * AppleT8142PMGR::initRegMaps() maps ApplePMGR::MISC_CORES
-         * (RegMap 8) to the 42nd /arm-io/pmgr register tuple.  Do not derive
+         * The PMGR MISC_CORES block (RegMap 8) is the 42nd /arm-io/pmgr
+         * register tuple.  Do not derive
          * this from reg[0]: on J813 the block is reg[41] at 0x3803c0000,
          * while reg[0] + the legacy 0x34000 offset points at a different
          * status block.

@@ -5,8 +5,8 @@ Branch: `windows-native-aic`. Base: `windows` (vGIC-emulation design, `ENABLE_VG
 **Status: HARDWARE-VALIDATED CORRECTNESS CHECKPOINT.** Native AIC2 CONFIG
 handoff, ten-core startup, timer reflection, and real Fast-IPI sends execute on
 a J414s M2 Pro. The pinned internal-storage profile reaches responsive Windows
-with SSH, HID, xHCI, and USB Ethernet under ten-core load. Exact running-kernel
-disassembly proves raw FIQ reaches `KiFIQException` and bugchecks `0x3D`, so the
+with SSH, HID, xHCI, and USB Ethernet under ten-core load. Tracing the running
+kernel proves raw FIQ reaches `KiFIQException` and bugchecks `0x3D`, so the
 narrow EL2 FIQ bridge remains required for stock Windows. Startup carrier
 readiness observes Windows x18 and its exception stacks fail-closed; it never
 rewrites x18, and routine exception-path diagnostics are compiled out.
@@ -406,7 +406,7 @@ Later J414s runs advanced substantially beyond the first recovery failure:
 - Keeping the x18/KPCR repair active after the AIC2 `CONFIG` handoff eliminated the
   repeatable `IRQL_NOT_LESS_OR_EQUAL (0xA)` at `KfRaiseIrql+4`. A four-E-core control
   configuration then ran for minutes with the Windows logo/spinner and no bugcheck.
-  **Correction (2026-08-05):** exact running-PE disassembly later proved that
+  **Correction (2026-08-05):** inspecting the running kernel image later proved that
   every recorded zero was inside Windows' exception-vector hardening stub. The
   stub deliberately saves x18, counts it to zero through `SB`, and reloads it at
   RVAs `0x629c20/0x629c24`; the public-PDB-nearest name is
@@ -432,7 +432,7 @@ Later J414s runs advanced substantially beyond the first recovery failure:
   already identical across the two core types; that experiment was removed.
 - A 5 kHz EL2 sampler found CPU4 alive after EOI with stable x18/SP, looping at kernel
   offsets `0x4fc4`, `0x13a88`, and `0x13a98` until the BSP times out and tears down the
-  temporary KPCR mapping. The next hardware step is to capture/disassemble this loop
+  temporary KPCR mapping. The next hardware step is to capture this loop
   and identify its waited-on value. The sampler itself was diagnostic-only and is not
   retained in the checkpoint commit.
 
