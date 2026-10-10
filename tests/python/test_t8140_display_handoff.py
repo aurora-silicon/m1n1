@@ -8,7 +8,7 @@ def test_t8140_display_handoff(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     source = (repo / "src/kboot.c").read_text()
     start = source.index("struct dt_t8140_dram {")
-    end = source.index("static int dt_set_display(void)", start)
+    end = source.index("/* T8142 display carveouts:", start)
     helper = source[start:end]
     asc_source = (repo / "src/asc.c").read_text()
     asc_defs = asc_source[asc_source.index("#define ASC_CPU_CONTROL"):asc_source.index("struct asc_dev {")]

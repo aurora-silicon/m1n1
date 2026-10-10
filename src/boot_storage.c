@@ -22,7 +22,6 @@
 #ifdef CHAINLOADING
 int rust_load_image(const char *spec, void **image, size_t *size);
 void rust_free_image(void *image, size_t size);
-#endif
 
 static int boot_image_header(const void *data, size_t file_size, u64 *text_offset, u64 *image_size)
 {
@@ -112,6 +111,7 @@ static int boot_check_dtb(const void *data, size_t size)
     compat[6 + i] = 0;
     return fdt_node_check_compatible(data, 0, compat);
 }
+#endif
 
 int boot_storage_load(const char *spec, struct kernel_header **kernel, void **fdt)
 {
@@ -151,11 +151,13 @@ int boot_storage_load(const char *spec, struct kernel_header **kernel, void **fd
         }
     }
 
+    /* EFI payloads such as U-Boot let the selected OS supply its initramfs. */
+    bool have_initrd = strcmp(part[3], "-") != 0;
     if (!nvme_init())
         goto fail_specs;
     void *files[3] = {0};
     size_t sizes[3] = {0};
-    for (size_t i = 0; i < 3; i++) {
+    for (size_t i = 0; i < (have_initrd ? 3 : 2); i++) {
         int len = snprintf(file_spec, spec_len + 1, "%s;%s", part[0], part[i + 1]);
         if (len < 0 || (size_t)len > spec_len || rust_load_image(file_spec, &files[i], &sizes[i]) ||
             !files[i] || !sizes[i])
@@ -164,7 +166,8 @@ int boot_storage_load(const char *spec, struct kernel_header **kernel, void **fd
 
     if (boot_check_dtb(files[1], sizes[1]))
         goto fail;
-    if (!((sizes[2] >= 18 && ((u8 *)files[2])[0] == 0x1f && ((u8 *)files[2])[1] == 0x8b) ||
+    if (have_initrd &&
+        !((sizes[2] >= 18 && ((u8 *)files[2])[0] == 0x1f && ((u8 *)files[2])[1] == 0x8b) ||
           (sizes[2] >= 6 && (!memcmp(files[2], "070701", 6) || !memcmp(files[2], "070702", 6)))))
         goto fail;
 
@@ -174,7 +177,7 @@ int boot_storage_load(const char *spec, struct kernel_header **kernel, void **fd
     kboot_set_initrd(files[2], sizes[2]);
     *kernel = prepared;
     *fdt = files[1];
-    printf("boot: three ESP files validated\n");
+    printf("boot: ESP image and DTB validated%s\n", have_initrd ? " with initramfs" : " without initramfs");
     rust_free_image(files[0], sizes[0]);
     free(fields);
     free(file_spec);

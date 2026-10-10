@@ -22,7 +22,6 @@ pub enum Error {
     InvalidFile,
     OutOfMemory,
     UnexpectedEof,
-    Unknown,
 }
 
 impl From<fatfs::Error<nvme::Error>> for Error {
@@ -33,8 +32,12 @@ impl From<fatfs::Error<nvme::Error>> for Error {
 
 fn valid_fat_path(path: &str) -> bool {
     !path.is_empty()
-        && path.bytes().all(|byte| (0x20..0x7f).contains(&byte) && byte != b';' && byte != b'\\')
-        && path.split('/').all(|component| !component.is_empty() && component != "." && component != "..")
+        && path
+            .bytes()
+            .all(|byte| (0x20..0x7f).contains(&byte) && byte != b';' && byte != b'\\')
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 #[cfg(test)]
@@ -44,7 +47,13 @@ mod path_tests {
     #[test]
     fn stage1_path_grammar() {
         assert!(valid_fat_path("aurora/stage2.bin"));
-        for path in ["aurora/a\0b", "aurora/a\x1fb", "aurora//b", "aurora/./b", "aurora/../b"] {
+        for path in [
+            "aurora/a\0b",
+            "aurora/a\x1fb",
+            "aurora//b",
+            "aurora/./b",
+            "aurora/../b",
+        ] {
             assert!(!valid_fat_path(path), "accepted {path:?}");
         }
     }
@@ -71,28 +80,33 @@ fn load_image(spec: &str) -> Result<Vec<u8>, Error> {
         let storage = nvme::NVMEStorage::new(1, 0);
         let mut pt = gpt::GPT::new(storage)?;
 
-        //println!("Partitions:");
-        //pt.dump();
-
         println!("Searching for the requested partition");
         pt.find_by_partuuid(uuid)?.ok_or(Error::PartitionNotFound)?
     };
 
     let offset = part.get_starting_lba();
-    let sectors = part.get_ending_lba().checked_sub(offset).and_then(|n| n.checked_add(1))
+    let sectors = part
+        .get_ending_lba()
+        .checked_sub(offset)
+        .and_then(|n| n.checked_add(1))
         .ok_or(Error::BadArgs)?;
 
     println!("Partition offset: {}", offset);
 
     let storage = nvme::NVMEStorage::new(1, offset)
-        .with_extent(sectors).map_err(|_| Error::BadArgs)?
+        .with_extent(sectors)
+        .map_err(|_| Error::BadArgs)?
         .with_read_budget(512 * 1024 * 1024 / 4096);
     let opts = FsOptions::new().update_accessed_date(false);
 
     let fs = FileSystem::new(storage, opts)?;
     let (parent, file_name) = path.rsplit_once('/').unwrap_or(("", path));
     let root = fs.root_dir();
-    let dir = if parent.is_empty() { root } else { root.open_dir(parent)? };
+    let dir = if parent.is_empty() {
+        root
+    } else {
+        root.open_dir(parent)?
+    };
     let mut matched = None;
     for result in dir.iter() {
         let entry = result?;
@@ -116,7 +130,8 @@ fn load_image(spec: &str) -> Result<Vec<u8>, Error> {
     println!("File size: {}", size);
 
     let mut buf = Vec::new();
-    buf.try_reserve_exact(size).map_err(|_| Error::OutOfMemory)?;
+    buf.try_reserve_exact(size)
+        .map_err(|_| Error::OutOfMemory)?;
     buf.resize(size, 0);
     let mut slice = &mut buf[..];
     while !slice.is_empty() {

@@ -21,7 +21,6 @@
 #define TPS_MODE_DBMA       ((u32)'D' | ((u32)'B' << 8) | ((u32)'M' << 16) | ((u32)'a' << 24))
 
 #define TPS_SPMI_REG_SELECT 0x00
-#define TPS_SPMI_REG_SIZE   0x1f
 #define TPS_SPMI_REG_DATA   0x20
 
 // Write to TPS_SPMI_REG_SELECT with MSB=1 will
@@ -209,7 +208,7 @@ int tps6598x_cmd_status(tps6598x_dev_t *dev, const char *cmd)
 {
     u32 cmd_status;
 
-    if (tps6598x_read_reg(dev, TPS_REG_CMD1, (u8 *)&cmd_status, 4) < 0) {
+    if (tps6598x_read_reg(dev, TPS_REG_CMD1, (u8 *)&cmd_status, 4) != 4) {
         printf("tps6598x: read status for cmd: %s failed\n", cmd);
         return -1;
     }
@@ -298,7 +297,7 @@ int tps6598x_powerup(tps6598x_dev_t *dev)
 {
     u8 power_state;
 
-    if (tps6598x_read_reg(dev, TPS_REG_POWER_STATE, &power_state, 1) < 0)
+    if (tps6598x_read_reg(dev, TPS_REG_POWER_STATE, &power_state, 1) != 1)
         return -1;
 
     if (power_state == 0)
@@ -308,7 +307,7 @@ int tps6598x_powerup(tps6598x_dev_t *dev)
     if (tps6598x_command(dev, "SSPS", &data, 1, NULL, 0))
         return -1;
 
-    if (tps6598x_read_reg(dev, TPS_REG_POWER_STATE, &power_state, 1) < 0)
+    if (tps6598x_read_reg(dev, TPS_REG_POWER_STATE, &power_state, 1) != 1)
         return -1;
 
     if (power_state != 0)
@@ -470,7 +469,7 @@ int tps6598x_foreach_hpm(hpm_match_t *match, hpm_action_t *action, void *data)
 
                 if (!match(hpm_path, data))
                     continue;
-                matched = true;
+                matched = HPM_FOREACH_MATCH;
 
                 if (!spmi) {
                     spmi = spmi_init(bus_path);

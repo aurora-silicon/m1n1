@@ -193,6 +193,35 @@ void run_actions(void)
     uartproxy_run(NULL);
 }
 
+static void j873g_run_proxy(void)
+{
+    u32 model_len = 0, target_len = 0;
+    const char *model = adt_getprop(adt, 0, "model", &model_len);
+    const char *target = adt_getprop(adt, 0, "target-type", &target_len);
+
+    if (board_id != 0x24 || !model || model_len != sizeof("Mac18,5") ||
+        memcmp(model, "Mac18,5", sizeof("Mac18,5")) || !target ||
+        target_len != sizeof("J873g") || memcmp(target, "J873g", sizeof("J873g")))
+        panic("Unsupported T8152 board\n");
+
+    /* Adopt firmware power and USB state. Only the qualified display route
+     * may be initialized here; secondary CPUs remain parked for the proxy. */
+    printf("J873g: KIS bring-up with native SMP\n");
+    mmu_init();
+    wdt_disable();
+    if (smp_init() < 0)
+        panic("Unsupported T8152 CPU topology\n");
+#ifdef USE_FB
+    if (display_init() < 0)
+        printf("display: initialization failed, continuing with firmware framebuffer\n");
+    fb_init(false);
+    fb_display_logo();
+    fb_set_active(true);
+#endif
+    printf("Initialization complete. Running proxy...\n");
+    uartproxy_run(NULL);
+}
+
 void m1n1_main(void)
 {
     printf("\n\nm1n1 %s\n", m1n1_version);
@@ -207,6 +236,11 @@ void m1n1_main(void)
     firmware_init();
 
     heapblock_init();
+
+    if (chip_id == T8152) {
+        j873g_run_proxy();
+        goto next_stage;
+    }
 
 #ifndef BRINGUP
     if (supports_gxf())
@@ -256,13 +290,14 @@ void m1n1_main(void)
 
     run_actions();
 
+next_stage:
     if (!next_stage.entry) {
         panic("Nothing to do!\n");
     }
 
     printf("Preparing to run next stage at %p...\n", next_stage.entry);
 
-    if (!nvme_shutdown()) {
+    if (chip_id != T8152 && !nvme_shutdown()) {
         printf("NVMe handoff failed; returning to proxy\n");
         uartproxy_run(NULL);
         panic("NVMe handoff failed\n");
@@ -270,8 +305,10 @@ void m1n1_main(void)
     usb_cdc_cleanup();
     exception_shutdown();
 #ifndef BRINGUP
-    usb_iodev_shutdown();
-    display_shutdown(DCP_SLEEP_IF_EXTERNAL);
+    if (chip_id != T8152) {
+        usb_iodev_shutdown();
+        display_shutdown(DCP_SLEEP_IF_EXTERNAL);
+    }
 #ifdef USE_FB
     fb_shutdown(next_stage.restore_logo);
 #endif

@@ -343,7 +343,6 @@ static int pmgr_save_parents(u8 die, u16 id, struct pmgr_saved_modes *saved, siz
     u32 reg = read32(addr);
     saved->modes[saved->count++] = (struct pmgr_saved_mode){
         .addr = addr,
-        .actual = FIELD_GET(PMGR_PS_ACTUAL, reg),
         .target = FIELD_GET(PMGR_PS_TARGET, reg),
     };
     return 0;
@@ -435,11 +434,6 @@ int pmgr_adt_power_disable(const char *path)
 int pmgr_adt_power_enable_traced(const char *path)
 {
     return pmgr_adt_devices_set_mode(path, PMGR_PS_ACTIVE, true, true);
-}
-
-int pmgr_adt_power_disable_traced(const char *path)
-{
-    return pmgr_adt_devices_set_mode(path, PMGR_PS_PWRGATE, false, true);
 }
 
 int pmgr_adt_power_enable_index(const char *path, u32 index)

@@ -68,3 +68,46 @@ def test_perpetually_busy_command_times_out_without_10000_polls(tmp_path):
     assert lib.tps6598x_command_execute(ctypes.byref(ops), None, b"TEST",
                                          None, 0, None, 0) == -2
     assert 1 <= len(polls) <= 15
+
+
+def test_status_and_power_reads_require_complete_values(tmp_path):
+    source = (ROOT / "src/tps6598x.c").read_text()
+    status = source[source.index("int tps6598x_cmd_status("):
+                    source.index("int tps6598x_disable_irqs(")]
+    power = source[source.index("int tps6598x_powerup("):
+                   source.index("int tps6598x_enter_kis(")]
+    harness = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef uint8_t u8;
+typedef uint32_t u32;
+typedef int tps6598x_dev_t;
+#define TPS_REG_CMD1 8
+#define TPS_CMD_INVALID 0x444d4321
+#define TPS_REG_POWER_STATE 0x20
+static int count;
+static int tps6598x_read_reg(tps6598x_dev_t *d, u8 reg, u8 *data, size_t len)
+{
+    memset(data, 0, len);
+    return count;
+}
+static int tps6598x_command(tps6598x_dev_t *d, const char *cmd, const u8 *in,
+                            size_t ilen, u8 *out, size_t olen) { return 0; }
+''' + status + power + r'''
+int main(void)
+{
+    for (count = -1; count <= 4; count++)
+        assert((tps6598x_cmd_status(NULL, "LOCK") == 0) == (count == 4));
+    for (count = -1; count <= 1; count++)
+        assert((tps6598x_powerup(NULL) == 0) == (count == 1));
+    return 0;
+}
+'''
+    binary = tmp_path / "tps-status"
+    subprocess.run(
+        ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
+         "-x", "c", "-", "-o", str(binary)], input=harness, text=True, check=True,
+    )
+    subprocess.run([str(binary)], check=True)

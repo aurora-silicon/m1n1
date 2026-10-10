@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "dptx_phy.h"
+#include "atc_phy.h"
 #include "malloc.h"
 
 #include "../adt.h"
@@ -14,6 +15,7 @@
 enum dptx_type {
     DPTX_PHY_T8112,
     DPTX_PHY_T602X,
+    DPTX_PHY_T8152_ATC,
 };
 
 typedef struct dptx_phy {
@@ -21,10 +23,17 @@ typedef struct dptx_phy {
     enum dptx_type type;
     u32 dcp_index;
     u32 active_lanes;
+    atc_phy_t *atc;
 } dptx_phy_t;
 
 int dptx_phy_activate(dptx_phy_t *phy)
 {
+    if (phy->type == DPTX_PHY_T8152_ATC) {
+        if (atc_phy_activate(phy->atc) || atc_phy_set_link_rate(phy->atc, 0x0a))
+            return -1;
+        phy->active_lanes = 0;
+        return 0;
+    }
     // MMIO: R.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
     // MMIO: W.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
     read32(phy->regs[1] + 0x10);
@@ -207,6 +216,15 @@ int dptx_phy_activate(dptx_phy_t *phy)
 
 int dptx_phy_set_active_lane_count(dptx_phy_t *phy, u32 num_lanes)
 {
+    if (phy->type == DPTX_PHY_T8152_ATC) {
+        if (num_lanes == 3 || num_lanes > 4)
+            return -1;
+        /* AppleTypeCPhyDisplayPortInterface::setActiveLaneCount is a no-op;
+         * its ATC port records the logical count after success. The physical
+         * lane mode was selected during the native four-lane initialization. */
+        phy->active_lanes = num_lanes;
+        return 0;
+    }
     u32 l;
 
     dprintf("DPTX-PHY: set_active_lane_count(%u) phy_regs = {0x%lx, 0x%lx}\n", num_lanes,
@@ -250,8 +268,22 @@ int dptx_phy_set_active_lane_count(dptx_phy_t *phy, u32 num_lanes)
     return 0;
 }
 
+u32 dptx_phy_get_active_lane_count(dptx_phy_t *phy)
+{
+    return phy->active_lanes;
+}
+
+int dptx_phy_set_drive_settings(dptx_phy_t *phy, const dptx_drive_settings_t *settings, u32 count)
+{
+    if (!phy || phy->type != DPTX_PHY_T8152_ATC)
+        return -1;
+    return atc_phy_set_drive_settings(phy->atc, settings, count);
+}
+
 int dptx_phy_set_link_rate(dptx_phy_t *phy, u32 link_rate)
 {
+    if (phy->type == DPTX_PHY_T8152_ATC)
+        return link_rate % 270 ? -1 : atc_phy_set_link_rate(phy->atc, link_rate / 270);
     UNUSED(link_rate);
     u32 sts_1008, sts_1014;
 
@@ -447,6 +479,23 @@ int dptx_phy_set_link_rate(dptx_phy_t *phy, u32 link_rate)
     return 0;
 }
 
+int dptx_phy_deactivate(dptx_phy_t *phy)
+{
+    if (!phy || phy->type != DPTX_PHY_T8152_ATC)
+        return -1;
+    int ret = atc_phy_deactivate(phy->atc);
+    if (!ret)
+        phy->active_lanes = 0;
+    return ret;
+}
+
+int dptx_phy_set_route(dptx_phy_t *phy, bool enable)
+{
+    if (!phy || phy->type != DPTX_PHY_T8152_ATC)
+        return -1;
+    return atc_phy_set_route(phy->atc, enable);
+}
+
 u32 dptx_phy_dcp_output(dptx_phy_t *phy)
 {
     switch (phy->type) {
@@ -454,6 +503,8 @@ u32 dptx_phy_dcp_output(dptx_phy_t *phy)
             return 5;
         case DPTX_PHY_T602X:
             return 4;
+        case DPTX_PHY_T8152_ATC:
+            return 3;
         default:
             return 5;
     }
@@ -474,6 +525,8 @@ dptx_phy_t *dptx_phy_init(const char *phy_node, u32 dcp_index)
         type = DPTX_PHY_T8112;
     else if (adt_is_compatible(adt, node, "dptx-phy,t602x"))
         type = DPTX_PHY_T602X;
+    else if (adt_is_compatible(adt, node, "atc-phy,t8152"))
+        type = DPTX_PHY_T8152_ATC;
     else {
         printf("DPtx-phy: dptx-phy node %s is not compatible\n", phy_node);
         return NULL;
@@ -485,6 +538,15 @@ dptx_phy_t *dptx_phy_init(const char *phy_node, u32 dcp_index)
 
     phy->type = type;
     phy->dcp_index = dcp_index;
+
+    if (type == DPTX_PHY_T8152_ATC) {
+        if (dcp_index != 0)
+            goto out_err;
+        phy->atc = atc_phy_init(phy_node);
+        if (!phy->atc)
+            goto out_err;
+        return phy;
+    }
 
     if (adt_get_reg(adt, adt_phy_path, "reg", 0, &phy->regs[0], NULL) < 0) {
         printf("DPtx-phy: failed to get %s.reg[0]\n", phy_node);
@@ -505,5 +567,9 @@ out_err:
 
 void dptx_phy_shutdown(dptx_phy_t *phy)
 {
+    if (!phy)
+        return;
+    if (phy->type == DPTX_PHY_T8152_ATC)
+        atc_phy_shutdown(phy->atc);
     free(phy);
 }

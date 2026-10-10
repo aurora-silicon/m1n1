@@ -152,6 +152,33 @@ cpu_reset:
     mov w0, 'O'
     bl debug_putc
 
+    /* T8152 has two six-core banks; Aff2 describes the core class. Pick a
+     * private stack before C so a late reset never uses the next CPU's stack. */
+    adrp x1, chip_id
+    ldr w1, [x1, :lo12:chip_id]
+    mov w2, #T8152
+    cmp w1, w2
+    b.ne 4f
+    mrs x2, MPIDR_EL1
+    and x3, x2, #0xff
+    ubfx x4, x2, #8, #8
+    cmp x3, #6
+    b.hs 5f
+    cmp x4, #1
+    b.hi 5f
+    add x5, x4, x4, lsl #1
+    add x3, x3, x5, lsl #1
+    adrp x1, secondary_stacks
+    add x1, x1, :lo12:secondary_stacks
+    add x3, x3, #1
+    mov x5, #SECONDARY_STACK_SIZE
+    madd x1, x3, x5, x1
+    b 3f
+5:
+    wfe
+    b 5b
+4:
+
     // for EL3 just keep the shared reset stack for now
     mrs x8, CurrentEL
     cmp x8, #0xc

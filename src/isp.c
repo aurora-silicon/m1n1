@@ -32,7 +32,7 @@ static const struct {
     {"ISP_FE", 0x4018},
 };
 
-// Candidate from the ISP-2 measurement plan; release requires its A/B receipts.
+// Candidate heap limit; requires hardware validation.
 #define ISP_T8140_HEAP_TOP 0x2200000
 #define ISP_T8140_SEG_END  0x21ec000
 
@@ -110,8 +110,9 @@ int isp_init(void)
 
     u64 isp_base, isp_size;
     u64 pmgr_base = 0;
-    err = adt_get_reg(adt, adt_isp_path, "reg", 0, &isp_base, &isp_size);
-    if (err || isp_size < ISP_ASC_VERSION + sizeof(u32) || isp_base > UINT64_MAX - isp_size)
+    reason = "invalid ISP aperture";
+    if (adt_get_reg(adt, adt_isp_path, "reg", 0, &isp_base, &isp_size) ||
+        isp_size < ISP_ASC_VERSION + sizeof(u32) || isp_base > UINT64_MAX - isp_size)
         goto out;
 
     if (t8140) {

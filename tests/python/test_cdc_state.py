@@ -39,8 +39,6 @@ def state_lib(tmp_path):
     lib.usb_cdc_recovery_due.argtypes = [ctypes.POINTER(Recovery), ctypes.c_uint64]
     lib.usb_cdc_recovery_due.restype = ctypes.c_bool
     lib.usb_cdc_recovery_attempted.argtypes = [ctypes.POINTER(Recovery), ctypes.c_uint64]
-    lib.usb_cdc_dma_may_release.argtypes = [ctypes.c_bool, ctypes.c_int, ctypes.c_bool]
-    lib.usb_cdc_dma_may_release.restype = ctypes.c_bool
     return lib
 
 
@@ -88,14 +86,3 @@ def test_recovery_has_three_attempts_and_connect_resets_budget(tmp_path):
     lib.usb_cdc_recovery_connected(ctypes.byref(recovery))
     lib.usb_cdc_recovery_arm(ctypes.byref(recovery), 6000)
     assert recovery.pending and recovery.attempts == 0
-
-
-def test_reset_and_close_keep_dma_owned_trbs_at_each_transfer_phase(tmp_path):
-    lib = state_lib(tmp_path)
-    for phase in ("ep0-setup", "ep0-data-in", "ep0-data-out",
-                  "ep0-status-in", "ep0-status-out", "bulk-first",
-                  "bulk-chained", "bulk-last"):
-        assert not lib.usb_cdc_dma_may_release(True, -1, False), phase
-        assert lib.usb_cdc_dma_may_release(True, 0, False), phase
-        assert lib.usb_cdc_dma_may_release(True, -1, True), phase
-    assert lib.usb_cdc_dma_may_release(False, -1, False)

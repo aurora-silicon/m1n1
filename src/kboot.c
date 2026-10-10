@@ -1255,6 +1255,17 @@ static const struct adt_tunable_info usb4_rc_tunables[] = {
     {"lbw_fabric_tunables", "apple,tunable-rc", 0x8000, 0x4000, true},
 };
 
+/* Type 7 firmware does not supply the four per-direction fabric tables. */
+static const struct adt_tunable_info usb4_t8142_nhi_tunables[] = {
+    {"hi_up_tx_desc_fabric_tunables", "apple,tunable-nhi", 0xe8000, 0x4000, false},
+    {"hi_up_tx_data_fabric_tunables", "apple,tunable-nhi", 0xec000, 0x4000, false},
+    {"hi_up_rx_desc_fabric_tunables", "apple,tunable-nhi", 0xf0000, 0x4000, false},
+    {"hi_up_wr_fabric_tunables", "apple,tunable-nhi", 0xf4000, 0x4000, false},
+    {"hi_up_merge_fabric_tunables", "apple,tunable-nhi", 0xf8000, 0x4000, true},
+    {"hi_dn_merge_fabric_tunables", "apple,tunable-nhi", 0xfc000, 0x4000, true},
+    {"fw_int_ctl_management_tunables", "apple,tunable-nhi", 0x4000, 0x4000, true},
+};
+
 static const struct adt_tunable_info usb4_pcie_adapter_tunables[] = {
     {"pcie_adapter_regs_tunables", "apple,tunable-pcie-adapter", 0x0, 0x4000, true},
 };
@@ -1288,7 +1299,7 @@ static int dt_append_acio_tunable(int adt_node, int fdt_node,
             return 0;
     }
 
-    if (tunables_len % sizeof(*tunable_adt)) {
+    if ((tunable_info->required && !tunables_len) || tunables_len % sizeof(*tunable_adt)) {
         printf("ADT: tunable %s with invalid length %d\n", tunable_info->adt_name, tunables_len);
         return -1;
     }
@@ -1307,8 +1318,15 @@ static int dt_append_acio_tunable(int adt_node, int fdt_node,
             return -1;
         }
 
-        if (tunable->offset + tunable->size > tunable_info->reg_size) {
+        if (tunable_info->reg_size < tunable->size ||
+            tunable->offset > tunable_info->reg_size - tunable->size ||
+            tunable_info->reg_offset > UINT32_MAX - tunable->offset) {
             printf("kboot: ACIO tunable has invalid offset %x\n", tunable->offset);
+            return -1;
+        }
+
+        if (tunable->mask > UINT32_MAX || tunable->value > UINT32_MAX) {
+            printf("kboot: ACIO tunable does not fit a 32-bit register\n");
             return -1;
         }
 
@@ -1355,7 +1373,7 @@ static int dt_copy_usb4_drom(const char *adt_path, const char *dt_alias, u64 rou
 
     u32 drom_len;
     const u8 *drom_blob = adt_getprop(adt, adt_node, "thunderbolt-drom", &drom_len);
-    if (!drom_blob || !drom_len)
+    if (!drom_blob || drom_len < 1 + sizeof(router_uuid))
         bail("ADT: Failed to get thunderbolt-drom\n");
 
     if (drom_len > sizeof(drom))
@@ -1405,6 +1423,13 @@ static int dt_set_acio_tunables(void)
     char adt_path[32];
     char fdt_alias[32];
     u64 router_uuid = rust_usb4_router_uuid();
+    const struct adt_tunable_info *nhi_tunables = usb4_nhi_tunables;
+    size_t n_nhi_tunables = ARRAY_SIZE(usb4_nhi_tunables);
+
+    if (chip_id == T8142) {
+        nhi_tunables = usb4_t8142_nhi_tunables;
+        n_nhi_tunables = ARRAY_SIZE(usb4_t8142_nhi_tunables);
+    }
 
     if (!router_uuid)
         bail("ADT: unable to generate USB4 router UUID\n");
@@ -1426,8 +1451,7 @@ static int dt_set_acio_tunables(void)
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_nhi", i);
         if (!fdt_get_alias(dt, fdt_alias))
             snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-nhi", i);
-        dt_copy_acio_tunables(adt_path, fdt_alias, usb4_nhi_tunables,
-                              sizeof(usb4_nhi_tunables) / sizeof(*usb4_nhi_tunables));
+        dt_copy_acio_tunables(adt_path, fdt_alias, nhi_tunables, n_nhi_tunables);
         dt_copy_usb4_drom(adt_path, fdt_alias, router_uuid | i);
     }
 
@@ -1607,6 +1631,8 @@ static int dt_disable_pcie_mappers(int parent)
 
 static int dt_disable_t8140_pcie(void)
 {
+    if (pcie_t8140_disable_piodma(dt))
+        return -1;
     int nodes[64];
     int count = 0;
     int node = -1;
@@ -1757,6 +1783,24 @@ static int dt_device_set_reserved_mem_from_dart(int node, dart_dev_t *dart, cons
     if (chip_id == T8140)
         printf("FDT: %s DART %s: IOVA 0x%lx -> PA 0x%lx size 0x%lx validated\n", device, name, iova,
                paddr, size);
+    /* dart_search returns a page-table offset without the bus address's
+     * high bits. On T8142 the display DARTs translate a size-aligned window
+     * high in the bus address space (64 GiB at 1 TiB); add the window base so
+     * Linux reserves the IOVA the device actually uses.
+     */
+    if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
+        int owner = fdt_node_offset_by_phandle(dt, phandle);
+        int iommu = owner < 0 ? owner : dt_get_iommu_node(owner, 0);
+        int len = 0;
+        const fdt64_t *range =
+            iommu < 0 ? NULL : fdt_getprop(dt, iommu, "apple,dma-range", &len);
+        if (range && len == 16) {
+            u64 base = fdt64_ld(&range[0]), span = fdt64_ld(&range[1]);
+            if (span && !(span & (span - 1)) && base >= span && !(base & (span - 1)) &&
+                iova < span)
+                iova |= base;
+        }
+    }
 
     return dt_device_set_reserved_mem(node, name, phandle, iova, size);
 }
@@ -2891,6 +2935,123 @@ refuse:
     return dt_t8140_refuse_display();
 }
 
+/* T8142 display carveouts: DCP uses SID 23, the display pipe SID 0 and
+ * PIODMA SID 16. IOVAs are resolved from the inherited DART tables, since the
+ * live OS-log alias can differ from its static segment descriptor.
+ */
+static struct disp_mapping disp_reserved_regions_t8142[] = {
+    {"region-id-49", "asc-firmware", true, false, false},
+    {"region-id-50", "dcp_data", true, false, false},
+    {"region-id-57", "region57", true, false, false},
+    {"region-id-94", "region94", true, true, false},
+    {"region-id-95", "region95", true, false, true},
+};
+
+static bool dt_display_phys_reserved(u64 phys, u64 size)
+{
+    int parent = fdt_path_offset(dt, "/reserved-memory");
+    int node;
+
+    fdt_for_each_subnode(node, dt, parent) {
+        int len;
+        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+        if (!reg || len != 16 || !fdt_getprop(dt, node, "no-map", NULL))
+            continue;
+        u64 base = fdt64_ld(&reg[0]), count = fdt64_ld(&reg[1]);
+        if (phys >= base && size <= count && phys - base <= count - size)
+            return true;
+    }
+    return false;
+}
+
+/* The T8142 DCP data carveout is fragmented in DVA space, and __SHARED
+ * extends outside it. Preserve every live segment, including aliases whose ADT
+ * physical field differs from the active DART translation (__OS_LOG).
+ * IOVA-only reservations avoid overlapping physical reserved-memory nodes
+ * when a segment is already contained in a carveout or the framebuffer.
+ */
+static int dt_reserve_m5_display_segments(void)
+{
+    const char *alias = "dcp";
+    int owner = fdt_path_offset(dt, alias);
+    int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 dram, dram_size;
+    u32 len = 0;
+    int ret = 0;
+    const struct adt_segment_ranges *segments;
+
+    if (owner < 0)
+        return 0;
+    if (nub < 0 || chosen < 0 ||
+        ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size))
+        bail("ADT: missing M5 display firmware memory bounds\n");
+    segments = adt_getprop(adt, nub, "segment-ranges", &len);
+    if (!segments || !len || len % sizeof(*segments) || len / sizeof(*segments) > 64)
+        bail("ADT: invalid M5 display segment inventory\n");
+    u32 owner_phandle = fdt_get_phandle(dt, owner);
+    dart_dev_t *dart = dt_init_dart_by_node(owner, 0);
+    if (!dart)
+        bail("FDT: cannot inspect M5 display firmware translations\n");
+
+    u64 total = 0;
+    for (u32 i = 0; i < len / sizeof(*segments); i++) {
+        u64 start = segments[i].remap;
+        u64 size = ALIGN_UP((u64)segments[i].size, SZ_16K);
+        total += size;
+        if (!size || (start & (SZ_16K - 1)) || start < (1ULL << 40) ||
+            start - (1ULL << 40) >= (1ULL << 36) ||
+            size > (1ULL << 36) - (start - (1ULL << 40)) || total > 128 * SZ_1M)
+            bail_cleanup("ADT: unsupported M5 display firmware segment\n");
+        for (u64 offset = 0; offset < size;) {
+            u64 iova = start + offset;
+            u64 phys = (u64)dart_translate(dart, iova);
+            if (phys < dram || phys - dram > dram_size - SZ_16K ||
+                (phys & (SZ_16K - 1)))
+                bail_cleanup("DART: invalid M5 display firmware page\n");
+            bool reserved = dt_display_phys_reserved(phys, SZ_16K);
+            u64 count = SZ_16K;
+            while (offset + count < size) {
+                u64 next = (u64)dart_translate(dart, iova + count);
+                if (next != phys + count || next < dram ||
+                    next - dram > dram_size - SZ_16K ||
+                    dt_display_phys_reserved(next, SZ_16K) != reserved)
+                    break;
+                count += SZ_16K;
+            }
+            char name[64];
+            int node;
+            if (!reserved) {
+                snprintf(name, sizeof(name), "dcp-firmware@%lx", phys);
+                node = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, phys, count);
+            } else {
+                snprintf(name, sizeof(name), "dcp-iova-%lx", iova);
+                int parent = fdt_path_offset(dt, "/reserved-memory");
+                node = fdt_add_subnode(dt, parent, name);
+                if (node < 0)
+                    bail_cleanup("FDT: cannot add M5 display IOVA reservation\n");
+                u32 phandle;
+                if (fdt_generate_phandle(dt, &phandle) ||
+                    fdt_setprop_u32(dt, node, "phandle", phandle) ||
+                    fdt_setprop_string(dt, node, "compatible", "apple,asc-mem"))
+                    bail_cleanup("FDT: cannot describe M5 display IOVA reservation\n");
+            }
+            if (node < 0)
+                bail_cleanup("FDT: cannot reserve M5 display firmware\n");
+            u32 phandle = fdt_get_phandle(dt, node);
+            if (dt_device_set_reserved_mem(node, name, owner_phandle, iova, count) ||
+                dt_device_add_mem_region(alias, phandle, NULL))
+                bail_cleanup("FDT: cannot attach M5 display firmware reservation\n");
+            offset += count;
+        }
+    }
+    printf("FDT: reserved live M5 display firmware segments (%lu bytes)\n", total);
+err:
+    dart_shutdown(dart);
+    return ret;
+}
+
 static int dt_set_display(void)
 {
     if (chip_id == T8140)
@@ -2958,6 +3119,12 @@ static int dt_set_display(void)
             return ret;
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6022")) {
         /* noop */
+    } else if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
+        ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
+                                          disp_reserved_regions_t8142,
+                                          ARRAY_SIZE(disp_reserved_regions_t8142));
+        if (ret)
+            return ret;
     } else {
         printf("FDT: unknown compatible, skip display reserved-memory setup\n");
         return 0;
@@ -2977,10 +3144,12 @@ static int dt_set_display(void)
 
     const display_config_t *disp_cfg = display_get_config();
 
-    if (disp_cfg)
-        return dt_vram_reserved_region(disp_cfg->dcp_alias, "disp0");
-    else
-        return dt_vram_reserved_region("dcp", "disp0");
+    ret = dt_vram_reserved_region(disp_cfg ? disp_cfg->dcp_alias : "dcp", "disp0");
+    if (ret)
+        return ret;
+    if (!fdt_node_check_compatible(dt, 0, "apple,t8142"))
+        return dt_reserve_m5_display_segments();
+    return 0;
 }
 
 static const char *excluded_pmp_props[] = {
@@ -3959,6 +4128,11 @@ int kboot_boot(void *kernel)
                 return -1;
         } else {
             printf("kboot: T8140 APCIe initialized; retaining PCIe consumers\n");
+            ret = pcie_t8140_handoff(dt);
+            if (ret < 0)
+                return -1;
+            if (ret > 0 && dt_disable_t8140_pcie())
+                return -1;
         }
         if (fdt_pack(dt))
             bail("FDT: fdt_pack() failed\n");
@@ -3966,7 +4140,7 @@ int kboot_boot(void *kernel)
         if (dt_remain < SZ_16K)
             printf("FDT: free dt buffer space low, %u bytes left\n", dt_remain);
     }
-    ret = dapf_init_all();
+    ret = chip_id == T8142 ? dapf_init_fdt(dt) : dapf_init_all();
     if (ret < 0 && chip_id == T8140) {
         printf("kboot: refusing T8140 handoff after DAPF failure\n");
         pcie_shutdown();

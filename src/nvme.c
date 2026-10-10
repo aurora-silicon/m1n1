@@ -117,6 +117,7 @@ struct nvme_queue {
     u8 cq_phase;
 
     bool adminq;
+    bool failed;
 };
 
 static_assert(sizeof(struct nvme_command) == 64, "invalid nvme_command size");
@@ -129,6 +130,7 @@ static enum {
 } nvme_type;
 
 static bool nvme_initialized = false;
+static bool nvme_reboot_required;
 bool nvme_adopt_live_session = false;
 bool nvme_keep_running_for_linux = false;
 static u8 nvme_die;
@@ -250,6 +252,10 @@ static bool nvme_ctrl_shutdown(void)
 
 static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u64 *result)
 {
+    /* A timed-out command may still own slot 0 and its DMA mappings. */
+    if (q->failed)
+        return false;
+
     bool found = false;
     bool completed = false;
     u64 timeout;
@@ -324,6 +330,7 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
 
     if (!found) {
         nvme_cmd_timed_out = !completed;
+        q->failed = true;
         printf("nvme: could not find command completion in CQ\n");
         return false;
     }
@@ -339,6 +346,10 @@ static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u6
 
 bool nvme_init(void)
 {
+    if (nvme_reboot_required) {
+        printf("nvme: setup failed; reboot required before initialization\n");
+        return false;
+    }
     if (nvme_initialized) {
         printf("nvme: already initialized\n");
         return true;
@@ -391,8 +402,18 @@ bool nvme_init(void)
             printf("nvme: Error getting NVMe base address.\n");
             goto out_reset;
         }
+        /*
+         * The J700 ADT advertises only the first 64 KiB of this alias.
+         * Its linear queue registers live at +0x24908..+0x24910 in the
+         * same non-secure alias. The public T8140 Linux binding describes
+         * the full 0x30000 aperture. Admit only that measured SoC/layout;
+         * retain the normal bounds and overlap checks for every other BAR.
+         */
+        if (chip_id == T8140 && nvmmu_base == 0x38dcc0000 &&
+            nvme_base == 0x3cdcc0000 && nvme_size == 0x10000)
+            nvme_size = 0x30000;
         if (nvmmu_size < NVMMU_TCB_STAT + sizeof(u32) ||
-            nvme_size < NVME_BOOT_STATUS + sizeof(u32) || nvmmu_base > UINT64_MAX - nvmmu_size ||
+            nvme_size < NVME_DB_LINEAR_IOSQ + sizeof(u32) || nvmmu_base > UINT64_MAX - nvmmu_size ||
             nvme_base > UINT64_MAX - nvme_size ||
             (nvmmu_base < nvme_base + nvme_size && nvme_base < nvmmu_base + nvmmu_size)) {
             printf("nvme: invalid split BAR geometry\n");
@@ -532,8 +553,11 @@ out_disable_ctrl:
     nvme_ctrl_disable();
     nvme_poll_syslog();
 out_shutdown:
-    if (adopting)
-        goto out_asc;
+    if (adopting) {
+        /* ANS may still reference the queues if controller shutdown failed. */
+        printf("nvme: preserving adopted ANS queues after setup failure; reboot required\n");
+        goto out_preserve;
+    }
     if (nvme_type != NVME_T8132) {
         rtkit_sleep(nvme_rtkit);
         // Some machines call this ANS, some ANS2...
@@ -542,8 +566,8 @@ out_shutdown:
     }
 out_rtkit:
     if (nvme_type == NVME_T8132 && nvme_asc && asc_cpu_running(nvme_asc)) {
-        printf("nvme: preserving running post-M4 ANS after setup failure\n");
-        goto out_reset;
+        printf("nvme: preserving running post-M4 ANS after setup failure; reboot required\n");
+        goto out_preserve;
     }
     rtkit_free(nvme_rtkit);
 out_sart:
@@ -563,6 +587,11 @@ out_reset:
     nvme_base = 0;
     nvmmu_base = 0;
     nvme_die = 0;
+    return false;
+
+out_preserve:
+    /* Retained DMA resources must not be reused or handed off to another image. */
+    nvme_reboot_required = true;
     return false;
 }
 
@@ -624,6 +653,10 @@ bool nvme_has_live_post_m4_session(void)
 
 bool nvme_shutdown(void)
 {
+    if (nvme_reboot_required) {
+        printf("nvme: refusing shutdown after setup failure; reboot required\n");
+        return false;
+    }
     if (!nvme_initialized) {
         // nvme_ensure_shutdown();
         return true;
@@ -725,8 +758,8 @@ static bool nvme_submit_read(u32 nsid, u64 lba, void *buffer, u32 count, u64 prp
 
 bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
 {
-    if (!nvme_initialized || !count || count > 256 || ((u64)buffer & (SZ_4K - 1)) ||
-        lba > UINT64_MAX - (count - 1))
+    if (!nvme_initialized || ioq.failed || !count || count > NVME_MAX_READ_BLOCKS ||
+        ((u64)buffer & (SZ_4K - 1)) || lba > UINT64_MAX - (count - 1))
         return false;
 
     if (count > 1 && nvme_multi_enabled) {

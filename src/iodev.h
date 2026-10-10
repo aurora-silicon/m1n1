@@ -61,6 +61,7 @@ void iodev_lock(iodev_id_t id);
 void iodev_unlock(iodev_id_t id);
 
 void iodev_console_write(const void *buf, size_t length);
+void iodev_console_rewind(iodev_id_t id);
 void iodev_console_kick(void);
 void iodev_console_flush(void);
 

@@ -72,11 +72,68 @@ must put Image or Image.gz, the matching DTB, and a gzip or cpio initramfs at
 the named paths. Do not mix a kernel Image and modules from different build
 output folders.
 
+For an EFI boot manager such as U-Boot, use `-` as the fourth field:
+
+```sh
+printf '%s\n' 'boot=<ESP PARTUUID>;aurora/boot/u-boot.bin;aurora/boot/t8140-j700.dtb;-' >> stage2-for-esp.bin
+```
+
+This loads only the image and DTB, without publishing a loader initramfs.
+The selected EFI OS image supplies its own initramfs. Do not substitute an
+empty cpio archive: Linux gives `linux,initrd-*` in the device tree priority
+over the EFI initramfs, so an empty archive can hide the OS's storage modules
+and `/init`. The three-file direct Linux route remains unchanged.
+
+## Experimental retained-radio handoff
+
+This is an opt-in integration with a local kernel, not the default public
+kernel's PIODMA contract. Only a J700 DTB whose kernel implements Linux-owned
+SID1 and retained firmware SID16/18 may set this property on its PCIe host:
+
+```dts
+apple,j700-radio-handoff = "retained-sid1-v1";
+```
+
+With no marker, m1n1 leaves the existing public PCIe handoff unchanged.
+The implementation paired with this mode is the local Semi-dirtyroom kernel
+commit `8cc2955ae`; it has not been published. The output properties
+`linux-enablement-mac,owned-streams` and
+`linux-enablement-mac,static-dart-bypass-test` are its experimental ABI, not
+upstream bindings. Do not opt a stock public kernel into this mode. A future
+public ownership binding must use a separately qualified contract version.
+
+After PCIe initialization, the opted-in handoff validates J700's ADT DART
+policy and radio link. PCIe initialization can already have torn down an
+inherited link; the handoff does not promise to preserve it. An inactive link
+is brought up using the pcIO rail, active-low PERST#, CLKREQ# and Intr2AXI,
+keeping PERST# asserted during power cycling and observing the settling delays.
+The power sequence is adapted from the owner's private Neo loader and checked
+against J700's ADT and DebugUSB captures. This is not a cleanroom provenance
+certification. Intr2AXI is ADT register 10 at 0x390024000; accessing register 11
+at 0x390048080 produced a synchronous external abort during development.
+
+A guarded typed ECAM read must identify MT7932 before exposing function 0.
+Linux owns SID1, firmware retains SID16/18, and the DMA window stays within
+32-bit bus addresses. Function 1 remains unavailable. PIODMA diagnostic nodes,
+including the root-level SID17 consumer, are disabled. The host's CLKREQ#
+pinctrl properties and the port's power request are removed to prevent Linux
+from remuxing or reclaiming firmware-owned resources. These properties may
+already be absent in an opted-in DTB.
+
+Policy, link-training or identity rejection disables the PCIe consumers and
+PIODMA diagnostics while allowing the rest of the OS to boot. The reason is
+recorded in `/chosen/apple,radio-handoff-status`. The existing SMC/RTKit
+protocol still has unbounded waits, and resource identity checks do not guard
+every MMIO access against a hardware fault. This mode needs cold-power-cycle
+qualification and additional fault-path hardening before broader release.
+
 ## Qualification and installation
 
 The J700 CDC transition arms a 170 second watchdog while waiting for
 the primary host session. A completed primary DTR handshake disarms it;
 an incomplete transition resets through the normal recovery path.
+This path has host-side tests. Gen1 enumeration, primary handshake and
+reconnect still require hardware validation.
 
 First run PLAN P2 T-tethered on K-clean and K-full using only
 `aurora-ctl hw request`, and retain each `plan.json`, `receipt.json`, console
@@ -99,3 +156,19 @@ the owner password. Keep the previous bare Stage 1 for rollback with the same
 
 No worker should access the target directly or run the old bench scripts. All
 target tests and recovery go through approved `aurora-ctl hw request` entries.
+
+## T8140 NVMe non-secure alias aperture
+
+On J700, the live ADT advertises `ans/reg[9]` as a 0x10000-byte window even
+though the linear queue control and doorbells are at +0x24908..+0x24910 in
+that non-secure alias. The public T8140 Linux device tree describes
+its full 0x30000-byte aperture. Stage 2 must recognize that specific layout
+before applying its normal register bounds check.
+
+The compatibility rule is limited to T8140, translated NVMMU base
+0x38dcc0000, translated NVMe base 0x3cdcc0000 and the advertised 0x10000-byte
+NVMe window. Other SoCs, unexpected addresses, shorter windows, undersized
+NVMMU resources, overflow and overlapping resources retain their rejection
+paths. The ANS-adoption host regression exercises the observed aperture and
+negative layouts before any queue publication. The aperture was verified on
+one J700 with two warm ESP boots. Cold-power-cycle qualification remains pending.
