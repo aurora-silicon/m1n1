@@ -408,7 +408,7 @@ establish firmware tunable completion.
 
 ## Native Linux USB handoff
 
-USB0 has two T8110 DART banks in the ADT. Two independent RAM-only Linux boots
+USB0 has two T8110 DART banks in the ADT. Three RAM-only Linux trials
 completed root-shell commands over high-speed CDC with both providers in
 the DWC3 `iommus` property, following the upstream T8112 model:
 
@@ -428,10 +428,20 @@ all 16 TCRs were 1. Check it again immediately before the vector. Retain the
 existing bank1 SID1 and controller retirement checks. Linux's ordinary DART
 probe resets the bank, so an old snapshot cannot authorize a later handoff.
 
-The successful test used notification suppression and the existing endpoint
-diagnostic controls. Normal CDC notifications, sustained transfers, ECM and
-SuperSpeed still require separate validation. The test recovered through the
-original hardware watchdog and changed no installed images or partitions.
+The first two trials used notification suppression, omitted empty-transfer
+priming and deferred initial requests until the configuration status stage
+completed. A later trial kept priming omitted and notifications suppressed,
+disabled request deferral, and returned a complete fresh-nonce UID0 command
+through the ordinary queue/kick path. It recovered through the original
+watchdog. This qualifies one command with those controls, not sustained use.
+
+Restoring empty priming failed configuration even with notifications
+suppressed. Enabling notifications on the working skip-only setup also
+failed. Increasing the notification allocation to 128 bytes confirmed DMA
+alignment while retaining the 10-byte packet, but did not resolve the failure.
+These comparisons do not establish its hardware cause. Normal notifications,
+ECM and SuperSpeed remain unqualified. Installed images and partitions were
+preserved.
 
 ## Other implementation boundaries
 

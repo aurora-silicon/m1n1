@@ -93,6 +93,16 @@ gadget code sets its configured state before completing function activation
 and the control-request status stage; the kernel-side state alone does not
 prove either completed.
 
+Later RAM trials using both USB DART banks completed three fresh-nonce root
+commands over physical high-speed ACM bulk traffic. Each returned UID0,
+the exact kernel release and command line, a configured UDC, speed and uptime,
+then passed independent watchdog recovery. The first two used notification
+suppression, omitted empty-transfer priming and request deferral. The third
+kept suppression and omitted priming but disabled request deferral, confirming
+the ordinary queue/kick path for one command. Enabling notifications on that
+setup still failed configuration. Sustained operation, normal notifications
+and ECM remain unqualified; see the native USB handoff driver contract.
+
 Two initramfs errors were corrected before enumeration. This kernel's
 `gether_set_ifname()` requires a template containing exactly one `%d`; write
 it literally with `printf 'usb%%d\n'`. Configfs resolves a symlink target
@@ -265,8 +275,8 @@ executable checks and preserve the caller's 45-second watchdog. The final
 verified recovery explicitly disables it. The earlier checked implementation
 failed this transition; adding the resource, force and completion handling
 made it pass. Test-only watchdog startup and RAM diagnostics stay outside
-the production changes. Native Linux gadget traffic and SuperSpeed remain
-unqualified.
+the production changes. Separate native RAM bulk-command results are recorded
+above; reliable normal Linux ACM and SuperSpeed remain unqualified.
 
 A later console checkpoint records the post-retirement registers after the
 original MMU-off reset and before the recovery copy. Two samples of all 46
