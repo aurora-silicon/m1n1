@@ -31,6 +31,12 @@ issuing commands and retain the allocation, tables and IOP until recovery.
 Do not free memory merely because a command timed out. AOP shutdown does not
 yet provide a reliable ownership-release acknowledgement.
 
+The C-backed proxy API takes `dart_init(base, sid, dart_type, keep_pts=False)`;
+the type remains the third Python argument. Persistent `dart_map` buffers must
+be caller-owned target addresses, not byte strings passed for temporary upload.
+With the updated m1n1 image, failed DART commands raise `ProxyRemoteError`.
+Retain the backing memory after an uncertain map or unmap until recovery.
+
 ## Audio transport and mappings
 
 Use the advertised `aop-audio` service on endpoint 0x22 after application queue
