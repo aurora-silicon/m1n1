@@ -18,7 +18,6 @@ typedef uint8_t u8;
 #define CHAINLOADING 1
 #define T8140 0x8140
 #define BOOT_SPEC_MAX 1024
-static int chip_id = T8140;
 struct kernel_header { int unused; };
 static struct kernel_header image;
 static char tree, archive[] = "070701";

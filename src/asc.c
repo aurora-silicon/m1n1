@@ -88,8 +88,8 @@ asc_dev_t *asc_init(const char *path)
         u32 mailbox = 0;
         u32 mailbox_len;
         const void *mailbox_prop = adt_getprop(adt, node, "msgbox-mailbox-num", &mailbox_len);
-        /* All three optional mailbox properties default to zero when
-         * absent. The J873 SMC omits them and uses mailbox 0,
+        /* AppleASCWrapV8::initialize defaults all three optional mailbox
+         * properties to zero. The J873 SMC omits them and uses mailbox 0,
          * aperture 1 in the non-alias bank. Reject malformed present data. */
         if (mailbox_prop) {
             if (mailbox_len != sizeof(mailbox)) {

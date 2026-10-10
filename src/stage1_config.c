@@ -9,7 +9,7 @@
 
 #include "tinf/tinf.h"
 
-#if defined(CHAINLOADING) && !defined(J700_ESP_STAGE2)
+#if defined(CHAINLOADING) && !defined(ESP_STAGE2)
 
 struct stage1_config_block {
     char magic[16];

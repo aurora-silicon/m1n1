@@ -16,7 +16,7 @@ void smp_secondary_prep_el3(void);
 
 int smp_init(void);
 int smp_start_secondaries(void);
-void smp_stop_secondaries(bool deep_sleep);
+int smp_stop_secondaries(bool deep_sleep);
 
 #define smp_call0(i, f)          smp_call4(i, f, 0, 0, 0, 0)
 #define smp_call1(i, f, a)       smp_call4(i, f, a, 0, 0, 0)
@@ -25,8 +25,11 @@ void smp_stop_secondaries(bool deep_sleep);
 
 int smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3);
 
+#define SMP_TIMEOUT -2
+
 int smp_wait_timed(int cpu, u64 *retval, u32 timeout_ms);
-u64 smp_wait(int cpu);
+/* A NULL result discards the callback value, never the completion status. */
+int smp_wait(int cpu, u64 *retval);
 
 bool smp_is_alive(int cpu);
 uint64_t smp_get_mpidr(int cpu);

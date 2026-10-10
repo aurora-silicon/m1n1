@@ -364,15 +364,17 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
     return i >= 100 ? -1 : 0;
 }
 
-static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
+static int smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
 {
     int i;
 
-    if (index >= MAX_CPUS)
-        return;
+    if (index < 0 || index >= MAX_CPUS)
+        return -1;
 
     if (!spin_table[index].flag)
-        return;
+        return 0;
+    if (spin_table[index].target)
+        return -1;
 
     printf("Stopping CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
 
@@ -383,7 +385,10 @@ static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
 
     u64 dsleep = deep_sleep;
     // Put the CPU to sleep
-    smp_call1(index, cpu_sleep, dsleep);
+    if (smp_call1(index, cpu_sleep, dsleep)) {
+        printf("SMP: CPU %d did not accept the stop request\n", index);
+        return -1;
+    }
 
     // If going into deep sleep, powering off the last core in a cluster kills our register
     // access, so just wait a bit.
@@ -391,7 +396,7 @@ static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
         udelay(10000);
         printf("  Presumed stopped.\n");
         memset(&spin_table[index], 0, sizeof(struct spin_table));
-        return;
+        return 0;
     }
 
     // Check that it actually shut down
@@ -404,11 +409,13 @@ static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
 
     if (i >= 50) {
         printf("Failed!\n");
+        return -1;
     } else {
         printf("  Stopped.\n");
 
         memset(&spin_table[index], 0, sizeof(struct spin_table));
     }
+    return 0;
 }
 
 static int smp_init_t8152(void)
@@ -747,16 +754,16 @@ int smp_start_secondaries(void)
     return 0;
 }
 
-void smp_stop_secondaries(bool deep_sleep)
+int smp_stop_secondaries(bool deep_sleep)
 {
     if (chip_id == T8152) {
         printf("SMP: T8152 power-off is not supported; reset the target\n");
-        return;
+        return -1;
     }
     printf("Stopping secondary CPUs...\n");
 
     if (!smp_initialized)
-        return;
+        return -1;
 
     smp_set_wfe_mode(true);
 
@@ -766,8 +773,10 @@ void smp_stop_secondaries(bool deep_sleep)
         if (!cpu->valid || i == boot_cpu_idx)
             continue;
 
-        smp_stop_cpu(i, cpu, deep_sleep);
+        if (smp_stop_cpu(i, cpu, deep_sleep))
+            return -1;
     }
+    return 0;
 }
 
 void smp_send_ipi(int cpu)
@@ -816,7 +825,7 @@ int smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
         sysop("dmb sy");
         if (ticks_to_msecs(get_ticks() - started) >= 1000) {
             printf("SMP: CPU %d did not acknowledge call\n", cpu);
-            return -1;
+            return SMP_TIMEOUT;
         }
     }
     return 0;
@@ -833,7 +842,7 @@ int smp_wait_timed(int cpu, u64 *retval, u32 timeout_ms)
         sysop("dmb sy");
         if (ticks_to_msecs(get_ticks() - started) >= timeout_ms) {
             printf("SMP: CPU %d call did not complete\n", cpu);
-            return -1;
+            return SMP_TIMEOUT;
         }
     }
 
@@ -841,11 +850,10 @@ int smp_wait_timed(int cpu, u64 *retval, u32 timeout_ms)
     return 0;
 }
 
-u64 smp_wait(int cpu)
+int smp_wait(int cpu, u64 *retval)
 {
-    u64 retval = 0;
-    smp_wait_timed(cpu, &retval, 300000);
-    return retval;
+    u64 ignored;
+    return smp_wait_timed(cpu, retval ? retval : &ignored, 300000);
 }
 
 void smp_set_wfe_mode(bool new_mode)

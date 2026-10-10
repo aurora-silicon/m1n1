@@ -1,4 +1,4 @@
-"""Release package contents must include the FAT provenance and logo terms."""
+"""Release package contents must include the FAT and logo licences."""
 
 import hashlib
 from pathlib import Path
@@ -7,7 +7,7 @@ import sys
 from tools import package_j700
 
 
-def test_package_includes_fatfs_provenance(tmp_path, monkeypatch):
+def test_package_includes_fatfs_license(tmp_path, monkeypatch):
     commit = package_j700.subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=package_j700.REPO, text=True
     ).strip()
@@ -31,11 +31,12 @@ def test_package_includes_fatfs_provenance(tmp_path, monkeypatch):
     ])
     package_j700.main()
 
-    source = package_j700.REPO / "rust/fatfs/PROVENANCE.md"
-    packaged = output / "fatfs/PROVENANCE.md"
+    source = package_j700.REPO / "3rdparty_licenses/LICENSE.MIT.fatfs"
+    packaged = output / "3rdparty_licenses/LICENSE.MIT.fatfs"
     assert packaged.read_bytes() == source.read_bytes()
     digest = hashlib.sha256(packaged.read_bytes()).hexdigest()
-    assert f"{digest}  fatfs/PROVENANCE.md" in (output / "SHA256SUMS").read_text().splitlines()
+    assert f"{digest}  3rdparty_licenses/LICENSE.MIT.fatfs" in \
+        (output / "SHA256SUMS").read_text().splitlines()
     logo_license = package_j700.REPO / "3rdparty_licenses/LICENSE.AURORA-LOGO"
     assert (output / "3rdparty_licenses/LICENSE.AURORA-LOGO").read_bytes() == \
         logo_license.read_bytes()

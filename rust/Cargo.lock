@@ -11,6 +11,7 @@ checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 [[package]]
 name = "fatfs"
 version = "0.4.0"
+source = "git+https://github.com/aurora-silicon/fatfs?rev=7d505fbfa37a945af5549517f47c1d2e87a8333e#7d505fbfa37a945af5549517f47c1d2e87a8333e"
 dependencies = [
  "bitflags",
  "log",

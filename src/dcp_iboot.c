@@ -168,7 +168,7 @@ static int dcp_ib_cmd(dcp_iboot_if_t *iboot, int op, size_t in_size)
     size_t rxsize = RXBUF_LEN;
     /* The 26A428 AFKEPV2 handlers return only transport status for these
      * setters. Supplying a reply buffer makes firmware try to copy an empty
-     * message and assert while queueing the response. */
+     * message and assert in AFKEPCommandContext::enqueueResponse. */
     bool status_only = afk_epic_is_v2(iboot->epic) &&
                        (op == IBOOT_SET_POWER || op == IBOOT_SET_MODE ||
                         op == IBOOT_SET_SURFACE);

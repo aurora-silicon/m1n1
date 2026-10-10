@@ -11,6 +11,7 @@
 
 static bool hv_wdt_active = false;
 static bool hv_wdt_enabled = false;
+static bool hv_wdt_join_pending = false;
 static volatile u64 hv_wdt_timestamp = 0;
 static u64 hv_wdt_timeout = 0;
 static volatile u64 hv_wdt_breadcrumbs[MAX_CPUS] = {0};
@@ -147,10 +148,12 @@ void hv_wdt_init(void)
     cpu_dbg_base = reg[0];
 }
 
-void hv_wdt_start(int cpu)
+int hv_wdt_start(int cpu)
 {
     if (hv_wdt_active)
-        return;
+        return 0;
+    if (hv_wdt_join_pending)
+        return -1;
 
     hv_wdt_cpu = cpu;
     memset((void *)hv_wdt_breadcrumbs, 0, sizeof(hv_wdt_breadcrumbs));
@@ -158,14 +161,26 @@ void hv_wdt_start(int cpu)
     hv_wdt_pet();
     hv_wdt_active = true;
     hv_wdt_enabled = true;
-    smp_call4(hv_wdt_cpu, hv_wdt_main, 0, 0, 0, 0);
+    int ret = smp_call4(hv_wdt_cpu, hv_wdt_main, 0, 0, 0, 0);
+    hv_wdt_join_pending = ret == 0 || ret == SMP_TIMEOUT;
+    if (ret) {
+        hv_wdt_active = false;
+        hv_wdt_enabled = false;
+        sysop("dmb ish");
+        return -1;
+    }
+    return 0;
 }
 
-void hv_wdt_stop(void)
+int hv_wdt_stop(void)
 {
-    if (!hv_wdt_active)
-        return;
+    if (!hv_wdt_join_pending)
+        return 0;
 
     hv_wdt_active = false;
-    smp_wait(hv_wdt_cpu);
+    sysop("dmb ish");
+    if (smp_wait(hv_wdt_cpu, NULL))
+        return -1;
+    hv_wdt_join_pending = false;
+    return 0;
 }

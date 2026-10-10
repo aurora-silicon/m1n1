@@ -760,10 +760,11 @@ void mmu_init_secondary_local(void)
     write_sctlr(sctlr);
 }
 
-void mmu_init_secondary(int cpu)
+int mmu_init_secondary(int cpu)
 {
-    smp_call4(cpu, mmu_init_secondary_local, 0, 0, 0, 0);
-    smp_wait(cpu);
+    if (smp_call4(cpu, mmu_init_secondary_local, 0, 0, 0, 0))
+        return -1;
+    return smp_wait(cpu, NULL);
 }
 
 void mmu_shutdown(void)

@@ -263,7 +263,7 @@ static bool dt_bootarg_space(char c)
     return c == ' ' || c == '\t' || c == '\n';
 }
 
-static int dt_set_t8140_wfx_args(int node)
+static int dt_set_wfx_args(int node)
 {
     static const char token[] = "arm64.nowfxt";
     int len = 0;
@@ -300,7 +300,7 @@ static int dt_set_t8140_wfx_args(int node)
     int ret = fdt_setprop_string(dt, node, "bootargs", updated);
     free(updated);
     if (ret)
-        bail("FDT: couldn't set T8140 bootargs\n");
+        bail("FDT: couldn't set WFx bootargs\n");
     return 0;
 }
 
@@ -322,7 +322,7 @@ static int dt_set_chosen(void)
         printf("FDT: set chosen.%s\n", name);
     }
 
-    if (chip_id == T8140 && dt_set_t8140_wfx_args(node))
+    if (chip_id == T8140 && dt_set_wfx_args(node))
         return -1;
 
     if (initrd_start && initrd_size) {

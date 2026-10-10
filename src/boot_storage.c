@@ -122,7 +122,7 @@ int boot_storage_load(const char *spec, struct kernel_header **kernel, void **fd
     printf("boot: internal storage is not supported in this build\n");
     return -1;
 #else
-    if (chip_id != T8140 || !spec || !kernel || !fdt)
+    if (!spec || !kernel || !fdt)
         return -1;
     size_t spec_len = strnlen(spec, BOOT_SPEC_MAX + 1);
     if (!spec_len || spec_len > BOOT_SPEC_MAX)

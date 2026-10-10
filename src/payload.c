@@ -48,7 +48,7 @@ static void *fdt = NULL;
 static char *chainload_spec = NULL;
 static char *boot_spec = NULL;
 static bool payload_scanned = false;
-#ifndef J700_ESP_STAGE2
+#ifndef ESP_STAGE2
 static bool stage1_config_applied = false;
 static char stage1_esp_chosen[96];
 #endif
@@ -328,7 +328,7 @@ int payload_run(void)
         payload_scanned = true;
     }
 
-#ifndef J700_ESP_STAGE2
+#ifndef ESP_STAGE2
     if (!stage1_config_applied && chip_id == T8140) {
         const char *target = stage1_config_target();
         if (target) {
@@ -374,7 +374,8 @@ int payload_run(void)
             printf("SMP: refusing payload handoff with missing T8140 CPUs\n");
             goto boot_failed;
         }
-        mitigations_perform();
+        if (mitigations_perform())
+            goto boot_failed;
         if (enable_tso) {
 
             do_enable_tso();
@@ -382,8 +383,10 @@ int payload_run(void)
                 if (i == boot_cpu_idx)
                     continue;
                 if (smp_is_alive(i)) {
-                    smp_call0(i, do_enable_tso);
-                    smp_wait(i);
+                    if (smp_call0(i, do_enable_tso) || smp_wait(i, NULL)) {
+                        printf("TSO: CPU %d initialization failed\n", i);
+                        goto boot_failed;
+                    }
                 }
             }
             kboot_set_chosen("apple,tso", "");
@@ -412,8 +415,8 @@ int payload_run(void)
         return 0;
 
     boot_failed:
+        next_stage.entry = NULL;
         if (boot_spec) {
-            next_stage.entry = NULL;
             kboot_set_initrd(NULL, 0);
             nvme_keep_running_for_linux = false;
             nvme_shutdown();

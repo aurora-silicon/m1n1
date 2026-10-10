@@ -337,7 +337,7 @@ void usb_init(void)
         return;
 
     /* J700's inherited DebugUSB carrier must survive normal boot and kboot. */
-#if defined(J700_CDC_PROXY) || defined(T8140_KIS_PROXY) || defined(J700_ESP_STAGE2)
+#if defined(J700_CDC_PROXY) || defined(T8140_KIS_PROXY) || defined(ESP_STAGE2)
     if (chip_id == T8140)
         return;
 #endif
@@ -401,7 +401,7 @@ void usb_hpm_restore_irqs(bool force)
 
 void usb_iodev_init(void)
 {
-#if defined(J700_CDC_PROXY) || defined(T8140_KIS_PROXY) || defined(J700_ESP_STAGE2)
+#if defined(J700_CDC_PROXY) || defined(T8140_KIS_PROXY) || defined(ESP_STAGE2)
     if (chip_id == T8140)
         return;
 #endif

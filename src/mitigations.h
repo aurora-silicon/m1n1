@@ -4,6 +4,6 @@
 #define MITIGATIONS_H
 
 void mitigations_configure(const char *config);
-void mitigations_perform(void);
+int mitigations_perform(void);
 
 #endif

@@ -93,11 +93,16 @@ CFG += CHAINLOADING
 CARGO_FLAGS += --features chainload
 endif
 
+# Accept the original build option for existing J700 build scripts.
 ifeq ($(J700_ESP_STAGE2),1)
-ifneq ($(CHAINLOADING),1)
-$(error J700_ESP_STAGE2 requires CHAINLOADING=1 for boot=)
+ESP_STAGE2 := 1
 endif
-CFG += J700_ESP_STAGE2
+
+ifeq ($(ESP_STAGE2),1)
+ifneq ($(CHAINLOADING),1)
+$(error ESP_STAGE2 requires CHAINLOADING=1 for boot=)
+endif
+CFG += ESP_STAGE2
 endif
 
 ifeq ($(J700_CDC_PROXY),1)

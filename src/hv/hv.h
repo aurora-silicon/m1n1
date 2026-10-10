@@ -89,8 +89,8 @@ void hv_wdt_pet(void);
 void hv_wdt_suspend(void);
 void hv_wdt_resume(void);
 void hv_wdt_init(void);
-void hv_wdt_start(int cpu);
-void hv_wdt_stop(void);
+int hv_wdt_start(int cpu);
+int hv_wdt_stop(void);
 void hv_wdt_breadcrumb(char c);
 void hv_do_panic(void);
 
@@ -114,7 +114,7 @@ void hv_set_elr(u64 val);
 /* HV main */
 void hv_init(void);
 void hv_start(void *entry, u64 regs[4]);
-void hv_start_secondary(int cpu, void *entry, u64 regs[4]);
+int hv_start_secondary(int cpu, void *entry, u64 regs[4]);
 void hv_exit_cpu(int cpu);
 void hv_rendezvous(void);
 bool hv_switch_cpu(int cpu);

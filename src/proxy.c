@@ -326,7 +326,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             mmu_restore(request->args[0]);
             break;
         case P_MMU_INIT_SECONDARY:
-            mmu_init_secondary(request->args[0]);
+            if (mmu_init_secondary(request->args[0]))
+                reply->status = S_ERROR;
             break;
 
         case P_XZDEC: {
@@ -357,7 +358,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
                 reply->status = S_ERROR;
             break;
         case P_SMP_STOP_SECONDARIES:
-            smp_stop_secondaries(request->args[0]);
+            if (smp_stop_secondaries(request->args[0]))
+                reply->status = S_ERROR;
             break;
         case P_SMP_CALL:
             if (smp_call4(request->args[0], (void *)request->args[1], request->args[2],
@@ -550,10 +552,12 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
                                          request->args[3]);
             break;
         case P_HV_WDT_START:
-            hv_wdt_start(request->args[0]);
+            if (hv_wdt_start(request->args[0]))
+                reply->status = S_ERROR;
             break;
         case P_HV_START_SECONDARY:
-            hv_start_secondary(request->args[0], (void *)request->args[1], &request->args[2]);
+            if (hv_start_secondary(request->args[0], (void *)request->args[1], &request->args[2]))
+                reply->status = S_ERROR;
             break;
         case P_HV_SWITCH_CPU:
             reply->retval = hv_switch_cpu(request->args[0]);

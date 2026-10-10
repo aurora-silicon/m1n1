@@ -87,15 +87,17 @@ static void apply_mitigations(void)
     }
 }
 
-void mitigations_perform(void)
+int mitigations_perform(void)
 {
     apply_mitigations();
     for (int i = 0; i < MAX_CPUS; i++) {
         if (i == boot_cpu_idx)
             continue;
         if (smp_is_alive(i)) {
-            smp_call0(i, apply_mitigations);
-            smp_wait(i);
+            if (smp_call0(i, apply_mitigations) || smp_wait(i, NULL)) {
+                printf("Mitigations: CPU %d initialization failed\n", i);
+                return -1;
+            }
         }
     }
 
@@ -106,4 +108,5 @@ void mitigations_perform(void)
                p->vulnerable ? (p->mitigated ? "Mitigated" : "Vulnerable") : "Not vulnerable");
     }
     printf("\n");
+    return 0;
 }

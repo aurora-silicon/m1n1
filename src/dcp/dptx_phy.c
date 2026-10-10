@@ -219,8 +219,8 @@ int dptx_phy_set_active_lane_count(dptx_phy_t *phy, u32 num_lanes)
     if (phy->type == DPTX_PHY_T8152_ATC) {
         if (num_lanes == 3 || num_lanes > 4)
             return -1;
-        /* Setting the active lane count does nothing to the PHY on macOS;
-         * the ATC port records the logical count after success. The physical
+        /* AppleTypeCPhyDisplayPortInterface::setActiveLaneCount is a no-op;
+         * its ATC port records the logical count after success. The physical
          * lane mode was selected during the native four-lane initialization. */
         phy->active_lanes = num_lanes;
         return 0;
