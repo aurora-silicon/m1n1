@@ -336,6 +336,16 @@ logical-register selection and reads, with no HPM wakeup/shutdown, role or VDM
 commands. Recheck orientation after a reconnect; this snapshot does not prove
 SuperSpeed cable capability.
 
+A separate guarded HPM0 query of logical data-status register `0x5f`
+requested up to 64 bytes and returned four: `f3 00 00 80`. The returned
+length is authoritative; the remaining buffer was not read or padded.
+Controller FIFOs were empty before and after the single query, and the
+proxy completed it without CPU exceptions. Natural watchdog recovery
+returned to the installed proxy and retired the temporary allocations.
+This tests the ACE3 variable-length read path. The raw reply has not been
+bound to native status fields or the PHY processor's tunables-ready bit;
+it does not establish SuperSpeed readiness or enumeration.
+
 A later guarded RAM test traversed all 164 compact records in the nine
 present native mode-1 tuning tables, then applied the three crossbar writes,
 common sleep override and eight override clears for each lane. All 20

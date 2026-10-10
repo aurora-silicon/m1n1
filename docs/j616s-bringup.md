@@ -159,6 +159,13 @@ verified proxy and explicitly disables the watchdog. This establishes native
 timer interrupt delivery and page setup; scheduler-clock initialization,
 device initialization and a gadget shell remain unqualified.
 
+Subsequent full native boot attempts did not enumerate a USB console.
+An isolated build with jump labels disabled and a normal-kernel attempt
+with the inherited framebuffer both returned through natural watchdog
+recovery. Neither result identifies the kernel's stopping point. The
+framebuffer driver probes during device initialization, so absence of
+display output does not locate a failure before that stage.
+
 ## Memory controller
 
 The ADT identifies the controller as `mcc,t6041`, with four AMCC apertures
