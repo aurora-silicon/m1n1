@@ -125,6 +125,9 @@ typedef struct dwc3_dev {
     dart_dev_t *dart;
 
     enum ep0_state ep0_state;
+#ifdef J700_CDC_PROXY
+    bool ep0_three_stage;
+#endif
     const void *ep0_buffer;
     u32 ep0_buffer_len;
     void *ep0_read_buffer;
@@ -134,6 +137,13 @@ typedef struct dwc3_dev {
     u32 evt_buffer_offset;
     bool failed;
     bool dma_unsafe;
+#ifdef J700_CDC_PROXY
+    bool reset_in_progress;
+    bool ep0_progressed_during_reset;
+    bool configured_during_reset;
+    bool cdc_reconfigure;
+    bool cdc_ever_configured;
+#endif
 
     void *scratchpad;
     void *xferbuffer;
@@ -143,7 +153,6 @@ typedef struct dwc3_dev {
         bool xfer_in_progress;
         bool zlp_pending;
         bool stalled;
-        bool end_cmd_pending;
         u8 resource_index;
         u8 trb_count;
         u8 completed_trbs;
@@ -457,20 +466,21 @@ static int usb_dwc3_ep_command(dwc3_dev_t *dev, u8 ep, u32 command, u32 par0, u3
 #ifdef J700_CDC_PROXY
 static int usb_dwc3_end_transfer(dwc3_dev_t *dev, u8 ep)
 {
-    dev->endpoints[ep].end_cmd_pending = true;
-    u32 command = DWC3_DEPCMD_ENDTRANSFER | DWC3_DEPCMD_CMDIOC |
-                  DWC3_DEPCMD_PARAM(dev->endpoints[ep].resource_index);
-    if (usb_dwc3_ep_command(dev, ep, command, 0, 0, 0)) {
-        dev->endpoints[ep].end_cmd_pending = false;
-        return -1;
-    }
-    u64 deadline = timeout_calculate(100000);
-    while (dev->endpoints[ep].end_cmd_pending && !timeout_expired(deadline))
-        usb_dwc3_handle_events(dev);
-    if (dev->endpoints[ep].end_cmd_pending) {
-        dev->endpoints[ep].end_cmd_pending = false;
-        return -1;
-    }
+    /* An IOC wait recursively dispatches EP0 events while a SETUP request
+     * is still being handled. Linux uses a non-IOC ENDTRANSFER and allows
+     * the controller 1 ms to retire DMA before reusing the TRB. */
+    u32 phy = read32(dev->regs + DWC3_GUSB2PHYCFG(0));
+    if (phy & DWC3_GUSB2PHYCFG_SUSPHY)
+        clear32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_SUSPHY);
+    write32(dev->regs + DWC3_DEPCMDPAR0(ep), 0);
+    write32(dev->regs + DWC3_DEPCMDPAR1(ep), 0);
+    write32(dev->regs + DWC3_DEPCMDPAR2(ep), 0);
+    write32(dev->regs + DWC3_DEPCMD(ep), DWC3_DEPCMD_ENDTRANSFER |
+                                              DWC3_DEPCMD_PARAM(dev->endpoints[ep].resource_index) |
+                                              DWC3_DEPCMD_CMDACT);
+    mdelay(1);
+    if (phy & DWC3_GUSB2PHYCFG_SUSPHY)
+        set32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_SUSPHY);
     return 0;
 }
 #endif
@@ -600,7 +610,12 @@ static int usb_dwc3_start_status_phase(dwc3_dev_t *dev, u8 ep)
     struct dwc3_trb *trb;
     uintptr_t trb_iova = usb_dwc3_init_trb(dev, ep, &trb);
 
+#ifdef J700_CDC_PROXY
+    trb->ctrl |= dev->ep0_three_stage ? DWC3_TRBCTL_CONTROL_STATUS3
+                                      : DWC3_TRBCTL_CONTROL_STATUS2;
+#else
     trb->ctrl |= DWC3_TRBCTL_CONTROL_STATUS2;
+#endif
     trb->size = DWC3_TRB_SIZE_LENGTH(0);
 #ifdef J700_CDC_PROXY
     trb->bpl = trb_iova;
@@ -690,6 +705,27 @@ static void usb_dwc3_close_pipe(dwc3_dev_t *dev, int pipe)
     }
 #endif
 }
+
+#ifdef J700_CDC_PROXY
+static int usb_dwc3_configure_cdc_endpoints(dwc3_dev_t *dev)
+{
+    /* DEPSTARTCFG(2) discards the old non-control transfer resources. The
+     * databook requires a fresh configuration for each SET_CONFIGURATION. */
+    if (usb_dwc3_ep_command(dev, USB_LEP_CTRL_OUT,
+                            DWC3_DEPCMD_DEPSTARTCFG | DWC3_DEPCMD_PARAM(2), 0, 0, 0))
+        return -1;
+
+    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++) {
+        if (usb_dwc3_ep_configure(dev, dev->pipe[i].ep_intr, DWC3_DEPCMD_TYPE_INTR, 64) ||
+            usb_dwc3_ep_configure(dev, dev->pipe[i].ep_in, DWC3_DEPCMD_TYPE_BULK,
+                                  CDC_BULK_PACKET_SIZE) ||
+            usb_dwc3_ep_configure(dev, dev->pipe[i].ep_out, DWC3_DEPCMD_TYPE_BULK,
+                                  CDC_BULK_PACKET_SIZE))
+            return -1;
+    }
+    return 0;
+}
+#endif
 
 static void usb_build_serial(void)
 {
@@ -825,16 +861,36 @@ static void usb_dwc3_ep0_handle_standard_device(dwc3_dev_t *dev,
                     dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
                     for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
                         usb_dwc3_close_pipe(dev, i);
+#ifdef J700_CDC_PROXY
+                    dev->cdc_reconfigure = true;
+#endif
                     break;
                 case 1:
-                    /* we've already configured these endpoints so that we just need to enable them
-                     * here */
+#ifdef J700_CDC_PROXY
+                    if (dev->cdc_reconfigure) {
+                        write32(dev->regs + DWC3_DALEPENA,
+                                DWC3_DALEPENA_EP(USB_LEP_CTRL_OUT) |
+                                    DWC3_DALEPENA_EP(USB_LEP_CTRL_IN));
+                        for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
+                            usb_dwc3_close_pipe(dev, i);
+                        if (dev->failed || usb_dwc3_configure_cdc_endpoints(dev)) {
+                            usb_dwc3_fail_session(dev);
+                            return;
+                        }
+                        dev->cdc_reconfigure = false;
+                        if (dev->reset_in_progress)
+                            dev->configured_during_reset = true;
+                    }
+#endif
                     set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_OUT));
                     set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_IN));
                     set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_INTR_IN));
                     set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_OUT_2));
                     set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_BULK_IN_2));
                     set32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CDC_INTR_IN_2));
+#ifdef J700_CDC_PROXY
+                    dev->cdc_ever_configured = true;
+#endif
                     dev->ep0_state = USB_DWC3_EP0_STATE_DATA_SEND_STATUS;
                     break;
                 default:
@@ -1008,6 +1064,9 @@ static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_pac
 static void usb_dwc3_ep0_handle_setup(dwc3_dev_t *dev)
 {
     const union usb_setup_packet *setup = dev->endpoints[0].xfer_buffer;
+#ifdef J700_CDC_PROXY
+    dev->ep0_three_stage = !!setup->raw.wLength;
+#endif
 
     switch (setup->raw.bmRequestType & USB_REQUEST_TYPE_MASK) {
         case USB_REQUEST_TYPE_STANDARD:
@@ -1265,12 +1324,21 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
 {
     if (event.endpoint_number >= MAX_ENDPOINTS)
         return;
-    if (event.endpoint_event == DWC3_DEPEVT_EPCMDCMPLT) {
 #ifdef J700_CDC_PROXY
-        dev->endpoints[event.endpoint_number].end_cmd_pending = false;
+    if (dev->reset_in_progress && event.endpoint_number <= USB_LEP_CTRL_IN &&
+        event.endpoint_event != DWC3_DEPEVT_EPCMDCMPLT)
+        dev->ep0_progressed_during_reset = true;
 #endif
+    if (event.endpoint_event == DWC3_DEPEVT_EPCMDCMPLT) {
         return;
     }
+
+#ifdef J700_CDC_PROXY
+    /* ENDTRANSFER polls events recursively. Do not restart a retired CDC
+     * transfer from an old completion or NRDY while reset is in progress. */
+    if (dev->reset_in_progress && event.endpoint_number > USB_LEP_CTRL_IN)
+        return;
+#endif
 
 #ifdef J700_CDC_PROXY
     if (event.endpoint_event == DWC3_DEPEVT_XFERINPROGRESS) {
@@ -1344,6 +1412,13 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
          */
         if (dev->endpoints[event.endpoint_number].xfer_in_progress)
             return;
+#ifdef J700_CDC_PROXY
+        /* EP0 is one control pipe; an NRDY on the other direction is stale. */
+        if (event.endpoint_number <= USB_LEP_CTRL_IN &&
+            (dev->endpoints[USB_LEP_CTRL_OUT].xfer_in_progress ||
+             dev->endpoints[USB_LEP_CTRL_IN].xfer_in_progress))
+            return;
+#endif
 
         switch (event.endpoint_number) {
             case USB_LEP_CTRL_IN:
@@ -1372,15 +1447,37 @@ static void usb_dwc3_handle_event_ep(dwc3_dev_t *dev, const struct dwc3_event_de
 static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev, bool rearm_setup)
 {
 #ifdef J700_CDC_PROXY
-    for (int i = 0; i < MAX_ENDPOINTS; ++i) {
+    if (dev->reset_in_progress)
+        return;
+    dev->reset_in_progress = true;
+    dev->ep0_progressed_during_reset = false;
+    dev->configured_during_reset = false;
+    dev->cdc_reconfigure = dev->cdc_ever_configured;
+    /* These writes must precede ENDTRANSFER's recursive event polling: a
+     * nested SET_ADDRESS or SET_CONFIGURATION belongs to the new bus state. */
+    mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_DEVADDR_MASK, DWC3_DCFG_DEVADDR(0));
+    write32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(0) | DWC3_DALEPENA_EP(1));
+    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++) {
+        dev->pipe[i].ready = false;
+        dev->pipe[i].host2device->read = dev->pipe[i].host2device->write;
+        dev->pipe[i].device2host->read = dev->pipe[i].device2host->write;
+    }
+    dev->primary_dtr_pending = false;
+
+    for (int i = 2; i < MAX_ENDPOINTS; ++i) {
         if (dev->endpoints[i].xfer_in_progress) {
             int status = usb_dwc3_end_transfer(dev, i);
             if (status) {
                 usb_debug_printf("ENDTRANSFER failed for EP %d on reset\n", i);
+                dev->reset_in_progress = false;
                 usb_dwc3_fail_session(dev);
                 return;
             }
         }
+        /* A nested SET_CONFIGURATION has already replaced the old endpoint
+         * resources. Do not clear its new transfer state or DMA buffers. */
+        if (dev->configured_during_reset)
+            break;
         dev->endpoints[i].xfer_in_progress = false;
         dev->endpoints[i].resource_index = 0;
         dev->endpoints[i].zlp_pending = false;
@@ -1397,21 +1494,33 @@ static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev, bool rearm_setup)
         }
     }
 
-    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++) {
-        dev->pipe[i].ready = false;
-        dev->pipe[i].host2device->read = dev->pipe[i].host2device->write;
-        dev->pipe[i].device2host->read = dev->pipe[i].device2host->write;
+    /* A live SETUP TRB is already the required post-reset EP0 state. Never
+     * clear it or its buffer after a nested event has advanced control. */
+    if (!dev->ep0_progressed_during_reset &&
+        dev->ep0_state != USB_DWC3_EP0_STATE_SETUP_HANDLE) {
+        bool data_phase = dev->ep0_state == USB_DWC3_EP0_STATE_DATA_SEND_DONE ||
+                          dev->ep0_state == USB_DWC3_EP0_STATE_DATA_RECV_DONE;
+        for (int i = 0; i <= USB_LEP_CTRL_IN; i++) {
+            if (data_phase && dev->endpoints[i].xfer_in_progress &&
+                usb_dwc3_end_transfer(dev, i)) {
+                dev->reset_in_progress = false;
+                usb_dwc3_fail_session(dev);
+                return;
+            }
+            if (dev->ep0_progressed_during_reset)
+                break;
+            dev->endpoints[i].xfer_in_progress = false;
+            dev->endpoints[i].resource_index = 0;
+        }
     }
-    dev->primary_dtr_pending = false;
-    dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
-
-    /* set device address back to zero */
-    mask32(dev->regs + DWC3_DCFG, DWC3_DCFG_DEVADDR_MASK, DWC3_DCFG_DEVADDR(0));
-
-    /* only keep control endpoints enabled */
-    write32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(0) | DWC3_DALEPENA_EP(1));
-    if (rearm_setup && !usb_dwc3_start_setup_phase(dev))
-        dev->ep0_state = USB_DWC3_EP0_STATE_SETUP_HANDLE;
+    if (!dev->ep0_progressed_during_reset &&
+        !dev->endpoints[USB_LEP_CTRL_OUT].xfer_in_progress &&
+        !dev->endpoints[USB_LEP_CTRL_IN].xfer_in_progress) {
+        dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
+        if (rearm_setup && !usb_dwc3_start_setup_phase(dev))
+            dev->ep0_state = USB_DWC3_EP0_STATE_SETUP_HANDLE;
+    }
+    dev->reset_in_progress = false;
 #else
     (void)rearm_setup;
     dev->endpoints[0].xfer_in_progress = false;
@@ -1550,7 +1659,8 @@ static int usb_dwc3_reannounce(dwc3_dev_t *dev)
                                   CDC_BULK_PACKET_SIZE))
             return -1;
     }
-
+    dev->cdc_reconfigure = false;
+    dev->cdc_ever_configured = false;
     dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
     write32(dev->regs + DWC3_DALEPENA,
             DWC3_DALEPENA_EP(USB_LEP_CTRL_OUT) | DWC3_DALEPENA_EP(USB_LEP_CTRL_IN));
@@ -1584,11 +1694,7 @@ void usb_dwc3_handle_events(dwc3_dev_t *dev)
     u32 count = read32(dev->regs + DWC3_GEVNTCOUNT(0)) & DWC3_GEVNTCOUNT_MASK;
     if (!count) {
 #ifdef J700_CDC_PROXY
-        bool end_pending = false;
-        for (int ep = 0; ep < MAX_ENDPOINTS; ep++)
-            end_pending |= dev->endpoints[ep].end_cmd_pending;
-        if (!end_pending)
-            usb_dwc3_maybe_reannounce(dev);
+        usb_dwc3_maybe_reannounce(dev);
 #endif
         return;
     }
@@ -1807,7 +1913,8 @@ dwc3_dev_t *usb_dwc3_init(uintptr_t regs, dart_dev_t *dart)
         if (!dev->pipe[i].device2host)
             goto error;
 
-        /* prepare INTR endpoint so that we don't have to reconfigure this device later */
+        /* Prepare CDC resources for the first enumeration. USB bus resets
+         * reconfigure them on the next SET_CONFIGURATION request. */
         if (usb_dwc3_ep_configure(dev, dev->pipe[i].ep_intr, DWC3_DEPCMD_TYPE_INTR, 64))
             goto error;
 
