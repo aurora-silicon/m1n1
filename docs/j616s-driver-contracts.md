@@ -402,8 +402,8 @@ establish firmware tunable completion.
 
 ## Native Linux USB handoff
 
-USB0 has two T8110 DART banks in the ADT. A RAM-only native Linux test
-completed a root-shell command over high-speed CDC with both providers in
+USB0 has two T8110 DART banks in the ADT. Two independent RAM-only Linux boots
+completed root-shell commands over high-speed CDC with both providers in
 the DWC3 `iommus` property, following the upstream T8112 model:
 
 | Bank | Aperture | Stream in the tested Linux model |
