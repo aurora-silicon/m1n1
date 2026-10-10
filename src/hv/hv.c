@@ -52,9 +52,49 @@ struct hv_secondary_info_t {
 };
 
 static struct hv_secondary_info_t hv_secondary_info;
+static u64 hv_secondary_regs[MAX_CPUS][4];
+static bool hv_shutdown_failed;
 
-void hv_init(void)
+static int hv_join_cpus(void)
 {
+    int ret = 0;
+    spin_lock(&bhl);
+    for (int i = 0; i < MAX_CPUS; i++)
+        hv_should_exit[i] = true;
+    spin_unlock(&bhl);
+
+    if (hv_wdt_stop()) {
+        printf("HV: watchdog CPU did not stop; returning to proxy\n");
+        ret = -1;
+    }
+
+    for (int i = 0; i < MAX_CPUS; i++) {
+        if (i == boot_cpu_idx)
+            continue;
+        spin_lock(&bhl);
+        bool started = hv_started_cpus[i];
+        spin_unlock(&bhl);
+        if (!started)
+            continue;
+        printf("HV: Waiting for CPU %d to exit\n", i);
+        if (smp_wait(i, NULL)) {
+            printf("HV: CPU %d did not exit; returning to proxy\n", i);
+            ret = -1;
+        } else {
+            spin_lock(&bhl);
+            hv_started_cpus[i] = false;
+            spin_unlock(&bhl);
+        }
+    }
+    hv_shutdown_failed = ret != 0;
+    return ret;
+}
+
+int hv_init(void)
+{
+    /* Keep shared guest state intact until a previous session has joined. */
+    if (hv_shutdown_failed && hv_join_cpus())
+        return -1;
     pcie_shutdown();
     // Make sure we wake up DCP if we put it to sleep, just quiesce it to match ADT
     if (display_is_external && display_start_dcp() >= 0)
@@ -105,6 +145,7 @@ void hv_init(void)
     sysop("tlbi alle1is");
     sysop("dsb ish");
     sysop("isb");
+    return 0;
 }
 
 static void hv_set_gxf_vbar(void)
@@ -112,11 +153,18 @@ static void hv_set_gxf_vbar(void)
     msr(SYS_IMP_APL_VBAR_GL1, _hv_vectors_start);
 }
 
-void hv_start(void *entry, u64 regs[4])
+int hv_start(void *entry, u64 regs[4])
 {
     if (boot_cpu_idx == -1) {
         printf("Boot CPU has not been found, can't start hypervisor\n");
-        return;
+        return -1;
+    }
+    if (hv_shutdown_failed) {
+        hv_join_cpus();
+        /* A host may already have started a new watchdog. Cleanup stops it,
+         * so do not enter a new guest in this same request. */
+        printf("HV: previous session required cleanup; retry guest initialization\n");
+        return -1;
     }
 
     memset(hv_should_exit, 0, sizeof(hv_should_exit));
@@ -162,36 +210,16 @@ void hv_start(void *entry, u64 regs[4])
 
     __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
     spin_lock(&bhl);
-
-    if (hv_wdt_stop())
-        panic("HV: watchdog CPU did not stop\n");
+    hv_started_cpus[boot_cpu_idx] = false;
+    spin_unlock(&bhl);
 
     printf("HV: Exiting hypervisor (main CPU)\n");
-
-    spin_unlock(&bhl);
-    // Wait a bit for the guest CPUs to exit on their own if they are in the process.
+    // Wait a bit for guest CPUs already in the process of exiting.
     udelay(200000);
-    spin_lock(&bhl);
-
-    hv_started_cpus[boot_cpu_idx] = false;
-
-    for (int i = 0; i < MAX_CPUS; i++) {
-        if (i == boot_cpu_idx) {
-            continue;
-        }
-        hv_should_exit[i] = true;
-        if (hv_started_cpus[i]) {
-            printf("HV: Waiting for CPU %d to exit\n", i);
-            spin_unlock(&bhl);
-            if (smp_wait(i, NULL))
-                panic("HV: CPU %d did not exit\n", i);
-            spin_lock(&bhl);
-            hv_started_cpus[i] = false;
-        }
-    }
-
-    printf("HV: All CPUs exited\n");
-    spin_unlock(&bhl);
+    int ret = hv_join_cpus();
+    if (!ret)
+        printf("HV: All CPUs exited\n");
+    return ret;
 }
 
 static void hv_init_secondary(struct hv_secondary_info_t *info)
@@ -271,13 +299,19 @@ int hv_start_secondary(int cpu, void *entry, u64 regs[4])
     iodev_console_flush();
 
     printf("HV: Entering guest secondary %d at %p\n", cpu, entry);
+    memcpy(hv_secondary_regs[cpu], regs, sizeof(hv_secondary_regs[cpu]));
     hv_started_cpus[cpu] = true;
     __atomic_or_fetch(&hv_cpus_in_guest, BIT(cpu), __ATOMIC_ACQUIRE);
 
     iodev_console_flush();
     /* An acknowledgement timeout can still have a late guest entry. Retain
      * the guest CPU state so exit waits for it instead of declaring it gone. */
-    return smp_call4(cpu, hv_enter_secondary, (u64)entry, (u64)regs, 0, 0);
+    int ret = smp_call4(cpu, hv_enter_secondary, (u64)entry, (u64)hv_secondary_regs[cpu], 0, 0);
+    if (ret && ret != SMP_TIMEOUT) {
+        hv_started_cpus[cpu] = false;
+        __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(cpu), __ATOMIC_ACQUIRE);
+    }
+    return ret;
 }
 
 void hv_exit_cpu(int cpu)
