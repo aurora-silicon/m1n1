@@ -92,27 +92,25 @@ an incomplete transition resets through the normal recovery path.
 This path has host-side tests. Gen1 enumeration, primary handshake and
 reconnect still require hardware validation.
 
-First run PLAN P2 T-tethered on K-clean and K-full using only
-`aurora-ctl hw request`, and retain each `plan.json`, `receipt.json`, console
-log and full dmesg under `runs/hw/h-<request>/`. Verify the build tag in the
-Stage 2 console and `/chosen/asahi,m1n1-stage2-version`. K-clean must retain
-six CPUs, NVMe root and simplefb; K-full must additionally probe SEP, PMP,
-Wi-Fi/BT, USB/ATC, AVE, GPU and ISP without a new error. The internal panel
-remains on simplefb. DCP handoff and the ISP heap top require their PLAN G4/G3
-clean measurements before full-platform qualification.
+Test every new build before it replaces an installed image:
 
-After a passing tethered run, use PLAN P2 T-esp with the installed Stage 1 and
-its approved persistent route. T-s1ram requires an aurora-ctl request kind that
-can RAM-vector an unmodified, hash-pinned Stage 1; it is not available yet.
-That test must cover host grab, no-host expiry, missing-file proxy fallback,
-image length, and panel logo. The final 1TR installation uses the filled **bare**
-Stage 1 with `kmutil configure-boot --raw --entry-point 2048
---lowest-virtual-address 0` against the Asahi proxy System volume. Ryan enters
-the owner password. Keep the previous bare Stage 1 for rollback with the same
-`kmutil` flags. Changing ESP Stage 2 or kernel files does not require 1TR.
+- Boot a new Stage 2 from a separate ESP file, such as
+  `aurora/stage2-test.bin`, through a Stage 1 filled with that path, before
+  replacing `aurora/stage2.bin`. Keep the previous `aurora/stage2.bin` as a
+  backup.
+- Check the build tag in the Stage 2 console and in
+  `/chosen/asahi,m1n1-stage2-version`, and keep the full kernel log of each
+  test boot.
+- A new Stage 1 should be tested for a host claiming the proxy window, the
+  window expiring with no host, a missing Stage 2 file (Stage 1 falls back to
+  the proxy), the image length, and the panel logo.
 
-No worker should access the target directly or run the old bench scripts. All
-target tests and recovery go through approved `aurora-ctl hw request` entries.
+The final 1TR installation uses the filled **bare** Stage 1 with
+`kmutil configure-boot --raw --entry-point 2048 --lowest-virtual-address 0`
+against the Linux stub's System volume, run from that stub's own recoveryOS;
+the machine owner enters the password. Keep the previous bare Stage 1 for
+rollback with the same `kmutil` flags. Changing ESP Stage 2 or kernel files
+does not require 1TR.
 
 ## T8140 NVMe non-secure alias aperture
 
