@@ -207,6 +207,19 @@ made it pass. Test-only watchdog startup and RAM diagnostics stay outside
 the production changes. Native Linux gadget traffic and SuperSpeed remain
 unqualified.
 
+A later console checkpoint records the post-retirement registers after the
+original MMU-off reset and before the recovery copy. Two samples of all 46
+selected registers match. DCTL reads `0x00f00000`, DSTS `0x00d20001`, and
+DEVTEN, DALEPENA and event count read zero. The DART command register reads
+`0x05000101` with BUSY clear; ERROR, PROTECT and LOCK read zero. Global stream
+enable remains `0x2`; SID1 TCR reads `0x2` and its TTBR reads zero. Other
+disabled streams retain nonzero TCRs and invalid-root address bits.
+
+These are observations at a stopped pre-device checkpoint. The source writes
+the SID1 bypass value `0x6`; that value must not be imposed as an exact
+readback predicate. Successful retirement does not clear the entire bank or
+qualify later driver activity, cache invalidation policy or a Linux gadget.
+
 ## DCP management
 
 A guarded inherited-state test checks the current 25G76 firmware UUID, exact
