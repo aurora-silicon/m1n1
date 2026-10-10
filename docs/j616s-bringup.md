@@ -105,6 +105,15 @@ that DT, so this is kernel/configfs qualification, not Linux gadget operation.
 One config-query command fails because the initramfs lacks a zcat symlink;
 its BusyBox applet remains available by explicit invocation.
 
+The exact kernel Image used for the native diagnostics also boots under
+this HV setup with the same RAM initramfs and minimal DT. Its reported
+configuration hash matches the frozen native build. On one CPU it completes
+scheduler-clock initialization and delay calibration, reaches a BusyBox
+shell, and advances uptime by two seconds across `sleep 2`. Timer IRQ 34
+advances from 25 to 1278 over the initial five seconds. Native execution
+context and peripheral nodes differ, so this comparison does not identify
+the native boot failure or qualify physical USB.
+
 The bounded captures end with a host timeout while the guest is running.
 Mappings and guest memory remain retained until hardware-watchdog recovery
 returns the installed proxy with its watchdog disabled. This is not a clean
