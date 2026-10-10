@@ -392,6 +392,13 @@ establish firmware tunable completion.
 
 ## Other implementation boundaries
 
+The Linux implementation draft is
+[aurora-silicon/linux#231](https://github.com/aurora-silicon/linux/pull/231),
+based on `aurora-wip`. It prepares ownership, profile and retirement checks
+without enabling the unqualified camera or streaming audio paths. Use the
+proxy evidence and route names above as implementation inputs; the draft's
+host/build results do not establish native hardware operation.
+
 CPU states 1/2, secondary MMU/dispatch and shared-memory coherence have live
 evidence; higher states and sleep/hotplug do not. Reuse existing upstream SMP
 fixes rather than duplicating them. MTP initialization, keyboard, touchpad and

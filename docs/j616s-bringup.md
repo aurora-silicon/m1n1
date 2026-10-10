@@ -11,6 +11,13 @@ unqualified.
 For implementation order, formats and ownership rules, start with the
 [driver contracts](j616s-driver-contracts.md).
 
+Linux driver preparation is tracked in
+[draft PR #231](https://github.com/aurora-silicon/linux/pull/231), against
+`aurora-wip`. It contains gated AOP/audio and ISP infrastructure plus a
+read-only inherited USB2 PHY provider. Its source and build checks do not
+qualify the combined kernel on J616s: camera/audio hardware admission remains
+closed, and native gadget enumeration and SuperSpeed remain unqualified.
+
 ## CPU clocks
 
 `cpufreq_init()` validates the device identity, three translated CPM apertures,
