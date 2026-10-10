@@ -26,9 +26,12 @@
 // Switch the DFU USB-C port to debugusb
 // #define USE_DEBUG_USB
 
+// Change the 'channel' used by the dockchannel-uart iodev (if unset: 1)
+// #define DOCKCHANNEL_UART_CHANNEL 0
+
 #ifdef RELEASE
 # define FB_SILENT_MODE
-# ifdef CHAINLOADING
+#if defined(CHAINLOADING) && !defined(J700_CDC_PROXY) && !defined(T8140_KIS_PROXY)
 #  define EARLY_PROXY_TIMEOUT 5
 # endif
 #endif

@@ -563,8 +563,8 @@ static int t8152_cpufreq_init(void)
         return 0;
     int path[8];
     int node = adt_path_offset_trace(adt, "/arm-io/pmgr-child", path);
-    if (chip_id != T8152 || board_id != 0x24 || !adt_is_compatible(adt, 0, "J873gAP") ||
-        node < 0 || !adt_is_compatible(adt, node, "pmgr2,t8152"))
+    if (chip_id != T8152 || board_id != 0x24 || !adt_is_compatible(adt, 0, "J873gAP") || node < 0 ||
+        !adt_is_compatible(adt, node, "pmgr2,t8152"))
         return -1;
     u32 len;
     const u16 *maps = adt_getprop(adt, node, "reg-maps", &len);
@@ -590,11 +590,11 @@ static int t8152_cpufreq_init(void)
         if (!opps || !table_len || table_len % 8 || table_len / 8 + t8152_state0 > 32)
             return -1;
         for (u32 i = 0; i < table_len / 8; i++) {
-            if (!opps[2 * i] || opps[2 * i] > 5000000 ||
-                (i && opps[2 * i] <= opps[2 * (i - 1)]))
+            if (!opps[2 * i] || opps[2 * i] > 5000000 || (i && opps[2 * i] <= opps[2 * (i - 1)]))
                 return -1;
         }
-        t8152_clocks[c] = (struct t8152_clock){.reg = base + 0x20, .opps = opps, .count = table_len / 8};
+        t8152_clocks[c] =
+            (struct t8152_clock){.reg = base + 0x20, .opps = opps, .count = table_len / 8};
     }
     t8152_clocks_ready = true;
     return 0;
@@ -602,20 +602,23 @@ static int t8152_cpufreq_init(void)
 
 __attribute__((used, retain, noinline)) u64 cpufreq_get_cluster_hz(unsigned int cluster)
 {
+    if (chip_id == T6040)
+        return cpufreq_t6040_get_hz(cluster);
     if (cluster >= 2 || t8152_cpufreq_init())
         return 0;
     struct t8152_clock *c = &t8152_clocks[cluster];
     u64 raw = read64(c->reg);
     u32 state = raw & 31;
-    if ((raw & CLUSTER_PSTATE_BUSY) || state < t8152_state0 ||
-        state - t8152_state0 >= c->count)
+    if ((raw & CLUSTER_PSTATE_BUSY) || state < t8152_state0 || state - t8152_state0 >= c->count)
         return 0;
     return (u64)c->opps[2 * (state - t8152_state0)] * 1000;
 }
 
 __attribute__((used, retain, noinline)) int cpufreq_set_cluster_pstate(unsigned int cluster,
-                                                                   unsigned int pstate)
+                                                                       unsigned int pstate)
 {
+    if (chip_id == T6040)
+        return cpufreq_t6040_set_pstate(cluster, pstate);
     if (cluster >= 2 || t8152_cpufreq_init())
         return -1;
     struct t8152_clock *c = &t8152_clocks[cluster];
@@ -637,9 +640,15 @@ failed:
     return -1;
 }
 
-
 int cpufreq_init(void)
 {
+    if (chip_id == T6040)
+        return cpufreq_t6040_init();
+    if (chip_id == T8140) {
+        printf("cpufreq: skipping T8140 P-state hold pending register evidence\n");
+        return 0;
+    }
+
     printf("cpufreq: Initializing clusters\n");
 
     const struct cluster_t *cluster = cpufreq_get_clusters();
@@ -662,6 +671,9 @@ int cpufreq_init(void)
 
 void cpufreq_fixup(void)
 {
+    if (chip_id == T6040 || chip_id == T8140)
+        return;
+
     const struct cluster_t *cluster = cpufreq_get_clusters();
 
     if (!cluster)

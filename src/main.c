@@ -22,11 +22,13 @@
 #include "pmgr.h"
 #include "sep.h"
 #include "smp.h"
+#include "stage1_config.h"
 #include "string.h"
 #include "tps6598x.h"
 #include "uart.h"
 #include "uartproxy.h"
 #include "usb.h"
+#include "usb_cdc.h"
 #include "utils.h"
 #include "wdt.h"
 #include "xnuboot.h"
@@ -73,6 +75,56 @@ void run_actions(void)
 {
     bool usb_up = false;
 
+#ifdef T6040_STAGE1_CDC
+    if (chip_id != T6040)
+        panic("T6040 Stage 1 CDC image requires an M4 Pro\n");
+#ifndef BRINGUP
+    /* Use the M4 Pro's ADT-discovered USB controllers, not J700's KIS/ATC route.
+     * The configurable window lets a host claim the proxy before ESP boot. */
+    usb_init();
+    usb_iodev_init();
+    usb_up = true;
+    u32 cdc_window_ms = stage1_config_target() ? stage1_config_window_ms() : 15000;
+    u64 cdc_start = ticks_to_msecs(get_ticks());
+    printf("Stage 1: CDC host window %u ms\n", cdc_window_ms);
+    while (ticks_to_msecs(get_ticks()) - cdc_start < cdc_window_ms) {
+        for (int j = 0; j < USB_IODEV_COUNT; j++) {
+            iodev_id_t iodev = IODEV_USB0 + j;
+            if (!(iodev_get_usage(iodev) & USAGE_UARTPROXY))
+                continue;
+            usb_iodev_vuart_setup(iodev);
+            iodev_handle_events(iodev);
+            if (iodev_can_write(iodev)) {
+                fb_set_active(true);
+                printf("Stage 1: CDC host connected\n");
+                uartproxy_run(NULL);
+                while (!next_stage.entry)
+                    uartproxy_run(NULL);
+                return;
+            }
+        }
+        mdelay(10);
+    }
+#endif
+#endif
+
+    u32 window_ms = chip_id == T8140 ? stage1_config_window_ms() : 0;
+#ifdef T8140_PROXY_WINDOW_MS
+    if (!stage1_config_target())
+        window_ms = T8140_PROXY_WINDOW_MS;
+#endif
+    if (chip_id == T8140 && window_ms) {
+        if (uartproxy_wait_dockchannel(window_ms)) {
+            printf("Stage 1: host request received\n");
+            fb_set_active(true);
+            uartproxy_run_presynced(IODEV_DOCKCHANNEL_UART);
+            while (!next_stage.entry)
+                uartproxy_run(NULL);
+            return;
+        }
+        printf("Stage 1: no host during proxy window\n");
+    }
+
 #ifndef BRINGUP
 #ifdef EARLY_PROXY_TIMEOUT
     int node = adt_path_offset(adt, "/chosen/asmb");
@@ -83,13 +135,13 @@ void run_actions(void)
         printf("Boot policy: sip0 = %ld\n", lp_sip0);
     }
 
-    if (!cur_boot_args.video.display && lp_sip0 == 127) {
-        printf("Bringing up USB for early debug...\n");
-
-        usb_init();
-        usb_iodev_init();
-
-        usb_up = true;
+    if (chip_id != T8140 && !cur_boot_args.video.display && lp_sip0 == 127) {
+        if (!usb_up) {
+            printf("Bringing up USB for early debug...\n");
+            usb_init();
+            usb_iodev_init();
+            usb_up = true;
+        }
 
         printf("Waiting for proxy connection... ");
         for (int i = 0; i < EARLY_PROXY_TIMEOUT * 100; i++) {
@@ -119,22 +171,29 @@ void run_actions(void)
 
     printf("Checking for payloads...\n");
 
+#ifndef J700_CDC_PROXY
     if (payload_run() == 0) {
         printf("Valid payload found\n");
         return;
     }
+#endif
     fb_set_active(true);
 
     printf("No valid payload found\n");
 
 #ifndef BRINGUP
-    if (!usb_up) {
+    if (!usb_up && chip_id != T8140) {
         usb_init();
         usb_iodev_init();
     }
 #endif
 
     printf("Running proxy...\n");
+
+#ifdef J700_CDC_AUTOSTART
+    if (usb_cdc_schedule(1000, 0, BIT(1) | BIT(2)))
+        panic("CDC autostart scheduling failed\n");
+#endif
 
     uartproxy_run(NULL);
 }
@@ -146,8 +205,8 @@ static void j873g_run_proxy(void)
     const char *target = adt_getprop(adt, 0, "target-type", &target_len);
 
     if (board_id != 0x24 || !model || model_len != sizeof("Mac18,5") ||
-        memcmp(model, "Mac18,5", sizeof("Mac18,5")) || !target ||
-        target_len != sizeof("J873g") || memcmp(target, "J873g", sizeof("J873g")))
+        memcmp(model, "Mac18,5", sizeof("Mac18,5")) || !target || target_len != sizeof("J873g") ||
+        memcmp(target, "J873g", sizeof("J873g")))
         panic("Unsupported T8152 board\n");
 
     /* Adopt firmware power and USB state. Only the qualified display route
@@ -168,11 +227,39 @@ static void j873g_run_proxy(void)
     uartproxy_run(NULL);
 }
 
+static bool prepare_next_stage(void)
+{
+    if (usb_dwc3_shutdown_failed())
+        return false;
+    if (chip_id != T8152 && !nvme_shutdown()) {
+        printf("NVMe handoff failed; returning to proxy\n");
+        uartproxy_run(NULL);
+        panic("NVMe handoff failed\n");
+    }
+    exception_shutdown();
+#ifndef BRINGUP
+    if (chip_id != T8152) {
+        if (!usb_iodev_shutdown())
+            return false;
+        display_shutdown(DCP_SLEEP_IF_EXTERNAL);
+    }
+#ifdef USE_FB
+    fb_shutdown(next_stage.restore_logo);
+#endif
+    mmu_shutdown();
+#endif
+
+    return true;
+}
+
 void m1n1_main(void)
 {
     printf("\n\nm1n1 %s\n", m1n1_version);
     printf("Copyright The Asahi Linux Contributors\n");
     printf("Licensed under the MIT license\n\n");
+#ifdef T8140_KIS_PROXY
+    printf("KIS carrier: retaining inherited DebugUSB\n");
+#endif
 
     printf("Running in EL%lu\n\n", mrs(CurrentEL) >> 2);
 
@@ -188,14 +275,23 @@ void m1n1_main(void)
 #ifndef BRINGUP
     if (supports_gxf())
         gxf_init();
-    mcc_init();
+    if (mcc_init() && (chip_id == T8140 || chip_id == T6040))
+        panic("MCC initialization failed\n");
     mmu_init();
     aic_init();
     smp_init();
 #endif
     wdt_disable();
+#ifdef J700_CDC_PROXY
+    if (usb_cdc_arm_watchdog()) {
+        wdt_reboot();
+        panic("CDC watchdog could not be armed\n");
+    }
+    printf("J700 CDC flavour: DebugUSB until scheduled Gen1 transition\n");
+#endif
 #ifndef BRINGUP
-    pmgr_init();
+    if (pmgr_init() && chip_id == T8140)
+        panic("T8140 PMGR initialization failed\n");
 #ifdef USE_DEBUG_USB
     tps6598x_enable_debugusb();
 #endif
@@ -229,19 +325,12 @@ next_stage:
 
     printf("Preparing to run next stage at %p...\n", next_stage.entry);
 
-    if (chip_id != T8152)
-        nvme_shutdown();
-    exception_shutdown();
-#ifndef BRINGUP
-    if (chip_id != T8152) {
-        usb_iodev_shutdown();
-        display_shutdown(DCP_SLEEP_IF_EXTERNAL);
+    if (!prepare_next_stage()) {
+        next_stage.entry = NULL;
+        /* USB ownership is uncertain. Leave mappings and the watchdog intact. */
+        while (1)
+            sysop("wfe");
     }
-#ifdef USE_FB
-    fb_shutdown(next_stage.restore_logo);
-#endif
-    mmu_shutdown();
-#endif
 
     printf("Vectoring to next stage...\n");
 

@@ -4,6 +4,7 @@ from construct import *
 import struct
 import time
 from .isp_opcodes import *
+from . import ISPChannelMessage
 
 class ISPIORequestCommand:
     def __init__(self, iova, insize, outsize, args):

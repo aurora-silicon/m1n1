@@ -61,9 +61,9 @@ class TAS5770Regs(RegMap):
 
 class R_MODE_CTRL(Register8):
     BOP_SRC = 7
-    ISNS_PD = 3
-    VSNS_PD = 2
-    MODE    = 1, 0, E_PWR_MODE
+    ISNS_PD = 4
+    VSNS_PD = 3
+    MODE    = 2, 0, E_PWR_MODE
 
 class R_CHNL_0(Register8):
     CDS_MODE  = 7, 6

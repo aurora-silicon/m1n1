@@ -170,6 +170,22 @@ class ALSSetPropertyUnkE4(ALSSetProperty):
         "retcode" / Const(0x0, Int32ul),
     )
 
+LASAngleReport = Struct(
+    "report_id" / Hex(Int8ul),
+    "angle" / Int8ul,
+    "unknown" / HexDump(GreedyBytes),
+)
+
+AudioProducerReport = Struct(
+    "devid" / FourCC,
+    "subtype" / Hex(Int32ul),
+    "unknown0" / Bytes(56),
+    "frame_count" / Int64ul,
+    "unknown1" / Bytes(24),
+    "write_offset" / Int64ul,
+    "unknown2" / GreedyBytes,
+)
+
 ALSLuxReport = Struct(
     "unk0" / Const(0xec, Hex(Int8ul)),
     "sequence" / Int32ul,
@@ -393,6 +409,14 @@ DEVPROPS = {
     ),
 }
 
+DevicePropertyReply = Struct(
+    "retcode" / Default(Hex(Int32ul), 0),
+    "len" / If(this.retcode == 0, Int32ul),
+    "data" / If(this.retcode == 0, FixedSized(this.len,
+        Switch(lambda s: (s._params.devid, s._params.modifier),
+            DEVPROPS, default=HexDump(GreedyBytes))))
+)
+
 class AudioPropertyKey(IntEnum):
     STATE   = 200   # 0xc8
     POWER   = 202   # 0xca
@@ -444,14 +468,12 @@ class AudioPropertyFormat(AudioProperty):
         "modifier" / Const(AudioPropertyKey.FORMAT, Int32ul),
         "data" / Const(0x1, Int32ul),
     )
-    RETS = Struct(
-        "retcode" / Const(0x0, Int32ul),
-        "format" / Int32ul, # 16 == float32?
-        "fourcc" / FourCC,  # PCML
-        "sample_rate" / Int32ul, # 16000
-        "channels" / Int32ul, # 3
-        "bytes_per_sample" / Int32ul, # 2
-    )
+    RETS = DevicePropertyReply
+
+    def read_resp(self, f):
+        self.rets = self.RETS.parse_stream(f,
+            devid=self.args.devid, modifier=AudioPropertyKey.FORMAT
+        )
 
 AudioPowerSetting = Struct(
     "devid" / FourCC,
@@ -497,13 +519,7 @@ class GetDeviceProp(WrappedCall):
         "modifier" / Int32ul,
         "unk6" / Hex(Const(0x01, Int32ul)),
     )
-    RETS = Struct(
-        "retcode" / Default(Hex(Int32ul), 0),
-        "len" / Optional(Int32ul),
-        "data" / Switch(lambda s: (s._params.devid, s._params.modifier),
-            DEVPROPS,
-        default=HexDump(GreedyBytes))
-    )
+    RETS = DevicePropertyReply
 
     def read_resp(self, f):
         self.rets = self.RETS.parse_stream(f,

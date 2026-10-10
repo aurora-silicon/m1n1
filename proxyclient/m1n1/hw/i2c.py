@@ -141,7 +141,10 @@ class I2C:
         self.regs.CTL.set(MTR=1, MRR=1)
 
     def clear_status(self):
-        self.regs.SMSTA.val = 0xffffffff
+        status = self.regs.SMSTA.reg
+        if status.XIP:
+            raise Exception("I2C transfer in progress")
+        self.regs.SMSTA.val = int(status)
 
     def _fifo_read(self, nbytes):
         read = []

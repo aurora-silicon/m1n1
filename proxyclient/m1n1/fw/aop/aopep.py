@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 import time
+from io import BytesIO
 from construct import *
 from ..afk.epic import *
 from .ipc import *
@@ -42,9 +43,6 @@ class AOPGyroEndpoint(EPICEndpoint):
         AOPGyroService,
     ]
 
-    def start_queues(self):
-        pass  # don't init gyro ep (we don't have one)
-
 # als
 class AOPALSService(EPICService):
     NAME = "als"
@@ -81,21 +79,40 @@ class AOPWakehintEndpoint(EPICEndpoint):
         AOPWakehintService,
     ]
 
-# unk26
-class AOPUNK26Service(EPICService):
-    NAME = "unk26"
-    SHORT = "unk26"
+# lid angle
+class AOPLASService(EPICService):
+    NAME = "las"
+    SHORT = "las"
+    last_report = None
 
-class AOPUNK26Endpoint(EPICEndpoint):
-    SHORT = "unk26"
+    @report_handler(0xc4, LASAngleReport)
+    def handle_angle(self, seq, fd, rep):
+        self.last_report = rep
+        self.log(rep)
+        return True
+
+class AOPLASEndpoint(EPICEndpoint):
+    SHORT = "las"
     SERVICES = [
-        AOPUNK26Service,
+        AOPLASService,
     ]
 
 # audio
 class AOPAudioService(EPICService):
     NAME = "aop-audio"
     SHORT = "audio"
+    last_producer_report = None
+    last_producer_report_payload = None
+
+    def handle_report(self, category, type, seq, fd):
+        if int(type) != 0x20:
+            return super().handle_report(category, type, seq, fd)
+        payload = fd.read()
+        if len(payload) >= 0x68 and payload[:8] == b"iapl\x08\x00\x00\xc3":
+            self.last_producer_report = AudioProducerReport.parse(payload)
+            self.last_producer_report_payload = payload
+            return True
+        return super().handle_report(category, type, seq, BytesIO(payload))
 
 class AOPAudioEndpoint(EPICEndpoint):
     SHORT = "audio"
@@ -112,8 +129,8 @@ class AOPAudioEndpoint(EPICEndpoint):
     def send_roundtrip(self, call, chan="aop-audio", **kwargs):
         return super(AOPAudioEndpoint, self).send_roundtrip(chan, call, **kwargs)
 
-    def send_cmd(self, call, chan="aop-audio", **kwargs):
-        return super(AOPAudioEndpoint, self).send_cmd(chan, call, **kwargs)
+    def send_cmd(self, type, data, chan="aop-audio", **kwargs):
+        return super(AOPAudioEndpoint, self).send_cmd(chan, type, data, **kwargs)
 
     def send_notifycmd(self, type, data, chan="aop-audio", **kwargs):
         return super(AOPAudioEndpoint, self).send_notifycmd(chan, type, data, **kwargs)

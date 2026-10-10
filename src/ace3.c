@@ -58,6 +58,10 @@ static int ace3_select(spmi_dev_t *dev, u8 sid, u8 lreg)
         u8 sel;
         if (spmi_ext_read(dev, sid, ACE3_SPMI_SELECT, &sel, 1) < 0)
             return -1;
+        if ((sel & ~ACE3_SELECT_BUSY) != lreg) {
+            printf("ace3: sid %u: unexpected selector %#x for register %#x\n", sid, sel, lreg);
+            return -1;
+        }
         if (!(sel & ACE3_SELECT_BUSY))
             return 0;
         if (timeout_expired(timeout)) {

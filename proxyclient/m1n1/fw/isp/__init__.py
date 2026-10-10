@@ -63,8 +63,7 @@ ISPIPCChanTableDescEntry = Struct(
     "src" / Int32ul,
     "num" / Int32ul,
     "pad" / Int32ul,
-    "iova" / Hex(Int32ul),
-    "pad" / Default(Int32ul, 0),
+    "iova" / Hex(Int64ul),
     "pad" / Default(Int32ul, 0),
     "pad" / Default(Int32ul, 0),
     "pad" / Padding(0xa0),
@@ -205,7 +204,7 @@ class ISPChannel:
     def handler(self):
         while True:
             req = self.read_msg(self.cursor)
-            if ((req.arg0 & 0xf) == 0x1): break  # ack flag
+            if ((req.arg0 & 0xf) in (0x1, 0x3)): break  # ACK or terminal ACK
             rsp = self.handle_once(req=req)
             if (rsp == None): raise RuntimeError("IRQ stuck")
 

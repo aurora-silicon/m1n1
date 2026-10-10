@@ -17,6 +17,7 @@
 #include "mcc.h"
 #include "memory.h"
 #include "nvme.h"
+#include "payload.h"
 #include "pcie.h"
 #include "pmgr.h"
 #include "smp.h"
@@ -26,7 +27,9 @@
 #include "uart.h"
 #include "uartproxy.h"
 #include "usb.h"
+#include "usb_cdc.h"
 #include "utils.h"
+#include "wdt.h"
 #include "xnuboot.h"
 
 #include "minilzlib/minlzma.h"
@@ -34,6 +37,8 @@
 
 void *rust_read_gigalocker(size_t *);
 void rust_free_gigalocker(void *, size_t);
+
+_Static_assert(sizeof(struct midr_part_features) == 20, "proxy CPU features ABI changed");
 
 int proxy_process(ProxyRequest *request, ProxyReply *reply)
 {
@@ -102,6 +107,11 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
                                      request->args[3], request->args[4]);
             break;
         case P_VECTOR:
+            if (usb_dwc3_shutdown_failed()) {
+                next_stage.entry = NULL;
+                reply->retval = -1;
+                break;
+            }
             // forcefully restore tps6598x IRQs
             usb_hpm_restore_irqs(1);
             iodev_console_flush();
@@ -122,6 +132,14 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_PUT_SIMD_STATE:
             put_simd_state((void *)request->args[0]);
+            break;
+        case P_WDT_ARM:
+            reply->retval = request->args[0] < 1 || request->args[0] > 178
+                                ? -1
+                                : wdt_arm_seconds(request->args[0]);
+            break;
+        case P_WDT_DISABLE:
+            wdt_disable();
             break;
         case P_REBOOT:
             reboot();
@@ -281,6 +299,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_IC_IVAU:
             ic_ivau_range((void *)request->args[0], request->args[1]);
+            sysop("dsb sy");
+            sysop("isb");
             break;
         case P_DC_IVAC:
             dc_ivac_range((void *)request->args[0], request->args[1]);
@@ -299,6 +319,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_DC_CVAC:
             dc_cvac_range((void *)request->args[0], request->args[1]);
+            sysop("dsb sy");
             break;
         case P_DC_CVAU:
             dc_cvau_range((void *)request->args[0], request->args[1]);
@@ -346,22 +367,26 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         }
 
         case P_SMP_START_SECONDARIES:
-            smp_start_secondaries();
+            if (smp_start_secondaries())
+                reply->status = S_ERROR;
             break;
         case P_SMP_STOP_SECONDARIES:
             smp_stop_secondaries(request->args[0]);
             break;
         case P_SMP_CALL:
-            smp_call4(request->args[0], (void *)request->args[1], request->args[2],
-                      request->args[3], request->args[4], request->args[5]);
+            if (smp_call4(request->args[0], (void *)request->args[1], request->args[2],
+                          request->args[3], request->args[4], request->args[5]))
+                reply->status = S_ERROR;
             break;
         case P_SMP_CALL_SYNC:
-            smp_call4(request->args[0], (void *)request->args[1], request->args[2],
-                      request->args[3], request->args[4], request->args[5]);
-            reply->retval = smp_wait(request->args[0]);
+            if (smp_call4(request->args[0], (void *)request->args[1], request->args[2],
+                          request->args[3], request->args[4], request->args[5]) ||
+                smp_wait_timed(request->args[0], &reply->retval, 300000))
+                reply->status = S_ERROR;
             break;
         case P_SMP_WAIT:
-            reply->retval = smp_wait(request->args[0]);
+            if (smp_wait_timed(request->args[0], &reply->retval, 300000))
+                reply->status = S_ERROR;
             break;
         case P_SMP_SET_WFE_MODE:
             smp_set_wfe_mode(request->args[0]);
@@ -370,22 +395,26 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = smp_is_alive(request->args[0]);
             break;
         case P_SMP_CALL_EL1:
-            smp_call4(request->args[0], el1_call, request->args[1], request->args[2],
-                      request->args[3], request->args[4]);
+            if (smp_call4(request->args[0], el1_call, request->args[1], request->args[2],
+                          request->args[3], request->args[4]))
+                reply->status = S_ERROR;
             break;
         case P_SMP_CALL_EL1_SYNC:
-            smp_call4(request->args[0], el1_call, request->args[1], request->args[2],
-                      request->args[3], request->args[4]);
-            reply->retval = smp_wait(request->args[0]);
+            if (smp_call4(request->args[0], el1_call, request->args[1], request->args[2],
+                          request->args[3], request->args[4]) ||
+                smp_wait_timed(request->args[0], &reply->retval, 300000))
+                reply->status = S_ERROR;
             break;
         case P_SMP_CALL_EL0:
-            smp_call4(request->args[0], el0_call, request->args[1], request->args[2],
-                      request->args[3], request->args[4]);
+            if (smp_call4(request->args[0], el0_call, request->args[1], request->args[2],
+                          request->args[3], request->args[4]))
+                reply->status = S_ERROR;
             break;
         case P_SMP_CALL_EL0_SYNC:
-            smp_call4(request->args[0], el0_call, request->args[1], request->args[2],
-                      request->args[3], request->args[4]);
-            reply->retval = smp_wait(request->args[0]);
+            if (smp_call4(request->args[0], el0_call, request->args[1], request->args[2],
+                          request->args[3], request->args[4]) ||
+                smp_wait_timed(request->args[0], &reply->retval, 300000))
+                reply->status = S_ERROR;
             break;
 
         case P_HEAPBLOCK_ALLOC:
@@ -405,7 +434,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_KBOOT_BOOT:
-            if (kboot_boot((void *)request->args[0]) == 0)
+            reply->retval = kboot_boot((void *)request->args[0]);
+            if (reply->retval == 0)
                 return 1;
             break;
         case P_KBOOT_SET_CHOSEN:
@@ -419,6 +449,11 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_KBOOT_SET_UBOOT:
             reply->retval = kboot_set_uboot((void *)request->args[0], (void *)request->args[1]);
+            break;
+        case P_KBOOT_BOOT_STORAGE:
+            if (payload_boot_storage((const char *)request->args[0]) == 0)
+                return 1;
+            reply->status = S_ERROR;
             break;
 
         case P_PMGR_POWER_ENABLE:
@@ -460,6 +495,15 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 
         case P_USB_IODEV_VUART_SETUP:
             usb_iodev_vuart_setup(request->args[0]);
+            break;
+
+        case P_CDC_SCHEDULE:
+            if (request->args[0] > 15000 || request->args[1] || request->args[2] > 7 ||
+                usb_cdc_schedule(request->args[0], request->args[1], request->args[2]))
+                reply->status = S_ERROR;
+            break;
+        case P_CDC_STATUS:
+            reply->retval = usb_cdc_status();
             break;
 
         case P_TUNABLES_APPLY_GLOBAL:
@@ -581,17 +625,18 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_PCIE_INIT:
-            pcie_init();
+            reply->retval = pcie_init();
             break;
         case P_PCIE_SHUTDOWN:
-            pcie_shutdown();
+            reply->retval = pcie_shutdown();
             break;
 
         case P_NVME_INIT:
             reply->retval = nvme_init();
             break;
         case P_NVME_SHUTDOWN:
-            nvme_shutdown();
+            if (!nvme_shutdown())
+                reply->status = S_ERROR;
             break;
         case P_NVME_READ:
             reply->retval = nvme_read(request->args[0], request->args[1], (void *)request->args[2]);
@@ -624,11 +669,20 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = dapf_init_all();
             break;
         case P_DAPF_INIT:
-            reply->retval = dapf_init((const char *)request->args[0], 1);
+            reply->retval = dapf_init((const char *)request->args[0], request->args[1]);
             break;
 
         case P_CPUFREQ_INIT:
             reply->retval = cpufreq_init();
+            break;
+        case P_CPUFREQ_GET_CLUSTER_HZ:
+            reply->retval =
+                request->args[0] > UINT32_MAX ? 0 : cpufreq_get_cluster_hz(request->args[0]);
+            break;
+        case P_CPUFREQ_SET_CLUSTER_PSTATE:
+            reply->retval = request->args[0] > UINT32_MAX || request->args[1] > UINT32_MAX
+                                ? -1
+                                : cpufreq_set_cluster_pstate(request->args[0], request->args[1]);
             break;
 
         case P_READ_GIGALOCKER: {

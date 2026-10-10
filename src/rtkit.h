@@ -20,6 +20,7 @@ struct rtkit_buffer {
     void *bfr;
     u64 dva;
     size_t sz;
+    bool owned;
 };
 
 rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,

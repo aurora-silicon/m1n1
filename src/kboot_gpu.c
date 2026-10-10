@@ -427,7 +427,7 @@ static int dt_set_region(void *dt, int sgx, const char *name, const char *path)
         bail("ADT: GPU: failed to find %s property\n", prop);
 
     snprintf(prop, sizeof(prop), "%s-size", name);
-    if (ADT_GETPROP(adt, sgx, prop, &size) < 0 || !base)
+    if (ADT_GETPROP(adt, sgx, prop, &size) < 0 || !size)
         bail("ADT: GPU: failed to find %s property\n", prop);
 
     return dt_set_resvmem(dt, path, base, size);
@@ -490,8 +490,101 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
     return 0;
 }
 
+static int dt_set_gpu_t8140(void *dt)
+{
+    int gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0)
+        return 0;
+    if (fdt_node_check_compatible(dt, gpu, "apple,agx-t8140") &&
+        fdt_node_check_compatible(dt, gpu, "gpu,t8140"))
+        return 0;
+
+    int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    u32 count, num_states, tables, len;
+    const struct perf_state *states, *sram;
+    if (sgx < 0 || ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
+        ADT_GETPROP(adt, sgx, "gpu-num-perf-states", &num_states) != sizeof(num_states) ||
+        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) || count != 16 ||
+        num_states != 15 || tables != 1)
+        goto disable;
+    states = adt_getprop(adt, sgx, "perf-states", &len);
+    if (!states || len != count * sizeof(*states))
+        goto disable;
+    sram = adt_getprop(adt, sgx, "perf-states-sram", &len);
+    if (!sram || len != count * sizeof(*sram))
+        goto disable;
+    for (u32 i = 0; i < count; i++)
+        if (states[i].volt > UINT32_MAX / 1000)
+            goto disable;
+
+    int ph_len;
+    const fdt32_t *opp_ph = fdt_getprop(dt, gpu, "operating-points-v2", &ph_len);
+    if (!opp_ph || ph_len != sizeof(*opp_ph))
+        goto disable;
+    int table = fdt_node_offset_by_phandle(dt, fdt32_ld(opp_ph));
+    if (table < 0)
+        goto disable;
+    int opp, opp_count = 0;
+    fdt_for_each_subnode(opp, dt, table)
+    {
+        if (++opp_count > 16 || !fdt_getprop(dt, opp, "opp-hz", &ph_len) || ph_len != sizeof(u64) ||
+            !fdt_getprop(dt, opp, "opp-microvolt", &ph_len) || ph_len != sizeof(u32))
+            goto disable;
+    }
+    if (opp_count != 16)
+        goto disable;
+
+    static const struct {
+        const char *name;
+        const char *path;
+    } regions[] = {
+        {"gfx-handoff", "/reserved-memory/uat-handoff"},
+        {"gfx-shared-l2-region", "/reserved-memory/uat-l2-pagetables"},
+        {"gfx-shared-region", "/reserved-memory/uat-pagetables"},
+        {"gpu-region", "/reserved-memory/uat-ttbs"},
+    };
+    u64 base[ARRAY_SIZE(regions)], size[ARRAY_SIZE(regions)];
+    for (size_t i = 0; i < ARRAY_SIZE(regions); i++) {
+        char prop[64];
+        snprintf(prop, sizeof(prop), "%s-base", regions[i].name);
+        if (ADT_GETPROP(adt, sgx, prop, &base[i]) != sizeof(u64))
+            goto disable;
+        snprintf(prop, sizeof(prop), "%s-size", regions[i].name);
+        if (ADT_GETPROP(adt, sgx, prop, &size[i]) != sizeof(u64) || !base[i] || !size[i] ||
+            (base[i] & (SZ_16K - 1)) || (size[i] & (SZ_16K - 1)) ||
+            base[i] > UINT64_MAX - size[i] || fdt_path_offset(dt, regions[i].path) < 0)
+            goto disable;
+        for (size_t j = 0; j < i; j++)
+            if (base[i] < base[j] + size[j] && base[j] < base[i] + size[i])
+                goto disable;
+    }
+
+    opp_count = 0;
+    fdt_for_each_subnode(opp, dt, table)
+    {
+        if (fdt_setprop_inplace_u64(dt, opp, "opp-hz", states[opp_count].freq) ||
+            fdt_setprop_inplace_u32(dt, opp, "opp-microvolt", states[opp_count].volt * 1000))
+            goto disable;
+        opp_count++;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(regions); i++)
+        if (dt_set_resvmem(dt, regions[i].path, base[i], size[i]))
+            goto disable;
+    return 0;
+
+disable:
+    gpu = fdt_path_offset(dt, "gpu");
+    if (gpu >= 0 && fdt_setprop_string(dt, gpu, "status", "disabled"))
+        return -1;
+    printf("FDT: GPU: invalid T8140 ADT or DT data, disabling GPU\n");
+    return 0;
+}
+
 int dt_set_gpu(void *dt)
 {
+    if (chip_id == T8140)
+        return dt_set_gpu_t8140(dt);
+
     bool has_cs_afr = false;
     int (*calc_power)(u32 count, u32 table_count, const struct perf_state *core,
                       const struct perf_state *sram, const struct aux_perf_states *cs, u32 *max_pwr,

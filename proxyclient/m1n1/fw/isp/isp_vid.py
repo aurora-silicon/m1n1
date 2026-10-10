@@ -8,6 +8,7 @@ import struct
 import _thread
 
 from .isp_cmd import ISPIOCommandDispatcher
+from . import ISPChannelMessage
 
 ISPFrameMeta = Struct(
         "unk_0" / Hex(Int32ul),
@@ -15,8 +16,7 @@ ISPFrameMeta = Struct(
         "unk_8" / Hex(Int32ul),
         "pad" / Default(Int32ul, 0),
 
-        "meta_iova" / Hex(Int32ul),
-        "pad" / Default(Int32ul, 0),
+        "meta_iova" / Hex(Int64ul),
         "pad" / Default(Int32ul, 0),
         "pad" / Default(Int32ul, 0),
 
@@ -32,10 +32,8 @@ ISPFrameMeta = Struct(
         "unk_48" / Hex(Int32ul),
         "pad" / Default(Int32ul, 0),
 
-        "luma_iova" / Hex(Int32ul),
-        "pad" / Default(Int32ul, 0),
-        "cbcr_iova" / Hex(Int32ul),
-        "pad" / Default(Int32ul, 0),
+        "luma_iova" / Hex(Int64ul),
+        "cbcr_iova" / Hex(Int64ul),
 
         "pad" / Padding(0x20),
 
@@ -119,10 +117,8 @@ BufH2TSendArgsHeader = Struct(
 )
 
 BufH2TSendArgs = Struct(
-    "iova0" / Int32ul,
-    "pad" / Default(Int32ul, 0),
-        "iova1" / Int32ul,
-    "pad" / Default(Int32ul, 0),
+    "iova0" / Int64ul,
+        "iova1" / Int64ul,
         "pad" / Padding(0x10),
     "flag0" / Int32ul,
         "flag1" / Int32ul,

@@ -15,7 +15,7 @@ int smp_secondary_prepare(void);
 void smp_secondary_prep_el3(void);
 
 int smp_init(void);
-void smp_start_secondaries(void);
+int smp_start_secondaries(void);
 void smp_stop_secondaries(bool deep_sleep);
 
 #define smp_call0(i, f)          smp_call4(i, f, 0, 0, 0, 0)
@@ -23,8 +23,9 @@ void smp_stop_secondaries(bool deep_sleep);
 #define smp_call2(i, f, a, b)    smp_call4(i, f, a, b, 0, 0)
 #define smp_call3(i, f, a, b, c) smp_call4(i, f, a, b, c, 0)
 
-void smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3);
+int smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3);
 
+int smp_wait_timed(int cpu, u64 *retval, u32 timeout_ms);
 u64 smp_wait(int cpu);
 
 bool smp_is_alive(int cpu);

@@ -146,12 +146,32 @@ struct mcc_regs {
     u32 cache_status_mask;
     u32 cache_status_val;
     u32 cache_disable;
+    bool has_cache_control;
 
     struct tz_regs *tz;
 };
 
 static int mcc_count;
 static struct mcc_regs mcc_regs[MAX_MCC_INSTANCES];
+
+static int mcc_get_count(int node, const char *name, u64 *value)
+{
+    u32 len;
+    const void *prop = adt_getprop(adt, node, name, &len);
+
+    if (!prop)
+        return -1;
+    if (len == sizeof(u32)) {
+        u32 count;
+        memcpy(&count, prop, sizeof(count));
+        *value = count;
+    } else if (len == sizeof(u64)) {
+        memcpy(value, prop, sizeof(*value));
+    } else {
+        return -1;
+    }
+    return 0;
+}
 
 static u32 plane_read32(int mcc, int plane, u64 offset)
 {
@@ -179,6 +199,10 @@ int mcc_enable_cache(void)
     /* The 6030 memory controller supports setting a waymask, but the desktop chips do not appear to
        use it */
     for (int mcc = 0; mcc < mcc_count; mcc++) {
+        if (!mcc_regs[mcc].has_cache_control) {
+            printf("MCC: cache control is firmware-owned on MCC %d; leaving it enabled\n", mcc);
+            continue;
+        }
         for (int plane = 0; plane < mcc_regs[mcc].plane_count; plane++) {
             plane_write32(mcc, plane, PLANE_CACHE_ENABLE, mcc_regs[mcc].cache_enable_val);
             if (plane_poll32(mcc, plane, PLANE_CACHE_STATUS, mcc_regs[mcc].cache_status_mask,
@@ -211,6 +235,41 @@ int mcc_unmap_carveouts(void)
     // region-id-2 and region-id-4 on a booted macos, in the /chosen/carveout-memory-map DT node.
     // This can be used along with dumping the mcc reg space to find the correct start/end/enable
     // above.
+    if (!mcc_regs[0].tz || !mcc_regs[0].tz->count) {
+        static const char *const names[] = {"region-id-4", "region-id-2"};
+        int node = adt_path_offset(adt, "/chosen/carveout-memory-map");
+
+        if (node < 0)
+            return -1;
+        if (mem_size_actual > UINT64_MAX - ram_base)
+            return -1;
+        for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+            u32 len;
+            const u64 *range = adt_getprop(adt, node, names[i], &len);
+            u64 start, size;
+
+            if (!range || len != 2 * sizeof(u64))
+                return -1;
+            memcpy(&start, range, sizeof(start));
+            memcpy(&size, range + 1, sizeof(size));
+            if (!size || start < ram_base || start > UINT64_MAX - size ||
+                start + size > ram_base + mem_size_actual ||
+                ((start | size) & (get_page_size() - 1)) ||
+                mcc_carveout_count >= ARRAY_SIZE(mcc_carveouts) - 1)
+                return -1;
+
+            printf("MMU: Unmapping %s at 0x%lx..0x%lx\n", names[i], start, start + size);
+            mmu_rm_mapping(start, size);
+            mmu_rm_mapping(start | REGION_RWX_EL0, size);
+            mmu_rm_mapping(start | REGION_RW_EL0, size);
+            mmu_rm_mapping(start | REGION_RX_EL1, size);
+            mcc_carveouts[mcc_carveout_count].base = start;
+            mcc_carveouts[mcc_carveout_count].size = size;
+            mcc_carveout_count++;
+        }
+        return 0;
+    }
+
     for (u32 i = 0; i < mcc_regs[0].tz->count; i++) {
         uint64_t off = mcc_regs[0].tz->stride * i;
         uint64_t start = plane_read32(0, 0, mcc_regs[0].tz->start + off);
@@ -278,6 +337,7 @@ int mcc_init_t8103(int node, int *path, bool t8112)
     mcc_regs[0].cache_status_mask = T8103_CACHE_STATUS_MASK;
     mcc_regs[0].cache_status_val = T8103_CACHE_STATUS_VAL;
     mcc_regs[0].cache_disable = t8112 ? T8112_CACHE_DISABLE : 0;
+    mcc_regs[0].has_cache_control = true;
     mcc_regs[0].tz = &t8103_tz_regs;
 
     printf("MCC: Initialized T8103 MCC (%d channels)\n", val);
@@ -328,6 +388,7 @@ int mcc_init_t6000(int node, int *path, bool t602x)
         mcc_regs[i].cache_status_mask = T6000_CACHE_STATUS_MASK;
         mcc_regs[i].cache_status_val = T6000_CACHE_STATUS_VAL;
         mcc_regs[i].cache_disable = 0;
+        mcc_regs[i].has_cache_control = true;
 
         mcc_regs[i].tz = t602x ? &t602x_tz_regs : &t8103_tz_regs;
     }
@@ -364,6 +425,7 @@ int mcc_init_t6031(int *path, u32 reg_offset, u32 plane_count, u32 dcs_count)
         mcc_regs[i].cache_status_mask = T6031_CACHE_STATUS_MASK;
         mcc_regs[i].cache_status_val = T6031_CACHE_STATUS_VAL;
         mcc_regs[i].cache_disable = 0;
+        mcc_regs[i].has_cache_control = true;
 
         mcc_regs[i].tz = &t6031_tz_regs;
     }
@@ -396,6 +458,7 @@ int mcc_init_t8122(int *path, u32 reg_offset, u32 plane_count, u32 dcs_count,
         mcc_regs[i].cache_status_mask = T8122_CACHE_STATUS_MASK;
         mcc_regs[i].cache_status_val = T8122_CACHE_STATUS_VAL;
         mcc_regs[i].cache_disable = 0;
+        mcc_regs[i].has_cache_control = true;
 
         mcc_regs[i].tz = tz_regs;
     }
@@ -506,6 +569,78 @@ int mcc_init_m4(int node, int *path)
     return 0;
 }
 
+static int mcc_init_firmware_cache(int node, int *path)
+{
+    u32 reg_idx;
+    u64 count = 1, channels = 0, planes = 4, stride = T8103_PLANE_STRIDE;
+    int lock_node = adt_path_offset(adt, "/chosen/lock-regs/amcc");
+    bool t6041 = adt_is_compatible(adt, node, "mcc,t6041");
+
+    if (ADT_GETPROP(adt, node, "amcc-reg-idx", &reg_idx) < 0)
+        return -1;
+    if (adt_getprop(adt, node, "amcc-count", NULL) && mcc_get_count(node, "amcc-count", &count))
+        return -1;
+    if (adt_getprop(adt, node, "dcs-count-per-amcc", NULL) &&
+        mcc_get_count(node, "dcs-count-per-amcc", &channels))
+        return -1;
+    if (!count || count > MAX_MCC_INSTANCES || channels > INT32_MAX)
+        return -1;
+
+    if (lock_node >= 0 && adt_getprop(adt, lock_node, "plane-count", NULL)) {
+        if (mcc_get_count(lock_node, "plane-count", &planes))
+            return -1;
+    } else if (adt_getprop(adt, node, "amcc-plane-enable-mask", NULL)) {
+        u64 mask;
+        if (mcc_get_count(node, "amcc-plane-enable-mask", &mask))
+            return -1;
+        planes = __builtin_popcountll(mask);
+    }
+    if (lock_node >= 0 && adt_getprop(adt, lock_node, "plane-stride", NULL) &&
+        mcc_get_count(lock_node, "plane-stride", &stride))
+        return -1;
+    if (!planes || planes > INT32_MAX || !stride || (stride & 3))
+        return -1;
+
+    /* Restrict this path to the observed J616s layout. */
+    if (t6041 && (chip_id != T6040 || board_id != 6 || reg_idx != 12 || count != 4 ||
+                  channels != 4 || planes != 4 || stride != 0x40000))
+        return -1;
+
+    mcc_count = count;
+    for (int i = 0; i < mcc_count; i++) {
+        u64 base, size;
+        if (reg_idx > (u32)(INT32_MAX - i) ||
+            adt_get_reg(adt, path, "reg", reg_idx + i, &base, &size) || !base ||
+            (planes - 1) > (UINT64_MAX - 4) / stride || (planes - 1) * stride + 4 > size ||
+            (t6041 && (base != 0x220000000 + (u64)i * 0x2000000 || size != 0x200000)))
+            return -1;
+        mcc_regs[i].plane_base = base;
+        mcc_regs[i].plane_stride = stride;
+        mcc_regs[i].plane_count = planes;
+        mcc_regs[i].dcs_count = channels;
+        mcc_regs[i].tz = NULL;
+        mcc_regs[i].has_cache_control = false;
+    }
+
+    if (t6041) {
+        for (int i = 0; i < mcc_count; i++) {
+            for (int plane = 0; plane < mcc_regs[i].plane_count; plane++) {
+                u32 status = plane_read32(i, plane, 0x2804);
+                if ((status & 0x1f001f00) != 0x0c000c00) {
+                    printf("MCC: Unexpected cache status on MCC %d plane %d: 0x%x\n", i, plane,
+                           status);
+                    return -1;
+                }
+            }
+        }
+    }
+
+    printf("MCC: Initialized T%x MCCs (%d instances, %d planes, %d channels)\n", chip_id, mcc_count,
+           mcc_regs[0].plane_count, mcc_regs[0].dcs_count);
+    mcc_initialized = true;
+    return 0;
+}
+
 int mcc_init(void)
 {
     int path[8];
@@ -528,6 +663,10 @@ int mcc_init(void)
         return mcc_init_m3(node, path);
     } else if (adt_is_compatible(adt, node, "mcc,t8132")) {
         return mcc_init_m4(node, path);
+    } else if (adt_is_compatible(adt, node, "mcc,t8140")) {
+        return mcc_init_firmware_cache(node, path);
+    } else if (adt_is_compatible(adt, node, "mcc,t6041")) {
+        return mcc_init_firmware_cache(node, path);
     } else if (adt_is_compatible(adt, node, "mcc,t6030")) {
         return mcc_init_m3(node, path);
     } else if (adt_is_compatible(adt, node, "mcc,t6031")) {

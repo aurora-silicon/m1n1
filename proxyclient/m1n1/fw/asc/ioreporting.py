@@ -51,7 +51,7 @@ class ASCIOReportingEndpoint(ASCBaseEndpoint):
     @msg_handler(8, IOReporting_Report)
     def Init(self, msg):
         self.log("report!")
-        buf = self.asc.iface.readmem(self.iobuffer, self.bufsize)
+        buf = self.asc.ioread(self.iobuffer_dva, self.bufsize)
         #chexdump(buf)
         self.send(IOReporting_Report())
         return True

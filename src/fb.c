@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
+#include "../build/build_cfg.h"
+
 #include "fb.h"
 #include "assert.h"
 #include "iodev.h"
@@ -46,8 +48,11 @@ static struct {
 } console;
 
 extern u8 _binary_build_bootlogo_48_bin_start[];
-extern u8 _binary_build_bootlogo_128_bin_start[];
-extern u8 _binary_build_bootlogo_256_bin_start[];
+#define LOGO_SYMBOL_(name, size) _binary_build_##name##_##size##_bin_start
+#define LOGO_SYMBOL(name, size)  LOGO_SYMBOL_(name, size)
+
+extern u8 LOGO_SYMBOL(BUILTIN_LOGO, 128)[];
+extern u8 LOGO_SYMBOL(BUILTIN_LOGO, 256)[];
 
 extern u8 _binary_build_font_bin_start[];
 extern u8 _binary_build_font_retina_bin_start[];
@@ -59,13 +64,13 @@ const struct image logo_48 = {
 };
 
 const struct image logo_128 = {
-    .ptr = (void *)_binary_build_bootlogo_128_bin_start,
+    .ptr = (void *)LOGO_SYMBOL(BUILTIN_LOGO, 128),
     .width = 128,
     .height = 128,
 };
 
 const struct image logo_256 = {
-    .ptr = (void *)_binary_build_bootlogo_256_bin_start,
+    .ptr = (void *)LOGO_SYMBOL(BUILTIN_LOGO, 256),
     .width = 256,
     .height = 256,
 };

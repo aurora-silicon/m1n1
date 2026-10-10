@@ -45,6 +45,50 @@ CACHE_RANGE_OP(dc_civac_range, "dc civac")
 extern u8 _stack_top[];
 
 uint64_t ram_base = 0;
+static u64 firmware_ro_start;
+static u64 firmware_ro_end;
+static bool firmware_ro_checked;
+static bool firmware_ro_valid;
+
+int memory_fw_ro_range(u64 *start, u64 *end)
+{
+    if (chip_id != T8140)
+        return 0;
+
+    if (!firmware_ro_checked) {
+        u64 lower, upper, ram_end;
+
+        firmware_ro_checked = true;
+        if (!is_boot_cpu())
+            return -1;
+        lower = mrs(CTRR_M4_LWR_EL2);
+        upper = mrs(CTRR_M4_UPR_EL2);
+        if ((lower | upper) & (SZ_4K - 1))
+            return -1;
+        if (!cur_boot_args.mem_size ||
+            cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size ||
+            upper > UINT64_MAX - SZ_4K)
+            return -1;
+        ram_end = cur_boot_args.phys_base + cur_boot_args.mem_size;
+        firmware_ro_end = upper + SZ_4K;
+        if (firmware_ro_end < lower || firmware_ro_end - lower != 3 * SZ_16K ||
+            lower < cur_boot_args.phys_base || firmware_ro_end > ram_end ||
+            cur_boot_args.top_of_kernel_data < cur_boot_args.phys_base ||
+            cur_boot_args.top_of_kernel_data >= ram_end)
+            return -1;
+        firmware_ro_start = lower;
+        firmware_ro_valid = true;
+        printf("MMU: firmware RO range [0x%lx, 0x%lx)\n", firmware_ro_start, firmware_ro_end);
+    }
+
+    if (!firmware_ro_valid)
+        return -1;
+    if (start)
+        *start = firmware_ro_start;
+    if (end)
+        *end = firmware_ro_end;
+    return 1;
+}
 
 static inline u64 read_sctlr(void)
 {
@@ -175,6 +219,44 @@ enum SPRR_val_t {
 
 static u64 *mmu_pt_L0;
 
+static void mmu_publish_translation(void)
+{
+    sysop("dsb ishst");
+    sysop("tlbi vmalle1is");
+    sysop("dsb ish");
+    sysop("isb");
+}
+
+static void mmu_write_descriptor(u64 *entry, u64 value, u64 from)
+{
+    u64 old = *entry;
+
+    if (old == value)
+        return;
+    if (!mmu_active()) {
+        *entry = value;
+        return;
+    }
+
+    u64 daif = mrs(DAIF);
+    msr(DAIF, daif | 0x3c0);
+
+    /* Keep the table writable if its identity mapping is the block being broken. */
+    u64 *write_entry = entry;
+    if (!(from & (REGION_RWX_EL0 | REGION_RW_EL0 | REGION_RX_EL1)))
+        write_entry = (u64 *)((u64)entry | REGION_RW_EL0);
+
+    if (old & PTE_VALID) {
+        *write_entry = 0;
+        mmu_publish_translation();
+    } else {
+        sysop("dsb ishst");
+    }
+    *write_entry = value;
+    mmu_publish_translation();
+    msr(DAIF, daif);
+}
+
 static u64 *mmu_pt_get_l1(u64 from)
 {
     u64 l0idx = from >> VADDR_L0_OFFSET_BITS;
@@ -189,7 +271,7 @@ static u64 *mmu_pt_get_l1(u64 from)
     memset64(l1, 0, ENTRIES_PER_L1_TABLE * sizeof(u64));
 
     l0d = ((u64)l1) | FIELD_PREP(PTE_TYPE, PTE_TABLE) | PTE_VALID;
-    mmu_pt_L0[l0idx] = l0d;
+    mmu_write_descriptor(&mmu_pt_L0[l0idx], l0d, from);
     return l1;
 }
 
@@ -236,7 +318,7 @@ static u64 *mmu_pt_get_l2(u64 from)
     }
 
     l1d = ((u64)l2) | FIELD_PREP(PTE_TYPE, PTE_TABLE) | PTE_VALID;
-    l1[l1idx] = l1d;
+    mmu_write_descriptor(&l1[l1idx], l1d, from);
     return l2;
 }
 
@@ -283,7 +365,7 @@ static u64 *mmu_pt_get_l3(u64 from)
     }
 
     l2d = ((u64)l3) | FIELD_PREP(PTE_TYPE, PTE_TABLE) | PTE_VALID;
-    l2[l2idx] = l2d;
+    mmu_write_descriptor(&l2[l2idx], l2d, from);
     return l3;
 }
 
@@ -299,7 +381,7 @@ static void mmu_pt_map_l3(u64 from, u64 to, u64 size)
         u64 idx = (from >> VADDR_L3_OFFSET_BITS) & MASK(VADDR_L3_INDEX_BITS);
         u64 *l3 = mmu_pt_get_l3(from);
 
-        l3[idx] = to;
+        mmu_write_descriptor(&l3[idx], to, from);
         from += BIT(VADDR_L3_OFFSET_BITS);
         to += BIT(VADDR_L3_OFFSET_BITS);
     }
@@ -327,7 +409,7 @@ int mmu_map(u64 from, u64 to, u64 size)
     }
 
     // 16K does not support L1 blocks without FEAT_LPA2
-    if (!is_16k()) {
+    if (!mmu_active() && !is_16k() && chip_id != T8140) {
         // Map L2 until L1-aligned or reached end of mapping
         u64 boundary_l1 = ALIGN_UP(from, MASK(VADDR_L1_OFFSET_BITS));
         chunk = min(ALIGN_DOWN(size, MASK(VADDR_L1_OFFSET_BITS)), boundary_l1 - from);
@@ -350,8 +432,24 @@ int mmu_map(u64 from, u64 to, u64 size)
 
     // L2 mappings
     chunk = ALIGN_DOWN(size, MASK(VADDR_L2_OFFSET_BITS));
-    if (chunk && (to & VADDR_L2_ALIGN_MASK) == 0) {
-        mmu_pt_map_l2(from, to, chunk);
+    if (!mmu_active() && chunk && (to & VADDR_L2_ALIGN_MASK) == 0) {
+        u64 ro_start, ro_end;
+        bool split_ro = (to & PTE_VALID) && memory_fw_ro_range(&ro_start, &ro_end) > 0;
+        u64 block_size = BIT(VADDR_L2_OFFSET_BITS);
+
+        if (!split_ro) {
+            mmu_pt_map_l2(from, to, chunk);
+        } else {
+            for (u64 offset = 0; offset < chunk; offset += block_size) {
+                u64 target = (to + offset) & PTE_TARGET_MASK;
+                if (target < ro_end && target + block_size > ro_start) {
+                    printf("MMU: splitting firmware RO block at 0x%lx\n", target);
+                    mmu_pt_map_l3(from + offset, to + offset, block_size);
+                } else {
+                    mmu_pt_map_l2(from + offset, to + offset, block_size);
+                }
+            }
+        }
         from += chunk;
         to += chunk;
         size -= chunk;
@@ -498,7 +596,8 @@ static void mmu_add_default_mappings(void)
     mmu_add_mapping(ram_base, ram_base, mem_size_actual, MAIR_IDX_NORMAL, PERM_RWX);
 
     /* Unmap carveout regions */
-    mcc_unmap_carveouts();
+    if (mcc_unmap_carveouts() && (chip_id == T8140 || chip_id == T6040))
+        panic("MMU: Firmware carveouts are unavailable\n");
 
     /*
      * Remap m1n1 executable code as RX.
@@ -586,6 +685,9 @@ void mmu_init(void)
         return;
     }
 
+    if (memory_fw_ro_range(NULL, NULL) < 0)
+        panic("MMU: invalid T8140 firmware RO range\n");
+
     mmu_init_pagetables();
     mmu_add_default_mappings();
     mmu_configure();
@@ -595,6 +697,8 @@ void mmu_init(void)
     // Enable EL0 memory access by EL1
     if (supports_pan())
         msr(PAN, 0);
+
+    sysop("dmb sy");
 
     // RES1 bits
     u64 sctlr = SCTLR_LSMAOE | SCTLR_nTLSMD | SCTLR_TSCXT | SCTLR_ITD;
@@ -621,6 +725,8 @@ void mmu_init_secondary_local(void)
     // Enable EL0 memory access by EL1
     if (supports_pan())
         msr(PAN, 0);
+
+    sysop("dmb sy");
 
     // RES1 bits
     u64 sctlr = SCTLR_LSMAOE | SCTLR_nTLSMD | SCTLR_TSCXT | SCTLR_ITD;

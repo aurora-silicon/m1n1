@@ -75,6 +75,7 @@ void dc_civac_range(void *addr, size_t length);
 void dcsw_op_all(u64 op_type);
 
 void mmu_init(void);
+int memory_fw_ro_range(u64 *start, u64 *end);
 void mmu_init_secondary(int cpu);
 void mmu_init_secondary_local(void);
 void mmu_publish_secondary(void);

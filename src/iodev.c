@@ -105,6 +105,36 @@ ssize_t iodev_write(iodev_id_t id, const void *buf, size_t length)
     return ret;
 }
 
+ssize_t iodev_write_nonblocking(iodev_id_t id, const void *buf, size_t length)
+{
+    if (!iodevs[id] || !iodevs[id]->ops->write)
+        return -1;
+
+    if (mmu_active())
+        spin_lock(&iodevs[id]->lock);
+    ssize_t ret = iodevs[id]->ops->write_nonblocking
+                      ? iodevs[id]->ops->write_nonblocking(iodevs[id]->opaque, buf, length)
+                      : iodevs[id]->ops->write(iodevs[id]->opaque, buf, length);
+    if (mmu_active())
+        spin_unlock(&iodevs[id]->lock);
+    return ret;
+}
+
+ssize_t iodev_write_atomic(iodev_id_t id, const void *buf, size_t length)
+{
+    if (!iodevs[id] || !iodevs[id]->ops->write)
+        return -1;
+
+    if (mmu_active())
+        spin_lock(&iodevs[id]->lock);
+    ssize_t ret = iodevs[id]->ops->write_atomic
+                      ? iodevs[id]->ops->write_atomic(iodevs[id]->opaque, buf, length)
+                      : iodevs[id]->ops->write(iodevs[id]->opaque, buf, length);
+    if (mmu_active())
+        spin_unlock(&iodevs[id]->lock);
+    return ret;
+}
+
 ssize_t iodev_queue(iodev_id_t id, const void *buf, size_t length)
 {
     if (!iodevs[id] || !iodevs[id]->ops->queue)
@@ -159,8 +189,11 @@ static void _iodev_console_write_helper(iodev_id_t iod, char prefix, const void 
     if (!(iodevs[iod]->usage & USAGE_CONSOLE))
         return;
 
-    iodevs[iod]->ops->write(iodevs[iod]->opaque, &prefix, 1);
-    iodevs[iod]->ops->write(iodevs[iod]->opaque, buf, length);
+    ssize_t (*write)(void *, const void *, size_t) = iodevs[iod]->ops->write_nonblocking
+                                                         ? iodevs[iod]->ops->write_nonblocking
+                                                         : iodevs[iod]->ops->write;
+    if (write(iodevs[iod]->opaque, &prefix, 1) == 1)
+        write(iodevs[iod]->opaque, buf, length);
 }
 
 void iodev_console_write(const void *buf, size_t length)
@@ -210,7 +243,7 @@ void iodev_console_write(const void *buf, size_t length)
             size_t block = min(con_wp - con_rp[id], CONSOLE_BUFFER_SIZE - buf_rp);
 
             dprintf("  write buf %d\n", block);
-            ssize_t ret = iodev_write(id, &con_buf[buf_rp], block);
+            ssize_t ret = iodev_write_nonblocking(id, &con_buf[buf_rp], block);
 
             if (ret <= 0)
                 goto next_dev;
@@ -223,7 +256,7 @@ void iodev_console_write(const void *buf, size_t length)
 
         // Write the current buffer
         while (wrote < length) {
-            ssize_t ret = iodev_write(id, p, length - wrote);
+            ssize_t ret = iodev_write_nonblocking(id, p, length - wrote);
 
             if (ret <= 0)
                 goto next_dev;

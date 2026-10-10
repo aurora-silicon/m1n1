@@ -57,3 +57,28 @@ void wdt_reboot(void)
     write32(wdt_base + WDT_COUNT, 0);
     write32(wdt_base + WDT_CTL, 4);
 }
+
+int wdt_arm_seconds(unsigned seconds)
+{
+    int path[8];
+    int node = adt_path_offset_trace(adt, "/arm-io/wdt", path);
+    u64 primary, primary_size, secondary, secondary_size;
+    u32 version;
+    if ((chip_id != T8140 && chip_id != T6040) || seconds < 1 || seconds > 178 || node < 0 ||
+        ADT_GETPROP(adt, node, "wdt-version", &version) < 0 || version != 2 ||
+        adt_get_reg(adt, path, "reg", 0, &primary, &primary_size) ||
+        adt_get_reg(adt, path, "reg", 2, &secondary, &secondary_size) || (primary & 3) ||
+        primary_size < 0x20 || secondary_size != 4 || read32(secondary))
+        return -1;
+
+    u32 alarm = seconds * 24000000u;
+    write32(primary + WDT_CTL, 0);
+    write32(primary + WDT_COUNT, 0);
+    write32(primary + WDT_ALARM, alarm);
+    write32(primary + WDT_CTL, 4);
+    sysop("dsb sy");
+    if (read32(primary + WDT_ALARM) != alarm || !(read32(primary + WDT_CTL) & 4))
+        return -1;
+    wdt_base = primary;
+    return 0;
+}

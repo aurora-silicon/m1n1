@@ -27,6 +27,8 @@ typedef enum {
     P_EL3_CALL,
     P_GET_CHIPID,
     P_GET_CPU_FEATURES,
+    P_WDT_ARM,
+    P_WDT_DISABLE,
 
     P_WRITE64 = 0x100, // Generic register functions
     P_WRITE32,
@@ -105,6 +107,7 @@ typedef enum {
     P_KBOOT_SET_INITRD,
     P_KBOOT_PREPARE_DT,
     P_KBOOT_SET_UBOOT,
+    P_KBOOT_BOOT_STORAGE,
 
     P_PMGR_POWER_ENABLE = 0x800, // power/clock management ops
     P_PMGR_POWER_DISABLE,
@@ -119,6 +122,8 @@ typedef enum {
     P_IODEV_WRITE,
     P_IODEV_WHOAMI,
     P_USB_IODEV_VUART_SETUP,
+    P_CDC_SCHEDULE,
+    P_CDC_STATUS,
 
     P_TUNABLES_APPLY_GLOBAL = 0xa00,
     P_TUNABLES_APPLY_LOCAL,
@@ -178,6 +183,8 @@ typedef enum {
     P_DAPF_INIT,
 
     P_CPUFREQ_INIT = 0x1300,
+    P_CPUFREQ_GET_CLUSTER_HZ,
+    P_CPUFREQ_SET_CLUSTER_PSTATE,
 
     P_READ_GIGALOCKER = 0x1400,
     P_FREE_GIGALOCKER,
@@ -185,6 +192,7 @@ typedef enum {
 
 #define S_OK     0
 #define S_BADCMD -1
+#define S_ERROR  -2
 
 typedef struct {
     u64 opcode;

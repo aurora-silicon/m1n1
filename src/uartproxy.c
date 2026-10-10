@@ -7,6 +7,7 @@
 #include "proxy.h"
 #include "string.h"
 #include "types.h"
+#include "usb_cdc.h"
 #include "utils.h"
 
 #define REQ_SIZE 64
@@ -68,6 +69,38 @@ static_assert(sizeof(UartReply) == (REPLY_SIZE + 4), "Invalid UartReply size");
 #define PROXY_FEAT_ALL                (PROXY_FEAT_DISABLE_DATA_CSUMS)
 
 static u32 iodev_proxy_buffer[IODEV_MAX];
+static iodev_id_t presynced_iodev = IODEV_MAX;
+
+bool uartproxy_wait_dockchannel(unsigned int timeout_ms)
+{
+    const iodev_id_t iodev = IODEV_DOCKCHANNEL_UART;
+    if (!(iodev_get_usage(iodev) & USAGE_UARTPROXY)) {
+        printf("Proxy: DockChannel unavailable; skipping host window\n");
+        return false;
+    }
+    for (unsigned int ms = 0; ms < timeout_ms; ms++) {
+        iodev_handle_events(iodev);
+        for (unsigned int bytes = 0; bytes < 256 && iodev_can_read(iodev) > 0; bytes++) {
+            u8 byte;
+            if (iodev_read(iodev, &byte, 1) != 1)
+                break;
+            iodev_proxy_buffer[iodev] = (iodev_proxy_buffer[iodev] >> 8) | ((u32)byte << 24);
+            if ((iodev_proxy_buffer[iodev] & 0xffffff) == 0xAA55FF) {
+                presynced_iodev = iodev;
+                return true;
+            }
+        }
+        mdelay(1);
+    }
+    return false;
+}
+
+int uartproxy_run_presynced(iodev_id_t iodev)
+{
+    if (presynced_iodev != iodev)
+        return -1;
+    return uartproxy_run(NULL);
+}
 
 #define CHECKSUM_INIT     0xDEADBEEF
 #define CHECKSUM_FINAL    0xADDEDBAD
@@ -130,7 +163,9 @@ int uartproxy_run(struct uartproxy_msg_start *start)
     u64 checksum_val;
     u64 enabled_features = 0;
 
-    iodev_id_t iodev = IODEV_MAX;
+    bool use_presynced = !start && presynced_iodev < IODEV_MAX;
+    iodev_id_t iodev = use_presynced ? presynced_iodev : IODEV_MAX;
+    presynced_iodev = IODEV_MAX;
 
     UartRequest request;
     UartReply reply = {REQ_BOOT};
@@ -138,7 +173,7 @@ int uartproxy_run(struct uartproxy_msg_start *start)
         // Startup notification only goes out via UART and Dockchannel UART
         reply.checksum = checksum(&reply, REPLY_SIZE - 4);
         iodev_write(IODEV_UART, &reply, REPLY_SIZE);
-        iodev_write(IODEV_DOCKCHANNEL_UART, &reply, REPLY_SIZE);
+        iodev_write_atomic(IODEV_DOCKCHANNEL_UART, &reply, REPLY_SIZE);
     } else {
         // Exceptions / hooks keep the current iodev
         iodev = uartproxy_iodev;
@@ -148,23 +183,29 @@ int uartproxy_run(struct uartproxy_msg_start *start)
     }
 
     while (running) {
+        usb_cdc_poll();
         if (!start) {
-            // Look for commands from any iodev on startup
-            for (iodev = 0; iodev < IODEV_MAX;) {
-                u8 b;
-                if ((iodev_get_usage(iodev) & USAGE_UARTPROXY)) {
-                    iodev_handle_events(iodev);
-                    if (iodev_can_read(iodev) && iodev_read(iodev, &b, 1) == 1) {
-                        iodev_proxy_buffer[iodev] >>= 8;
-                        iodev_proxy_buffer[iodev] |= b << 24;
-                        if ((iodev_proxy_buffer[iodev] & 0xffffff) == 0xAA55FF)
-                            break;
+            // A bounded host window may already have consumed the sync word.
+            if (use_presynced) {
+                use_presynced = false;
+            } else
+                for (iodev = 0; iodev < IODEV_MAX;) {
+                    if (iodev == 0)
+                        usb_cdc_poll();
+                    u8 b;
+                    if ((iodev_get_usage(iodev) & USAGE_UARTPROXY)) {
+                        iodev_handle_events(iodev);
+                        if (iodev_can_read(iodev) && iodev_read(iodev, &b, 1) == 1) {
+                            iodev_proxy_buffer[iodev] >>= 8;
+                            iodev_proxy_buffer[iodev] |= b << 24;
+                            if ((iodev_proxy_buffer[iodev] & 0xffffff) == 0xAA55FF)
+                                break;
+                        }
                     }
+                    iodev++;
+                    if (iodev == IODEV_MAX)
+                        iodev = 0;
                 }
-                iodev++;
-                if (iodev == IODEV_MAX)
-                    iodev = 0;
-            }
         } else {
             // Stick to the current iodev for exceptions
             do {
