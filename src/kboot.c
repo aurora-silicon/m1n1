@@ -2550,14 +2550,14 @@ static int dt_t8140_enable_consumer(const char *path)
     return ret;
 }
 
-static bool dt_t8140_validate_dcp_asc(const char *path, const char *name)
+static bool dt_t8140_validate_dcp_asc(const char *path, const char *name, bool allow_idle)
 {
     asc_dev_t *asc = asc_init(path);
     if (!asc) {
         printf("FDT: T8140 %s: ASC unavailable at %s\n", name, path);
         return false;
     }
-    bool ready = asc_validate_inherited_dcp(asc, name);
+    bool ready = asc_validate_inherited_dcp(asc, name, allow_idle);
     asc_free(asc);
     return ready;
 }
@@ -2804,7 +2804,7 @@ static int dt_set_display_t8140(void)
     }
 
     step = "internal DCP ASC and mailboxes";
-    if (!dt_t8140_validate_dcp_asc("/arm-io/dcp", "dcp")) {
+    if (!dt_t8140_validate_dcp_asc("/arm-io/dcp", "dcp", false)) {
         reason = "inherited DCP ASC is not live with healthy empty mailboxes";
         goto rollback;
     }
@@ -2851,7 +2851,7 @@ static int dt_set_display_t8140(void)
         }
         if (!ret) {
             step = "DCPEXT ASC and mailboxes";
-            ret = dt_t8140_validate_dcp_asc("/arm-io/dcpext", "dcpext") ? 0 : -1;
+            ret = dt_t8140_validate_dcp_asc("/arm-io/dcpext", "dcpext", true) ? 0 : -1;
         }
         ext_ready = !ret;
         if (ret) {
@@ -4147,12 +4147,12 @@ int kboot_boot(void *kernel)
         if (chosen < 0)
             return -1;
         if (fdt_getprop(dt, chosen, "apple,dcp-rtkit-quiesced", NULL)) {
-            bool healthy = dt_t8140_validate_dcp_asc("/arm-io/dcp", "dcp");
+            bool healthy = dt_t8140_validate_dcp_asc("/arm-io/dcp", "dcp", false);
             int ext = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
             const char *status = ext < 0 ? NULL : fdt_getprop(dt, ext, "status", NULL);
             if (healthy && status && !strcmp(status, "okay"))
                 healthy = pmgr_power_is_on(0, "DISPEXT0_CPU") == 1 &&
-                          dt_t8140_validate_dcp_asc("/arm-io/dcpext", "dcpext");
+                          dt_t8140_validate_dcp_asc("/arm-io/dcpext", "dcpext", true);
             if (!healthy) {
                 printf("kboot: DCP changed state before handoff; disabling display\n");
                 if (dt_t8140_refuse_display() || fdt_pack(dt))

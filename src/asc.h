@@ -21,7 +21,7 @@ bool asc_is_v8(asc_dev_t *asc);
 void asc_cpu_start(asc_dev_t *asc);
 void asc_cpu_stop(asc_dev_t *asc);
 bool asc_cpu_running(asc_dev_t *asc);
-bool asc_validate_inherited_dcp(asc_dev_t *asc, const char *name);
+bool asc_validate_inherited_dcp(asc_dev_t *asc, const char *name, bool allow_idle);
 
 bool asc_can_recv(asc_dev_t *asc);
 bool asc_can_send(asc_dev_t *asc);
