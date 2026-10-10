@@ -4,9 +4,11 @@ Tested on J616sAP (Mac16,7), board 6, with the ADT supplied by macOS build
 26A428. The branch is stacked on `j700` while the draft targets `aurora-wip`.
 Upstream Asahi M1/M2/M3 m1n1 and proxyclient behavior is the implementation
 standard; J700 is the feature-parity target. Linux RAM boot preparation is
-now in scope. A bounded one-CPU hypervisor Linux boot reaches a RAM-only
-BusyBox shell; native boot, persistent operation and Linux peripherals remain
-unqualified.
+now in scope. A bounded one-CPU native Linux test reaches PID 1 and the boot
+framebuffer. Its USB gadget enumerates at high speed, but the host times out
+when selecting its configuration. A separate hypervisor test reaches a
+RAM-only BusyBox shell. Native USB shell access, persistent operation and
+other Linux peripherals remain unqualified.
 
 For implementation order, formats and ownership rules, start with the
 [driver contracts](j616s-driver-contracts.md).
@@ -16,7 +18,8 @@ Linux driver preparation is tracked in
 `aurora-wip`. It contains gated AOP/audio and ISP infrastructure plus a
 read-only inherited USB2 PHY provider. Its source and build checks do not
 qualify the combined kernel on J616s: camera/audio hardware admission remains
-closed, and native gadget enumeration and SuperSpeed remain unqualified.
+closed. The separate native test below establishes descriptor enumeration,
+not working USB data or SuperSpeed.
 
 ## CPU clocks
 
@@ -72,6 +75,44 @@ M1N1DEVICE=/dev/ttyACM0 python proxyclient/experiments/t6040_amp.py
 
 The probe leaves secondaries running in WFE mode. Reboot before repeating it.
 
+## Native USB RAM boot
+
+A separate native diagnostic Image, SHA256
+`06fe50711cc7ec2a58354e280fadc85a25518450368caa851d448c2cb2ad37d2`,
+boots Linux 7.1.12+ on one CPU, registers the inherited framebuffer and runs
+`/init`. The test uses an owned 128 MiB allocation and a validated 45-second
+hardware watchdog. It mounts RAM and pseudo filesystems only. This is not
+qualification of every driver in the integration kernel.
+
+The host observed high-speed device `1d6b:0104`, product
+`J616s RAM Linux ACM ECM`, serial `j616s-ram-linux`. The kernel reports UDC
+`382280000.usb`, a configured gadget, `ttyGS0`, and ECM interface `usb0` at
+`192.0.2.2/30`. The host subsequently reports configuration #1 timeout
+`-110`; no host ACM shell or ECM data transfer is qualified. The composite
+gadget code sets its configured state before completing function activation
+and the control-request status stage; the kernel-side state alone does not
+prove either completed.
+
+Two initramfs errors were corrected before enumeration. This kernel's
+`gether_set_ifname()` requires a template containing exactly one `%d`; write
+it literally with `printf 'usb%%d\n'`. Configfs resolves a symlink target
+from the calling process's working directory at creation time. Use absolute
+function targets when setup runs outside the gadget directory:
+
+```sh
+printf 'usb%%d\n' > "$GADGET/functions/ecm.usb0/ifname"
+ln -s "$GADGET/functions/acm.gs0" "$GADGET/configs/c.1/acm.gs0"
+ln -s "$GADGET/functions/ecm.usb0" "$GADGET/configs/c.1/ecm.usb0"
+```
+
+A host last-close with `HUPCL` can send a CDC control request during m1n1
+retirement. The diagnostic client holds its original descriptor until the
+source USB device disappears or a two-second deadline, then closes it without
+further proxy operations. Native handoff remains intermittent; this comparison
+is not proof that all USB shutdown failures are fixed. Failed retirement keeps
+DMA memory and the original watchdog until cold recovery. Installed images,
+boot policy, partitions and attached storage remain unchanged.
+
 ## Minimal Linux RAM boot
 
 A guarded direct-entry test boots Linux 7.1.12+ through m1n1's hypervisor on
@@ -117,16 +158,19 @@ the native boot failure or qualify physical USB.
 The bounded captures end with a host timeout while the guest is running.
 Mappings and guest memory remain retained until hardware-watchdog recovery
 returns the installed proxy with its watchdog disabled. This is not a clean
-guest shutdown or a persistent Linux development session. Native boot, Linux
-SMP and peripheral drivers require separate qualification.
+guest shutdown or a persistent Linux development session. Native results are
+reported above; Linux SMP and peripheral data transfer remain unqualified.
 
-Separate native RAM diagnostics reach the original Linux CPU setup, TTBR
+The following earlier checkpoints preceded the native full-boot results above;
+they do not identify the current USB configuration failure. Separate native
+RAM diagnostics reach the original Linux CPU setup, TTBR
 loads, MMU enable and early kernel mapping. Nonce-bound markers survive a
 warm return to the fully verified proxy. Fresh page-table walks verify the
 diagnostic code, marker and FDT mappings, plus the virtual address of
 `__primary_switched`. A further checkpoint reaches that virtual entry and
 verifies the kernel stack, task pointer and exception vectors before
-`finalise_el2`. Completed kernel startup and gadget traffic remain unqualified.
+`finalise_el2`. These checkpoints alone do not qualify completed startup or
+gadget traffic.
 Diagnostic code uses owned linker padding with verified permissions; guest
 tables and CPU context remain retained after the warm return.
 
