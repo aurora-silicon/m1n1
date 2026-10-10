@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 import platform, os, sys, struct, serial, time
+import operator
 from construct import *
 from enum import IntEnum, IntFlag
 from serial.tools.miniterm import Miniterm
@@ -1150,11 +1151,13 @@ class M1N1Proxy(Reloadable):
     def tunables_apply_local_addr(self, path, prop, base):
         return self.request(self.P_TUNABLES_APPLY_LOCAL, path, prop, base)
 
-    def dart_init(self, base, sid, dart_type=DART.T8020):
-        return self.request(self.P_DART_INIT, base, sid, dart_type)
+    def dart_init(self, base, sid, dart_type=DART.T8020, keep_pts=False):
+        return self.request(self.P_DART_INIT, base, sid, keep_pts, dart_type)
     def dart_shutdown(self, dart):
         return self.request(self.P_DART_SHUTDOWN, dart)
     def dart_map(self, dart, iova, bfr, len):
+        # Mapped storage must remain caller-owned after this request returns.
+        bfr = operator.index(bfr)
         return self.request(self.P_DART_MAP, dart, iova, bfr, len)
     def dart_unmap(self, dart, iova, len):
         return self.request(self.P_DART_UNMAP, dart, iova, len)
