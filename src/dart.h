@@ -27,6 +27,7 @@ int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_
 int dart_map(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len);
 int dart_map_flags(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len, u32 flags);
 void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len);
+bool dart_unmap_checked(dart_dev_t *dart, uintptr_t iova, size_t len);
 void dart_free_l2(dart_dev_t *dart, uintptr_t iova);
 void *dart_translate(dart_dev_t *dart, uintptr_t iova);
 void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova);

@@ -246,8 +246,7 @@ bool rtkit_unmap(rtkit_dev_t *rtk, u64 dva, size_t sz)
         return true;
     } else if (rtk->dart) {
         dva &= ~rtk->dva_base;
-        dart_unmap(rtk->dart, dva & IOVA_MASK, sz);
-        if (dart_has_failed(rtk->dart))
+        if (!dart_unmap_checked(rtk->dart, dva & IOVA_MASK, sz))
             return false;
         iova_free(rtk->dart_iovad, dva, sz);
         return true;

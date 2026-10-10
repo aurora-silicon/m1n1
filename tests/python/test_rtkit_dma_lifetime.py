@@ -114,7 +114,7 @@ void dart_unmap(dart_dev_t *, uintptr_t, size_t);
 bool rtkit_free_buffer(rtkit_dev_t *, struct rtkit_buffer *);
 '''
     for signature in ("static void dart_t8110_tlb_invalidate(", "int dart_map_flags(",
-                      "int dart_map(", "void dart_unmap("):
+                      "int dart_map(", "bool dart_unmap_checked(", "void dart_unmap("):
         harness += function(dart, signature)
     for signature in ("bool rtkit_map(", "bool rtkit_unmap(", "bool rtkit_alloc_buffer(",
                       "bool rtkit_free_buffer(", "void rtkit_free("):
@@ -150,14 +150,23 @@ int main(int argc, char **argv)
     assert(bfr->dva == (rtk.dart ? (0x4000 | rtk.dva_base) : (u64)backing));
     for (size_t i = 0; i < bfr->sz; i++)
         assert(((u8 *)backing)[i] == 0);
-    if (mode == 1 || mode == 2 || mode == 5) {
-        fail_tlbi = mode != 5;
+    if (mode == 1 || mode == 2 || mode == 5 || mode >= 8) {
+        fail_tlbi = mode == 1 || mode == 2;
         fail_sart_remove = mode == 5;
+        dart.locked = mode == 8;
+        if (mode == 9)
+            bfr->sz--;
+        if (mode == 10)
+            bfr->dva++;
+        unsigned before_unmap = writes + polls + unmapped;
         struct rtkit_buffer saved = *bfr;
         assert(!rtkit_free_buffer(&rtk, bfr));
         assert(!memcmp(bfr, &saved, sizeof(saved)));
         assert(!physical_frees && !iova_frees);
-        if (rtk.dart) {
+        if (mode >= 8) {
+            assert(!dart.failed && before_unmap == writes + polls + unmapped);
+        }
+        if (mode == 1 || mode == 2) {
             unsigned before = allocations + iova_allocs + writes + polls + unmapped;
             assert(dart_has_failed(&dart));
             assert(!rtkit_alloc_buffer(&rtk, bfr, 1));
@@ -190,9 +199,10 @@ int main(int argc, char **argv)
     return binary
 
 
-@pytest.mark.parametrize("case", range(8), ids=[
+@pytest.mark.parametrize("case", range(11), ids=[
     "healthy-dart", "map-tlbi-timeout", "unmap-tlbi-timeout", "healthy-sart",
     "sart-map-rejected", "sart-unmap-rejected", "map-before-publication", "iova-exhausted",
+    "locked-domain", "unaligned-size", "unaligned-iova",
 ])
 def test_buffer_and_iova_ownership(lifetime_binary, case):
     subprocess.run([str(lifetime_binary), str(case)], check=True, timeout=5)

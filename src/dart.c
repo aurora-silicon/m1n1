@@ -732,15 +732,15 @@ static void dart_unmap_page(dart_dev_t *dart, uintptr_t iova)
     l2[l2_index] = 0;
 }
 
-void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
+bool dart_unmap_checked(dart_dev_t *dart, uintptr_t iova, size_t len)
 {
-    if (dart->failed || dart->locked)
-        return;
+    if (!dart || dart->failed || dart->locked)
+        return false;
 
     if (len % SZ_16K)
-        return;
+        return false;
     if (iova % SZ_16K)
-        return;
+        return false;
 
     while (len) {
         dart_unmap_page(dart, iova);
@@ -750,6 +750,12 @@ void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
     }
 
     dart->params->tlb_invalidate(dart);
+    return !dart->failed;
+}
+
+void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
+{
+    (void)dart_unmap_checked(dart, iova, len);
 }
 
 void dart_free_l2(dart_dev_t *dart, uintptr_t iova)

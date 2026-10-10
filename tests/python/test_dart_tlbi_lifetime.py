@@ -53,7 +53,8 @@ static void mock_free(void *p) { assert(!forbidden); frees++; }
 void dart_unmap(dart_dev_t *, uintptr_t, size_t);
 '''
     for signature in ("static void dart_t8020_tlb_invalidate(", "static void dart_t8110_tlb_invalidate(",
-                      "int dart_map_flags(", "void dart_unmap(", "void dart_free_l2(",
+                      "int dart_map_flags(", "bool dart_unmap_checked(", "void dart_unmap(",
+                      "void dart_free_l2(",
                       "bool dart_shutdown_checked(", "bool dart_has_failed("):
         harness += function(source, signature)
     harness += r'''
@@ -67,12 +68,31 @@ int main(int argc, char **argv) {
     params.tlb_invalidate = dart_t8020_tlb_invalidate;
 #endif
     dart_dev_t dart = {.regs=0x1000, .device=1, .params=&params, .l1={table}};
-    failure = mode != 0;
+    failure = mode != 0 && mode != 9;
+    if (mode >= 4 && mode <= 8) {
+        dart_dev_t *domain = mode == 8 ? NULL : &dart;
+        uintptr_t iova = mode == 5 ? 0x4001 : 0x4000;
+        size_t size = mode == 6 ? SZ_16K - 1 : SZ_16K;
+        dart.locked = mode == 4;
+        dart.failed = mode == 7;
+        forbidden = true;
+        assert(!dart_unmap_checked(domain, iova, size));
+        dart_unmap(domain, iova, size);
+        assert(!writes && !polls && !unmap_pages && !frees);
+        assert(table[0] == DART_PTE_VALID);
+        return 0;
+    }
+    if (mode == 9 || mode == 10) {
+        assert(dart_unmap_checked(&dart, 0x4000, 0) == (mode == 9));
+        assert(polls == 1 && writes > 0 && !unmap_pages && !frees);
+        assert(dart.failed == (mode == 10) && table[0] == DART_PTE_VALID);
+        return 0;
+    }
     if (mode == 1) {
         assert(dart_map_flags(&dart, 0x4000, (void *)0x80000, SZ_16K*2, 0) == -1);
         assert(pages == 2 && dart_has_failed(&dart) && !frees);
     } else if (mode == 2) {
-        dart_unmap(&dart, 0x4000, SZ_16K);
+        assert(!dart_unmap_checked(&dart, 0x4000, SZ_16K));
         assert(unmap_pages == 1 && dart_has_failed(&dart) && !frees);
     } else if (mode == 3) {
         assert(!dart_shutdown_checked(&dart));
@@ -80,7 +100,7 @@ int main(int argc, char **argv) {
     } else {
         assert(dart_map_flags(&dart, 0x4000, (void *)0x80000, SZ_16K, 0) == 0);
         assert(!dart_has_failed(&dart));
-        dart_unmap(&dart, 0x4000, SZ_16K);
+        assert(dart_unmap_checked(&dart, 0x4000, SZ_16K));
         assert(dart_shutdown_checked(&dart));
         assert(frees == 3 && table[0] == 0);
         return 0;
@@ -101,5 +121,5 @@ int main(int argc, char **argv) {
                     *( ["-DTEST_T8110"] if t8110 else [] ),
                     "-I", str(ROOT / "src"), "-x", "c", "-", "-o", str(binary)],
                    input=harness, text=True, check=True)
-    for case in range(4):
+    for case in range(11):
         subprocess.run([str(binary), str(case)], check=True)
