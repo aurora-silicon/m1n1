@@ -150,13 +150,14 @@ establish controller initialization, not timer or interrupt delivery, completed
 kernel startup or a Linux gadget shell.
 
 A later diagnostic completes the original timer initialization, global IRQ
-enable and console initialization. The selected timer's IRQ 36 count advances
-from zero to one over 3,730,061 counter ticks at the reported 1 GHz frequency
-(3.730061 ms). The console is the dummy 80-by-25 console. Two complete log
+enable, console initialization and per-CPU page setup. Its marker records the
+return from `setup_per_cpu_pageset`. The selected timer's IRQ 36 count advances
+from zero to one over 3,724,788 counter ticks at the reported 1 GHz frequency
+(3.724788 ms). The console is the dummy 80-by-25 console. Two complete log
 captures match and validate 50 finalized records. Recovery returns to the
 verified proxy and explicitly disables the watchdog. This establishes native
-timer interrupt delivery; device initialization and a gadget shell remain
-unqualified.
+timer interrupt delivery and page setup; scheduler-clock initialization,
+device initialization and a gadget shell remain unqualified.
 
 ## Memory controller
 
