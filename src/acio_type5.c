@@ -493,9 +493,9 @@ int acio_type5_config_response_parse(const acio_type5_config_request_t *request,
                                               first_value, first_value ? 1 : 0);
 }
 
-/* Grade-A host-router topology block.
+/* Host-router topology block.
  *
- * updateTopologyID writes ROUTER_CS_1..CS_4 as ONE transaction: config space
+ * ROUTER_CS_1..CS_4 are written as ONE transaction: config space
  * 2 (router), port 0, offset 1, length 4, big-endian payload.  It is preceded
  * by a length-5 read of CS_0..CS_4 because CS_1 and CS_4 are
  * read-modify-write.
@@ -871,14 +871,14 @@ int acio_type5_router_complete(acio_type5_router_sm_t *sm, int status, u32 value
         sm->state = sm->route == 0 ? 5 : 1;
         return 0;
     }
-    /* ROUTER_CS_5 acceptance is bit 31 clear, and nothing else.  Apple's
-     * `ccmn w8,#1,#4,eq ; cset w21,gt` accepts 0x7FFFFFFF (CMN sets N=1,V=1,
-     * Z=0 so GT is true), so an earlier revision that also rejected
+    /* ROUTER_CS_5 acceptance is bit 31 clear, and nothing else: 0x7FFFFFFF
+     * is accepted, so an earlier revision that also rejected
      * 0x7FFFFFFF was over-strict and would have failed a legal router.
      * 0xFFFFFFFF and 0x80000000 are already covered by the bit-31 test.
      *
      * The read value is DISCARDED, never OR'd into the subsequent write --
-     * the written value comes solely from allParentsSupportUSBTunnels(). */
+     * the written value depends only on whether every parent router
+     * supports USB tunnels. */
     if ((sm->state == 1 && (value & 0x80000000u)) ||
         (sm->state == 4 && (value & 0x02000000u) != 0x02000000u))
         return -1;

@@ -79,8 +79,8 @@ static bool sart_power_on(int node, int *sart_path, const char *adt_path)
     printf("sart: Powering on %s via 0x%lx\n", adt_path, power_reg);
 
     /*
-     * IOCoastGuardSARTMapper writes zero, waits 100 us, and polls until the
-     * same register reads back as zero before touching the SART table.
+     * Write zero, wait 100 us, and poll until the same register reads back
+     * as zero before touching the SART table.
      */
     for (unsigned int i = 0; i < APPLE_SART_POWER_POLL_RETRIES; ++i) {
         write32(power_reg, APPLE_SART_POWER_ON);

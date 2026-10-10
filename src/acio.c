@@ -203,8 +203,8 @@ int acio_discover_resources(u32 index, acio_resources_t *resources)
     /* Host-router adapters come from the ADT, never from a config scan.
      * adapter N type = portmap[N-1]; the adapter count is the portmap
      * length; port-defaults is a parallel array of packed hop/buffer
-     * limits.  loadPortMap's own error contract rejects a portmap whose
-     * length is not a multiple of 4, so do the same. */
+     * limits.  A portmap whose length is not a multiple of 4 is malformed,
+     * so reject it. */
     u32 portmap_size = 0;
     u32 defaults_size = 0;
     const u32 *portmap = adt_getprop(adt, acio_node, "portmap", &portmap_size);

@@ -482,7 +482,7 @@ int acio_type5_nfc_next(acio_type5_nfc_cas_t *cas, u32 observed_cs4);
 /* --- counters -------------------------------------------------------------
  * Counter clear is config space 3, three dwords of zero at offset
  * counter_id * 3, addressed to the source port.  Counter IDs are bounded by
- * ADP_CS_1 [18:8] (getMaxCounters).  There is deliberately NO release step:
+ * ADP_CS_1 [18:8].  There is deliberately NO release step:
  * the counter ID is bound at hop-ID allocate time and dies with the hop-ID
  * release, so teardown must NOT try to free it. */
 #define ACIO_TYPE5_COUNTER_DWORDS 3u
@@ -647,8 +647,8 @@ enum acio_type5_error {
     ACIO_TYPE5_E_SCAN_MAXPORT = 0x0a03,
     ACIO_TYPE5_E_SCAN_ADAPTER = 0x0a04,
     ACIO_TYPE5_E_SCAN_NO_USB3 = 0x0a05,
-    /* Apple refuses the scan for a port that is not a lane adapter
-     * (portAllowsDeviceScan requires getAdapterType() == 1). */
+    /* The scan is refused for a port that is not a lane adapter
+     * (adapter type 1). */
     ACIO_TYPE5_E_SCAN_NOT_LANE = 0x0a06,
     /* The LANE_ADP capability could not be located, so the link state could
      * not be read at all.  Distinct from "read it and it was not up": an

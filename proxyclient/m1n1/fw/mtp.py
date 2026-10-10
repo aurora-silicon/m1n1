@@ -414,7 +414,7 @@ class MTPMultitouchInterface(MTPHIDInterface):
             payload = dchid_firmware_payload(self.AFE_FIRMWARE, self.iface)
             self.log("sending CBOR image: %d bytes" % len(payload))
             self.proto.comm.init_afe(self.iface, payload)
-            # Apple's performCBORBootload: register the image, then drive the
+            # Register the image, then drive the
             # interface through power state 0 and then 2.
             self.proto.comm.set_interface_power(self.iface, 0)
             self.proto.comm.set_interface_power(self.iface, 2, delay=0.05)

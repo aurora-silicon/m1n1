@@ -190,11 +190,11 @@ class WindowsUnifiedContractTests(unittest.TestCase):
         self.assertNotIn("pmgr_t6020_acio_reconfig_enable", runtime)
         self.assertNotIn("PMGR_T6020_CIO_RECONFIG", pmgr)
         # The PS TARGET/ACTUAL poll must stay far more permissive than m1n1's
-        # original 10000 us.  It is deliberately NOT expressed as Apple's
-        # 0x2ee00: that constant is a raw mach-tick delta (~8 ms at 24 MHz),
-        # not microseconds, and it belongs to enableCioReconfig's pre-wait
+        # original 10000 us.  It is deliberately NOT expressed as 0x2ee00:
+        # that constant is a raw 24 MHz tick count (~8 ms), not
+        # microseconds, and it is the CIO reconfiguration pre-wait
         # rather than the PS convergence poll.  Reusing the literal here
-        # re-asserted a decoded-Apple-constant claim that is false, so the
+        # re-asserted a claim that is false, so the
         # test now pins the value and forbids the bad justification.
         self.assertIn("#define PMGR_POLL_TIMEOUT 192000", pmgr)
         self.assertNotIn("Apple's TARGET/ACTUAL wait: 192000 us", pmgr)

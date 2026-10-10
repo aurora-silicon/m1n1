@@ -91,7 +91,7 @@ static void test_descriptors_and_control(void)
 
     acio_type5_control_ring_t ring;
     acio_type5_control_ring_defaults(&ring);
-    /* The control path is hard-wired to ring 0 by allocateTransmitRing; the
+    /* The control path is hard-wired to ring 0; the
      * enabled-ring mask excludes ring 0 because the control path owns it. */
     assert(ring.ring == ACIO_TYPE5_CONTROL_RING && ring.ring == 0);
     assert(ACIO_TYPE5_CONTROL_TX_CREDITS == 2);
@@ -420,7 +420,7 @@ static void test_error_telemetry(void)
                   acio_type5_error_name(ACIO_TYPE5_E_ROUTER_POLL_ACK)) != 0);
 }
 
-/* Host-router topology block, pinned to the updateTopologyID decode:
+/* Host-router topology block:
  * space 2, port 0, offset 1, length 4, big-endian, preceded by a length-5
  * read of CS_0..CS_4 because CS_1 and CS_4 are read-modify-write. */
 /* Decoded against the REAL J414s /arm-io/acio1 ADT bytes. */
@@ -566,7 +566,7 @@ static void test_counter_clear(void)
     assert(acio_type5_counter_clear_offset(0, 8, &offset) == 0 && offset == 0);
     assert(acio_type5_counter_clear_offset(1, 8, &offset) == 0 && offset == 3);
     assert(acio_type5_counter_clear_offset(7, 8, &offset) == 0 && offset == 21);
-    /* Bounded by getMaxCounters (ADP_CS_1 [18:8]). */
+    /* Bounded by ADP_CS_1 [18:8]. */
     assert(acio_type5_counter_clear_offset(8, 8, &offset) < 0);
     assert(acio_type5_counter_clear_offset(0, 0, &offset) < 0);
     assert(acio_type5_counter_clear_offset(0, 8, NULL) < 0);
@@ -682,8 +682,8 @@ static void test_router(void)
     assert(acio_type5_router_complete(&sm, 0, 0x01000000) == 0);
     assert(acio_type5_router_next(&sm, &action) == 0 && action.kind == ACIO_TYPE5_ROUTER_READ);
     assert(acio_type5_router_complete(&sm, 0, 0xffffffff) < 0);
-    /* CORRECTION: 0x7FFFFFFF is ACCEPTED. Apple's `ccmn w8,#1,#4,eq ;
-     * cset w21,gt` makes GT true for it, so rejecting it would fail a legal
+    /* CORRECTION: 0x7FFFFFFF is ACCEPTED: only bit 31 decides, so
+     * rejecting it would fail a legal
      * router. Bit 31 set is the only value-based rejection. */
     assert(acio_type5_router_complete(&sm, 0, 0x7fffffff) == 0);
     sm.state = 1;

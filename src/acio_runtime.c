@@ -23,15 +23,11 @@
     (ACIO_TYPE5_RX_RING_BASE + ACIO_TYPE5_CONTROL_RING * ACIO_TYPE5_RING_STRIDE)
 #define ACIO_CONTROL_PAGE_SIZE 0x4000u
 #define ACIO_CONTROL_TIMEOUT_US 500000u
-/* Apple's waitForRingDisableDone polls at IODelay(10) us with a deadline of
- * 0x05F5E100 ns = 100 ms, returning 0xE00002D6 on timeout.  Confirmed
- * against the Type5 ring-transport contract section 7.4 step 3, so this is
- * Apple's value rather than a chosen one. */
+/* Ring disable-done is polled every 10 us for up to 100 ms (the Type5
+ * ring-transport contract, section 7.4 step 3). */
 #define ACIO_RING_DISABLE_TIMEOUT_US 100000u
-/* Apple's config poll cadence/budget are CALLER-supplied, not baked into a
- * helper: configPollDWordWithMask takes (interval, count) and the router
- * paths pass interval 0x3E8 and count 0x3E8, i.e. 1000 us between polls and
- * up to 1000 polls -- a 1 s ceiling.  Sourced, no longer a placeholder. */
+/* Router config polls run every 1000 us, up to 1000 polls -- a 1 s
+ * ceiling. */
 #define ACIO_ROUTER_POLL_INTERVAL_US 1000u
 #define ACIO_ROUTER_POLL_TIMEOUT_US 1000000u
 #define ACIO_ROUTER_MAX_STEPS 16u
@@ -283,33 +279,26 @@ static int acio_control_start(acio_type5_runtime_t *runtime)
     u64 tx = resources->nhi_base + ACIO_CTRL_TX_OFF;
     u64 rx = resources->nhi_base + ACIO_CTRL_RX_OFF;
     /* Ring-manager interrupt enable; m1n1 polls, so mask every ring IRQ.
-     * Both the TX and RX GenericACIO ring managers address this same
-     * register (regmap-constant-offsets.txt:13-16).
+     * The TX and RX ring managers share this register.
      *
-     * Rings 1..11 deliberately require nothing here.  Creating a ring object
-     * touches no MMIO at all -- createRings, initWithNHI and allocate() have
-     * a proven zero register-access count -- and there is no global
+     * Rings 1..11 deliberately require nothing here.  Creating a ring needs
+     * no register access, and there is no global
      * "enable all rings" register on this path.  The enable bit is per-ring,
      * bit 31 of that ring's own +0x10, so an unstarted ring's 16 KiB page is
      * simply never written.  Bringing up ring 0 alone is a first-class
      * designed-in mode, not an improvisation. */
     write32(resources->nhi_base + 0xd0010, 0);
 
-    /* Apple's per-ring order, taken from the INSTRUCTION order in
-     * TransmitRing::start / ReceiveRing::start rather than from the
-     * summary table in the ring-transport contract, whose section 7.2 has
-     * the last two steps in the wrong order:
+    /* Per-ring programming order (the summary table in the ring-transport
+     * contract, section 7.2, has the last two steps the wrong way round):
      *
      *   +0x00/+0x04 descriptor IOVA
      *   -> +0x0C geometry
      *   -> +0x14  (RX PDF bitmasks / TX shared-buffer credits)
      *   -> +0x10  options word with bit 31 ENABLE, written LAST.
      *
-     * RX: setPDFBitmasks is called at ReceiveRing::start+0x470, the enable
-     * write is at +0x637.  TX: configureSharedBuffer at +0x457, enable at
-     * +0x570.  Nothing but the doorbell and a bit-31 clear is ever written
-     * after enable, and re-writing base/geometry/PDF while enabled is
-     * illegal. */
+     * Nothing but the doorbell and a bit-31 clear is ever written after
+     * enable, and re-writing base/geometry/PDF while enabled is illegal. */
     write32(tx + 0x00, (u32)tx_iova);
     write32(tx + 0x04, (u32)(tx_iova >> 32));
     /* TX +0x0C is a plain entry count. */
@@ -335,12 +324,11 @@ static int acio_control_start(acio_type5_runtime_t *runtime)
             0xffffffff);
 
     /* TX +0x14 is the ACIO shared-buffer credit allocation, NOT a PDF mask.
-     * Apple's allocateSharedBuffer splits a 232-credit pool across the 12
-     * TX rings as {ring 0: 2, rings 1-5: 40, rings 6-11: 5}, and
-     * configureSharedBuffer writes the low 16 bits of that value on every
-     * ACIO TX ring start.  A previous revision wrote a literal 2 here with
-     * no source; the correct value for the control ring's hop is the pool
-     * share for that hop. */
+     * A 232-credit pool is split across the 12 TX rings as
+     * {ring 0: 2, rings 1-5: 40, rings 6-11: 5}, and the low 16 bits of a
+     * ring's share are written on every ACIO TX ring start.  A previous
+     * revision wrote a literal 2 here with no source; the correct value for
+     * the control ring's hop is the pool share for that hop. */
     write32(tx + 0x14, ACIO_TYPE5_CONTROL_TX_CREDITS);
 
     /* Options word, written LAST: bit 31 ENABLE, bit 30 raw mode, bit 29
@@ -350,12 +338,11 @@ static int acio_control_start(acio_type5_runtime_t *runtime)
      * would make explicit cache maintenance mandatory.  TX additionally has
      * isoch interval in 26:0, isoch in 27 and E2E in 28; the control ring
      * is raw, non-isoch and non-E2E, so all of those stay zero. */
-    /* Publish a zero consumer/producer index BEFORE enabling.  Apple's
-     * ReceiveRing::start() never writes +0x08 -- only startDMA() does, and it
-     * writes ring[0x48] just before its own enable write.  A plain start()
-     * therefore leaves the hardware index at whatever a previous life or the
-     * reset value left there while software believes head == 0.  Writing it
-     * explicitly removes that disagreement. */
+    /* Publish a zero consumer/producer index BEFORE enabling.  Starting a
+     * ring does not by itself reset the +0x08 index, so it can hold
+     * whatever a previous life or the reset value left there while
+     * software believes head == 0.  Writing it explicitly removes that
+     * disagreement. */
     write32(tx + 0x08, 0);
     write32(rx + 0x08, 0);
 
@@ -415,10 +402,9 @@ static int acio_control_rx_recycle(acio_type5_runtime_t *runtime,
  * This must happen mid-transaction, not after it: MEASURED on J414s, the
  * router withholds the pending config response and retries the event for the
  * whole 500 ms budget while the ack is outstanding, so a deferred ack can
- * never converge.  Apple does the same thing structurally -- the event
- * listener path submits sendPlugEventAck's ConfigErrorCommand on the shared
- * TX ring while other config commands are in flight; its control path is
- * multi-command by design.
+ * never converge.  The control path is multi-command by design: the ack
+ * goes out on the shared TX ring while other config commands are in
+ * flight.
  *
  * Ring accounting: the transaction owns slot `tx_complete` (its request, in
  * flight) and has advanced `tx_head` past it.  The ack claims the next free
@@ -578,10 +564,8 @@ static int acio_control_transaction(acio_type5_runtime_t *runtime,
          * recycle the slot and keep waiting for the real response.
          *
          * Field positions in dword2 -- port [5:0], unplug bit 31 -- are
-         * LINUX-DERIVED (struct cfg_event_pkg); Apple's own bit-level event
-         * parse was not located in the corpus (only the already-parsed
-         * consumers: Switch::processPlugEvent, fakePlugEvent(unplug, route,
-         * port)).  The raw dword is printed so a hardware run can falsify
+         * LINUX-DERIVED (struct cfg_event_pkg).  The raw dword is printed
+         * so a hardware run can falsify
          * the layout: if acks do not stop the retries AND the raw word's
          * [13:8] differs from [5:0], the port was extracted from the wrong
          * field, not the pg encoding. */
@@ -869,9 +853,9 @@ static int acio_scan_wait_link_up(acio_type5_runtime_t *runtime, u32 index,
         return acio_fail_keep_specific(runtime, ACIO_TYPE5_E_SCAN_ADAPTER,
                                        down_adapter);
 
-    /* Apple's `portAllowsDeviceScan` refuses anything whose adapter type is
-     * not 1. A child router hangs off a LANE adapter; asking a USB3 or PCIe
-     * adapter for a link state would read a different register entirely. */
+    /* Only an adapter of type 1 is scanned. A child router hangs off a LANE
+     * adapter; asking a USB3 or PCIe adapter for a link state would read a
+     * different register entirely. */
     u32 type = adp[2] & 0x00ffffffu;
     if (type != ACIO_TYPE5_ADAPTER_LANE) {
         printf("acio%u: host adapter %u is type %#x, not a lane adapter; "
@@ -1083,11 +1067,10 @@ int acio_type5_usb3_tunnel_up(u32 index, u64 down_route, u8 down_adapter,
 
 /* Enable or disable one USB3 protocol adapter at its DISCOVERED capability.
  *
- * Read-modify-write over two control packets, because m1n1 has no equivalent of
- * Apple's configModifyDWordWithMask primitive: read the capability dword, clear
- * [31:30], OR in the requested state, write it back. Apple writes bit 30 as 1
- * in BOTH the enable (0xC0000000) and disable (0x40000000) cases; that is
- * preserved rather than "simplified" to a single bit. */
+ * Read-modify-write over two control packets: read the capability dword,
+ * clear [31:30], OR in the requested state, write it back. Bit 30 is written
+ * as 1 in BOTH the enable (0xC0000000) and disable (0x40000000) cases; that
+ * is preserved rather than "simplified" to a single bit. */
 static int acio_usb3_adapter_enable(acio_type5_runtime_t *runtime, u32 index,
                                     u64 route, u8 adapter, u16 cap_offset,
                                     bool enable)
@@ -1159,14 +1142,12 @@ int acio_type5_usb3_tunnel_device_up(u32 index, u8 host_lane_adapter,
      *   Rx (device -> host):  device USB3-Up  --hop8--> device lane
      *                         host  lane      --hop8--> host  USB3-Down
      *
-     * Hop ID 8 in both directions (`setSourceHopIDRange(0x00080008)`); the two
+     * Hop ID 8 in both directions; the two
      * hops on a router never collide because they are keyed by (adapter, hop).
      *
-     * Credits follow getInitialCreditsForPathTableIndex: the hop where a path
-     * STARTS takes SourceInitialCredits (2), the hop where it ENDS takes
-     * DestinationInitialCredits (14). Grade B -- the 2/14 literals are grade A
-     * from createPaths, their per-hop assignment is derived from the path
-     * model, not read off a trace. */
+     * Credits: the hop where a path STARTS takes the source initial credits
+     * (2), the hop where it ENDS takes the destination initial credits (14).
+     * The per-hop assignment is derived from the path model. */
     if (acio_usb3_program_hop(runtime, index, 0, host_usb3_down_adapter,
                               ACIO_TYPE5_USB3_HOP, host_lane_adapter,
                               ACIO_TYPE5_USB3_HOP,
@@ -1403,11 +1384,10 @@ int acio_type5_router_configure(u32 index, u64 route, bool all_parents_support_u
 #define ACIO_CIO_RECONFIG_PREWAIT_US 8000u
 #define ACIO_CIO_RECONFIG_DONE_US 10000000u
 
-/* Resolve which SoCTuner device-set, and therefore which reconfiguration
- * slot, belongs to this ACIO instance.  Stock raises the virtual PMGR device
- * named in `/arm-io/acioN` clock-gates[3] (CIO<N>_RECONFIG-V); SoCTuner sees
- * that device's status bit go 0 -> 1 and pulses the reconfiguration index
- * equal to the device-set array position.  Deriving the slot from the live
+/* Resolve which reconfiguration slot belongs to this ACIO instance.  The
+ * slot is tied to the virtual PMGR device named in `/arm-io/acioN`
+ * clock-gates[3] (CIO<N>_RECONFIG-V): raising that device is what triggers
+ * the reconfiguration pulse for its slot.  Deriving the slot from the live
  * ADT rather than hardcoding keeps this correct per ACIO instance, which
  * matters because the end state runs two complexes concurrently. */
 static int acio_reconfig_slot(u32 index, u32 *slot_out)
@@ -1630,11 +1610,11 @@ int acio_type5_firmware_start(u32 index, const void *bundle, size_t bundle_size,
 
     if (acio_runtime_power_running(index) < 0)
         goto fail;
-    /* Stock raises the virtual CIO<N>_RECONFIG-V device after the real CIO
-     * gates converge to PS_ON, and SoCTuner then pulses the reconfiguration
-     * slot synchronously, inside the same setDevicePowerState call.  m1n1 has
-     * no SoCTuner and the virtual device writes no register, so the pulse
-     * must be issued directly, here, at that same boundary. */
+    /* The reconfiguration pulse belongs right after the real CIO gates
+     * converge to PS_ON, when the virtual CIO<N>_RECONFIG-V device is raised.
+     * m1n1 has no PMGR policy layer and the virtual device writes no
+     * register, so the pulse must be issued directly, here, at that same
+     * boundary. */
     if (acio_cio_reconfig(runtime, index) < 0)
         goto fail;
     runtime->phase = ACIO_TYPE5_RUNTIME_POWERED;
@@ -1735,9 +1715,9 @@ int acio_type5_runtime_abort(u32 index)
     snprintf(dart_path, sizeof(dart_path), "/arm-io/dart-acio%u", index);
 
     /* Order matters: stop the rings, then remove the DART mappings, and only
-     * then release the DART clock vote.  Apple issues Fact(0) first in
-     * setHWState because its own teardown guarantees no NHI DMA is in
-     * flight by that point; here DMA is only provably quiesced after the
+     * then release the DART clock vote.  macOS drops that vote first, at a
+     * point where its own teardown guarantees no NHI DMA is in
+     * flight; here DMA is only provably quiesced after the
      * ring disable-done handshake and dart_unmap, so the vote is dropped
      * last.  Gating the DART clock with live mappings would be silently
      * unsafe -- Apple's force-inactive flag makes its own code skip the
