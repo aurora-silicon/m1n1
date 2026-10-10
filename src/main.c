@@ -282,7 +282,6 @@ void m1n1_main(void)
 
 #ifndef J700_CDC_STAGE1
     cpufreq_fixup();
-    sep_init();
 #endif
 #endif
 
