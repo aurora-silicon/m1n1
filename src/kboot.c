@@ -2594,6 +2594,66 @@ static int dt_t8140_disable_refs(int node, const char *prop, const char *cells_p
     return 0;
 }
 
+/* A PD controller linked to a Type-C route on a disabled DCP would wait for a
+ * mode switch that never registers. */
+static int dt_t8140_disable_typec_routes(const char *dcp_path)
+{
+    char names[4][32];
+    size_t count = 0;
+    int route;
+
+    int node = fdt_path_offset(dt, dcp_path);
+    if (node < 0)
+        return -1;
+    int routes = fdt_subnode_offset(dt, node, "typec-routes");
+    if (routes < 0)
+        return 0;
+    fdt_for_each_subnode(route, dt, routes)
+    {
+        const char *name = fdt_get_name(dt, route, NULL);
+        if (!name || count == ARRAY_SIZE(names))
+            return -1;
+        snprintf(names[count++], sizeof(names[0]), "%s", name);
+    }
+    for (size_t i = 0; i < count; i++) {
+        char path[160];
+        snprintf(path, sizeof(path), "%s/typec-routes/%s", dcp_path, names[i]);
+        node = fdt_path_offset(dt, path);
+        if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled") < 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* Leave the external DCP to its firmware: disable it, its DART, mailbox and routes. */
+static int dt_t8140_disable_dcpext(void)
+{
+    static const char *const aliases[] = {
+        "dcpext", "dispext0", "dcpext_dart", "dispext0_dart", "dcpext_mbox",
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(aliases); i++) {
+        int node = fdt_path_offset(dt, aliases[i]);
+        if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled") < 0)
+            return -1;
+    }
+
+    int node = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
+    if (node < 0)
+        return 0;
+    char path[128];
+    if (fdt_get_path(dt, node, path, sizeof(path)))
+        return -1;
+    if (dt_t8140_disable_refs(node, "iommus", "#iommu-cells"))
+        return -1;
+    node = fdt_path_offset(dt, path);
+    if (node < 0 || dt_t8140_disable_refs(node, "mboxes", "#mbox-cells"))
+        return -1;
+    node = fdt_path_offset(dt, path);
+    if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled") < 0)
+        return -1;
+    return dt_t8140_disable_typec_routes(path);
+}
+
 /* A refused handoff must not let Linux bind an unclaimed live controller. */
 static int dt_t8140_refuse_display(void)
 {
@@ -2638,6 +2698,8 @@ static int dt_t8140_refuse_display(void)
         if (node < 0)
             return -1;
         if (fdt_setprop_string(dt, node, "status", "disabled"))
+            return -1;
+        if (dt_t8140_disable_typec_routes(paths[i]))
             return -1;
     }
     for (size_t i = 0; i < ARRAY_SIZE(consumers); i++) {
@@ -2872,25 +2934,8 @@ static int dt_set_display_t8140(void)
             goto rollback;
     } else {
         step = "disable unvalidated DCPEXT";
-        static const char *const aliases[] = {
-            "dcpext", "dispext0", "dcpext_dart", "dispext0_dart", "dcpext_mbox",
-        };
-        for (size_t i = 0; i < ARRAY_SIZE(aliases); i++) {
-            node = fdt_path_offset(dt, aliases[i]);
-            if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled") < 0)
-                goto rollback;
-        }
-        node = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
-        if (node >= 0) {
-            if (dt_t8140_disable_refs(node, "iommus", "#iommu-cells"))
-                goto rollback;
-            node = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
-            if (node < 0 || dt_t8140_disable_refs(node, "mboxes", "#mbox-cells"))
-                goto rollback;
-            node = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
-            if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled") < 0)
-                goto rollback;
-        }
+        if (dt_t8140_disable_dcpext())
+            goto rollback;
     }
     step = "disable unvalidated external display consumer";
     node = -1;
@@ -4150,12 +4195,16 @@ int kboot_boot(void *kernel)
             bool healthy = dt_t8140_validate_dcp_asc("/arm-io/dcp", "dcp", false);
             int ext = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
             const char *status = ext < 0 ? NULL : fdt_getprop(dt, ext, "status", NULL);
-            if (healthy && status && !strcmp(status, "okay"))
-                healthy = pmgr_power_is_on(0, "DISPEXT0_CPU") == 1 &&
-                          dt_t8140_validate_dcp_asc("/arm-io/dcpext", "dcpext", true);
             if (!healthy) {
                 printf("kboot: DCP changed state before handoff; disabling display\n");
                 if (dt_t8140_refuse_display() || fdt_pack(dt))
+                    return -1;
+            } else if (status && !strcmp(status, "okay") &&
+                       (pmgr_power_is_on(0, "DISPEXT0_CPU") != 1 ||
+                        !dt_t8140_validate_dcp_asc("/arm-io/dcpext", "dcpext", true))) {
+                /* The internal panel does not depend on the external DCP. */
+                printf("kboot: DCPEXT changed state before handoff; disabling it\n");
+                if (dt_t8140_disable_dcpext() || fdt_pack(dt))
                     return -1;
             }
         }
