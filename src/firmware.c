@@ -21,7 +21,7 @@ struct fw_version_info system_firmware;
 
 const struct fw_version_info fw_versions[NUM_FW_VERSIONS] = {
     // clang-format off
-    [V_UNKNOWN]  = {V_UNKNOWN,  "unknown",     {0},            1, "unknown"},
+    [V_UNKNOWN]  = {V_UNKNOWN,  "unknown",     {0, 0, 0},      3, "unknown"},
     [V11_0B1]    = {V11_0B1,    "11.0 beta",   {10, 98, 1},    3, "iBoot-6603.110.6.3"},
     [V11_0B3]    = {V11_0B3,    "11.0 beta3",  {10, 98, 3},    3, "iBoot-6671.0.0.0.6"},
     [V11_0B4]    = {V11_0B4,    "11.0 beta4",  {10, 98, 4},    3, "iBoot-6723.0.0.141.6"},
@@ -201,6 +201,7 @@ const struct fw_version_info fw_versions[NUM_FW_VERSIONS] = {
     [V26_3B2]    = {V26_3B2,    "26.3 beta2",  {26, 2, 98, 2}, 4, "iBoot-13822.80.406"},
     [V26_3]      = {V26_3,      "26.3",        {26, 3, 0},     3, "iBoot-13822.81.10"},
     [V26_4]      = {V26_4,      "26.4",        {26, 4, 0},     3, "mBoot-18000.101.7"},
+    [V26_6_2]    = {V26_6_2,    "26.6.2",      {26, 6, 2},     3, "mBoot-18000.161.10"},
     // clang-format on
 };
 
@@ -235,7 +236,7 @@ void firmware_parse_version(const char *s, u32 *out)
 static void detect_firmware(struct fw_version_info *info, const char *ver)
 {
     for (size_t i = 0; i < ARRAY_SIZE(fw_versions); i++) {
-        if (!strcmp(fw_versions[i].iboot, ver)) {
+        if (fw_versions[i].iboot && !strcmp(fw_versions[i].iboot, ver)) {
             *info = fw_versions[i];
             return;
         }
@@ -248,19 +249,17 @@ static void detect_firmware(struct fw_version_info *info, const char *ver)
 bool firmware_iboot_in_range(u32 min[IBOOT_VER_COMP], u32 max[IBOOT_VER_COMP],
                              u32 this[IBOOT_VER_COMP])
 {
-    int i;
-    for (i = 0; i < IBOOT_VER_COMP; i++)
-        if (this[i] != min[i])
-            break;
+    int lower = 0;
+    int upper = 0;
 
-    if (this[i] < min[i])
-        return false;
+    for (int i = 0; i < IBOOT_VER_COMP; i++) {
+        if (!lower && this[i] != min[i])
+            lower = this[i] < min[i] ? -1 : 1;
+        if (!upper && this[i] != max[i])
+            upper = this[i] < max[i] ? -1 : 1;
+    }
 
-    for (i = 0; i < IBOOT_VER_COMP; i++)
-        if (this[i] != max[i])
-            break;
-
-    return this[i] < max[i];
+    return lower >= 0 && upper < 0;
 }
 
 // Note: semi-open range

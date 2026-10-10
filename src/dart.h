@@ -21,6 +21,7 @@ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t
 dart_dev_t *dart_init_adt(const char *path, int instance, int device, bool keep_pts);
 void dart_lock_adt(const char *path, int instance);
 dart_dev_t *dart_init_fdt(void *dt, u32 phandle, int device, bool keep_pts);
+dart_dev_t *dart_init_fdt_locked(void *dt, u32 phandle, int device);
 int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_base);
 int dart_map(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len);
 int dart_map_flags(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len, u32 flags);
@@ -30,6 +31,7 @@ void *dart_translate(dart_dev_t *dart, uintptr_t iova);
 void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova);
 u64 dart_search(dart_dev_t *dart, void *paddr);
 u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len);
+u64 dart_search_range(dart_dev_t *dart, u64 paddr, size_t len);
 void dart_shutdown(dart_dev_t *dart);
 u64 dart_vm_base(dart_dev_t *dart);
 

@@ -163,7 +163,8 @@ void hv_start(void *entry, u64 regs[4])
     __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
     spin_lock(&bhl);
 
-    hv_wdt_stop();
+    if (hv_wdt_stop())
+        panic("HV: watchdog CPU did not stop\n");
 
     printf("HV: Exiting hypervisor (main CPU)\n");
 
@@ -182,7 +183,8 @@ void hv_start(void *entry, u64 regs[4])
         if (hv_started_cpus[i]) {
             printf("HV: Waiting for CPU %d to exit\n", i);
             spin_unlock(&bhl);
-            smp_wait(i);
+            if (smp_wait(i, NULL))
+                panic("HV: CPU %d did not exit\n", i);
             spin_lock(&bhl);
             hv_started_cpus[i] = false;
         }
@@ -256,15 +258,16 @@ static void hv_enter_secondary(void *entry, u64 regs[4])
     spin_unlock(&bhl);
 }
 
-void hv_start_secondary(int cpu, void *entry, u64 regs[4])
+int hv_start_secondary(int cpu, void *entry, u64 regs[4])
 {
     printf("HV: Initializing secondary %d\n", cpu);
     iodev_console_flush();
 
-    mmu_init_secondary(cpu);
+    if (mmu_init_secondary(cpu))
+        return -1;
     iodev_console_flush();
-    smp_call4(cpu, hv_init_secondary, (u64)&hv_secondary_info, 0, 0, 0);
-    smp_wait(cpu);
+    if (smp_call4(cpu, hv_init_secondary, (u64)&hv_secondary_info, 0, 0, 0) || smp_wait(cpu, NULL))
+        return -1;
     iodev_console_flush();
 
     printf("HV: Entering guest secondary %d at %p\n", cpu, entry);
@@ -272,7 +275,9 @@ void hv_start_secondary(int cpu, void *entry, u64 regs[4])
     __atomic_or_fetch(&hv_cpus_in_guest, BIT(cpu), __ATOMIC_ACQUIRE);
 
     iodev_console_flush();
-    smp_call4(cpu, hv_enter_secondary, (u64)entry, (u64)regs, 0, 0);
+    /* An acknowledgement timeout can still have a late guest entry. Retain
+     * the guest CPU state so exit waits for it instead of declaring it gone. */
+    return smp_call4(cpu, hv_enter_secondary, (u64)entry, (u64)regs, 0, 0);
 }
 
 void hv_exit_cpu(int cpu)

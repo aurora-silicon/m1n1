@@ -1,0 +1,168 @@
+/* SPDX-License-Identifier: MIT */
+
+#include "../build/build_cfg.h"
+
+#include "usb_cdc.h"
+#include "string.h"
+#include "tps6598x.h"
+#include "usb.h"
+#include "usb_cdc_state.h"
+#include "utils.h"
+#include "wdt.h"
+
+static struct usb_cdc_state cdc;
+#ifdef J700_CDC_PROXY
+static tps6598x_irq_state_t cdc_irq_state;
+static bool watchdog_armed;
+static bool carrier_owned;
+
+static bool cdc_dfu_hpm(char *path, void *unused)
+{
+    (void)unused;
+    return !strcmp(path, "/arm-io/nub-spmi-a0/hpm0");
+}
+
+static int cdc_reset_hpm(char *path, tps6598x_dev_t *hpm, void *unused)
+{
+    (void)path;
+    (void)unused;
+    return tps6598x_cold_reset(hpm) ? HPM_ACTION_ERROR : HPM_ACTION_STOP;
+}
+
+static int cdc_power_hpm(char *path, tps6598x_dev_t *hpm, void *unused)
+{
+    (void)path;
+    (void)unused;
+    if (tps6598x_powerup(hpm) || tps6598x_disable_irqs(hpm, &cdc_irq_state))
+        return HPM_ACTION_ERROR;
+    return HPM_ACTION_STOP;
+}
+
+static void cdc_set_step(unsigned step)
+{
+    cdc.step = step;
+}
+#endif
+
+int usb_cdc_schedule(u32 delay_ms, u32 reserved, u32 flags)
+{
+#ifndef J700_CDC_PROXY
+    (void)delay_ms;
+    (void)reserved;
+    (void)flags;
+    return -1;
+#else
+    if (chip_id != T8140)
+        return -1;
+    return usb_cdc_state_schedule(&cdc, delay_ms, reserved, flags, ticks_to_msecs(get_ticks()));
+#endif
+}
+
+u32 usb_cdc_status(void)
+{
+    return usb_cdc_state_status(&cdc);
+}
+
+void usb_cdc_poll(void)
+{
+#ifdef J700_CDC_PROXY
+    if (!usb_cdc_state_due(&cdc, ticks_to_msecs(get_ticks())))
+        return;
+
+    cdc.step = 1;
+    /* HPM0 cold reset irrevocably retires the inherited KIS carrier. */
+    carrier_owned = true;
+    if (cdc.flags & BIT(2)) {
+        if (tps6598x_foreach_hpm(cdc_dfu_hpm, cdc_reset_hpm, NULL) != HPM_ACTION_STOP)
+            goto failed;
+        mdelay(1000);
+    }
+
+    cdc.step = 2;
+    if (tps6598x_foreach_hpm(cdc_dfu_hpm, cdc_power_hpm, NULL) != HPM_ACTION_STOP)
+        goto failed;
+
+    if (usb_cdc_link_start(cdc_set_step, !!(cdc.flags & BIT(0))))
+        goto failed;
+
+    cdc.state = USB_CDC_DWC_READY;
+    printf("CDC Gen1 ready; awaiting host, status=0x%x\n", usb_cdc_status());
+    return;
+
+failed:
+    cdc.state = USB_CDC_FAILED;
+    printf("CDC transition failed at step %u; VDM recovery required\n", cdc.step);
+#endif
+}
+
+int usb_cdc_arm_watchdog(void)
+{
+#if defined(J700_CDC_PROXY) && !defined(J700_CDC_NO_WATCHDOG)
+    if (chip_id != T8140 || wdt_arm_seconds(170))
+        return -1;
+    watchdog_armed = true;
+#endif
+    return 0;
+}
+
+bool usb_cdc_ready(void)
+{
+    return cdc.state == USB_CDC_DWC_READY;
+}
+
+bool usb_cdc_failed(void)
+{
+    return cdc.state == USB_CDC_FAILED;
+}
+
+bool usb_cdc_owns_carrier(void)
+{
+#ifdef J700_CDC_PROXY
+    return carrier_owned;
+#else
+    return false;
+#endif
+}
+
+int usb_cdc_cancel(void)
+{
+#ifdef J700_CDC_PROXY
+    if (carrier_owned || cdc.state != USB_CDC_SCHEDULED)
+        return -1;
+    cdc.state = USB_CDC_IDLE;
+    return 0;
+#else
+    return -1;
+#endif
+}
+
+void usb_cdc_cleanup(void)
+{
+#ifdef J700_CDC_PROXY
+    usb_iodev_shutdown();
+    if (watchdog_armed) {
+        wdt_disable();
+        watchdog_armed = false;
+    }
+#endif
+}
+
+void usb_cdc_primary_opened(void)
+{
+#ifdef J700_CDC_PROXY
+    if (cdc.state == USB_CDC_DWC_READY && watchdog_armed) {
+        wdt_disable();
+        watchdog_armed = false;
+        printf("CDC primary open; watchdog disabled\n");
+    }
+#endif
+}
+
+void usb_cdc_link_failed(void)
+{
+#ifdef J700_CDC_PROXY
+    cdc.state = USB_CDC_FAILED;
+    cdc.step = 5;
+    printf("CDC link mode mismatch; device stopped for VDM recovery\n");
+#endif
+}

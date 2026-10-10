@@ -640,6 +640,11 @@ failed:
 
 int cpufreq_init(void)
 {
+    if (chip_id == T8140) {
+        printf("cpufreq: skipping T8140 P-state hold pending register evidence\n");
+        return 0;
+    }
+
     printf("cpufreq: Initializing clusters\n");
 
     const struct cluster_t *cluster = cpufreq_get_clusters();
@@ -662,6 +667,9 @@ int cpufreq_init(void)
 
 void cpufreq_fixup(void)
 {
+    if (chip_id == T8140)
+        return;
+
     const struct cluster_t *cluster = cpufreq_get_clusters();
 
     if (!cluster)

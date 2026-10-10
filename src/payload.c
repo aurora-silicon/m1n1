@@ -6,13 +6,16 @@
 #include "payload.h"
 #include "adt.h"
 #include "assert.h"
+#include "boot_storage.h"
 #include "chainload.h"
 #include "cpufreq.h"
 #include "display.h"
 #include "heapblock.h"
 #include "kboot.h"
 #include "mitigations.h"
+#include "nvme.h"
 #include "smp.h"
+#include "stage1_config.h"
 #include "utils.h"
 
 #include "libfdt/libfdt.h"
@@ -43,6 +46,12 @@ static char expect_compatible[256];
 static struct kernel_header *kernel = NULL;
 static void *fdt = NULL;
 static char *chainload_spec = NULL;
+static char *boot_spec = NULL;
+static bool payload_scanned = false;
+#ifndef ESP_STAGE2
+static bool stage1_config_applied = false;
+static char stage1_esp_chosen[96];
+#endif
 
 static void *load_one_payload(void *start, size_t size);
 
@@ -167,12 +176,13 @@ static void *load_kernel(void *p, size_t size)
 
 #ifdef CHAINLOADING
 static size_t chosen_cnt = 1;
-static char *chosen[MAX_CHOSEN_VARS] = {
+/* The extra slot carries nvme.adopt without reducing the chosen-variable limit. */
+static char *chosen[MAX_CHOSEN_VARS + 1] = {
     "chosen.asahi,m1n1-stage1-version=" BUILD_TAG,
 };
 #else
 static size_t chosen_cnt = 0;
-static char *chosen[MAX_CHOSEN_VARS];
+static char *chosen[MAX_CHOSEN_VARS + 1];
 #endif
 
 static bool enable_tso = false;
@@ -190,15 +200,22 @@ static bool check_var(u8 **p)
         return false;
 
     *end = 0;
-    printf("Found a variable at %p: %s\n", *p, (char *)*p);
+    printf("Found variable %.*s\n", (int)(val - (char *)*p - 1), (char *)*p);
 
     if (IS_VAR("chosen.")) {
         if (chosen_cnt >= MAX_CHOSEN_VARS)
-            printf("Too many chosen vars, ignoring %s\n", *p);
+            printf("Too many chosen vars, ignoring %.*s\n", (int)(val - (char *)*p - 1),
+                   (char *)*p);
         else
             chosen[chosen_cnt++] = (char *)*p;
     } else if (IS_VAR("chainload=")) {
         chainload_spec = val;
+    } else if (IS_VAR("boot=")) {
+        if (!boot_spec)
+            boot_spec = val;
+    } else if (IS_VAR("nvme.adopt=")) {
+        if (!strcmp(val, "live-rtkit-v1"))
+            nvme_adopt_live_session = true;
     } else if (IS_VAR("display=")) {
         display_configure(val);
     } else if (IS_VAR("mitigations=")) {
@@ -206,7 +223,7 @@ static bool check_var(u8 **p)
     } else if (IS_VAR("tso=")) {
         enable_tso = val[0] == '1';
     } else {
-        printf("Unknown variable %s\n", *p);
+        printf("Unknown variable %.*s\n", (int)(val - (char *)*p - 1), (char *)*p);
     }
 
     *p = (u8 *)(end + 1);
@@ -304,19 +321,61 @@ int payload_run(void)
         return -1;
     }
 
-    void *p = _payload_start;
+    if (!payload_scanned) {
+        void *p = _payload_start;
+        while (p)
+            p = load_one_payload(p, 0);
+        payload_scanned = true;
+    }
 
-    while (p)
-        p = load_one_payload(p, 0);
+#ifndef ESP_STAGE2
+    if (!stage1_config_applied && chip_id == T8140) {
+        const char *target = stage1_config_target();
+        if (target) {
+            if (chainload_spec && strcmp(chainload_spec, target)) {
+                printf("Payload: embedded and appended chainload targets differ\n");
+                return -1;
+            }
+            chainload_spec = (char *)target;
+            if (chosen_cnt >= MAX_CHOSEN_VARS)
+                return -1;
+            snprintf(stage1_esp_chosen, sizeof(stage1_esp_chosen),
+                     "chosen.asahi,efi-system-partition=%s", stage1_config_esp_uuid());
+            chosen[chosen_cnt++] = stage1_esp_chosen;
+        }
+        stage1_config_applied = true;
+    }
+#endif
+
+    if (chainload_spec && boot_spec) {
+        printf("Payload: cannot combine boot= and chainload=\n");
+        next_stage.entry = NULL;
+        return -1;
+    }
 
     if (chainload_spec) {
-        return chainload_load(chainload_spec, chosen, chosen_cnt);
+        next_stage.entry = NULL;
+        int ret = chainload_load(chainload_spec, chosen, &chosen_cnt, ARRAY_SIZE(chosen));
+        if (ret) {
+            next_stage.entry = NULL;
+            nvme_shutdown();
+        }
+        return ret;
+    }
+
+    if (boot_spec && boot_storage_load(boot_spec, &kernel, &fdt)) {
+        next_stage.entry = NULL;
+        return -1;
     }
 
     if (kernel && fdt) {
         cpufreq_init();
-        smp_start_secondaries();
-        mitigations_perform();
+        if (smp_start_secondaries() && chip_id == T8140) {
+            printf("SMP: refusing payload handoff with missing T8140 CPUs\n");
+            goto boot_failed;
+        }
+        if (mitigations_perform())
+            goto boot_failed;
         if (enable_tso) {
 
             do_enable_tso();
@@ -324,8 +383,10 @@ int payload_run(void)
                 if (i == boot_cpu_idx)
                     continue;
                 if (smp_is_alive(i)) {
-                    smp_call0(i, do_enable_tso);
-                    smp_wait(i);
+                    if (smp_call0(i, do_enable_tso) || smp_wait(i, NULL)) {
+                        printf("TSO: CPU %d initialization failed\n", i);
+                        goto boot_failed;
+                    }
                 }
             }
             kboot_set_chosen("apple,tso", "");
@@ -339,15 +400,28 @@ int payload_run(void)
             memcpy(var, chosen[i], val - chosen[i]);
             var[val - chosen[i]] = 0; // Terminate var name
             if (kboot_set_chosen(var + 7, val + 1) < 0)
-                printf("Failed to kboot set %s='%s'\n", chosen[i], val);
+                printf("Failed to kboot set %s\n", var + 7);
         }
 
         if (kboot_prepare_dt(fdt)) {
             printf("Failed to prepare FDT!\n");
-            return -1;
+            goto boot_failed;
         }
 
-        return kboot_boot(kernel);
+        if (kboot_boot(kernel))
+            goto boot_failed;
+        if (boot_spec)
+            nvme_keep_running_for_linux = true;
+        return 0;
+
+    boot_failed:
+        next_stage.entry = NULL;
+        if (boot_spec) {
+            kboot_set_initrd(NULL, 0);
+            nvme_keep_running_for_linux = false;
+            nvme_shutdown();
+        }
+        return -1;
     } else if (kernel && !fdt) {
         printf("ERROR: Kernel found but no devicetree for %s available.\n", expect_compatible);
     } else if (!kernel && fdt) {
@@ -355,4 +429,12 @@ int payload_run(void)
     }
 
     return -1;
+}
+
+int payload_boot_storage(const char *spec)
+{
+    if (!spec)
+        return -1;
+    boot_spec = (char *)spec;
+    return payload_run();
 }
