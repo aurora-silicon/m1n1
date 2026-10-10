@@ -10,6 +10,7 @@
 #define ASC_CPU_CONTROL_START 0x10
 #define ASC_CPU_STATUS         0x48
 #define ASC_CPU_STATUS_STOPPED BIT(1)
+#define ASC_CPU_STATUS_IDLE    BIT(5)
 
 #define ASC_MBOX_CONTROL_ENABLE   BIT(0)
 #define ASC_MBOX_CONTROL_FULL  BIT(16)
@@ -166,12 +167,26 @@ static bool asc_mailbox_empty(u32 control)
            ((control >> 12) & 0xf) == ((control >> 8) & 0xf);
 }
 
-bool asc_validate_inherited_dcp(asc_dev_t *asc, const char *name)
+/*
+ * A started coprocessor with nothing to do may stop in its idle loop until a
+ * mailbox message arrives. The external DCP is handed over like that while no
+ * display is attached.
+ */
+static bool asc_inherited_cpu_live(u32 control, u32 status, bool allow_idle)
+{
+    if (!(control & ASC_CPU_CONTROL_START))
+        return false;
+    if (!(status & ASC_CPU_STATUS_STOPPED))
+        return true;
+    return allow_idle && (status & ASC_CPU_STATUS_IDLE);
+}
+
+bool asc_validate_inherited_dcp(asc_dev_t *asc, const char *name, bool allow_idle)
 {
     u32 control = read32(asc->cpu_base + ASC_CPU_CONTROL);
     u32 status = read32(asc->cpu_base + ASC_CPU_STATUS);
     printf("asc: %s inherited CPU control=0x%x status=0x%x\n", name, control, status);
-    if (!(control & ASC_CPU_CONTROL_START) || (status & ASC_CPU_STATUS_STOPPED)) {
+    if (!asc_inherited_cpu_live(control, status, allow_idle)) {
         printf("asc: %s inherited CPU is not running\n", name);
         return false;
     }
@@ -192,7 +207,7 @@ bool asc_validate_inherited_dcp(asc_dev_t *asc, const char *name)
     control = read32(asc->cpu_base + ASC_CPU_CONTROL);
     status = read32(asc->cpu_base + ASC_CPU_STATUS);
     printf("asc: %s inherited CPU recheck control=0x%x status=0x%x\n", name, control, status);
-    if (!(control & ASC_CPU_CONTROL_START) || (status & ASC_CPU_STATUS_STOPPED)) {
+    if (!asc_inherited_cpu_live(control, status, allow_idle)) {
         printf("asc: %s inherited CPU stopped during mailbox check\n", name);
         return false;
     }
