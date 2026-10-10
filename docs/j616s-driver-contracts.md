@@ -400,6 +400,33 @@ kernel policy value is not established under proxy; this continuation has
 not yet been tested. Recording a timeout and following that path would not
 establish firmware tunable completion.
 
+## Native Linux USB handoff
+
+USB0 has two T8110 DART banks in the ADT. A RAM-only native Linux test
+completed a root-shell command over high-speed CDC with both providers in
+the DWC3 `iommus` property, following the upstream T8112 model:
+
+| Bank | Aperture | Stream in the tested Linux model |
+| --- | --- | --- |
+| 0 | `0x382f00000`, size `0xc000` | 0 |
+| 1 | `0x382f80000`, size `0xc000` | 1 |
+
+Both providers use interrupt 1623 and the same low 32-bit DMA window. DWC3
+uses interrupt 1619. The existing Apple DART driver supports multiple
+providers and shared interrupts; this experiment did not change that driver.
+The result does not identify which transactions use each bank.
+
+Before handoff, check both banks in the current proxy session. The tested
+bank0 state had no protection or lock, no enabled streams and no valid TTBRs;
+all 16 TCRs were 1. Check it again immediately before the vector. Retain the
+existing bank1 SID1 and controller retirement checks. Linux's ordinary DART
+probe resets the bank, so an old snapshot cannot authorize a later handoff.
+
+The successful test used notification suppression and the existing endpoint
+diagnostic controls. Normal CDC notifications, sustained transfers, ECM and
+SuperSpeed still require separate validation. The test recovered through the
+original hardware watchdog and changed no installed images or partitions.
+
 ## Other implementation boundaries
 
 The Linux implementation draft is
