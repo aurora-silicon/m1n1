@@ -356,3 +356,8 @@ int payload_run(void)
 
     return -1;
 }
+
+int payload_chainload(const char *spec)
+{
+    return chainload_load(spec, chosen, chosen_cnt);
+}

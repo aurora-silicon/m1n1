@@ -33,4 +33,9 @@
 # endif
 #endif
 
+// The ESP stage 1 runs its own, configurable USB proxy window
+#ifdef ESP_STAGE1
+# undef EARLY_PROXY_TIMEOUT
+#endif
+
 #endif

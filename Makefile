@@ -86,6 +86,61 @@ CFG += CHAINLOADING
 CARGO_FLAGS += --features chainload
 endif
 
+# Stage 1 for macOS 26.6.2 OS firmware that loads one stage 2 file from the
+# internal EFI system partition (see src/stage1.c). It is built for one board:
+# - J613_STAGE1=1: MacBook Air 13" M3 (J613)
+# - J615_STAGE1=1: MacBook Air 15-inch M3 (J615). Experimental: not yet tested
+#   on hardware.
+STAGE1_BOARD :=
+ifeq ($(J613_STAGE1),1)
+STAGE1_BOARD := J613
+endif
+ifeq ($(J615_STAGE1),1)
+ifneq ($(STAGE1_BOARD),)
+$(error J613_STAGE1=1 and J615_STAGE1=1 cannot be combined)
+endif
+STAGE1_BOARD := J615
+endif
+
+ifneq ($(STAGE1_BOARD),)
+ifneq ($(CHAINLOADING),1)
+$(error $(STAGE1_BOARD)_STAGE1=1 needs CHAINLOADING=1)
+endif
+CFG += ESP_STAGE1 ESP_STAGE1_$(STAGE1_BOARD)
+ifeq ($(strip $(M1N1_VERSION_TAG)),)
+M1N1_VERSION_TAG := v1.6.1-m3air.stage1
+endif
+export M1N1_VERSION_TAG
+ifneq ($(shell printf '%s\n' '$(M1N1_VERSION_TAG)' | LC_ALL=C grep -Ex '[A-Za-z0-9._+-]+'),$(M1N1_VERSION_TAG))
+$(error M1N1_VERSION_TAG must match [A-Za-z0-9._+-]+)
+endif
+ifneq ($(LOGO),)
+$(error LOGO is not supported with $(STAGE1_BOARD)_STAGE1=1)
+endif
+
+# Size rule for the installed raw image (S). On 26.6.2, iBoot places live
+# firmware log buffers (0x5f000 bytes) directly after the installed object, and
+# the chainloaded stage 2 is copied to the same base, so its bytes in
+# [S, S + 0x5f000) are overwritten by firmware:
+# - S >= 0x114000 keeps that range clear of a 0x114000-byte stage 2 m1n1;
+# - S + 0x5f000 <= 0x3e0000 keeps it inside the zero padding that the Aurora
+#   m1n1 stage 2 no longer uses once it has started.
+# This layout was measured on J613. J615 has the same SoC and OS firmware and
+# uses the same bounds, which have not yet been checked on a J615.
+STAGE1_MIN_SIZE := 0x114000
+STAGE1_MAX_SIZE := 0x381000
+STAGE1_CHECK = $(QUIET)size=$$(wc -c < $@); \
+	if [ $$size -lt $$(($(STAGE1_MIN_SIZE))) ] || [ $$size -gt $$(($(STAGE1_MAX_SIZE))) ]; then \
+		printf 'error: %s is 0x%x bytes; a $(STAGE1_BOARD) stage 1 must be %s..%s bytes\n' \
+			$@ $$size $(STAGE1_MIN_SIZE) $(STAGE1_MAX_SIZE) >&2; \
+		rm -f $@; exit 1; \
+	fi; \
+	if [ "$$(tail -c 8 $@)" != STACKBOT ]; then \
+		echo "error: $@ does not end with the STACKBOT marker" >&2; rm -f $@; exit 1; \
+	fi; \
+	printf '  SIZE  %s 0x%x bytes (allowed %s..%s)\n' $@ $$size $(STAGE1_MIN_SIZE) $(STAGE1_MAX_SIZE)
+endif
+
 LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
 	-z nocopyreloc --gc-sections -pie
@@ -168,6 +223,7 @@ OBJECTS := \
 	smc.o \
 	smp.o \
 	spmi.o \
+	stage1.o stage1_cfg.o \
 	start.o \
 	startup.o \
 	string.o \
@@ -258,6 +314,7 @@ ifeq ($(LOGO),)
 build/$(NAME).bin: build/$(NAME)-raw.elf
 	$(QUIET)echo "  RAW   $@"
 	$(QUIET)$(OBJCOPY) -O binary --strip-debug $< $@
+	$(STAGE1_CHECK)
 
 else
 build/$(NAME)-asahi.bin: build/$(NAME)-raw.elf

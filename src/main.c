@@ -22,6 +22,7 @@
 #include "pmgr.h"
 #include "sep.h"
 #include "smp.h"
+#include "stage1.h"
 #include "string.h"
 #include "tps6598x.h"
 #include "uart.h"
@@ -71,6 +72,9 @@ void get_device_info(void)
 
 void run_actions(void)
 {
+#ifdef ESP_STAGE1
+    stage1_run_actions();
+#else
     bool usb_up = false;
 
 #ifndef BRINGUP
@@ -137,6 +141,7 @@ void run_actions(void)
     printf("Running proxy...\n");
 
     uartproxy_run(NULL);
+#endif
 }
 
 void m1n1_main(void)
