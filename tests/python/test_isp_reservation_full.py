@@ -8,8 +8,8 @@ def test_isp_reservation_no_space(tmp_path):
     source = (Path(__file__).resolve().parents[2] / "src/kboot.c").read_text()
     firmware = source[source.index("static int dt_reserve_asc_firmware("):
                       source.index("static int dt_set_ave(")]
-    heap = source[source.index("static int dt_set_isp_fwdata(void)"):
-                  source.index("static int dt_disable_missing_devs(")]
+    heap_start = source.index("static int dt_set_isp_fwdata(void)")
+    heap = source[heap_start:source.index("\nstatic ", heap_start + 1)]
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>

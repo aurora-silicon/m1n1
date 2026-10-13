@@ -20,7 +20,7 @@ def refusal_binary(tmp_path):
     iommu = source[source.index("static int dt_get_iommu_node("):
                    source.index("static dart_dev_t *dt_init_dart_by_node(")]
     helpers = source[source.index("static int dt_t8140_disable_refs("):
-                     source.index("/* A bounded observation of register descriptions")]
+                     source.index("static int dt_set_display_t8140(void)")]
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
