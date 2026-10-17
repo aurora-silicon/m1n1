@@ -824,6 +824,59 @@ void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova)
     return dart_translate_internal(dart, iova, 1);
 }
 
+/*
+ * Walk the page tables of a locked T8110 DART stream without touching its
+ * state: no stream is enabled, reset or invalidated. The stream must translate
+ * through its tables (DAPF bypass and a remap selector without remap enable do
+ * not change that); a bypassed or remapping stream, an invalid TTBR or tables
+ * outside DRAM are refused. @visit is called for every valid L2 entry and stops
+ * the walk by returning non-zero.
+ */
+int dart_walk_locked_t8110(uintptr_t base, u8 sid, u64 dram_base, u64 dram_size,
+                           int (*visit)(u64 iova, u64 paddr, void *opaque), void *opaque)
+{
+    u64 dram_end = dram_base + dram_size;
+
+    if (!visit || dram_size < SZ_16K || dram_end <= dram_base)
+        return -1;
+
+    u32 tcr = read32(base + DART_T8110_TCR_OFF + 4 * sid);
+    u32 ttbr = read32(base + DART_T8110_TTBR_OFF + 4 * sid);
+
+    if (!(read32(base + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR) ||
+        !(tcr & DART_T8110_TCR_TRANSLATE_ENABLE) ||
+        (tcr & (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_REMAP_EN)) ||
+        !(ttbr & DART_T8110_TTBR_VALID))
+        return -1;
+
+    u64 l1 = (u64)FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT;
+    if (l1 < dram_base || l1 > dram_end - SZ_16K)
+        return -1;
+
+    for (u32 i = 0; i < SZ_16K / sizeof(u64); i++) {
+        u64 pte = ((const volatile u64 *)l1)[i];
+        if (!(pte & DART_PTE_VALID))
+            continue;
+
+        u64 l2 = FIELD_GET(DART_T6000_PTE_OFFSET, pte) << DART_PTE_OFFSET_SHIFT;
+        if (l2 < dram_base || l2 > dram_end - SZ_16K)
+            return -1;
+
+        for (u32 j = 0; j < SZ_16K / sizeof(u64); j++) {
+            pte = ((const volatile u64 *)l2)[j];
+            if (!(pte & DART_PTE_VALID))
+                continue;
+
+            u64 paddr = FIELD_GET(DART_T6000_PTE_OFFSET, pte) << DART_PTE_OFFSET_SHIFT;
+            int ret = visit(((u64)i << 25) | ((u64)j << 14), paddr, opaque);
+            if (ret)
+                return ret;
+        }
+    }
+
+    return 0;
+}
+
 u64 dart_search(dart_dev_t *dart, void *paddr)
 {
     for (int ttbr = 0; ttbr < dart->params->ttbr_count; ++ttbr) {
