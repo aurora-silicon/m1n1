@@ -4024,6 +4024,224 @@ static int dt_set_t6030_dcp_handoff(void)
     return 0;
 }
 
+/*
+ * J514S external display controllers (DCPEXT0/1). iBoot loads the panel's
+ * firmware image for them as well and leaves their segments and DART tables in
+ * memory; it starts a controller only for a display attached at power-on. The
+ * OS may run a controller once its segments are reserved before it allocates
+ * memory (the OS log segment lies in usable RAM) at the DART addresses the
+ * firmware uses, and the controller is published with its firmware identity
+ * and its Type-C display routes. Only the ADT and the FDT are read here: the
+ * controllers may be unpowered. A controller that does not validate stays
+ * disabled.
+ */
+#define T6030_DCPEXT_SEGMENTS 4
+
+/* ADT segment flags and runtime DART addresses of TEXT, DATA, OS log and scratch. */
+static const u32 t6030_dcpext_seg_flags[T6030_DCPEXT_SEGMENTS] = {0x1, 0x0, 0xa, 0x2};
+static const u64 t6030_dcpext_text_remap = 0x10040000000UL;
+static const u64 t6030_dcpext_data_remap = 0x10080000000UL;
+static const u64 t6030_dcpext_scratch_remap[2] = {0x100c0000000UL, 0x100c1000000UL};
+
+/* Carveouts holding the page tables of each controller's DART streams. */
+static const u32 t6030_dcpext_table_regions[2][3] = {{70, 68, 69}, {85, 83, 84}};
+
+static bool ranges_overlap(u64 a, u64 a_size, u64 b, u64 b_size)
+{
+    return a < b + b_size && b < a + a_size;
+}
+
+/* An existing reservation of the same name must cover exactly the same range. */
+static bool dt_t6030_reservation_matches(const char *name, u64 paddr, u64 size)
+{
+    int resv = fdt_path_offset(dt, "/reserved-memory");
+    int node = resv < 0 ? resv : fdt_subnode_offset(dt, resv, name);
+    int len;
+
+    if (node < 0)
+        return true;
+
+    const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+    return reg && len == 2 * sizeof(*reg) && fdt64_ld(&reg[0]) == paddr &&
+           fdt64_ld(&reg[1]) == size && fdt_getprop(dt, node, "no-map", NULL);
+}
+
+static int dt_t6030_dcpext_validate(unsigned int n, const char *nub_path, char *uuid_out)
+{
+    int nub = adt_path_offset(adt, nub_path);
+    if (nub < 0)
+        bail("ADT: J514S DCPEXT%u: %s not found\n", n, nub_path);
+
+    u32 len = 0;
+    const struct adt_segment_ranges *segs = adt_getprop(adt, nub, "segment-ranges", &len);
+    if (!segs || len != T6030_DCPEXT_SEGMENTS * sizeof(*segs))
+        bail("ADT: J514S DCPEXT%u: unexpected segment-ranges (%u bytes)\n", n, segs ? len : 0);
+
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 dram_base = 0, dram_size = 0;
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) || !dram_size)
+        bail("ADT: J514S DCPEXT%u: no DRAM bounds\n", n);
+
+    for (unsigned int i = 0; i < T6030_DCPEXT_SEGMENTS; i++) {
+        struct adt_segment_ranges seg;
+        u64 remap;
+        char name[64];
+
+        memcpy(&seg, &segs[i], sizeof(seg));
+        u64 size = ALIGN_UP((u64)seg.size, SZ_16K);
+
+        switch (i) {
+            case 0:
+                remap = t6030_dcpext_text_remap;
+                break;
+            case 1:
+                remap = t6030_dcpext_data_remap;
+                break;
+            case 2:
+                remap = seg.phys; /* the OS log runs at its physical address */
+                break;
+            default:
+                remap = t6030_dcpext_scratch_remap[n];
+                break;
+        }
+
+        if (seg.unk != t6030_dcpext_seg_flags[i] || seg.remap != remap || !seg.size ||
+            (seg.phys & (SZ_16K - 1)) || seg.phys < dram_base ||
+            seg.phys + size > dram_base + dram_size)
+            bail("ADT: J514S DCPEXT%u: unexpected segment %u: PA 0x%lx remap 0x%lx size 0x%x "
+                 "flags 0x%x\n",
+                 n, i, seg.phys, seg.remap, seg.size, seg.unk);
+
+        for (unsigned int j = 0; j < i; j++) {
+            struct adt_segment_ranges prev;
+
+            memcpy(&prev, &segs[j], sizeof(prev));
+            if (ranges_overlap(seg.phys, size, prev.phys, ALIGN_UP((u64)prev.size, SZ_16K)))
+                bail("ADT: J514S DCPEXT%u: segments %u and %u overlap\n", n, j, i);
+        }
+
+        /* TEXT is the panel's image and shares its reservation. */
+        snprintf(name, sizeof(name), "asc-firmware@%lx", seg.phys);
+        if (!dt_t6030_reservation_matches(name, seg.phys, size))
+            bail("FDT: J514S DCPEXT%u: conflicting reservation %s\n", n, name);
+    }
+
+    int cmap = adt_path_offset(adt, "/chosen/carveout-memory-map");
+    for (unsigned int i = 0; i < 3; i++) {
+        char prop[24];
+        u64 region[2];
+
+        snprintf(prop, sizeof(prop), "region-id-%u", t6030_dcpext_table_regions[n][i]);
+        if (cmap < 0 || ADT_GETPROP_ARRAY(adt, cmap, prop, region) != sizeof(region) ||
+            !region[1] || (region[0] & (SZ_16K - 1)))
+            bail("ADT: J514S DCPEXT%u: no DART table storage %s\n", n, prop);
+    }
+
+    /* The image is the panel's: only hand over what the panel's handoff qualified. */
+    const char *uuid = adt_getprop(adt, nub, "uuid", &len);
+    if (!uuid || !len || len > 64 || strnlen(uuid, len) != 36)
+        bail("ADT: J514S DCPEXT%u: no firmware UUID\n", n);
+    int dcp = fdt_path_offset(dt, "dcp");
+    const char *panel = dcp < 0 ? NULL : fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
+    if (!panel)
+        bail("FDT: J514S DCPEXT%u: the internal display firmware was not handed over\n", n);
+    if (strncmp(uuid, panel, 36) || panel[36])
+        bail("FDT: J514S DCPEXT%u: firmware %.36s is not the panel's %s\n", n, uuid, panel);
+
+    memcpy(uuid_out, panel, 37);
+    return 0;
+}
+
+/* Reserve the DART table storage that lies in usable RAM. */
+static int dt_t6030_dcpext_reserve_tables(unsigned int n)
+{
+    int cmap = adt_path_offset(adt, "/chosen/carveout-memory-map");
+    u64 ram = cur_boot_args.phys_base, ram_size = cur_boot_args.mem_size;
+
+    for (unsigned int i = 0; i < 3; i++) {
+        char prop[24], name[40];
+        u64 region[2];
+
+        snprintf(prop, sizeof(prop), "region-id-%u", t6030_dcpext_table_regions[n][i]);
+        if (ADT_GETPROP_ARRAY(adt, cmap, prop, region) != sizeof(region))
+            return -1;
+
+        u64 size = ALIGN_UP(region[1], SZ_16K);
+        if (!ranges_overlap(region[0], size, ram, ram_size))
+            continue;
+
+        snprintf(name, sizeof(name), "dart-tables@%lx", region[0]);
+        if (dt_get_or_add_reserved_mem(name, "apple,dart-mem", true, region[0], size) < 0)
+            return -1;
+    }
+
+    return 0;
+}
+
+/* Enable the controller's Type-C display routes, then the controller. */
+static int dt_t6030_dcpext_enable(const char *alias)
+{
+    int node = fdt_path_offset(dt, alias);
+    if (node < 0)
+        return -1;
+
+    int routes = fdt_subnode_offset(dt, node, "typec-routes");
+    if (routes < 0)
+        return -1;
+
+    int route;
+    fdt_for_each_subnode(route, dt, routes)
+    {
+        if (fdt_setprop_string(dt, route, "status", "okay"))
+            return -1;
+    }
+
+    node = fdt_path_offset(dt, alias);
+    if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
+        return -1;
+
+    return 0;
+}
+
+static void dt_set_t6030_dcpext(unsigned int n)
+{
+    char alias[16], nub_path[48], uuid[40];
+
+    snprintf(alias, sizeof(alias), "dcpext%u", n);
+    if (!fdt_get_alias(dt, alias))
+        return; /* not described by this device tree */
+
+    int node = fdt_path_offset(dt, alias);
+    if (node < 0)
+        return;
+    const char *status = fdt_getprop(dt, node, "status", NULL);
+    if (status && !strcmp(status, "okay")) {
+        printf("FDT: J514S DCPEXT%u already enabled; leaving it alone\n", n);
+        return;
+    }
+
+    snprintf(nub_path, sizeof(nub_path), "/arm-io/%s/iop-%s-nub", alias, alias);
+    if (dt_t6030_dcpext_validate(n, nub_path, uuid))
+        return;
+
+    /* Everything validated: from here on only FDT updates. */
+    if (dt_t6030_dcpext_reserve_tables(n) ||
+        dt_reserve_asc_firmware(nub_path, NULL, alias, true, 0) || dt_set_dcp_firmware(alias)) {
+        printf("FDT: J514S DCPEXT%u: cannot reserve the firmware\n", n);
+        return;
+    }
+
+    node = fdt_path_offset(dt, alias);
+    if (node < 0 || fdt_setprop_string(dt, node, "apple,firmware-uuid", uuid) ||
+        dt_t6030_dcpext_enable(alias)) {
+        printf("FDT: J514S DCPEXT%u: cannot publish the controller\n", n);
+        return;
+    }
+
+    printf("FDT: J514S DCPEXT%u firmware %s handed over\n", n, uuid);
+}
+
 static int dt_set_display(void)
 {
     if (chip_id == T8140)
@@ -4104,6 +4322,9 @@ static int dt_set_display(void)
          */
         if (dt_set_t6030_dcp_handoff())
             printf("FDT: J514S DCP handoff not published; keeping the boot framebuffer\n");
+        /* The external controllers run the panel's image: never fatal either. */
+        for (unsigned int n = 0; n < 2; n++)
+            dt_set_t6030_dcpext(n);
         return 0;
     } else {
         printf("FDT: unknown compatible, skip display reserved-memory setup\n");
