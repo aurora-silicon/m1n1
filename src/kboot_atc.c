@@ -173,6 +173,18 @@ static const struct adt_tunable_info atc_tunables_t8130[] = {
     {"tunable_LN1_TX_SHM_USB_DFLT", "apple,tunable-lane1-usb", 0x14000, 0x1000, true},
 };
 
+/*
+ * A T6030 ATC PHY wired as a fixed DisplayPort transmitter (the J514S HDMI
+ * port's): the calibration its power-up applies, in this order, in one list.
+ */
+static const struct adt_tunable_info atc_tunables_t6030_dp[] = {
+    {"tunable_AUSCMN_DIG", "apple,tunable-dp-calibration", 0x800, 0x200, true},
+    {"tunable_AUSPLL_CORE", "apple,tunable-dp-calibration", 0x2200, 0x4000, true},
+    {"tunable_AUX_TOP", "apple,tunable-dp-calibration", 0x16000, 0x4000, true},
+    {"tunable_AUSCMN_SHM", "apple,tunable-dp-calibration", 0xa00, 0x200, true},
+    {"tunable_CLKMON_CFG", "apple,tunable-dp-calibration", 0x2600, 0x100, true},
+};
+
 static const struct atc_fuse_info atc_fuses_t8103_port0[] = {
     {0x23d2bc434, 9, 6, CIO3PLL_DCO_NCTRL, CIO3PLL_DCO_COARSEBIN_EFUSE0},
     {0x23d2bc434, 15, 6, CIO3PLL_DCO_NCTRL, CIO3PLL_DCO_COARSEBIN_EFUSE1},
@@ -698,6 +710,23 @@ static void dt_export_j700_atc(void *dt, int adt_node, int fdt_node)
         free(output[i].data);
 }
 
+/* Only the DP calibration: this PHY has no USB, USB4 or Type-C side. */
+static void dt_copy_atc_t6030_dp_tunables(void *dt, int adt_node, int fdt_node,
+                                          const char *adt_path)
+{
+    const char *name = atc_tunables_t6030_dp[0].fdt_name;
+
+    fdt_delprop(dt, fdt_node, name);
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t6030_dp); ++i) {
+        if (dt_append_atc_tunable(dt, adt_node, fdt_node, &atc_tunables_t6030_dp[i])) {
+            fdt_delprop(dt, fdt_node, name);
+            printf("FDT: Unable to copy the DP calibration for %s\n", adt_path);
+            return;
+        }
+    }
+    printf("FDT: Copied the DP calibration for %s\n", adt_path);
+}
+
 static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_alias, int port)
 {
     int ret;
@@ -720,6 +749,12 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
     dt_export_j700_atc(dt, adt_node, fdt_node);
     if (adt_node < 0)
         return;
+
+    if (!fdt_node_check_compatible(dt, fdt_node, "apple,t6030-atcphy-dp")) {
+        if (adt_is_compatible_at(adt, adt_node, "atc-phy,t8122", 0))
+            dt_copy_atc_t6030_dp_tunables(dt, adt_node, fdt_node, adt_path);
+        return;
+    }
 
     ret = dt_append_fuses(dt, adt_node, fdt_node, port);
     if (ret) {

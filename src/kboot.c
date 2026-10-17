@@ -4179,7 +4179,10 @@ static int dt_t6030_dcpext_reserve_tables(unsigned int n)
     return 0;
 }
 
-/* Enable the controller's Type-C display routes, then the controller. */
+/*
+ * Enable the controller's Type-C display routes, then the controller. DCPEXT0
+ * drives the built-in HDMI port instead: a fixed output without routes.
+ */
 static int dt_t6030_dcpext_enable(const char *alias)
 {
     int node = fdt_path_offset(dt, alias);
@@ -4187,15 +4190,16 @@ static int dt_t6030_dcpext_enable(const char *alias)
         return -1;
 
     int routes = fdt_subnode_offset(dt, node, "typec-routes");
-    if (routes < 0)
+    if (routes < 0 && routes != -FDT_ERR_NOTFOUND)
         return -1;
 
     int route;
-    fdt_for_each_subnode(route, dt, routes)
-    {
-        if (fdt_setprop_string(dt, route, "status", "okay"))
-            return -1;
-    }
+    if (routes >= 0)
+        fdt_for_each_subnode(route, dt, routes)
+        {
+            if (fdt_setprop_string(dt, route, "status", "okay"))
+                return -1;
+        }
 
     node = fdt_path_offset(dt, alias);
     if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
