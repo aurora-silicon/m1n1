@@ -45,6 +45,7 @@ static int dt_get_iommu_node(int node, u32 index)
 static int fdt_setprop_string(void *tree, int node, const char *name, const char *value)
 { (void)tree; (void)node; (void)name; (void)value; return 0; }
 static void dart_shutdown(dart_dev_t *dart) { (void)dart; }
+static void dt_enable_dcp_typec_routes(const char *dcp_alias) { (void)dcp_alias; }
 ''' + helper + r'''
 int main(void)
 {
