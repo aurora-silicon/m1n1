@@ -4,6 +4,7 @@
 #include "errno.h"
 #include "malloc.h"
 #include "sio.h"
+#include "soc.h"
 #include "types.h"
 #include "utils.h"
 
@@ -85,8 +86,9 @@ struct copy_rule {
     int fw_param;
     bool keyed;
     int blobsize;
+    bool irq; // keyed records end in a u32 interrupt number, none (~0) from the ADT
     u32 nkeys;
-    const char *keys[9];
+    const char *keys[10];
 };
 
 #define SPACER "\xff\xff\xff\xff"
@@ -133,6 +135,52 @@ struct copy_rule copy_rules[] = {
     },
 };
 
+/*
+ * SIO firmware protocol 10 (T6030) takes six DMA shim records of 36 bytes, the
+ * ADT's 32 bytes and an interrupt (none for any of them), and nine device types.
+ * The ADT still describes the shims and device types as above.
+ */
+static struct copy_rule copy_rules_v10[] = {
+    {
+        .prop = "asio-ascwrap-tunables",
+        .fw_param = PARAM_TUNABLES,
+    },
+    {
+        .blobsize = 0x1b80,
+        .fw_param = PARAM_UNK_000b,
+    },
+    {
+        .blobsize = 0x1e000,
+        .fw_param = PARAM_PANIC_BUFFER,
+    },
+    {
+        .blobsize = 0x4000,
+        .fw_param = PARAM_UNK_030d,
+    },
+    {
+        .prop = "map-range",
+        .fw_param = PARAM_MAP_RANGE,
+        .blobsize = 16,
+        .keyed = true,
+        .keys = {SPACER, SPACER, SPACER, "MISC", NULL},
+    },
+    {
+        .prop = "dmashim",
+        .fw_param = PARAM_DMASHIM_DATA,
+        .blobsize = 32,
+        .irq = true,
+        .keyed = true,
+        .keys = {"SSPI", "SUAR", "SAUD", "ADMA", "AAUD", SPACER, NULL},
+    },
+    {
+        .prop = "device-type",
+        .fw_param = PARAM_DEVICE_TYPE,
+        .blobsize = 8,
+        .keyed = true,
+        .keys = {"dSPI", "dUAR", "dMCA", "dDPA", "dPDM", "dALE", "dAMC", "dAPD", SPACER, NULL},
+    },
+};
+
 int find_key_index(const char *keylist[], u32 needle)
 {
     int i;
@@ -160,8 +208,16 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
         goto err;
     }
 
-    for (int i = 0; i < (int)ARRAY_SIZE(copy_rules); i++) {
-        struct copy_rule *rule = &copy_rules[i];
+    struct copy_rule *rules = copy_rules;
+    int nrules = ARRAY_SIZE(copy_rules);
+
+    if (chip_id == T6030) {
+        rules = copy_rules_v10;
+        nrules = ARRAY_SIZE(copy_rules_v10);
+    }
+
+    for (int i = 0; i < nrules; i++) {
+        struct copy_rule *rule = &rules[i];
         u32 len;
 
         if (!rule->prop) {
@@ -186,9 +242,17 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
         }
 
         int nkeys = find_key_index(rule->keys, 0);
-        u8 *sio_blob = add_fwdata(siodata, nkeys * rule->blobsize, rule->fw_param);
+        int stride = rule->blobsize + (rule->irq ? 4 : 0);
+        u8 *sio_blob = add_fwdata(siodata, nkeys * stride, rule->fw_param);
         if (!sio_blob)
             goto err;
+
+        if (rule->irq) {
+            u32 none = ~0u;
+
+            for (int k = 0; k < nkeys; k++)
+                memcpy8(sio_blob + k * stride + rule->blobsize, &none, sizeof(none));
+        }
 
         if (len % (rule->blobsize + 4) != 0) {
             printf("%s: bad length %d of ADT property '%s', expected multiple of %d + 4\n",
@@ -207,7 +271,7 @@ struct sio_data *sio_setup_fwdata(const char *adt_path)
                 goto err;
             }
 
-            memcpy8(sio_blob + (key_idx * rule->blobsize), (void *)(p + 4), rule->blobsize);
+            memcpy8(sio_blob + (key_idx * stride), (void *)(p + 4), rule->blobsize);
         }
     }
 
