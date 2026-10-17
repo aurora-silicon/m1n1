@@ -30,6 +30,7 @@
 #include "types.h"
 #include "usb.h"
 #include "utils.h"
+#include "vsprintf.h"
 #include "xnuboot.h"
 
 #include "libfdt/libfdt.h"
@@ -2232,7 +2233,15 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
             return -1;
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
-        ret = dt_device_set_reserved_mem(mem_node, node_name, dev_phandle, iova, seg_size);
+        /*
+         * The OS log segment (flags 0xa) of a T6030 display coprocessor runs at
+         * its physical address and is not reached through the DART: reserve
+         * its RAM, marked as such, without an IOMMU mapping.
+         */
+        if (chip_id == T6030 && !strncmp(fdt_path, "dcp", 3) && seg->unk == 0xa)
+            ret = fdt_setprop_empty(dt, mem_node, "apple,dcp-os-log");
+        else
+            ret = dt_device_set_reserved_mem(mem_node, node_name, dev_phandle, iova, seg_size);
         if (ret < 0)
             return ret;
 
@@ -3747,6 +3756,274 @@ err:
     return ret;
 }
 
+/*
+ * J514S (T6030) internal display.
+ *
+ * iBoot leaves the panel's display coprocessor (DCP) running, its firmware
+ * DART and the display frontend DART locked and translating. The OS adopts
+ * that session as it is, so this only describes it: the firmware segments are
+ * reserved at the DART addresses the firmware uses, and the frontend's
+ * inherited scanout (SID0) and PIODMA (SID4) mappings are published once every
+ * page of them matched a display segment of the firmware. Nothing is reset or
+ * enabled in hardware; a refused handoff keeps the boot framebuffer.
+ */
+
+/* DCP firmware builds whose handoff the J514S display driver implements. */
+static const char *const t6030_dcp_uuids[] = {
+    "DDF38191-93B3-324A-BC8F-643006F5AC82",
+};
+
+/* Why the frontend handoff stopped, published in /chosen for the OS. */
+static char t6030_display_handoff[160] = "not attempted";
+
+static int t6030_display_handoff_fail(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(t6030_display_handoff, sizeof(t6030_display_handoff), fmt, ap);
+    va_end(ap);
+    printf("FDT: J514S display handoff: %s\n", t6030_display_handoff);
+    return -1;
+}
+
+struct t6030_display_maps {
+    const struct adt_segment_ranges *segments;
+    u32 count;
+    u64 bytes[32];
+    u64 rejected_iova, rejected_paddr;
+    bool rejected;
+};
+
+/* Account an inherited page to the display segment it belongs to. */
+static int t6030_display_page(u64 iova, u64 paddr, void *opaque)
+{
+    struct t6030_display_maps *maps = opaque;
+
+    for (u32 i = 0; i < maps->count; i++) {
+        const struct adt_segment_ranges *seg = &maps->segments[i];
+        u64 start = seg->remap & (BIT(36) - 1);
+        u64 size = ALIGN_UP((u64)seg->size, SZ_16K);
+
+        if (seg->unk != 2 || iova < start || iova - start >= size)
+            continue;
+        if ((seg->remap >> 36) != 0x10 || paddr != seg->phys + iova - start)
+            break;
+        maps->bytes[i] += SZ_16K;
+        return 0;
+    }
+
+    /* Never drop an inherited mapping that cannot be described. */
+    maps->rejected = true;
+    maps->rejected_iova = iova;
+    maps->rejected_paddr = paddr;
+    return -1;
+}
+
+static int dt_t6030_enable_iommu(int node)
+{
+    int dart = dt_get_iommu_node(node, 0);
+
+    if (dart < 0)
+        return -1;
+    return fdt_setprop_string(dt, dart, "status", "okay") ? -1 : 0;
+}
+
+static int dt_set_t6030_display_maps(const struct adt_segment_ranges *segments, u32 count,
+                                     u64 dram_base, u64 dram_size)
+{
+    static const char *const aliases[] = {"disp0", "disp0_piodma"};
+    static const u8 streams[] = {0, 4};
+    static const u32 expected[] = {3, 1};
+    struct t6030_display_maps maps[2] = {
+        {.segments = segments, .count = count},
+        {.segments = segments, .count = count},
+    };
+    u32 phandles[2];
+    int adt_path[8];
+    u64 adt_base;
+    int len;
+
+    /* The frontend DART's registers, as described by both trees. */
+    int display = fdt_path_offset(dt, "disp0");
+    int dart = display < 0 ? display : dt_get_iommu_node(display, 0);
+    if (dart < 0)
+        return t6030_display_handoff_fail("disp0 has no DART node (%d)", dart);
+    const fdt32_t *reg = fdt_getprop(dt, dart, "reg", &len);
+    if (!reg || len < 16)
+        return t6030_display_handoff_fail("disp0 DART has no reg");
+    u64 dart_base = ((u64)fdt32_ld(&reg[0]) << 32) | fdt32_ld(&reg[1]);
+    if (adt_path_offset_trace(adt, "/arm-io/dart-disp0", adt_path) < 0 ||
+        adt_get_reg(adt, adt_path, "reg", 0, &adt_base, NULL) < 0)
+        return t6030_display_handoff_fail("ADT has no /arm-io/dart-disp0 reg");
+    if (adt_base != dart_base)
+        return t6030_display_handoff_fail("DART base: FDT 0x%lx, ADT 0x%lx", dart_base, adt_base);
+
+    for (u32 n = 0; n < 2; n++) {
+        if (dart_walk_locked_t8110(dart_base, streams[n], dram_base, dram_size, t6030_display_page,
+                                   &maps[n])) {
+            if (maps[n].rejected)
+                return t6030_display_handoff_fail("SID%u: no segment for iova 0x%lx -> 0x%lx",
+                                                  streams[n], maps[n].rejected_iova,
+                                                  maps[n].rejected_paddr);
+            /* PROTECT, TCR and TTBR, as the walk has just read them. */
+            return t6030_display_handoff_fail(
+                "SID%u: walk refused, protect 0x%x tcr 0x%x ttbr 0x%x", streams[n],
+                read32(dart_base + 0x200), read32(dart_base + 0x1000 + 4 * streams[n]),
+                read32(dart_base + 0x1400 + 4 * streams[n]));
+        }
+
+        u32 regions = 0;
+        for (u32 i = 0; i < count; i++) {
+            u64 size = ALIGN_UP((u64)segments[i].size, SZ_16K);
+
+            if (!maps[n].bytes[i])
+                continue;
+            if (maps[n].bytes[i] != size)
+                return t6030_display_handoff_fail("SID%u: segment %u mapped 0x%lx of 0x%lx bytes",
+                                                  streams[n], i, maps[n].bytes[i], size);
+            regions++;
+        }
+        if (regions != expected[n])
+            return t6030_display_handoff_fail("SID%u: %u segments mapped, expected %u", streams[n],
+                                              regions, expected[n]);
+    }
+
+    /* Every inherited page is accounted for; publish them. */
+    for (u32 n = 0; n < 2; n++) {
+        int node = fdt_path_offset(dt, aliases[n]);
+        if (node < 0)
+            return t6030_display_handoff_fail("could not publish the mappings");
+        phandles[n] = fdt_get_phandle(dt, node);
+        if (!phandles[n] && (fdt_generate_phandle(dt, &phandles[n]) ||
+                             fdt_setprop_u32(dt, node, "phandle", phandles[n])))
+            return t6030_display_handoff_fail("could not publish the mappings");
+    }
+    for (u32 i = 0; i < count; i++) {
+        u64 size = ALIGN_UP((u64)segments[i].size, SZ_16K);
+        char name[64];
+
+        if (!maps[0].bytes[i] && !maps[1].bytes[i])
+            continue;
+        snprintf(name, sizeof(name), "asc-firmware@%lx", segments[i].phys);
+        int node = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, segments[i].phys, size);
+        if (node < 0)
+            return t6030_display_handoff_fail("could not publish the mappings");
+        u32 phandle = fdt_get_phandle(dt, node);
+        for (u32 n = 0; n < 2; n++)
+            if (maps[n].bytes[i] &&
+                dt_device_set_reserved_mem(node, name, phandles[n], segments[i].remap, size))
+                return t6030_display_handoff_fail("could not publish the mappings");
+        for (u32 n = 0; n < 2; n++)
+            if (maps[n].bytes[i] && dt_device_add_mem_region(aliases[n], phandle, NULL))
+                return t6030_display_handoff_fail("could not publish the mappings");
+    }
+
+    int piodma = fdt_path_offset(dt, "disp0_piodma");
+    if (piodma < 0 || dt_t6030_enable_iommu(piodma))
+        return t6030_display_handoff_fail("could not publish the mappings");
+    piodma = fdt_path_offset(dt, "disp0_piodma");
+    if (fdt_setprop_empty(dt, piodma, "apple,j514s-inherited-mappings") ||
+        fdt_setprop_string(dt, piodma, "status", "okay"))
+        return t6030_display_handoff_fail("could not publish the mappings");
+    printf("FDT: J514S DISP0 SID0/SID4 mappings preserved; PIODMA enabled\n");
+    snprintf(t6030_display_handoff, sizeof(t6030_display_handoff), "PIODMA enabled");
+
+    int dcp = fdt_path_offset(dt, "dcp");
+    if (dcp >= 0 && fdt_getprop(dt, dcp, "apple,j514s-native-scanout", NULL)) {
+        display = fdt_path_offset(dt, "disp0");
+        if (display < 0 ||
+            fdt_node_check_compatible(dt, display, "apple,t6030-display-diagnostics") ||
+            fdt_setprop_empty(dt, display, "apple,j514s-inherited-mappings"))
+            return t6030_display_handoff_fail("could not publish the mappings");
+        display = fdt_path_offset(dt, "disp0");
+        if (fdt_setprop_string(dt, display, "status", "okay"))
+            return t6030_display_handoff_fail("could not publish the mappings");
+        printf("FDT: J514S scanout enabled with the inherited SID0 mappings\n");
+    }
+
+    return 0;
+}
+
+/*
+ * Reserve the running panel DCP's firmware and publish its identity. The DCP
+ * firmware DART is enabled only once its reservations are published.
+ */
+static int dt_set_t6030_dcp_handoff(void)
+{
+    int dcp = fdt_path_offset(dt, "dcp");
+    if (dcp < 0)
+        return 0; /* no display coprocessor described: boot framebuffer only */
+    if (chip_id != T6030 || fdt_node_check_compatible(dt, 0, "apple,j514s") ||
+        fdt_node_check_compatible(dt, dcp, "apple,t6030-dcp"))
+        bail("FDT: unsupported T6030 DCP handoff target\n");
+
+    int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
+    if (nub < 0)
+        bail("ADT: missing J514S DCP firmware metadata\n");
+
+    u32 len;
+    const struct adt_segment_ranges *segments = adt_getprop(adt, nub, "segment-ranges", &len);
+    if (!segments || !len || len % sizeof(*segments) || len / sizeof(*segments) > 32)
+        bail("ADT: invalid J514S DCP firmware segment list\n");
+    u32 count = len / sizeof(*segments);
+
+    int chosen = adt_path_offset(adt, "/chosen");
+    u64 dram_base, dram_size;
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) < 0 ||
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) < 0)
+        bail("ADT: missing J514S DRAM bounds\n");
+    u64 dram_end = dram_base + dram_size;
+    if (!dram_size || dram_end <= dram_base)
+        bail("ADT: invalid J514S DRAM bounds\n");
+
+    /* Validate the whole list before changing the FDT. */
+    for (u32 i = 0; i < count; i++) {
+        u64 size = ALIGN_UP((u64)segments[i].size, SZ_16K);
+
+        if (!size || (segments[i].phys | segments[i].remap) & (SZ_16K - 1) ||
+            segments[i].phys < dram_base || segments[i].phys + size < segments[i].phys ||
+            segments[i].phys + size > dram_end || segments[i].remap + size < segments[i].remap)
+            bail("ADT: invalid J514S DCP firmware segment %u\n", i);
+    }
+
+    const char *uuid = adt_getprop(adt, nub, "uuid", &len);
+    if (!uuid || len != 37 || uuid[len - 1])
+        bail("ADT: invalid J514S DCP firmware UUID\n");
+    bool qualified = false;
+    for (size_t i = 0; i < ARRAY_SIZE(t6030_dcp_uuids); i++)
+        if (!strcmp(uuid, t6030_dcp_uuids[i]))
+            qualified = true;
+    if (!qualified) {
+        printf("FDT: J514S DCP firmware %s not supported; keeping the boot framebuffer\n", uuid);
+        return 0;
+    }
+    if (fdt_setprop_string(dt, dcp, "apple,firmware-uuid", uuid))
+        bail("FDT: cannot publish the J514S DCP firmware UUID\n");
+
+    if (dt_set_dcp_firmware("dcp"))
+        return -1;
+    if (dt_reserve_asc_firmware("/arm-io/dcp/iop-dcp-nub", NULL, "dcp", true, 0))
+        return -1;
+
+    dcp = fdt_path_offset(dt, "dcp");
+    if (dcp < 0 || dt_t6030_enable_iommu(dcp))
+        bail("FDT: cannot enable the J514S DCP firmware DART\n");
+
+    dcp = fdt_path_offset(dt, "dcp");
+    if (fdt_getprop(dt, dcp, "apple,j514s-native-piodma", NULL)) {
+        if (dt_set_t6030_display_maps(segments, count, dram_base, dram_size))
+            printf("FDT: J514S frontend handoff refused; PIODMA and scanout stay disabled\n");
+        chosen = fdt_path_offset(dt, "/chosen");
+        if (chosen < 0 ||
+            fdt_setprop_string(dt, chosen, "aurora,j514s-display-handoff", t6030_display_handoff))
+            printf("FDT: cannot record the J514S display handoff result\n");
+    }
+
+    printf("FDT: J514S DCP firmware %s handed over\n", uuid);
+    return 0;
+}
+
 static int dt_set_display(void)
 {
     if (chip_id == T8140)
@@ -3820,6 +4097,14 @@ static int dt_set_display(void)
                                           ARRAY_SIZE(disp_reserved_regions_t8142));
         if (ret)
             return ret;
+    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6030")) {
+        /*
+         * The running display is adopted as iBoot left it: no display reset, no
+         * framebuffer remapping. A refused handoff keeps the boot framebuffer.
+         */
+        if (dt_set_t6030_dcp_handoff())
+            printf("FDT: J514S DCP handoff not published; keeping the boot framebuffer\n");
+        return 0;
     } else {
         printf("FDT: unknown compatible, skip display reserved-memory setup\n");
         return 0;
