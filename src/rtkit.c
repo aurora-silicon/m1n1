@@ -75,6 +75,8 @@
 #define RTKIT_MIN_VERSION 11
 #define RTKIT_MAX_VERSION 12
 
+#define RTKIT_RX_PRINT_MAX 256
+
 #define IOVA_MASK GENMASK(35, 0)
 
 enum rtkit_power_state {
@@ -108,6 +110,9 @@ struct rtkit_dev {
     u32 syslog_cnt, syslog_size;
 
     bool crashed;
+
+    u32 log_pool_next;
+    u32 rx_printed;
 };
 
 struct syslog_log {
@@ -292,12 +297,67 @@ bool rtkit_free_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr)
     return true;
 }
 
+/*
+ * Locked Gen3 DART (T8152 DCP): segment #7 of the DCP segment-ranges (DVA
+ * 0x1f74000, 48 blocks of 16KiB, runtime class unk=2) is already mapped. It is
+ * the only region that serves crashlog and syslog buffers, because the DART
+ * cannot be extended. A block is handed out once, only if it still reads all
+ * zero, so live firmware data is never given away. The reply carries the
+ * requested size; a request smaller than a block still owns the whole block.
+ */
+#define LOG_POOL_DVA      0x1f74000ULL
+#define LOG_POOL_BLOCKS   48
+#define STATIC_DVA_WINDOW 0x10000000000ULL
+
+static bool rtkit_block_is_zero(const u64 *p)
+{
+    for (size_t i = 0; i < SZ_16K / sizeof(*p); i++)
+        if (p[i])
+            return false;
+    return true;
+}
+
+static bool rtkit_alloc_log_pool(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz)
+{
+    if (!rtk->dart || strcmp(rtk->name, "dcp") || !sz || sz > LOG_POOL_BLOCKS * SZ_16K)
+        return false;
+
+    size_t blocks = ALIGN_UP(sz, SZ_16K) / SZ_16K;
+    for (size_t start = rtk->log_pool_next; start + blocks <= LOG_POOL_BLOCKS; start++) {
+        u64 dva = LOG_POOL_DVA + start * SZ_16K;
+        u8 *phys = dart_translate_silent(rtk->dart, dva);
+        bool usable = phys != NULL;
+        for (size_t i = 0; usable && i < blocks; i++) {
+            u8 *blk = dart_translate_silent(rtk->dart, dva + i * SZ_16K);
+            usable = blk == phys + i * SZ_16K && rtkit_block_is_zero((u64 *)blk);
+        }
+        if (!usable)
+            continue;
+
+        rtk->log_pool_next = start + blocks;
+        bfr->dva = dva | STATIC_DVA_WINDOW;
+        bfr->bfr = phys;
+        bfr->sz = sz;
+        bfr->owned = false;
+        rtkit_printf("log pool: size %#zx -> blocks %zu..%zu dva %#lx phys %p\n", sz, start,
+                     start + blocks - 1, (unsigned long)bfr->dva, phys);
+        return true;
+    }
+
+    rtkit_printf("log pool: no free zero blocks for size %#zx (next %u)\n", sz,
+                 (unsigned)rtk->log_pool_next);
+    return false;
+}
+
 static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *msg,
                                         struct rtkit_buffer *bfr)
 {
     size_t n_4kpages = FIELD_GET(MSG_BUFFER_REQUEST_SIZE, msg->msg);
     size_t sz = n_4kpages << 12;
     u64 addr = FIELD_GET(MSG_BUFFER_REQUEST_IOVA, msg->msg);
+
+    rtkit_printf("buffer request ep 0x%02x type %u size %#zx iova %#lx\n", msg->ep,
+                 (unsigned)FIELD_GET(MGMT_TYPE, msg->msg), sz, addr);
 
     if (rtk->sram) {
         if (!addr) {
@@ -350,7 +410,9 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
                 goto send_reply;
             }
         }
-        if (!rtkit_alloc_buffer(rtk, bfr, sz)) {
+        if (!rtkit_alloc_buffer(rtk, bfr, sz) &&
+            !((msg->ep == RTKIT_EP_CRASHLOG || msg->ep == RTKIT_EP_SYSLOG) &&
+              rtkit_alloc_log_pool(rtk, bfr, sz))) {
             rtkit_printf("unable to allocate buffer\n");
             return false;
         }
@@ -414,7 +476,7 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
         return false;
     }
 
-    if (!rtkit_alloc_buffer(rtk, bfr, sz)) {
+    if (!rtkit_alloc_buffer(rtk, bfr, sz) && !rtkit_alloc_log_pool(rtk, bfr, sz)) {
         rtkit_printf("unable to allocate oslog buffer\n");
         return false;
     }
@@ -487,6 +549,11 @@ int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg)
 
         msg->msg = asc_msg.msg0;
         msg->ep = (u8)asc_msg.msg1;
+
+        if (rtk->rx_printed < RTKIT_RX_PRINT_MAX) {
+            rtk->rx_printed++;
+            rtkit_printf("rx ep 0x%02x msg 0x%lx\n", msg->ep, msg->msg);
+        }
 
         /* if this is an app message we can just forward it to the caller */
         if (msg->ep >= 0x20)
