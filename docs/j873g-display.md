@@ -1,4 +1,4 @@
-# J873g USB-C display
+# J873g display
 
 This path targets the outermost rear USB-C connector, farthest from HDMI,
 using ATC3 and the firmware-initialized DCP/DART state. It must validate the
@@ -15,14 +15,38 @@ Qualification requires a fresh RAM boot, HPD and DPCD evidence, four trained
 lanes, an acknowledged modeset, framebuffer readback, and visible output on the
 physical monitor. A framebuffer image alone does not prove the USB-C link.
 Then hand over the active simple-framebuffer to U-Boot/Linux and verify both
-the console and display persist. Save exact image hashes, raw logs and receipts.
+the console and display persist. Save exact image hashes and raw logs.
 
-On J873g, m1n1 now initializes the qualified ATC3 direct DisplayPort route
-automatically when firmware provides its dummy framebuffer. It starts at
-1280x720 at 60 Hz and enables the normal m1n1 console and logo. A real firmware
-framebuffer is adopted unchanged, including one supplied for HDMI; this does
-not add or qualify a new HDMI PHY initialization path. An unsupported or absent
-USB-C connection leaves the KIS proxy available.
+When firmware provides its dummy framebuffer, startup now tries the built-in
+HDMI PHY before the ATC3 direct DisplayPort route. Both routes request
+1280x720 at 60 Hz. A disconnected HDMI sink permits the USB-C attempt;
+missing PHY nodes, initialization errors and failed modesets stop initialization.
+A real firmware framebuffer remains unchanged. The HDMI changes have compiled
+CPU checks only; physical display and Linux handoff qualification remain open.
+
+The latest RAM diagnostic passed static firmware mapping checks and reached
+RTKit v12. Endpoint 4 then requested a fresh 16 KiB IOReport buffer. Its
+allocation failed at the locked DART mapping boundary, before either PHY ran.
+The native driver maps owned backing through the protected monitor. The loader
+has no proven monitor ABI or ownership contract; mapping failure remains fatal.
+
+T8152 RAM reloads require the Mach-O image, including runtime stacks and BSS.
+The host places the complete image and firmware block in fresh RAM. It checks
+the destination, staging block and next heap against preserved physical ranges.
+Do not reload a raw image over the enrolled loader or change inherited DART mappings.
+The host preserves cold T8152 secondary reset vectors. Native SMP owns their
+vector addresses, cache publication and release sequence after relocation.
+
+KIS memory writes retain the requested length and checksum. The shared transport
+combines data and its optional sentinel before word padding. Do not install a
+per-loader write adapter.
+
+The native ASCWrap `_dartMapiBootFirmware` routine excludes raw ADT bit 1
+records before it creates static firmware maps. The loader applies this rule
+without changing the inherited state of excluded records. For included records,
+DCP firmware reuse checks every page against the recorded physical backing.
+A hole or a conflicting translation fails before modifying a partial mapping.
+The loader retains the recorded remap domain and preserves locked DART roots.
 
 From a fresh RAM-loaded candidate with no secondary CPUs started, run
 `proxyclient/experiments/t8152-display.py build/m1n1.bin SHA256 --device PORT
@@ -42,7 +66,7 @@ console remains silent. The finite console ring retains the most recent text.
 Routine successful AFKv2 packet/callback and per-lane tuning traces use debug
 logging; errors and display startup summaries remain visible.
 
-The native automatic boot and history replay were checked on physical J873g.
+The USB-C-only baseline completed native boot and history replay on physical J873g.
 This image was read from the actual scanout framebuffer with the capture tool's
 default observation mode, before any host display-initialization call:
 
@@ -61,7 +85,7 @@ must retain those allocations and build its framebuffer node from the updated
 the original firmware boot arguments. U-Boot's J873 configuration already enables
 `VIDEO_SIMPLE`, `NO_FB_CLEAR` and the video console.
 
-The physical J873g run trained four HBR lanes and acknowledged the 1280x720
+The USB-C-only baseline trained four HBR lanes and acknowledged the 1280x720
 modeset. Public U-Boot inherited the framebuffer and booted Aurora WIP Linux;
 Linux bound its framebuffer console and passed twelve-CPU and bounded frequency
 workloads. The operator confirmed the Linux console and test banner were visible

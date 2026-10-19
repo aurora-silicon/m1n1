@@ -262,14 +262,15 @@ static int dptxport_call_get_max_drive_settings(afk_epic_service_t *service, voi
 static int dptxport_call_get_max_link_rate(afk_epic_service_t *service, void *reply_,
                                            size_t reply_size)
 {
-    UNUSED(service);
+    dptx_port_t *port = service->cookie;
     struct dptxport_apcall_link_rate *reply = reply_;
 
     if (reply_size < sizeof(*reply))
         return -1;
 
     reply->retcode = 0;
-    reply->link_rate = LINK_RATE_HBR3;
+    /* Capability from the PHY (HBR today); never overstate as HBR3. */
+    reply->link_rate = (port && port->phy) ? dptx_phy_max_link_rate(port->phy) : LINK_RATE_HBR;
 
     return 0;
 }
@@ -371,6 +372,15 @@ static int dptxport_call_set_link_rate(afk_epic_service_t *service, const void *
         return -1;
 
     link_rate = request->link_rate;
+
+    /* Gate against the PHY capability (HBR today); codes are monotonic. */
+    if (link_rate && port->phy && link_rate > dptx_phy_max_link_rate(port->phy)) {
+        printf("DPTXPort: link rate 0x%x exceeds PHY max 0x%x, rejecting\n", link_rate,
+               dptx_phy_max_link_rate(port->phy));
+        reply->retcode = 0;
+        reply->link_rate = port->link_rate;
+        return 0;
+    }
 
     switch (link_rate) {
         case LINK_RATE_RBR:
@@ -566,17 +576,40 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
             return dptx_phy_set_route(port->phy, command == DPTX_APCALL_DID_CHANGE_LINK_CONFIG)
                        ? 0xe00002bc : 0;
         case DPTX_APCALL_GET_MAX_LINK_RATE:
-            value = LINK_RATE_HBR;
+            value = (port && port->phy) ? dptx_phy_max_link_rate(port->phy) : LINK_RATE_HBR;
             break;
         case DPTX_APCALL_GET_LINK_RATE:
             value = port->link_rate;
             break;
-        case DPTX_APCALL_SET_LINK_RATE:
+        case DPTX_APCALL_SET_LINK_RATE: {
             if (!data || data_size < 17)
                 return 0xe00002c2;
-            if (((const u8 *)data)[16] != LINK_RATE_HBR || port->link_rate != LINK_RATE_HBR)
+            u8 rate = ((const u8 *)data)[16];
+            u32 phy_rate;
+            switch (rate) {
+                case LINK_RATE_RBR:
+                    phy_rate = 1620;
+                    break;
+                case LINK_RATE_HBR:
+                    phy_rate = 2700;
+                    break;
+                case LINK_RATE_HBR2:
+                    phy_rate = 5400;
+                    break;
+                case LINK_RATE_HBR3:
+                    phy_rate = 8100;
+                    break;
+                default:
+                    return 0xe00002c7;
+            }
+            /* Capability ceiling (HBR today); drop the artificial "must already be HBR". */
+            if (port->phy && rate > dptx_phy_max_link_rate(port->phy))
                 return 0xe00002c7;
-            return dptx_phy_set_link_rate(port->phy, 2700) ? 0xe00002bc : 0;
+            if (dptx_phy_set_link_rate(port->phy, phy_rate))
+                return 0xe00002bc; /* PHY failure: state unchanged */
+            port->link_rate = port->pending_link_rate = rate;
+            return 0;
+        }
         case DPTX_APCALL_GET_MAX_LANE_COUNT:
             value = 4;
             break;

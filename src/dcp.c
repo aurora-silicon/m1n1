@@ -127,11 +127,29 @@ static int dcp_create_firmware_mappings(const display_config_t *cfg, dcp_dev_t *
     unsigned int count = segments_len / sizeof(*seg);
 
     for (unsigned int i = 0; i < count; i++) {
-        u64 iova = seg[i].remap & ~asc_dram_mask;
-        if (dart_translate_silent(dcp->dart_dcp, iova))
+        if (seg[i].unk & BIT(1))
             continue;
-
+        u64 iova = seg[i].remap & ~asc_dram_mask;
         size_t len = ALIGN_UP(seg[i].size, SZ_16K);
+        bool mapped = false, missing = false;
+        for (size_t off = 0; off < len; off += SZ_16K) {
+            uintptr_t phys = (uintptr_t)dart_translate_silent(dcp->dart_dcp, iova + off);
+            if (!phys) {
+                missing = true;
+            } else if (phys != seg[i].phys + off) {
+                printf("dcp: Conflicting firmware mapping for segment #%u at %lx\n", i,
+                       iova + off);
+                return -1;
+            } else {
+                mapped = true;
+            }
+        }
+        if (!missing)
+            continue;
+        if (mapped) {
+            printf("dcp: Incomplete firmware mapping for segment #%u\n", i);
+            return -1;
+        }
         u32 flags = i == 0 ? 0b0100 : 0; // TEXT gets this bit set?
         printf("dcp: Mapping segment #%u %lx -> %lx [%lx]\n", i, iova, seg[i].phys, len);
         if (dart_map_flags(dcp->dart_dcp, iova, (void *)seg[i].phys, len, flags)) {

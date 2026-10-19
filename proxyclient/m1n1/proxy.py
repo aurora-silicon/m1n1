@@ -411,6 +411,10 @@ class UartInterface(Reloadable):
         if self.debug:
             print("<< DATA:")
             chexdump(data)
+        if self.is_kis:
+            if self.enabled_features & Feature.DISABLE_DATA_CSUMS:
+                data += struct.pack("<I", self.DATA_END_SENTINEL)
+            data += b"\0" * (-len(data) % 4)
         for i in range(0, len(data), 8192):
             self.dev.write(data[i:i + 8192])
             if progress:
@@ -418,7 +422,7 @@ class UartInterface(Reloadable):
                 sys.stdout.flush()
         if progress:
             print()
-        if self.enabled_features & Feature.DISABLE_DATA_CSUMS:
+        if not self.is_kis and self.enabled_features & Feature.DISABLE_DATA_CSUMS:
             # Extra sentinel after the data to make sure no data is lost
             self.dev.write(struct.pack("<I", self.DATA_END_SENTINEL))
 

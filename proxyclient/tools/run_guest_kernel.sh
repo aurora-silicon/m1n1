@@ -85,7 +85,7 @@ EOF
 fi
 
 echo "Chainloading to updated m1n1..."
-python3 "$base"/chainload.py -r "$base"/../../build/m1n1.bin
+python3 "$base"/chainload.py "$base"/../../build/m1n1.macho
 echo "Starting guest..."
 exec python3 "$base"/run_guest.py \
     -c "load_system_map('$kernel_base/System.map')" "$@" \

@@ -2,10 +2,13 @@
 
 #include "dptx_phy.h"
 #include "atc_phy.h"
+#include "t8152_dptx_port.h"
 #include "malloc.h"
 
 #include "../adt.h"
+#include "../soc.h"
 #include "../utils.h"
+#include "string.h"
 
 #define DPTX_MAX_LANES    4
 #define DPTX_LANE0_OFFSET 0x5000
@@ -16,6 +19,7 @@ enum dptx_type {
     DPTX_PHY_T8112,
     DPTX_PHY_T602X,
     DPTX_PHY_T8152_ATC,
+    DPTX_PHY_T8152_HDMI,
 };
 
 typedef struct dptx_phy {
@@ -34,6 +38,8 @@ int dptx_phy_activate(dptx_phy_t *phy)
         phy->active_lanes = 0;
         return 0;
     }
+    if (phy->type == DPTX_PHY_T8152_HDMI)
+        return t8152_dptx_activate_phy(phy->regs[0]);
     // MMIO: R.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
     // MMIO: W.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
     read32(phy->regs[1] + 0x10);
@@ -225,6 +231,12 @@ int dptx_phy_set_active_lane_count(dptx_phy_t *phy, u32 num_lanes)
         phy->active_lanes = num_lanes;
         return 0;
     }
+    if (phy->type == DPTX_PHY_T8152_HDMI) {
+        int ret = t8152_dptx_set_active_lanes(phy->regs[0], num_lanes);
+        if (!ret)
+            phy->active_lanes = num_lanes;
+        return ret;
+    }
     u32 l;
 
     dprintf("DPTX-PHY: set_active_lane_count(%u) phy_regs = {0x%lx, 0x%lx}\n", num_lanes,
@@ -284,6 +296,8 @@ int dptx_phy_set_link_rate(dptx_phy_t *phy, u32 link_rate)
 {
     if (phy->type == DPTX_PHY_T8152_ATC)
         return link_rate % 270 ? -1 : atc_phy_set_link_rate(phy->atc, link_rate / 270);
+    if (phy->type == DPTX_PHY_T8152_HDMI)
+        return t8152_dptx_program_rate(phy->regs[0], phy->regs[1], link_rate);
     UNUSED(link_rate);
     u32 sts_1008, sts_1014;
 
@@ -481,6 +495,12 @@ int dptx_phy_set_link_rate(dptx_phy_t *phy, u32 link_rate)
 
 int dptx_phy_deactivate(dptx_phy_t *phy)
 {
+    if (phy && phy->type == DPTX_PHY_T8152_HDMI) {
+        int ret = t8152_dptx_phy_power_down(phy->regs[0]);
+        if (!ret)
+            phy->active_lanes = 0;
+        return ret;
+    }
     if (!phy || phy->type != DPTX_PHY_T8152_ATC)
         return -1;
     int ret = atc_phy_deactivate(phy->atc);
@@ -505,8 +525,20 @@ u32 dptx_phy_dcp_output(dptx_phy_t *phy)
             return 4;
         case DPTX_PHY_T8152_ATC:
             return 3;
+        case DPTX_PHY_T8152_HDMI:
+            return 4;
         default:
             return 5;
+    }
+}
+
+u32 dptx_phy_max_link_rate(dptx_phy_t *phy)
+{
+    switch (phy->type) {
+        case DPTX_PHY_T8152_ATC:
+        case DPTX_PHY_T8152_HDMI:
+        default:
+            return 0x0a;
     }
 }
 
@@ -527,6 +559,10 @@ dptx_phy_t *dptx_phy_init(const char *phy_node, u32 dcp_index)
         type = DPTX_PHY_T602X;
     else if (adt_is_compatible(adt, node, "atc-phy,t8152"))
         type = DPTX_PHY_T8152_ATC;
+    else if (chip_id == T8152 && board_id == 0x24 &&
+             adt_is_compatible(adt, 0, "J873gAP") &&
+             !strcmp(phy_node, "/arm-io/dptx-phy"))
+        type = DPTX_PHY_T8152_HDMI;
     else {
         printf("DPtx-phy: dptx-phy node %s is not compatible\n", phy_node);
         return NULL;
@@ -548,15 +584,22 @@ dptx_phy_t *dptx_phy_init(const char *phy_node, u32 dcp_index)
         return phy;
     }
 
-    if (adt_get_reg(adt, adt_phy_path, "reg", 0, &phy->regs[0], NULL) < 0) {
+    u64 size0 = 0, size1 = 0;
+
+    if (adt_get_reg(adt, adt_phy_path, "reg", 0, &phy->regs[0], &size0) < 0) {
         printf("DPtx-phy: failed to get %s.reg[0]\n", phy_node);
         goto out_err;
     }
 
-    if (adt_get_reg(adt, adt_phy_path, "reg", 1, &phy->regs[1], NULL) < 0) {
+    if (adt_get_reg(adt, adt_phy_path, "reg", 1, &phy->regs[1], &size1) < 0) {
         printf("DPtx-phy: failed to get %s.reg[1]\n", phy_node);
         goto out_err;
     }
+
+    if (type == DPTX_PHY_T8152_HDMI &&
+        (phy->regs[0] != 0x31a740000ULL || size0 != 0x10000 ||
+         phy->regs[1] != 0x31a700000ULL || size1 != 0x4000))
+        goto out_err;
 
     return phy;
 

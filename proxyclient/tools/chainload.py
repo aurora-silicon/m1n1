@@ -27,6 +27,11 @@ from m1n1.setup import *
 from m1n1.tgtypes import BootArgs_r1, BootArgs_r2, BootArgs_r3
 from m1n1.macho import MachO
 from m1n1 import asm
+from m1n1.chainload import check_span, preserved_regions
+
+fresh_reload = p.get_chipid() == 0x8152
+if fresh_reload and args.raw:
+    raise ValueError("T8152 reload requires Mach-O runtime extents, not a raw image")
 
 new_base = u.base
 
@@ -59,6 +64,15 @@ preoslog_off = align(sepfw_length)
 bootargs_off = preoslog_off + align(preoslog_size)
 bootargs_size = 0x4000
 fw_size = bootargs_off + bootargs_size
+
+regions = []
+if fresh_reload:
+    regions = preserved_regions(u.adt)
+    regions.append(("live Stage 1", u.ba.phys_base, u.heap_base - u.ba.phys_base))
+    regions.append(("framebuffer", u.ba.video.base, u.ba.video.stride * u.ba.video.height))
+    new_base = u.memalign(0x4000, image_only_size + fw_size)
+    check_span(new_base, image_only_size + fw_size, u.ba.phys_base, u.ba.mem_size, regions)
+    entry += new_base - u.base
 packed_end = new_base + image_only_size + fw_size
 
 if not (u.ba.phys_base <= new_base < u.ba.phys_base + u.ba.mem_size):
@@ -98,9 +112,18 @@ if park_fw:
 
 copy_size = image_only_size if park_fw else image_only_size + fw_size
 print(f"Copy span: 0x{copy_size:x} bytes; firmware block: 0x{fw_dest:x}")
-image_addr = p.memalign(0x4000, copy_size + 0x4000)
+image_addr = (u.memalign if fresh_reload else p.memalign)(0x4000, copy_size + 0x4000)
 if not image_addr:
     raise MemoryError("No aligned staging block")
+if fresh_reload:
+    check_span(image_addr, copy_size + 0x4000, u.ba.phys_base, u.ba.mem_size, regions)
+    heap_cursor = u.heap.offset
+    reload_top = 0
+    for blocks, used in u.heap.blocks:
+        heap_cursor += blocks * u.heap.block
+        if used:
+            reload_top = heap_cursor
+    check_span(reload_top, 128 * 1024 * 1024, u.ba.phys_base, u.ba.mem_size, regions)
 fw_stage = fw_dest if park_fw else image_addr + image_only_size
 
 print(f"Loading kernel image (0x{len(image):x} bytes)...")
@@ -146,10 +169,8 @@ if rvbar != u.base:
     for cpu in u.adt["cpus"]:
         if cpu.state == "running":
             continue
-        if u.adt["/chosen"].chip_id == 0x8142:
-            # Host writes to a cold T8142 secondary's RVBAR can wedge CPU0.
-            # Leave the cold cores and their reset vectors to the next stage.
-            print(f"  {cpu.name}: preserving T8142 secondary RVBAR")
+        if u.adt["/chosen"].chip_id in (0x8142, 0x8152):
+            print(f"  {cpu.name}: preserving secondary RVBAR for native SMP")
             continue
         addr, size = cpu.cpu_impl_reg
         if p.read64(addr) & 1:
@@ -164,6 +185,8 @@ print("Setting up bootargs...")
 tba = u.ba.copy()
 
 tba.top_of_kernel_data = max(image_end, fw_dest + fw_size, live_heap, inherited_top, ro_end)
+if fresh_reload:
+    tba.top_of_kernel_data = max(tba.top_of_kernel_data, reload_top)
 
 if len(args.boot_args) > 0:
     boot_args = " ".join(args.boot_args)

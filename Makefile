@@ -136,6 +136,7 @@ DCP_OBJECTS := $(patsubst %,dcp/%, \
 	atc_phy.o \
 	dpav_ep.o \
 	dptx_phy.o \
+	t8152_dptx_port.o \
 	dptx_port_ep.o \
 	parser.o \
 	system_ep.o)

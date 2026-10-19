@@ -1,0 +1,149 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * AppleT8152DPTXPort PHY sequences from the 26A434 crossbar disassembly.
+ * Addresses are the kext runtime addresses in mac18g-t8152-hdmi-disasm.txt.
+ * set_field matches vtable+0xa28 (discriminator 0x170e): offset, shift, mask, value.
+ */
+#include "t8152_dptx_port.h"
+
+#include "../utils.h"
+
+#include "t8152_dptx_pll.h"
+
+#define T8152_LANE0  0x4500
+#define T8152_LANE_STRIDE 0x2800
+#define T8152_CAL_POLLS 100000
+
+static void set_field(u64 base, u32 offset, u32 shift, u32 mask, u32 value)
+{
+    mask32(base + offset, mask, (value << shift) & mask);
+}
+
+int t8152_dptx_activate_phy(u64 base)
+{
+    /* 0xfffffe0009138fb4. phyPowerUp at 0xfffffe000913a34c is ret and is not called. */
+    set_field(base, 0x1c00, 4, 0x3f0, 0x3c);
+    set_field(base, 0, 0, 0x1, 1);
+    return 0;
+}
+
+int t8152_dptx_phy_power_down(u64 base)
+{
+    /* 0xfffffe000913a354: clear bit 0 of 0x2400. */
+    set_field(base, 0x2400, 0, 0x1, 0);
+    return 0;
+}
+
+static u32 unused_lane_mask(u32 lanes)
+{
+    /* Const table at 0xfffffe00073cf020/030, simulated for 1..4:
+     * 1 -> 0xe, 2 -> 0xc, 3 -> 0x8, 4 -> 0. */
+    return (~((1u << lanes) - 1u)) & 0xf;
+}
+
+int t8152_dptx_set_active_lanes(u64 base, u32 lanes)
+{
+    static const struct {
+        u16 off;
+        u8 shift;
+        u32 mask;
+    } fields[] = {
+        {0x64, 4, 0x10}, {0x24, 4, 0x10}, {0x24, 1, 0x2},  {0x48, 0, 0x1},
+        {0x48, 1, 0x2},  {0x5c, 2, 0x4},  {0x5c, 3, 0x8}, {0x48, 4, 0x10},
+    };
+    u32 mask;
+    u32 lane;
+
+    if (lanes == 0)
+        return 0;
+    if (lanes > 4)
+        return -1;
+
+    mask = unused_lane_mask(lanes);
+    /* 0xfffffe000913a454: drop bit 0 of 0x2400 before the per-lane writes. */
+    set_field(base, 0x2400, 0, 0x1, 0);
+    for (lane = 0; lane < 4; lane++) {
+        u32 bit = (mask >> lane) & 1;
+        u32 origin = T8152_LANE0 + lane * T8152_LANE_STRIDE;
+        size_t i;
+
+        for (i = 0; i < ARRAY_SIZE(fields); i++)
+            set_field(base, origin + fields[i].off, fields[i].shift, fields[i].mask, bit);
+    }
+    /* 0xfffffe000913ab80 and 0xfffffe000913abb4. */
+    set_field(base, 0x2420, 0, 0xf, mask);
+    set_field(base, 0x2400, 0, 0x1, 1);
+    return 0;
+}
+
+int t8152_dptx_calibrate(u64 base)
+{
+    u32 polls;
+
+    /* 0xfffffe000913a070. Bit 0 of 0x1c04 is the done flag.
+     * 0xfffffe00091561f8 is _IODelay. The poll passes 10, so the wait is 10 us. */
+    if (!(read32(base + 0x1c04) & 1)) {
+        for (polls = 0; polls < T8152_CAL_POLLS; polls++) {
+            udelay(10);
+            if (read32(base + 0x1c04) & 1)
+                break;
+        }
+        if (polls == T8152_CAL_POLLS)
+            return -1;
+    }
+
+    set_field(base, 0x1c00, 4, 0x3f0, 0x3f);
+    set_field(base, 0x1c18, 15, 0x3f8000, (read32(base + 0x1c24) >> 6) & 0x7f);
+    set_field(base, 0x1c18, 14, 0x4000, 1);
+    return 0;
+}
+
+int t8152_dptx_apply_rate(u64 base, u32 link_rate_mbps)
+{
+    /* phyPowerUp is a native ret. Do not call it. Reject a bad rate before any write. */
+    if (t8152_dptx_pll_configure_fields(base, link_rate_mbps))
+        return -1;
+    return t8152_dptx_calibrate(base);
+}
+
+int t8152_dptx_shadow_update(u64 block0)
+{
+    /* 0xfffffe000912041c. Block0+0xa0: set 8, set 4, set/clear 0x40000,
+     * set/clear 0x80000, clear 4, clear 8. */
+    u64 reg = block0 + 0xa0;
+
+    mask32(reg, 0x8, 0x8);
+    mask32(reg, 0x4, 0x4);
+    mask32(reg, 0x40000, 0x40000);
+    mask32(reg, 0x40000, 0);
+    mask32(reg, 0x80000, 0x80000);
+    mask32(reg, 0x80000, 0);
+    mask32(reg, 0x4, 0);
+    mask32(reg, 0x8, 0);
+    return 0;
+}
+
+int t8152_dptx_latch_rate(u64 base, u32 link_rate_mbps)
+{
+    /* 0xfffffe00091395c8 calls _IODPLinkBitRateIsUHBR(rate) and the tail
+     * writes that return to 0x2400 shift 2 mask 4. The four rates this
+     * driver programs are not UHBR, so the bit is cleared. */
+    if (link_rate_mbps != 1620 && link_rate_mbps != 2700 &&
+        link_rate_mbps != 5400 && link_rate_mbps != 8100)
+        return -1;
+    set_field(base, 0x2400, 2, 4, 0);
+    return 0;
+}
+
+int t8152_dptx_program_rate(u64 port, u64 block0, u32 link_rate_mbps)
+{
+    if (!block0)
+        return -1;
+    if (t8152_dptx_pll_configure_fields(port, link_rate_mbps))
+        return -1;
+    if (t8152_dptx_shadow_update(block0))
+        return -1;
+    if (t8152_dptx_latch_rate(port, link_rate_mbps))
+        return -1;
+    return t8152_dptx_calibrate(port);
+}
