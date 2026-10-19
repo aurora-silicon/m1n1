@@ -8,6 +8,7 @@
 #include "../adt.h"
 #include "../soc.h"
 #include "../utils.h"
+#include "../pmgr.h"
 #include "string.h"
 
 #define DPTX_MAX_LANES    4
@@ -38,8 +39,21 @@ int dptx_phy_activate(dptx_phy_t *phy)
         phy->active_lanes = 0;
         return 0;
     }
-    if (phy->type == DPTX_PHY_T8152_HDMI)
+    if (phy->type == DPTX_PHY_T8152_HDMI) {
+        /* The stock loader leaves the DPTX PHY power domain off; the first
+         * MMIO access data-aborts (ESR 0x96004410, live 2026-10-19). Power the
+         * /arm-io/dptx-phy power-gates (ADT: power-gates = <5>), then read a
+         * harmless config register before the first write. */
+        int pret = pmgr_adt_power_enable("/arm-io/dptx-phy");
+        if (pret < 0) {
+            printf("dptx: power enable /arm-io/dptx-phy FAILED (%d); skipping PHY MMIO\n", pret);
+            return -1;
+        }
+        u32 probe = read32(phy->regs[0] + 0x10);
+        printf("dptx: power enable /arm-io/dptx-phy -> %d; %lx+0x10 reads 0x%x\n", pret,
+               phy->regs[0], probe);
         return t8152_dptx_activate_phy(phy->regs[0]);
+    }
     // MMIO: R.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
     // MMIO: W.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
     read32(phy->regs[1] + 0x10);
