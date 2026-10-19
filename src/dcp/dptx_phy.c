@@ -28,6 +28,7 @@ typedef struct dptx_phy {
     enum dptx_type type;
     u32 dcp_index;
     u32 active_lanes;
+    bool powered;
     atc_phy_t *atc;
 } dptx_phy_t;
 
@@ -41,18 +42,21 @@ int dptx_phy_activate(dptx_phy_t *phy)
     }
     if (phy->type == DPTX_PHY_T8152_HDMI) {
         /* The stock loader leaves the DPTX PHY power domain off; the first
-         * MMIO access data-aborts (ESR 0x96004410, live 2026-10-19). Power the
-         * /arm-io/dptx-phy power-gates (ADT: power-gates = <5>), then read a
-         * harmless config register before the first write. */
-        int pret = pmgr_adt_power_enable("/arm-io/dptx-phy");
+         * MMIO access data-aborts (ESR 0x96004410, live 2026-10-19). The ADT
+         * node's power-gates = <5> resolves to ECPU_4, NOT the PHY (Y,
+         * 2026-10-19); the real device is the pmgr child "DPTX_PHY" (id 0xa7),
+         * so power it by name. Never touch the PHY MMIO unless that succeeds. */
+        int pret = pmgr_power_on(0, "DPTX_PHY");
         if (pret < 0) {
-            printf("dptx: power enable /arm-io/dptx-phy FAILED (%d); skipping PHY MMIO\n", pret);
+            printf("dptx: pmgr DPTX_PHY power-on FAILED (%d); skipping PHY MMIO\n", pret);
             return -1;
         }
         u32 probe = read32(phy->regs[0] + 0x10);
-        printf("dptx: power enable /arm-io/dptx-phy -> %d; %lx+0x10 reads 0x%x\n", pret,
-               phy->regs[0], probe);
-        return t8152_dptx_activate_phy(phy->regs[0]);
+        printf("dptx: DPTX_PHY powered (ret %d); %lx+0x10 reads 0x%x\n", pret, phy->regs[0],
+               probe);
+        int aret = t8152_dptx_activate_phy(phy->regs[0]);
+        phy->powered = !aret;
+        return aret;
     }
     // MMIO: R.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
     // MMIO: W.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
@@ -510,9 +514,15 @@ int dptx_phy_set_link_rate(dptx_phy_t *phy, u32 link_rate)
 int dptx_phy_deactivate(dptx_phy_t *phy)
 {
     if (phy && phy->type == DPTX_PHY_T8152_HDMI) {
+        /* The PHY MMIO aborts unless the power-on succeeded (live
+         * ESR 0x96004410 in the deactivate path, 2026-10-19). */
+        if (!phy->powered)
+            return 0;
         int ret = t8152_dptx_phy_power_down(phy->regs[0]);
-        if (!ret)
+        if (!ret) {
             phy->active_lanes = 0;
+            phy->powered = false;
+        }
         return ret;
     }
     if (!phy || phy->type != DPTX_PHY_T8152_ATC)
