@@ -323,11 +323,40 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
         return true;
 
     } else {
+        /*
+         * Locked Gen3 DART (T8152 DCP): the DART tables are SPTM-owned and
+         * cannot be extended. For the IREPORT buffer request (ep 0x04,
+         * 16KiB), the native design pre-maps segment #6 of the DCP child
+         * node's segment-ranges: DVA 0x1f70000, phys 0x107e54d0000, size
+         * 0x4000, unk=0x2 (runtime class). It is already valid-mapped in
+         * the static table. Reply with that DVA instead of alloc+map.
+         * Y confirmed: no kernel consumer of seg6; native adopts the
+         * pre-loaded records. Never call dart_map here.
+         *
+         * Gated on (ep==IOREPORT && sz==SZ_16K): if dart_translate
+         * succeeds, the mapping exists; if not, fall through to the
+         * normal alloc path (fails on locked DART, correctly).
+         */
+        if (msg->ep == RTKIT_EP_IOREPORT && sz == SZ_16K && rtk->dart) {
+            u64 static_dva = 0x1f70000; /* seg#6, live pt dump */
+            void *static_buf = dart_translate(rtk->dart, static_dva);
+            if (static_buf) {
+                bfr->dva = static_dva | 0x10000000000ULL; /* full DVA with vm-base window */
+                bfr->bfr = static_buf;
+                bfr->sz = sz;
+                bfr->owned = false;
+                rtkit_printf("locked Gen3: reusing static IREPORT buffer "
+                             "at DVA 0x%lx\n", (unsigned long)static_dva);
+                goto send_reply;
+            }
+        }
         if (!rtkit_alloc_buffer(rtk, bfr, sz)) {
             rtkit_printf("unable to allocate buffer\n");
             return false;
         }
     }
+
+send_reply:
 
     struct asc_message reply;
     reply.msg1 = msg->ep;
