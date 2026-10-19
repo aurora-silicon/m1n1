@@ -7,7 +7,7 @@
 #include "malloc.h"
 #include "memory.h"
 #include "string.h"
-#include "utils.h"
+#include "exception.h"
 
 #include "libfdt/libfdt.h"
 
@@ -649,8 +649,32 @@ static u64 *dart_get_l2(dart_dev_t *dart, u32 idx)
     memset(tbl, 0, SZ_16K);
 
     u64 offset = FIELD_PREP(dart->params->offset_mask, ((u64)tbl) >> DART_PTE_OFFSET_SHIFT);
+    u64 entry = offset | DART_PTE_VALID;
 
-    dart->l1[ttbr][idx] = offset | DART_PTE_VALID;
+    if (dart->keep) {
+        /* Adopted tables: publish into the LIVE firmware root with a guarded
+         * store. A protected or rejected root fails this mapping, not the
+         * boot. Never called for TTBR/TCR/PROTECT - table entries only. */
+        enum exc_guard_t guard_save = exc_guard;
+        int count_save = exc_count;
+        exc_count = 0;
+        exc_guard = GUARD_SKIP | GUARD_SILENT;
+        dma_wmb();
+        dart->l1[ttbr][idx] = entry;
+        u64 readback = dart->l1[ttbr][idx];
+        exc_guard = guard_save;
+        u32 faults = exc_count;
+        exc_count = count_save;
+        printf("dart: publish L1[%d][%u] = 0x%lx readback 0x%lx faults %u\n", ttbr, idx, entry,
+               readback, faults);
+        if (faults || readback != entry) {
+            printf("dart: L1 publish rejected\n");
+            free(tbl);
+            return NULL;
+        }
+    } else {
+        dart->l1[ttbr][idx] = entry;
+    }
 
     return tbl;
 }
@@ -674,13 +698,19 @@ static int dart_map_page(dart_dev_t *dart, uintptr_t iova, uintptr_t paddr, u32 
     u64 offset = FIELD_PREP(dart->params->offset_mask, paddr >> DART_PTE_OFFSET_SHIFT);
 
     l2[l2_index] = offset | dart->params->pte_flags | flags;
+    if (dart->keep)
+        printf("dart: L2[0x%x] iova 0x%lx <- 0x%lx (readback 0x%lx)\n", l2_index, iova,
+               l2[l2_index], l2[l2_index]);
 
     return 0;
 }
 
 int dart_map_flags(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len, u32 flags)
 {
-    if (dart->locked)
+    /* Locked ADOPTED Gen3 (M6, research): PTE writes into the live firmware
+     * tables are allowed; every other locked DART still refuses. TTBR, TCR and
+     * PROTECT are never written on this path. */
+    if (dart->locked && !(dart->type == DART_GEN3 && dart->keep))
         return -1;
 
     uintptr_t paddr = (uintptr_t)bfr;
@@ -728,7 +758,7 @@ static void dart_unmap_page(dart_dev_t *dart, uintptr_t iova)
 
 void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
 {
-    if (dart->locked)
+    if (dart->locked && !(dart->type == DART_GEN3 && dart->keep))
         return;
 
     if (len % SZ_16K)
