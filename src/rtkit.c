@@ -75,6 +75,8 @@
 #define RTKIT_MIN_VERSION 11
 #define RTKIT_MAX_VERSION 12
 
+#define RTKIT_RX_PRINT_MAX 1024
+
 #define IOVA_MASK GENMASK(35, 0)
 
 enum rtkit_power_state {
@@ -83,6 +85,17 @@ enum rtkit_power_state {
     RTKIT_POWER_QUIESCED = 0x10,
     RTKIT_POWER_ON = 0x20,
     RTKIT_POWER_INIT = 0x220,
+};
+
+#define STATIC_DVA_WINDOW 0x10000000000ULL
+#define RTKIT_POOL_DVA    0x1e58000ULL
+#define RTKIT_POOL_BLOCKS 64
+
+/* A run of 16KiB blocks of an already-mapped firmware segment, handed out by bump. */
+struct rtkit_static_pool {
+    u64 dva;
+    u32 blocks;
+    u32 next;
 };
 
 struct rtkit_dev {
@@ -108,6 +121,9 @@ struct rtkit_dev {
     u32 syslog_cnt, syslog_size;
 
     bool crashed;
+
+    struct rtkit_static_pool pool;
+    u32 rx_printed;
 };
 
 struct syslog_log {
@@ -169,6 +185,10 @@ rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,
     rtk->iop_power = RTKIT_POWER_OFF;
     rtk->ap_power = RTKIT_POWER_OFF;
     rtk->dva_base = 0;
+
+    if (!strcmp(name, "dcp")) {
+        rtk->pool = (struct rtkit_static_pool){RTKIT_POOL_DVA, RTKIT_POOL_BLOCKS, 0};
+    }
 
     int iop_node = asc_get_iop_node(asc);
     ADT_GETPROP(adt, iop_node, "asc-dram-mask", &rtk->dva_base);
@@ -277,6 +297,57 @@ error:
     return false;
 }
 
+static bool rtkit_block_is_zero(const u64 *p)
+{
+    for (size_t i = 0; i < SZ_16K / sizeof(*p); i++)
+        if (p[i])
+            return false;
+    return true;
+}
+
+/*
+ * Locked Gen3 DART (T8152 DCP): the DART cannot be extended, so a buffer the
+ * normal path cannot map comes from the top 1MiB of DCP segment #5 (DVA
+ * 0x1e58000, 64 blocks of 16KiB). Segment #5 is mapped in the DCP DART only,
+ * unlike segments #6 and #7, which the display engine maps too. A block is
+ * handed out once, only if it still reads all zero, so live firmware data is
+ * never given away. The reply carries the requested size; a request smaller
+ * than a block still owns the whole block.
+ */
+static bool rtkit_alloc_static(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz)
+{
+    struct rtkit_static_pool *pool = &rtk->pool;
+
+    if (!rtk->dart || !pool->blocks || !sz || sz > (size_t)pool->blocks * SZ_16K)
+        return false;
+
+    size_t blocks = ALIGN_UP(sz, SZ_16K) / SZ_16K;
+    for (size_t start = pool->next; start + blocks <= pool->blocks; start++) {
+        u64 dva = pool->dva + start * SZ_16K;
+        u8 *phys = dart_translate_silent(rtk->dart, dva);
+        bool usable = phys != NULL;
+        for (size_t i = 0; usable && i < blocks; i++) {
+            u8 *blk = dart_translate_silent(rtk->dart, dva + i * SZ_16K);
+            usable = blk == phys + i * SZ_16K && rtkit_block_is_zero((u64 *)blk);
+        }
+        if (!usable)
+            continue;
+
+        pool->next = start + blocks;
+        bfr->dva = dva | STATIC_DVA_WINDOW;
+        bfr->bfr = phys;
+        bfr->sz = sz;
+        bfr->owned = false;
+        rtkit_printf("seg5 pool: size %#zx -> blocks %zu..%zu dva %#lx phys %p\n", sz, start,
+                     start + blocks - 1, (unsigned long)bfr->dva, phys);
+        return true;
+    }
+
+    rtkit_printf("seg5 pool: no free zero blocks for size %#zx (next %u)\n", sz,
+                 (unsigned)pool->next);
+    return false;
+}
+
 bool rtkit_free_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr)
 {
     if (!bfr->bfr || !bfr->owned) {
@@ -298,6 +369,9 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
     size_t n_4kpages = FIELD_GET(MSG_BUFFER_REQUEST_SIZE, msg->msg);
     size_t sz = n_4kpages << 12;
     u64 addr = FIELD_GET(MSG_BUFFER_REQUEST_IOVA, msg->msg);
+
+    rtkit_printf("buffer request ep 0x%02x type %u size %#zx iova %#lx\n", msg->ep,
+                 (unsigned)FIELD_GET(MGMT_TYPE, msg->msg), sz, addr);
 
     if (rtk->sram) {
         if (!addr) {
@@ -323,40 +397,11 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
         return true;
 
     } else {
-        /*
-         * Locked Gen3 DART (T8152 DCP): the DART tables are SPTM-owned and
-         * cannot be extended. For the IREPORT buffer request (ep 0x04,
-         * 16KiB), the native design pre-maps segment #6 of the DCP child
-         * node's segment-ranges: DVA 0x1f70000, phys 0x107e54d0000, size
-         * 0x4000, unk=0x2 (runtime class). It is already valid-mapped in
-         * the static table. Reply with that DVA instead of alloc+map.
-         * Y confirmed: no kernel consumer of seg6; native adopts the
-         * pre-loaded records. Never call dart_map here.
-         *
-         * Gated on (ep==IOREPORT && sz==SZ_16K): if dart_translate
-         * succeeds, the mapping exists; if not, fall through to the
-         * normal alloc path (fails on locked DART, correctly).
-         */
-        if (msg->ep == RTKIT_EP_IOREPORT && sz == SZ_16K && rtk->dart) {
-            u64 static_dva = 0x1f70000; /* seg#6, live pt dump */
-            void *static_buf = dart_translate(rtk->dart, static_dva);
-            if (static_buf) {
-                bfr->dva = static_dva | 0x10000000000ULL; /* full DVA with vm-base window */
-                bfr->bfr = static_buf;
-                bfr->sz = sz;
-                bfr->owned = false;
-                rtkit_printf("locked Gen3: reusing static IREPORT buffer "
-                             "at DVA 0x%lx\n", (unsigned long)static_dva);
-                goto send_reply;
-            }
-        }
-        if (!rtkit_alloc_buffer(rtk, bfr, sz)) {
+        if (!rtkit_alloc_buffer(rtk, bfr, sz) && !rtkit_alloc_static(rtk, bfr, sz)) {
             rtkit_printf("unable to allocate buffer\n");
             return false;
         }
     }
-
-send_reply:
 
     struct asc_message reply;
     reply.msg1 = msg->ep;
@@ -414,7 +459,7 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
         return false;
     }
 
-    if (!rtkit_alloc_buffer(rtk, bfr, sz)) {
+    if (!rtkit_alloc_buffer(rtk, bfr, sz) && !rtkit_alloc_static(rtk, bfr, sz)) {
         rtkit_printf("unable to allocate oslog buffer\n");
         return false;
     }
@@ -487,6 +532,11 @@ int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg)
 
         msg->msg = asc_msg.msg0;
         msg->ep = (u8)asc_msg.msg1;
+
+        if (rtk->rx_printed < RTKIT_RX_PRINT_MAX) {
+            rtk->rx_printed++;
+            rtkit_printf("rx ep 0x%02x msg 0x%lx\n", msg->ep, msg->msg);
+        }
 
         /* if this is an app message we can just forward it to the caller */
         if (msg->ep >= 0x20)
