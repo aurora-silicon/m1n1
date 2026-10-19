@@ -127,8 +127,10 @@ static int dcp_create_firmware_mappings(const display_config_t *cfg, dcp_dev_t *
     unsigned int count = segments_len / sizeof(*seg);
 
     for (unsigned int i = 0; i < count; i++) {
-        if (seg[i].unk & BIT(1))
-            continue;
+        /* No skip: the unk flags have no measured semantics. Every segment
+         * is validated against the existing firmware mapping (translate);
+         * remap==phys segments (e.g. segment 4, unk=0xa) validate through
+         * unchanged. Only genuinely missing segments get mapped. */
         u64 iova = seg[i].remap & ~asc_dram_mask;
         size_t len = ALIGN_UP(seg[i].size, SZ_16K);
         bool mapped = false, missing = false;

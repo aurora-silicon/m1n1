@@ -537,8 +537,9 @@ u32 dptx_phy_max_link_rate(dptx_phy_t *phy)
     switch (phy->type) {
         case DPTX_PHY_T8152_ATC:
         case DPTX_PHY_T8152_HDMI:
+            return 0x0a; /* measured T8152 training limit: HBR */
         default:
-            return 0x0a;
+            return 0x1e; /* T8112/T602X keep their previous HBR3 ceiling */
     }
 }
 
