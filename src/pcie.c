@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "adt.h"
+#include "exception.h"
 #include "pcie.h"
 #include "pmgr.h"
 #include "string.h"
@@ -359,6 +360,243 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
         return -1;
     printf("pcie: T8140 ADT preflight passed (%d ports, %d bridges)\n", ports, present);
     return 0;
+}
+
+/*
+ * T8152 (Apple M6) APCIe, PHY half only.
+ *
+ * The register sequences come from AppleT8152PCIe (macOS 27.0.1, kernel 26A425), decoded
+ * offline: _apcieCommonInit, _apcieGPInit (apcie-phy-tunables, _initializeAUS5Phys, PHY common
+ * enable). The root complex and port bring-up of _enableRootComplex are not decoded, so this
+ * code never brings a link up. Nothing here has run on hardware.
+ *
+ * Stages, each gated by the one before:
+ *   1. ADT preflight: no MMIO. Compatible, board, port count, reg geometry, window relations,
+ *      tunable records.
+ *   2. Power the controller, then read every register the sequences touch under an exception
+ *      guard. A fault, or a PHY that is not in the expected idle state, stops here.
+ *   3. Writes, only when built with PCIE_T8152_WRITES=1. Every poll has a timeout.
+ */
+#ifndef PCIE_T8152_WRITES
+#define PCIE_T8152_WRITES 0
+#endif
+
+#define T8152_PORTS       3
+#define T8152_REG_ENTRIES 28 /* 10 shared windows + 6 per port */
+#define T8152_POLL_US     250000
+
+#define T8152_REG_COMMON   1
+#define T8152_REG_PHYBASE  2
+#define T8152_REG_PHY      3
+#define T8152_REG_PHYIP    4
+#define T8152_REG_AXI2AF   5
+#define T8152_REG_CLKGEN   6
+#define T8152_REG_AUS5AON  7
+#define T8152_REG_AUS5TOP  8
+#define T8152_REG_GAPFOCLA 9
+#define T8152_REG_COUNT    10
+
+#define T8152_PHY_CTRL0       0x000
+#define T8152_PHY_CTRL0_RUN   BIT(21)
+#define T8152_PHY_CTRL4       0x004
+#define T8152_PHY_CTRL4_REQ   BIT(4)
+#define T8152_PHY_CTRL4_HOLD  BIT(5)
+#define T8152_PHY_STATUS      0x008
+#define T8152_PHY_STATUS_RST  BIT(4)
+#define T8152_AON_PG_STATUS   0x00c
+#define T8152_AON_PG_CTRL     0x010
+#define T8152_AON_PG_CTRL_ON  BIT(0)
+#define T8152_CLKGEN_CTRL     0x000
+#define T8152_CLKGEN_AUX      0x800
+#define T8152_PHYCMN_OFFSET   0x4000 /* from the PHY base window; inferred */
+#define T8152_PHYCMN_ENABLE   BIT(0)
+
+static const struct {
+    const char *name;
+    u32 idx;
+    u64 min_size;
+} t8152_wins[] = {
+    {"common", T8152_REG_COMMON, 0x4000},     {"phybase", T8152_REG_PHYBASE, 0x800000},
+    {"phy", T8152_REG_PHY, 0x4000},           {"phyip", T8152_REG_PHYIP, 0x1c4000},
+    {"axi2af", T8152_REG_AXI2AF, 0x1000000},  {"clkgen", T8152_REG_CLKGEN, 0x4000},
+    {"aus5aon", T8152_REG_AUS5AON, 0x4000},   {"aus5top", T8152_REG_AUS5TOP, 0x4000},
+    {"gapfocla", T8152_REG_GAPFOCLA, 0x4000},
+};
+
+struct t8152_regs {
+    u64 base[T8152_REG_COUNT];
+    u64 size[T8152_REG_COUNT];
+};
+
+static bool t8152_dirty;
+
+static int t8152_preflight(const char *path, int *adt_path, int adt_offset, struct t8152_regs *r)
+{
+    u32 ports, reg_len;
+
+    if (chip_id != T8152 || board_id != 0x24 || !adt_is_compatible(adt, 0, "J873gAP") ||
+        !adt_is_compatible(adt, adt_offset, "apcie,t8152")) {
+        printf("pcie: T8152 preflight: not a J873g apcie,t8152 node\n");
+        return -1;
+    }
+    if (ADT_GETPROP(adt, adt_offset, "#ports", &ports) < 0 || ports != T8152_PORTS) {
+        printf("pcie: T8152 preflight: expected %d ports\n", T8152_PORTS);
+        return -1;
+    }
+    if (!adt_getprop(adt, adt_offset, "reg", &reg_len) || reg_len != 16 * T8152_REG_ENTRIES) {
+        printf("pcie: T8152 preflight: unexpected reg length\n");
+        return -1;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(t8152_wins); i++) {
+        u32 idx = t8152_wins[i].idx;
+        if (adt_get_reg(adt, adt_path, "reg", idx, &r->base[idx], &r->size[idx]) ||
+            r->size[idx] < t8152_wins[i].min_size || (r->base[idx] & 3) ||
+            r->base[idx] + r->size[idx] > 0x400000000ULL) {
+            printf("pcie: T8152 preflight: bad reg[%d] (%s)\n", idx, t8152_wins[i].name);
+            return -1;
+        }
+    }
+    /* reg[3] is a view into reg[2]; reg[7] sits 0x400 above reg[8]. */
+    if (r->base[T8152_REG_PHY] != r->base[T8152_REG_PHYBASE] + 0x20000 ||
+        r->base[T8152_REG_AUS5AON] != r->base[T8152_REG_AUS5TOP] + 0x400) {
+        printf("pcie: T8152 preflight: window layout differs from the decoded kext\n");
+        return -1;
+    }
+    /* The PHY tunable list is required; AXI2AF tunables are optional. */
+    if (tunables_validate_local(path, "apcie-phy-tunables", r->size[T8152_REG_PHYBASE]) != 0) {
+        printf("pcie: T8152 preflight: apcie-phy-tunables missing or malformed\n");
+        return -1;
+    }
+    if (tunables_validate_local(path, "apcie-axi2af-tunables", r->size[T8152_REG_AXI2AF]) < 0) {
+        printf("pcie: T8152 preflight: apcie-axi2af-tunables malformed\n");
+        return -1;
+    }
+    return 0;
+}
+
+static bool t8152_probe_read(u64 addr, u32 *value)
+{
+    int before = exc_count;
+
+    exc_guard = GUARD_MARK | GUARD_SILENT;
+    u32 v = read32(addr);
+    sysop("dsb sy");
+    sysop("isb");
+    exc_guard = GUARD_OFF;
+    if (exc_count != before)
+        return false;
+    *value = v;
+    return true;
+}
+
+#if PCIE_T8152_WRITES
+static int t8152_phy_init(const char *path, int adt_offset, const struct t8152_regs *r)
+{
+    u64 phy = r->base[T8152_REG_PHY];
+    u64 aon = r->base[T8152_REG_AUS5AON];
+
+    /* _apcieCommonInit. The kext skips this when an unidentified platform stub returns 2. */
+    if (!(read32(aon + T8152_AON_PG_CTRL) & T8152_AON_PG_CTRL_ON))
+        set32(aon + T8152_AON_PG_CTRL, T8152_AON_PG_CTRL_ON);
+    if (adt_getprop(adt, adt_offset, "apcie-axi2af-tunables", NULL) &&
+        tunables_apply_local(path, "apcie-axi2af-tunables", T8152_REG_AXI2AF)) {
+        printf("pcie: T8152 axi2af tunables failed\n");
+        return -1;
+    }
+
+    /* _apcieGPInit */
+    if (tunables_apply_local(path, "apcie-phy-tunables", T8152_REG_PHYBASE)) {
+        printf("pcie: T8152 phy tunables failed\n");
+        return -1;
+    }
+
+    /* _initializeAUS5Phys */
+    set32(phy + T8152_PHY_CTRL4, T8152_PHY_CTRL4_REQ);
+    if (poll32(phy + T8152_PHY_STATUS, T8152_PHY_STATUS_RST, T8152_PHY_STATUS_RST, T8152_POLL_US)) {
+        printf("pcie: T8152 PHY reset status did not set\n");
+        return -1;
+    }
+    clear32(phy + T8152_PHY_CTRL4, T8152_PHY_CTRL4_HOLD);
+    set32(phy + T8152_PHY_CTRL0, T8152_PHY_CTRL0_RUN);
+
+    /* PHY common enable; the block is inferred from the kext's helper (PHY base + 0x4000). */
+    set32(r->base[T8152_REG_PHYBASE] + T8152_PHYCMN_OFFSET, T8152_PHYCMN_ENABLE);
+    return 0;
+}
+#endif
+
+/* Returns 1 when skipped or read-only, -1 when the controller was touched and no link exists. */
+static int pcie_t8152_init(const char *path)
+{
+    struct t8152_regs r = {0};
+    int adt_path[8];
+    int adt_offset;
+
+    if (t8152_dirty) {
+        printf("pcie: T8152 controller already touched; refusing retry\n");
+        return -1;
+    }
+    adt_offset = adt_path_offset_trace(adt, path, adt_path);
+    if (adt_offset < 0) {
+        printf("pcie: T8152 controller %s absent\n", path);
+        return 1;
+    }
+    if (t8152_preflight(path, adt_path, adt_offset, &r))
+        return 1;
+    printf("pcie: T8152 ADT preflight passed\n");
+
+    if (pmgr_adt_power_enable(path)) {
+        printf("pcie: T8152 power enable failed\n");
+        return 1;
+    }
+
+    struct {
+        const char *name;
+        u64 addr;
+        u32 value;
+    } probe[] = {
+        {"phy+0x000", r.base[T8152_REG_PHY] + T8152_PHY_CTRL0, 0},
+        {"phy+0x004", r.base[T8152_REG_PHY] + T8152_PHY_CTRL4, 0},
+        {"phy+0x008", r.base[T8152_REG_PHY] + T8152_PHY_STATUS, 0},
+        {"aus5aon+0x00c", r.base[T8152_REG_AUS5AON] + T8152_AON_PG_STATUS, 0},
+        {"aus5aon+0x010", r.base[T8152_REG_AUS5AON] + T8152_AON_PG_CTRL, 0},
+        {"aus5top+0x00c", r.base[T8152_REG_AUS5TOP] + T8152_AON_PG_STATUS, 0},
+        {"clkgen+0x000", r.base[T8152_REG_CLKGEN] + T8152_CLKGEN_CTRL, 0},
+        {"clkgen+0x800", r.base[T8152_REG_CLKGEN] + T8152_CLKGEN_AUX, 0},
+        {"phycommon+0x000", r.base[T8152_REG_PHYBASE] + T8152_PHYCMN_OFFSET, 0},
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(probe); i++) {
+        if (!t8152_probe_read(probe[i].addr, &probe[i].value)) {
+            printf("pcie: T8152 recon: read of %s (0x%lx) faulted; stopping\n", probe[i].name,
+                   probe[i].addr);
+            return -1;
+        }
+        printf("pcie: T8152 recon: %-16s = 0x%08x\n", probe[i].name, probe[i].value);
+    }
+
+    bool run = probe[0].value & T8152_PHY_CTRL0_RUN;
+    bool rst = probe[2].value & T8152_PHY_STATUS_RST;
+    if (run || rst) {
+        printf("pcie: T8152 recon: PHY not idle (run=%d reset-status=%d); no writes\n", run, rst);
+        return -1;
+    }
+
+#if PCIE_T8152_WRITES
+    printf("pcie: T8152 recon passed; running the PHY sequence\n");
+    t8152_dirty = true;
+    if (t8152_phy_init(path, adt_offset, &r))
+        return -1;
+    printf("pcie: T8152 PHY sequence done: phy+0x000 0x%08x phy+0x004 0x%08x phy+0x008 0x%08x\n",
+           read32(r.base[T8152_REG_PHY] + T8152_PHY_CTRL0),
+           read32(r.base[T8152_REG_PHY] + T8152_PHY_CTRL4),
+           read32(r.base[T8152_REG_PHY] + T8152_PHY_STATUS));
+    printf("pcie: T8152 root complex and port bring-up are not implemented; no link\n");
+    return -1;
+#else
+    printf("pcie: T8152 recon passed; writes disabled (build with PCIE_T8152_WRITES=1)\n");
+    return 1;
+#endif
 }
 
 static int pcie_init_controller(int controller, const char *path)
@@ -1050,6 +1288,9 @@ int pcie_init(void)
 
     if (pcie_initialized)
         return 0;
+
+    if (chip_id == T8152)
+        return pcie_t8152_init("/arm-io/apcie");
 
     if (chip_id == T8140) {
         struct state *state = &controllers[APCIE];
