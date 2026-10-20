@@ -634,6 +634,14 @@ static int display_init_t8152_route(const char *path)
     }
 
     int ret = -1;
+    /* The PHY's ADT port-number names the DCP DPTX remote port (link controller) that drives
+     * it; the HDMI dptx-phy says 1. */
+    u32 port = 0;
+    int node = adt_path_offset(adt, path);
+    const u32 *pn = node < 0 ? NULL : adt_getprop(adt, node, "port-number", NULL);
+    if (pn)
+        port = *pn;
+    printf("display: %s uses DPTX port %u\n", path, port);
     if (!strcmp(path, "/arm-io/dptx-phy"))
         dcp_dp2hdmi_power_on(dcp, "/arm-io/dp2hdmi-gpio0");
     dcp->phy = phy;
@@ -643,7 +651,8 @@ static int display_init_t8152_route(const char *path)
     dcp->dptx_ep = dcp_dptx_init(dcp, 2);
     if (!dcp->dptx_ep)
         goto out;
-    if (dcp_connect_dptx(dcp) || dcp_dptx_hpd(dcp->dptx_ep, 0, true))
+    if (dcp_dptx_connect(dcp->dptx_ep, dcp->phy, dcp->die, port) ||
+        dcp_dptx_hpd(dcp->dptx_ep, port, true))
         goto out;
     if (display_t8152_work(8000000) < 0)
         goto out;
@@ -666,7 +675,7 @@ static int display_init_t8152_route(const char *path)
 out:
     printf("display: %s %s\n", path, ret ? "initialization failed" : "has no sink");
     if (dcp->dptx_ep)
-        dcp_dptx_disconnect(dcp->dptx_ep, 0);
+        dcp_dptx_disconnect(dcp->dptx_ep, port);
     dcp->phy = NULL;
     display_shutdown(DCP_QUIESCED);
     dptx_phy_shutdown(phy);
