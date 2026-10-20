@@ -379,9 +379,16 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
  *   2. Power the controller, then read every register the sequences touch under an exception
  *      guard. A fault, a PHY that is not idle, or a port whose link is already up stops there.
  *   3. Writes, only when built with PCIE_T8152_WRITES=1. Every poll has a timeout.
+ *
+ * kboot_boot() calls pcie_init() on every boot, so none of this runs unless the image is built
+ * with PCIE_T8152_RECON=1 (read-only stages 1 and 2) or PCIE_T8152_WRITES=1. A default build
+ * keeps the old behaviour: the generic path reports an unsupported compatible and touches nothing.
  */
 #ifndef PCIE_T8152_WRITES
 #define PCIE_T8152_WRITES 0
+#endif
+#ifndef PCIE_T8152_RECON
+#define PCIE_T8152_RECON 0
 #endif
 
 #define T8152_PORTS       3
@@ -1679,7 +1686,7 @@ int pcie_init(void)
     if (pcie_initialized)
         return 0;
 
-    if (chip_id == T8152)
+    if (chip_id == T8152 && (PCIE_T8152_RECON || PCIE_T8152_WRITES))
         return pcie_t8152_init("/arm-io/apcie");
 
     if (chip_id == T8140) {
