@@ -8,6 +8,48 @@
 #include "string.h"
 #include "tunables.h"
 #include "utils.h"
+#include "vsprintf.h"
+
+/*
+ * Copy every "pcie:" console line into a buffer that kboot publishes as /chosen "m1n1,pcie-log" (a string list),
+ * because the m1n1 console is not on screen when Linux runs.
+ */
+#define PCIE_LOG_SIZE 6144
+static char pcie_log_buf[PCIE_LOG_SIZE];
+static u32 pcie_log_len;
+
+static int pcie_logged_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static int pcie_logged_printf(const char *fmt, ...)
+{
+    char line[256];
+    va_list ap;
+
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    debug_printf("%s", line);
+
+    size_t len = strlen(line);
+    if (!strncmp(line, "pcie:", 5)) {
+        while (len && line[len - 1] == '\n')
+            len--;
+        if (pcie_log_len + len + 1 <= PCIE_LOG_SIZE) {
+            memcpy(pcie_log_buf + pcie_log_len, line, len);
+            pcie_log_buf[pcie_log_len + len] = 0;
+            pcie_log_len += len + 1;
+        }
+    }
+    return n;
+}
+
+#undef printf
+#define printf(...) pcie_logged_printf(__VA_ARGS__)
+
+const char *pcie_log_get(u32 *len)
+{
+    *len = pcie_log_len;
+    return pcie_log_buf;
+}
 
 /*
  * The ADT uses 17 register sets:

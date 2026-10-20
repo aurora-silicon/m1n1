@@ -5370,6 +5370,18 @@ int kboot_boot(void *kernel)
         if (dt_remain < SZ_16K)
             printf("FDT: free dt buffer space low, %u bytes left\n", dt_remain);
     }
+    {
+        u32 log_len;
+        const char *log = pcie_log_get(&log_len);
+        int chosen = fdt_path_offset(dt, "/chosen");
+        if (log_len && chosen >= 0) {
+            if (fdt_open_into(dt, dt, dt_bufsize) || fdt_setprop(dt, chosen, "m1n1,pcie-log", log, log_len) ||
+                fdt_pack(dt))
+                printf("kboot: could not publish m1n1,pcie-log (%u bytes)\n", log_len);
+            else
+                printf("kboot: published m1n1,pcie-log (%u bytes)\n", log_len);
+        }
+    }
     ret = chip_id == T8142 ? dapf_init_fdt(dt) : dapf_init_all();
     if (ret < 0 && chip_id == T8140) {
         printf("kboot: refusing T8140 handoff after DAPF failure\n");
