@@ -390,6 +390,14 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
 #ifndef PCIE_T8152_RECON
 #define PCIE_T8152_RECON 0
 #endif
+/*
+ * PCIE_T8152_HANDOFF=1 (with PCIE_T8152_WRITES=1): do the controller and port initialisation
+ * but leave the radio power, the endpoint PERST# GPIO and the LTSSM start to the Linux driver
+ * (pcie-apple.c, sunrise power sequence), which performs them itself. The SMC is not opened.
+ */
+#ifndef PCIE_T8152_HANDOFF
+#define PCIE_T8152_HANDOFF 0
+#endif
 
 #define T8152_PORTS       3
 #define T8152_REG_ENTRIES 28 /* 10 shared windows + 6 per port */
@@ -767,6 +775,7 @@ static const struct {
     {0x130, 0x208}, {0x140, 0x10}, {0x144, 0x253770}, {0x21c, 0x0}, {0x834, 0x0}, {0x83c, 0x0},
 };
 
+#if !PCIE_T8152_HANDOFF
 #define T8152_GPIO_DATA     BIT(0)
 #define T8152_GPIO_MODE     GENMASK(3, 1)
 #define T8152_GPIO_MODE_OUT 1
@@ -795,6 +804,7 @@ static int t8152_radio_power_on(const struct t8152_ports *p, u32 port)
            p->radio_key[port], payload[0], payload[1], ret);
     return ret;
 }
+#endif
 
 static int t8152_port_init(const struct t8152_ports *p, u32 port, int bridge_offset)
 {
@@ -810,10 +820,12 @@ static int t8152_port_init(const struct t8152_ports *p, u32 port, int bridge_off
      * and at least 100 ms since power (PERST# release is also enforced to be 100 ms after the
      * reset timestamp in setEndpointReset).
      */
+#if !PCIE_T8152_HANDOFF
     if ((p->radio & BIT(port)) && t8152_radio_power_on(p, port))
         return -1;
     if (p->perst & BIT(port))
         t8152_gpio_drive(p, port, 0);
+#endif
 
     /* initializeRefclkBuffer (PHY lane window). */
     set32(lane + T8152_LANE_CTRL, BIT(0));
@@ -827,12 +839,14 @@ static int t8152_port_init(const struct t8152_ports *p, u32 port, int bridge_off
     set32(lane + T8152_LANE_CTRL, BIT(10));
 
     udelay(p->t_refclk_to_perst[port]);
+#if !PCIE_T8152_HANDOFF
     if (p->perst & BIT(port)) {
         mdelay(100);
         t8152_gpio_drive(p, port, 1);
         printf("pcie: T8152 port %d: endpoint PERST# released (pin %d)\n", port, p->perst_pin[port]);
         mdelay(p->perst_to_config[port]);
     }
+#endif
 
     /* _resetPortHardware */
     for (size_t i = 0; i < ARRAY_SIZE(t8152_port_reset); i++)
@@ -889,12 +903,17 @@ static int t8152_port_init(const struct t8152_ports *p, u32 port, int bridge_off
 
     /* _writeIntr2AxiReg(0x80, 1), then enableLinkTraining -> setLtssmEnable(true). */
     write32(p->intr[port] + 0x80, 1);
+#if PCIE_T8152_HANDOFF
+    printf("pcie: T8152 port %d: initialised; radio power, endpoint PERST# and LTSSM left to Linux\n", port);
+    return 0;
+#else
     set32(cfg + T8152_CFG_LTSSM_EN, BIT(0));
     if (poll32(cfg + T8152_CFG_LINKSTS, APCIE_PORT_LINKSTS_UP, APCIE_PORT_LINKSTS_UP, T8152_POLL_US))
         printf("pcie: T8152 port %d: link not up after %d ms\n", port, T8152_POLL_US / 1000);
     else
         printf("pcie: T8152 port %d: link up, status 0x%x\n", port, read32(cfg + T8152_CFG_LINKSTS));
     return 0;
+#endif
 
 timeout:
     printf("pcie: T8152 port %d: poll timed out (cfg+0x800 0x%x +0x804 0x%x +0x82c 0x%x +0x0a8 0x%x)\n",
