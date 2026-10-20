@@ -41,7 +41,10 @@ static void t8152_hdmi_tunables(u64 base)
     static const struct {
         const char *name;
         u32 offset;
-    } groups[] = {{"asdc-dppll-top-tunables", 0x600}, {"asdc-dppll-core-tunables", 0x800}};
+    } groups[] = {{"asdc-dppll-top-tunables", 0x600},  {"asdc-dppll-core-tunables", 0x800},
+                  /* Lane origins 0x4500 + n * 0x2800 (t8152_dptx_port.c); +0x24 is live. */
+                  {"lane-shm-regs-0-tunables", 0x4500}, {"lane-shm-regs-1-tunables", 0x6d00},
+                  {"lane-shm-regs-2-tunables", 0x9500}, {"lane-shm-regs-3-tunables", 0xbd00}};
     int node = adt_path_offset(adt, "/arm-io/dptx-phy");
     for (size_t g = 0; g < ARRAY_SIZE(groups); g++) {
         u32 len = 0;
@@ -103,6 +106,13 @@ int dptx_phy_activate(dptx_phy_t *phy)
                read32(phy->regs[1] + 0x48));
         t8152_hdmi_tunables(phy->regs[0]);
         int aret = t8152_dptx_activate_phy(phy->regs[0]);
+        /* AppleDPTX laneReset (0xa203f74): PMA_LANE_RESET_N is bit 2, its override bit 3.
+         * Live 2026-10-20: both bits stick only at +0x0 of the 16 lane sub-units
+         * (0x4500 + n * 0x2800 + k * 0x100), which reset to 0 = lanes held in reset. */
+        for (u32 n = 0; n < 4; n++)
+            for (u32 k = 0; k < 4; k++)
+                mask32(phy->regs[0] + 0x4500 + n * 0x2800 + k * 0x100, 0xc, 0xc);
+        printf("dptx: lane reset released, lane0 +0x0 %x\n", read32(phy->regs[0] + 0x4500));
         phy->powered = !aret;
         return aret;
     }
