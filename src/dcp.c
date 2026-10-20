@@ -45,7 +45,10 @@ static int dcp_smc_function_on(smc_dev_t *smc, int node, const char *prop, u32 *
     d[0] = ret;
     d[1] = payload[0];
     d[2] = payload[1];
-    printf("dcp: %s key %08x write8 {%08x, %08x} -> %d\n", prop, key, payload[0], payload[1], ret);
+    u32 rb[2] = {0, 0};
+    int rr = smc_read_u64(smc, key, rb);
+    printf("dcp: %s key %08x write8 {%08x, %08x} -> %d, readback %d {%08x, %08x}\n", prop, key,
+           payload[0], payload[1], ret, rr, rb[0], rb[1]);
     return ret;
 }
 
