@@ -737,14 +737,23 @@ fail:
     return -1;
 }
 
+/* T8152 fallback drive presets, indexed by voltage * 4 + pre-emphasis. */
+static const u32 drive_presets[16] = {
+    0x025, 0x420, 0x717, 0x90f, 0x019, 0x397, 0x78f, 0x025,
+    0x011, 0x38f, 0x025, 0x025, 0x000, 0x025, 0x025, 0x025,
+};
+
+int atc_phy_drive_preset(const dptx_drive_settings_t *s, u32 *preset)
+{
+    if (s->format || s->voltage > 3 || s->pre_emphasis > 3 || s->voltage + s->pre_emphasis > 3)
+        return -1;
+    *preset = drive_presets[s->voltage * 4 + s->pre_emphasis];
+    return 0;
+}
+
 int atc_phy_set_drive_settings(atc_phy_t *phy, const dptx_drive_settings_t *settings, u32 count)
 {
-    /* Matching T8152 fallback table, indexed by voltage * 4 + pre-emphasis.
-     * A rate-specific live table takes precedence when present. */
-    static const u32 defaults[16] = {
-        0x025, 0x420, 0x717, 0x90f, 0x019, 0x397, 0x78f, 0x025,
-        0x011, 0x38f, 0x025, 0x025, 0x000, 0x025, 0x025, 0x025,
-    };
+    /* A rate-specific live table takes precedence over drive_presets when present. */
     if (!phy || count > 4 || (!settings && count))
         return -1;
     if (!count)
@@ -756,8 +765,8 @@ int atc_phy_set_drive_settings(atc_phy_t *phy, const dptx_drive_settings_t *sett
     if (!table)
         table = adt_getprop(adt, phy->node, "dp-training-table", &len);
     if (!table)
-        table = defaults;
-    else if (len != sizeof(defaults))
+        table = drive_presets;
+    else if (len != sizeof(drive_presets))
         return -1;
     u32 presets[4];
     /* Validate the entire request before changing any lane. */
