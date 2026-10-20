@@ -197,8 +197,8 @@ static void j873g_run_proxy(void)
     fb_display_logo();
     fb_set_active(true);
 #endif
-    printf("Initialization complete. Running proxy...\n");
-    uartproxy_run(NULL);
+    printf("Initialization complete.\n");
+    run_actions();
 }
 
 void m1n1_main(void)
