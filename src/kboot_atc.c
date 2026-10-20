@@ -196,6 +196,17 @@ static const struct adt_tunable_info atc_tunables_t8152_usb2[] = {
 };
 
 /*
+ * T8152 USB2 PHY calibration for the fixed-peripheral port: the same power-up
+ * list plus the ADT's own device-mode values instead of the host ones. The
+ * host list is deliberately absent; a host role on this port would need its
+ * own export first.
+ */
+static const struct adt_tunable_info atc_tunables_t8152_usb2_dev[] = {
+    {"tunable_USB2PHY_DFLT", "apple,tunable-usb2phy-dflt", 0x0, 0x4000, true},
+    {"tunable_USB2PHY_DEV", "apple,tunable-usb2phy-dev", 0x0, 0x4000, true},
+};
+
+/*
  * The DRD lists live in several distinct ADT resources, not one: each entry
  * names the reg index of the bank that holds it, and its window is that
  * bank's own size less the native header in front of the calibration.
@@ -904,7 +915,9 @@ cleanup:
  * half-filled calibration is worse than none.
  */
 static void dt_copy_atc_usb2_tunables(void *dt, const char *adt_path, const char *dt_alias,
-                                     const char *fdt_compatible)
+                                     const char *fdt_compatible,
+                                     const struct adt_tunable_info *tunables,
+                                     size_t tunables_count)
 {
     const char *fdt_path = fdt_get_alias(dt, dt_alias);
     if (fdt_path == NULL) {
@@ -935,20 +948,20 @@ static void dt_copy_atc_usb2_tunables(void *dt, const char *adt_path, const char
         printf("kboot: no reg for the USB2 PHY bank of %s\n", adt_path);
         goto cleanup;
     }
-    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_usb2); ++i) {
-        if (bank_size != atc_tunables_t8152_usb2[i].reg_size) {
+    for (size_t i = 0; i < tunables_count; ++i) {
+        if (bank_size != tunables[i].reg_size) {
             printf("kboot: USB2 PHY bank of %s is %#llx bytes, not %#llx\n", adt_path,
                    (unsigned long long)bank_size,
-                   (unsigned long long)atc_tunables_t8152_usb2[i].reg_size);
+                   (unsigned long long)tunables[i].reg_size);
             goto cleanup;
         }
     }
 
-    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_usb2); ++i)
-        fdt_delprop(dt, fdt_node, atc_tunables_t8152_usb2[i].fdt_name);
+    for (size_t i = 0; i < tunables_count; ++i)
+        fdt_delprop(dt, fdt_node, tunables[i].fdt_name);
 
-    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_usb2); ++i) {
-        if (dt_append_atc_tunable(dt, adt_node, fdt_node, &atc_tunables_t8152_usb2[i]))
+    for (size_t i = 0; i < tunables_count; ++i) {
+        if (dt_append_atc_tunable(dt, adt_node, fdt_node, &tunables[i]))
             goto cleanup;
     }
 
@@ -956,8 +969,8 @@ static void dt_copy_atc_usb2_tunables(void *dt, const char *adt_path, const char
     return;
 
 cleanup:
-    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_usb2); ++i)
-        fdt_delprop(dt, fdt_node, atc_tunables_t8152_usb2[i].fdt_name);
+    for (size_t i = 0; i < tunables_count; ++i)
+        fdt_delprop(dt, fdt_node, tunables[i].fdt_name);
 
     printf("FDT: Unable to copy the USB2 PHY calibration for %s\n", adt_path);
 }
@@ -1040,8 +1053,13 @@ int kboot_setup_atc(void *dt)
         dt_copy_atc_tunables(dt, adt_path, fdt_alias, i);
     }
 
-    dt_copy_atc_usb2_tunables(dt, "/arm-io/atc-phy3", "usb2phy3", "apple,t8152-usb2-phy");
+    dt_copy_atc_usb2_tunables(dt, "/arm-io/atc-phy3", "usb2phy3", "apple,t8152-usb2-phy",
+                              atc_tunables_t8152_usb2, ARRAY_SIZE(atc_tunables_t8152_usb2));
     dt_copy_atc_drd_tunables(dt, "/arm-io/usb-drd3", "usbdrd3", "apple,t8152-dwc3");
+    dt_copy_atc_usb2_tunables(dt, "/arm-io/atc-phy0", "usb2phy0", "apple,t8152-usb2-phy",
+                              atc_tunables_t8152_usb2_dev,
+                              ARRAY_SIZE(atc_tunables_t8152_usb2_dev));
+    dt_copy_atc_drd_tunables(dt, "/arm-io/usb-drd0", "usbdrd0", "apple,t8152-dwc3");
 
     return 0;
 }
