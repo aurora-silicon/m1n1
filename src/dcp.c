@@ -24,8 +24,8 @@ static u32 dcp_die;
 u32 m6_diag[9];
 
 /* An SMC power function from the ADT. M2-era {phandle, fourcc, key, unk}: plain u32 write of
- * 0x800001. T8152 smc-pmu "pKW8" {phandle, fourcc, key, w0, w1}: an 8-byte key write whose two
- * words are the ADT arguments as given (live 2026-10-19: pcIO is 8 bytes and reads all zero). */
+ * 0x800001. T8152 smc-pmu "pKW8" {phandle, fourcc, key, w0, w1}: AppleSMCPMU 0x9ae6464/0x9ae67e0
+ * writes 8 bytes {w0, w1} to the key with bytes [0:2] replaced by the on value, no RMW. */
 static int dcp_smc_function_on(smc_dev_t *smc, int node, const char *prop, u32 *key_out)
 {
     u32 len = 0;
@@ -39,16 +39,13 @@ static int dcp_smc_function_on(smc_dev_t *smc, int node, const char *prop, u32 *
     if (len < 20)
         return smc_write_u32(smc, key, 0x800001);
 
-    u32 *d = &m6_diag[strcmp(prop, "function-dp2hdmi_pwr_en") ? 5 : 2];
-    u32 payload[2] = {f[3], f[4]}, pre[2] = {0}, post[2] = {0};
-    int rpre = smc_read_u64(smc, key, pre);
+    u32 payload[2] = {(f[3] & ~0xffffu) | 1, f[4]};
     int ret = smc_write(smc, key, payload, sizeof(payload));
-    int rpost = smc_read_u64(smc, key, post);
+    u32 *d = &m6_diag[strcmp(prop, "function-dp2hdmi_pwr_en") ? 5 : 2];
     d[0] = ret;
-    d[1] = pre[0];
-    d[2] = post[0];
-    printf("dcp: %s key %08x pre {%08x,%08x}(%d) write8 {%08x,%08x} -> %d post {%08x,%08x}(%d)\n",
-           prop, key, pre[0], pre[1], rpre, payload[0], payload[1], ret, post[0], post[1], rpost);
+    d[1] = payload[0];
+    d[2] = payload[1];
+    printf("dcp: %s key %08x write8 {%08x, %08x} -> %d\n", prop, key, payload[0], payload[1], ret);
     return ret;
 }
 
@@ -70,19 +67,6 @@ int dcp_dp2hdmi_power_on(dcp_dev_t *dcp, const char *path)
     }
     int r1 = dcp_smc_function_on(smc, node, "function-dp2hdmi_pwr_en", &dcp->dp2hdmi_pwr_gpio);
     int r2 = dcp_smc_function_on(smc, node, "function-hdmi_pwr_en", &dcp->hdmi_pwr_gpio);
-    {
-        /* Experiment: key info, then the ADT words with an "on" bit in byte 0, pin byte kept. */
-        u32 ki[2] = {0};
-        int ri = smc_key_info(smc, 0x7063494f, ki);
-        printf("dcp: pcIO keyinfo -> %d: %08x %08x\n", ri, ki[0], ki[1]);
-        static const char *fns[] = {"function-dp2hdmi_pwr_en", "function-hdmi_pwr_en"};
-        for (int i = 0; i < 2; i++) {
-            const u32 *f = adt_getprop(adt, node, fns[i], NULL);
-            u32 w[2] = {f[3] | 1, f[4]};
-            int rw = smc_write(smc, 0x7063494f, w, sizeof(w));
-            printf("dcp: %s on-bit write {%08x,%08x} -> %d\n", fns[i], w[0], w[1], rw);
-        }
-    }
     smc_shutdown(smc);
     /* Give the HDMI converter time to boot before DCP probes the sink. */
     mdelay(1500);

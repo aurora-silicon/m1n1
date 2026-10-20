@@ -302,17 +302,6 @@ int smc_read_u64(smc_dev_t *smc, u32 key, u32 out[2])
     return ret;
 }
 
-/* GET_KEY_INFO: the shared buffer then holds {size u8, type fourcc, attr u8}. */
-int smc_key_info(smc_dev_t *smc, u32 key, u32 out[2])
-{
-    if (!smc->shmem)
-        return -1;
-    int ret = smc_cmd(smc, FIELD_PREP(SMC_MSG_TYPE, SMC_GET_KEY_INFO) | FIELD_PREP(SMC_WRITE_KEY_KEY, key));
-    out[0] = read32((u64)smc->shmem);
-    out[1] = read32((u64)smc->shmem + 4);
-    return ret;
-}
-
 int smc_read_u32(smc_dev_t *smc, u32 key, u32 *value)
 {
     u8 id = smc->msgid & 0xF;
