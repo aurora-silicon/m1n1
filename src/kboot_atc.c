@@ -1053,6 +1053,9 @@ int kboot_setup_atc(void *dt)
         dt_copy_atc_tunables(dt, adt_path, fdt_alias, i);
     }
 
+    dt_copy_atc_usb2_tunables(dt, "/arm-io/atc-phy2", "usb2phy2", "apple,t8152-usb2-phy",
+                              atc_tunables_t8152_usb2, ARRAY_SIZE(atc_tunables_t8152_usb2));
+    dt_copy_atc_drd_tunables(dt, "/arm-io/usb-drd2", "usbdrd2", "apple,t8152-dwc3");
     dt_copy_atc_usb2_tunables(dt, "/arm-io/atc-phy3", "usb2phy3", "apple,t8152-usb2-phy",
                               atc_tunables_t8152_usb2, ARRAY_SIZE(atc_tunables_t8152_usb2));
     dt_copy_atc_drd_tunables(dt, "/arm-io/usb-drd3", "usbdrd3", "apple,t8152-dwc3");
