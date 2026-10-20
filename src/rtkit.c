@@ -450,6 +450,14 @@ static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *m
                          dva, bfr->bfr, sz);
             return true;
         }
+        if (rtk->sram && sz) {
+            bfr->dva = addr;
+            bfr->bfr = (void *)addr;
+            bfr->sz = sz;
+            bfr->owned = false;
+            rtkit_printf("firmware oslog buffer in SRAM (addr %#lx, size %#zx)\n", addr, sz);
+            return true;
+        }
         rtkit_printf("oslog buffer request outside mapped DART (%#lx, %#zx)\n", addr, sz);
         return false;
     }
@@ -760,8 +768,10 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
             if (bitmap & (1U << i)) {
                 u8 ep_idx = 32 * base + i;
 
-                if (ep_idx >= 0x20)
+                if (ep_idx >= 0x20) {
+                    rtkit_printf("app endpoint 0x%02x\n", ep_idx);
                     continue;
+                }
                 switch (ep_idx) {
                     case RTKIT_EP_CRASHLOG:
                         has_crashlog = true;

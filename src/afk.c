@@ -692,16 +692,25 @@ static int afkv2_handle_command(afk_epic_ep_t *epic, const struct afkv2_hdr *hdr
     const struct afkv2_cmd *cmd = payload;
     afk_epic_service_t *service = afk_epic_find_service(epic, hdr->interface);
     if (msg->type != SUBTYPE_STD_SERVICE || cmd->flags || !service ||
-        !service->ops->call_v2)
+        !service->ops->call_v2) {
+        printf("AFKV2: reject if %u: type %#x flags %#x service %p call_v2 %d size %zu\n",
+               hdr->interface, msg->type, cmd->flags, service,
+               service && service->ops->call_v2 ? 1 : 0, size);
+        hexdump(payload, min(size, (size_t)96));
         return afkv2_reject_command(epic, hdr, msg, payload, size);
+    }
 
     /* Only the observed inline callback form is supported. Validate both
      * lengths before copying or dispatching; no peer DMA address is used. */
     size_t body_size = size - sizeof(*cmd);
     const struct afkv2_service_call *call = (const void *)(cmd + 1);
     if (body_size < sizeof(*call) + sizeof(u32) || cmd->value < body_size ||
-        call->magic != 0x69706378 || call->length != body_size - sizeof(*call))
+        call->magic != 0x69706378 || call->length != body_size - sizeof(*call)) {
+        printf("AFKV2: reject if %u: body %zu value %u magic %#x length %u\n", hdr->interface,
+               body_size, cmd->value, call->magic, call->length);
+        hexdump(payload, min(size, (size_t)96));
         return afkv2_reject_command(epic, hdr, msg, payload, size);
+    }
 
     size_t length = sizeof(*hdr) + sizeof(*msg) + size;
     u8 *reply = calloc(1, length);

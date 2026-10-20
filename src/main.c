@@ -186,6 +186,11 @@ static void j873g_run_proxy(void)
     if (smp_init() < 0)
         panic("Unsupported T8152 CPU topology\n");
 #ifdef USE_FB
+    /* The DPTX PHY needs a pmgr device powered on before its first MMIO
+     * access (live ESR 0x96004410 without it). Load the pmgr tables first;
+     * the parent-enable pass only turns devices on, never off. */
+    int pret = pmgr_init();
+    printf("J873g: pmgr_init -> %d\n", pret);
     if (display_init() < 0)
         printf("display: initialization failed, continuing with firmware framebuffer\n");
     fb_init(false);

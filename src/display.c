@@ -634,6 +634,8 @@ static int display_init_t8152_route(const char *path)
     }
 
     int ret = -1;
+    if (!strcmp(path, "/arm-io/dptx-phy"))
+        dcp_dp2hdmi_power_on(dcp, "/arm-io/dp2hdmi-gpio0");
     dcp->phy = phy;
     dcp->dpav_ep = dcp_dpav_init(dcp);
     if (!dcp->dpav_ep)
@@ -648,6 +650,8 @@ static int display_init_t8152_route(const char *path)
 
     int timing_cnt = 0, color_cnt = 0;
     int hpd = dcp_ib_get_hpd(iboot, &timing_cnt, &color_cnt);
+    extern u32 m6_diag[9];
+    m6_diag[8] = 0x100 | (hpd & 0xff);
     if (hpd == 0) {
         ret = 0;
         goto out;

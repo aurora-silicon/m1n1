@@ -28,8 +28,37 @@ typedef struct dptx_phy {
     enum dptx_type type;
     u32 dcp_index;
     u32 active_lanes;
+    bool powered;
     atc_phy_t *atc;
 } dptx_phy_t;
+
+/* Experiment (2026-10-20): dptx-phy's ASDC tables equal the ATC PHY's entry for entry.
+ * Bases come from a live scan of reg[0]: dppll-core matches only 0x800 (6/6 entries on live
+ * registers), dppll-top 0x600 (same 0x200 gap as the ATC). Entries: {u32 off, u32 size,
+ * u64 mask, u64 value}. */
+static void t8152_hdmi_tunables(u64 base)
+{
+    static const struct {
+        const char *name;
+        u32 offset;
+    } groups[] = {{"asdc-dppll-top-tunables", 0x600}, {"asdc-dppll-core-tunables", 0x800}};
+    int node = adt_path_offset(adt, "/arm-io/dptx-phy");
+    for (size_t g = 0; g < ARRAY_SIZE(groups); g++) {
+        u32 len = 0;
+        const u8 *p = adt_getprop(adt, node, groups[g].name, &len);
+        for (u32 i = 0; p && i + 24 <= len; i += 24) {
+            u32 off;
+            u64 mask, val;
+            memcpy(&off, p + i, 4);
+            memcpy(&mask, p + i + 8, 8);
+            memcpy(&val, p + i + 16, 8);
+            u64 reg = base + groups[g].offset + off;
+            u32 old = read32(reg);
+            write32(reg, (old & ~(u32)mask) | (u32)val);
+            printf("dptx: tunable %s %lx: %08x -> %08x\n", groups[g].name, reg, old, read32(reg));
+        }
+    }
+}
 
 int dptx_phy_activate(dptx_phy_t *phy)
 {
@@ -41,18 +70,41 @@ int dptx_phy_activate(dptx_phy_t *phy)
     }
     if (phy->type == DPTX_PHY_T8152_HDMI) {
         /* The stock loader leaves the DPTX PHY power domain off; the first
-         * MMIO access data-aborts (ESR 0x96004410, live 2026-10-19). Power the
-         * /arm-io/dptx-phy power-gates (ADT: power-gates = <5>), then read a
-         * harmless config register before the first write. */
-        int pret = pmgr_adt_power_enable("/arm-io/dptx-phy");
+         * MMIO access data-aborts (ESR 0x96004410, live 2026-10-19). The ADT
+         * node's power-gates = <5> resolves to ECPU_4, NOT the PHY (Y,
+         * 2026-10-19); the real device is the pmgr child "DPTX_PHY" (id 0xa7),
+         * so power it by name. Never touch the PHY MMIO unless that succeeds. */
+        int pret = pmgr_power_on(0, "DPTX_PHY");
         if (pret < 0) {
-            printf("dptx: power enable /arm-io/dptx-phy FAILED (%d); skipping PHY MMIO\n", pret);
+            printf("dptx: pmgr DPTX_PHY power-on FAILED (%d); skipping PHY MMIO\n", pret);
             return -1;
         }
         u32 probe = read32(phy->regs[0] + 0x10);
-        printf("dptx: power enable /arm-io/dptx-phy -> %d; %lx+0x10 reads 0x%x\n", pret,
-               phy->regs[0], probe);
-        return t8152_dptx_activate_phy(phy->regs[0]);
+        printf("dptx: DPTX_PHY powered (ret %d); %lx+0x10 reads 0x%x\n", pret, phy->regs[0],
+               probe);
+        /* The stock loader also leaves the DP controller "DP" (id 206) and the AUX path off.
+         * With GLOBAL_AUX_CTRL0/1 and DPEXT0/1 off, dptx0/1-aux (0x31a760000/0x31a764000)
+         * data-abort; powered, they read 0x10 0x1 (live 2026-10-19). DCP then reports
+         * DEVICE_NOT_RESPONDING because it cannot reach AUX. */
+        static const char *const domains[] = {"DP", "GLOBAL_AUX_CTRL0", "GLOBAL_AUX_CTRL1",
+                                              "DPEXT0", "DPEXT1"};
+        for (size_t i = 0; i < ARRAY_SIZE(domains); i++)
+            printf("dptx: %s power-on -> %d\n", domains[i], pmgr_power_on(0, domains[i]));
+        /* reg[1] resets to the M2 Pro values (+0x48 = 0x444, live 2026-10-20). Experiment:
+         * the same DCP select and per-group enable as the T602X path below (0x444 -> 0x333). */
+        write32(phy->regs[1] + 0x10, phy->dcp_index);
+        static const u32 shifts[] = {4, 8, 0};
+        for (size_t i = 0; i < ARRAY_SIZE(shifts); i++) {
+            set32(phy->regs[1] + 0x48, 1 << shifts[i]);
+            set32(phy->regs[1] + 0x48, 2 << shifts[i]);
+            clear32(phy->regs[1] + 0x48, 4 << shifts[i]);
+        }
+        printf("dptx: reg1 +0x10 %x +0x48 %x\n", read32(phy->regs[1] + 0x10),
+               read32(phy->regs[1] + 0x48));
+        t8152_hdmi_tunables(phy->regs[0]);
+        int aret = t8152_dptx_activate_phy(phy->regs[0]);
+        phy->powered = !aret;
+        return aret;
     }
     // MMIO: R.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
     // MMIO: W.4   0x23c500010 (dptx-phy[1], offset 0x10) = 0x0
@@ -301,9 +353,12 @@ u32 dptx_phy_get_active_lane_count(dptx_phy_t *phy)
 
 int dptx_phy_set_drive_settings(dptx_phy_t *phy, const dptx_drive_settings_t *settings, u32 count)
 {
-    if (!phy || phy->type != DPTX_PHY_T8152_ATC)
+    if (!phy)
         return -1;
-    return atc_phy_set_drive_settings(phy->atc, settings, count);
+    /* ponytail: non-ATC PHYs keep their reset swing/pre-emphasis, as m1n1 does on the M2 Pro.
+     * Program the T8152 lane registers if training needs levels above 0. */
+    return phy->type == DPTX_PHY_T8152_ATC ? atc_phy_set_drive_settings(phy->atc, settings, count)
+                                           : 0;
 }
 
 int dptx_phy_set_link_rate(dptx_phy_t *phy, u32 link_rate)
@@ -510,9 +565,15 @@ int dptx_phy_set_link_rate(dptx_phy_t *phy, u32 link_rate)
 int dptx_phy_deactivate(dptx_phy_t *phy)
 {
     if (phy && phy->type == DPTX_PHY_T8152_HDMI) {
+        /* The PHY MMIO aborts unless the power-on succeeded (live
+         * ESR 0x96004410 in the deactivate path, 2026-10-19). */
+        if (!phy->powered)
+            return 0;
         int ret = t8152_dptx_phy_power_down(phy->regs[0]);
-        if (!ret)
+        if (!ret) {
             phy->active_lanes = 0;
+            phy->powered = false;
+        }
         return ret;
     }
     if (!phy || phy->type != DPTX_PHY_T8152_ATC)
@@ -525,9 +586,10 @@ int dptx_phy_deactivate(dptx_phy_t *phy)
 
 int dptx_phy_set_route(dptx_phy_t *phy, bool enable)
 {
-    if (!phy || phy->type != DPTX_PHY_T8152_ATC)
+    if (!phy)
         return -1;
-    return atc_phy_set_route(phy->atc, enable);
+    /* Only the ATC PHY sits behind a lane crossbar; other PHYs have no route to change. */
+    return phy->type == DPTX_PHY_T8152_ATC ? atc_phy_set_route(phy->atc, enable) : 0;
 }
 
 u32 dptx_phy_dcp_output(dptx_phy_t *phy)

@@ -603,9 +603,13 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
                     return 0xe00002c7;
             }
             /* Capability ceiling (HBR today); drop the artificial "must already be HBR". */
-            if (port->phy && rate > dptx_phy_max_link_rate(port->phy))
+            if (port->phy && rate > dptx_phy_max_link_rate(port->phy)) {
+                printf("DPTXV2: link rate %#x above max\n", rate);
                 return 0xe00002c7;
-            if (dptx_phy_set_link_rate(port->phy, phy_rate))
+            }
+            int pret = dptx_phy_set_link_rate(port->phy, phy_rate);
+            printf("DPTXV2: link rate %#x (%u Mbps) -> %d\n", rate, phy_rate, pret);
+            if (pret)
                 return 0xe00002bc; /* PHY failure: state unchanged */
             port->link_rate = port->pending_link_rate = rate;
             return 0;

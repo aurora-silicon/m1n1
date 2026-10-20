@@ -42,6 +42,7 @@ typedef struct dcp_dev {
 } dcp_dev_t;
 
 int dcp_connect_dptx(dcp_dev_t *dcp);
+int dcp_dp2hdmi_power_on(dcp_dev_t *dcp, const char *path);
 int dcp_work(dcp_dev_t *dcp);
 
 dcp_dev_t *dcp_init(const display_config_t *config);
