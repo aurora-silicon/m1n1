@@ -185,6 +185,51 @@ static const struct adt_tunable_info atc_tunables_t6030_dp[] = {
     {"tunable_CLKMON_CFG", "apple,tunable-dp-calibration", 0x2600, 0x100, true},
 };
 
+/*
+ * T8152 USB2 PHY calibration. Linux's apple_tunable reads these as offsets
+ * relative to the bank it already maps, so nothing here carries a physical
+ * address: reg_offset stays 0 and reg_size is the ADT's own bank size.
+ */
+static const struct adt_tunable_info atc_tunables_t8152_usb2[] = {
+    {"tunable_USB2PHY_DFLT", "apple,tunable-usb2phy-dflt", 0x0, 0x4000, true},
+    {"tunable_USB2PHY_HOST", "apple,tunable-usb2phy-host", 0x0, 0x4000, true},
+};
+
+/*
+ * The DRD lists live in several distinct ADT resources, not one: each entry
+ * names the reg index of the bank that holds it, and its window is that
+ * bank's own size less the native header in front of the calibration.
+ */
+struct drd_tunable_info {
+    struct adt_tunable_info tunable;
+    u32 reg_index;
+    size_t reg_extra;
+};
+
+/*
+ * T8152 USB3 DRD calibration, one distinct property per ADT list. Offsets are
+ * bank-relative: reg_offset is 0 everywhere, and reg_extra records the native
+ * header a block occupies at the front of its bank so the usable window is
+ * bank_size - reg_extra. PIPE_HANDLER_HOST, PWR_CTRL_DEFAULT and
+ * DRD_CIO_REGS_DEFAULT are absent on this board and are optional.
+ */
+static const struct drd_tunable_info atc_tunables_t8152_drd[] = {
+    {{"tunable_BULK_FABRIC_DEFAULT", "apple,tunable-bulk-fabric-default", 0, 0, true}, 6, 0},
+    {{"tunable_PIPE_HANDLER_DEFAULT", "apple,tunable-pipe-handler-default", 0, 0, true}, 3, 0},
+    {{"tunable_PIPE_HANDLER_HOST", "apple,tunable-pipe-handler-host", 0, 0, false}, 3, 0},
+    {{"tunable_PWR_CTRL_DEFAULT", "apple,tunable-pwr-ctrl-default", 0, 0, false}, 5, 0},
+    {{"tunable_DRD_USB31_GBL_DEFAULT", "apple,tunable-drd-usb31-gbl-default", 0, 0, true},
+     0, 0xc100},
+    {{"tunable_DRD_USB31_GBL_HOST", "apple,tunable-drd-usb31-gbl-host", 0, 0, true}, 0, 0xc100},
+    {{"tunable_DRD_CIO_REGS_DEFAULT", "apple,tunable-drd-cio-regs-default", 0, 0, false},
+     0, 0xcd20},
+    {{"tunable_DRD_USB31_DBG_DEFAULT", "apple,tunable-drd-usb31-dbg-default", 0, 0, true},
+     0, 0xd800},
+    {{"tunable_DRD_USB31_CFG_HOST", "apple,tunable-drd-usb31-cfg-host", 0, 0, true}, 1, 0},
+    {{"tunable_LINK_REGS_DEFAULT", "apple,tunable-link-regs-default", 0, 0, true}, 7, 0},
+    {{"tunable_AUSBC_DEBUG_DEFAULT", "apple,tunable-ausbc-debug-default", 0, 0, true}, 8, 0},
+};
+
 static const struct atc_fuse_info atc_fuses_t8103_port0[] = {
     {0x23d2bc434, 9, 6, CIO3PLL_DCO_NCTRL, CIO3PLL_DCO_COARSEBIN_EFUSE0},
     {0x23d2bc434, 15, 6, CIO3PLL_DCO_NCTRL, CIO3PLL_DCO_COARSEBIN_EFUSE1},
@@ -852,6 +897,134 @@ cleanup:
     printf("FDT: Unable to setup ATC tunables for %s - USB3/Thunderbolt will not work\n", adt_path);
 }
 
+/*
+ * USB2-only calibration export. Linux maps the bank itself and reads these
+ * offsets relative to it, so the ADT bank size is the window and no physical
+ * address ever reaches the devicetree. Any failure drops both properties:
+ * half-filled calibration is worse than none.
+ */
+static void dt_copy_atc_usb2_tunables(void *dt, const char *adt_path, const char *dt_alias,
+                                     const char *fdt_compatible)
+{
+    const char *fdt_path = fdt_get_alias(dt, dt_alias);
+    if (fdt_path == NULL) {
+        printf("FDT: Unable to find alias %s\n", dt_alias);
+        return;
+    }
+
+    int fdt_node = fdt_path_offset(dt, fdt_path);
+    if (fdt_node < 0) {
+        printf("FDT: Unable to find path %s for alias %s\n", fdt_path, dt_alias);
+        return;
+    }
+
+    if (fdt_node_check_compatible(dt, fdt_node, fdt_compatible)) {
+        printf("FDT: %s is not %s\n", fdt_path, fdt_compatible);
+        goto cleanup;
+    }
+
+    int adt_path_trace[8];
+    int adt_node = adt_path_offset_trace(adt, adt_path, adt_path_trace);
+    if (adt_node < 0 || !adt_is_compatible_at(adt, adt_node, "atc-phy,t8152", 0)) {
+        printf("kboot: no T8152 ATC PHY at %s\n", adt_path);
+        goto cleanup;
+    }
+
+    u64 bank_base = 0, bank_size = 0;
+    if (adt_get_reg(adt, adt_path_trace, "reg", 0, &bank_base, &bank_size)) {
+        printf("kboot: no reg for the USB2 PHY bank of %s\n", adt_path);
+        goto cleanup;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_usb2); ++i) {
+        if (bank_size != atc_tunables_t8152_usb2[i].reg_size) {
+            printf("kboot: USB2 PHY bank of %s is %#llx bytes, not %#llx\n", adt_path,
+                   (unsigned long long)bank_size,
+                   (unsigned long long)atc_tunables_t8152_usb2[i].reg_size);
+            goto cleanup;
+        }
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_usb2); ++i)
+        fdt_delprop(dt, fdt_node, atc_tunables_t8152_usb2[i].fdt_name);
+
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_usb2); ++i) {
+        if (dt_append_atc_tunable(dt, adt_node, fdt_node, &atc_tunables_t8152_usb2[i]))
+            goto cleanup;
+    }
+
+    printf("FDT: Copied the USB2 PHY calibration for %s\n", adt_path);
+    return;
+
+cleanup:
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_usb2); ++i)
+        fdt_delprop(dt, fdt_node, atc_tunables_t8152_usb2[i].fdt_name);
+
+    printf("FDT: Unable to copy the USB2 PHY calibration for %s\n", adt_path);
+}
+
+/*
+ * USB3 DRD calibration export. Linux maps each named bank and reads these
+ * offsets relative to it, so the exported value is the raw native offset and
+ * never a physical address. reg_extra only shrinks the window a record may sit
+ * in, so a native offset past its block is rejected. Every ADT list has its
+ * own property: absent optional ones are skipped and leave nothing behind.
+ */
+static void dt_copy_atc_drd_tunables(void *dt, const char *adt_path, const char *dt_alias,
+                                     const char *fdt_compatible)
+{
+    const char *fdt_path = fdt_get_alias(dt, dt_alias);
+    if (fdt_path == NULL) {
+        printf("FDT: Unable to find alias %s\n", dt_alias);
+        return;
+    }
+
+    int fdt_node = fdt_path_offset(dt, fdt_path);
+    if (fdt_node < 0) {
+        printf("FDT: Unable to find path %s for alias %s\n", fdt_path, dt_alias);
+        return;
+    }
+
+    if (fdt_node_check_compatible(dt, fdt_node, fdt_compatible)) {
+        printf("FDT: %s is not %s\n", fdt_path, fdt_compatible);
+        goto cleanup;
+    }
+
+    int adt_path_trace[8];
+    int adt_node = adt_path_offset_trace(adt, adt_path, adt_path_trace);
+    if (adt_node < 0 || !adt_is_compatible_at(adt, adt_node, "usb-drd,t8152", 0)) {
+        printf("kboot: no T8152 USB DRD at %s\n", adt_path);
+        goto cleanup;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_drd); ++i)
+        fdt_delprop(dt, fdt_node, atc_tunables_t8152_drd[i].tunable.fdt_name);
+
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_drd); ++i) {
+        struct adt_tunable_info tunable_info = atc_tunables_t8152_drd[i].tunable;
+        u64 bank_size = 0;
+        if (adt_get_reg(adt, adt_path_trace, "reg", atc_tunables_t8152_drd[i].reg_index, NULL,
+                        &bank_size) ||
+            atc_tunables_t8152_drd[i].reg_extra >= bank_size) {
+            printf("kboot: %s has no usable bank %u in %s\n", tunable_info.adt_name,
+                   atc_tunables_t8152_drd[i].reg_index, adt_path);
+            goto cleanup;
+        }
+
+        tunable_info.reg_size = bank_size - atc_tunables_t8152_drd[i].reg_extra;
+        if (dt_append_atc_tunable(dt, adt_node, fdt_node, &tunable_info))
+            goto cleanup;
+    }
+
+    printf("FDT: Copied the USB DRD calibration for %s\n", adt_path);
+    return;
+
+cleanup:
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_drd); ++i)
+        fdt_delprop(dt, fdt_node, atc_tunables_t8152_drd[i].tunable.fdt_name);
+
+    printf("FDT: Unable to copy the USB DRD calibration for %s\n", adt_path);
+}
+
 int kboot_setup_atc(void *dt)
 {
     char adt_path[32];
@@ -866,6 +1039,14 @@ int kboot_setup_atc(void *dt)
 
         dt_copy_atc_tunables(dt, adt_path, fdt_alias, i);
     }
+
+    /*
+     * The T8152 front USB2 PHY bank has no devicetree alias of its own yet, so
+     * the USB2-only export looks it up by the dedicated usb2phy2 alias. The
+     * parent tree owns that alias; nothing here creates nodes.
+     */
+    dt_copy_atc_usb2_tunables(dt, "/arm-io/atc-phy2", "usb2phy2", "apple,t8152-usb2-phy");
+    dt_copy_atc_drd_tunables(dt, "/arm-io/usb-drd2", "usbdrd2", "apple,t8152-dwc3");
 
     return 0;
 }

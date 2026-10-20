@@ -82,6 +82,14 @@ Supported compression formats:
 * gzip
 * xz
 
+### T8152 USB2 calibration
+
+The Linux devicetree must provide `usb2phy2` and `usbdrd2` aliases for the front USB2 port.
+The nodes must use `apple,t8152-usb2-phy` and `apple,t8152-dwc3`, respectively.
+m1n1 exports the PHY and host calibration from the matching ADT nodes into these existing nodes.
+Each calibration record contains a bank-relative byte offset, a clear mask and a set value.
+The Linux drivers select the register bank and apply the calibration.
+
 ## License
 
 m1n1 is licensed under the MIT license, as included in the [LICENSE](LICENSE) file.
