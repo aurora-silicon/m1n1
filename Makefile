@@ -1,8 +1,8 @@
 RUSTARCH ?= aarch64-unknown-none-softfloat
-BUILTIN_LOGO ?= bootlogo
+BUILTIN_LOGO ?= omarchy
 
 ifneq ($(BUILTIN_LOGO),bootlogo)
-ifneq ($(words $(wildcard data/$(BUILTIN_LOGO)_128.bin data/$(BUILTIN_LOGO)_256.bin)),2)
+ifneq ($(words $(wildcard data/$(BUILTIN_LOGO)_48.bin data/$(BUILTIN_LOGO)_128.bin data/$(BUILTIN_LOGO)_256.bin)),3)
 $(error BUILTIN_LOGO assets are missing)
 endif
 endif
@@ -158,7 +158,7 @@ OBJECTS := \
 	afk.o \
 	aic.o \
 	asc.o \
-	bootlogo_48.o $(BUILTIN_LOGO)_128.o $(BUILTIN_LOGO)_256.o \
+	$(BUILTIN_LOGO)_48.o $(BUILTIN_LOGO)_128.o $(BUILTIN_LOGO)_256.o \
 	chainload.o \
 	chainload_asm.o \
 	chickens.o \
