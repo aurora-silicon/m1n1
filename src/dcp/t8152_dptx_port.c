@@ -166,6 +166,9 @@ int t8152_dptx_program_rate(u64 port, u64 block0, u32 link_rate_mbps)
         return -1;
     if (t8152_dptx_pll_configure_fields(port, link_rate_mbps))
         return -1;
+    /* configurePll 0x9138f6c: 0x8d0 bit 5 if DT pclkdrv-select bit 0 is set, else bit 4.
+     * The M6 ADT has no pclkdrv-select, so the native driver sets bit 4. */
+    set_field(port, 0x8d0, 4, 0x10, 1);
     if (t8152_dptx_shadow_update(block0))
         return -1;
     t8152_dptx_pll_power_up(port);
