@@ -91,6 +91,10 @@ typedef struct dptx_port {
     afk_epic_service_t *service;
     dptx_phy_t *phy;
     u32 link_rate, pending_link_rate;
+    /* AppleT8152DPTXPort keeps SetDriveSettings as a 12-byte-per-lane shadow and returns it
+     * from GetDriveSettings (w7C); the PHY registers are not written. */
+    u32 drive_count;
+    dptx_drive_settings_t drive[4];
 } dptx_port_t;
 
 typedef struct dcp_dptx_if {
@@ -646,7 +650,18 @@ static u32 dptxport_call_v2(afk_epic_service_t *service, u16 group, u32 command,
             if (count > 4 || data_size < 32 + count * sizeof(*settings))
                 return 0xe00002c2;
             memcpy(settings, data + 32, count * sizeof(*settings));
-            return dptx_phy_set_drive_settings(port->phy, settings, count) ? 0xe00002bc : 0;
+            if (dptx_phy_set_drive_settings(port->phy, settings, count))
+                return 0xe00002bc;
+            port->drive_count = count;
+            memcpy(port->drive, settings, count * sizeof(*settings));
+            return 0;
+        }
+        case DPTX_APCALL_GET_DRIVE_SETTINGS: {
+            if (reply_size < 32 + sizeof(port->drive))
+                return 0xe00002c2;
+            memcpy(reply + 16, &port->drive_count, sizeof(port->drive_count));
+            memcpy(reply + 32, port->drive, sizeof(port->drive));
+            return 0;
         }
         case DPTX_APCALL_SET_DOWN_SPREAD:
             if (!data || data_size < 17)
