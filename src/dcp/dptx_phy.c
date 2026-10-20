@@ -100,9 +100,10 @@ int dptx_phy_activate(dptx_phy_t *phy)
             printf("dptx: %s power-on -> %d\n", domains[i], pmgr_power_on(0, domains[i]));
         /* reg[1] resets to the M2 Pro values (+0x48 = 0x444, live 2026-10-20). Experiment:
          * the same DCP select and per-group enable as the T602X path below (0x444 -> 0x333). */
-        /* +0x10 is setDPTXSourceSelect (bits 3:0 = source pipe). Live inc50: 1 brings back
-         * DEVICE_NOT_RESPONDING, so 0 (the internal DCP) is the route that reaches the PHY. */
-        write32(phy->regs[1] + 0x10, phy->dcp_index);
+        /* +0x10 is setDPTXSourceSelect: native read-modify-writes bits 3:0 only, with the
+         * connected UFP's dispext index. Live inc50: 1 brings back DEVICE_NOT_RESPONDING, so 0
+         * (the internal DCP) is the route that reaches the PHY. */
+        mask32(phy->regs[1] + 0x10, 0xf, phy->dcp_index & 0xf);
         static const u32 shifts[] = {4, 8, 0};
         for (size_t i = 0; i < ARRAY_SIZE(shifts); i++) {
             set32(phy->regs[1] + 0x48, 1 << shifts[i]);
