@@ -14,7 +14,8 @@
     } while (0)
 #endif
 
-#define CONSOLE_BUFFER_SIZE 8192
+/* 1 MiB: the M6 debug link drops during DCP bring-up; the reconnected reader gets the backlog. */
+#define CONSOLE_BUFFER_SIZE (1 << 20)
 
 extern struct iodev iodev_uart;
 extern struct iodev iodev_dockchannel_uart;
