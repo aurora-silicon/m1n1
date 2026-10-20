@@ -32,19 +32,24 @@ typedef struct dptx_phy {
     atc_phy_t *atc;
 } dptx_phy_t;
 
-/* Experiment (2026-10-20): dptx-phy's ASDC tables equal the ATC PHY's entry for entry.
- * Bases come from a live scan of reg[0]: dppll-core matches only 0x800 (6/6 entries on live
- * registers), dppll-top 0x600 (same 0x200 gap as the ATC). Entries: {u32 off, u32 size,
- * u64 mask, u64 value}. */
+/* AppleT8152DPTXPort::handleSetTunables (0x9138e28) applies these dptx-phy ADT tables, in this
+ * order, through 0x9120f9c; bases are the native table at 0x805e8c8, offsets into reg[0].
+ * ADT entries are {u32 off, u32 size, u64 mask, u64 value}. */
 static void t8152_hdmi_tunables(u64 base)
 {
     static const struct {
         const char *name;
         u32 offset;
-    } groups[] = {{"asdc-dppll-top-tunables", 0x600},  {"asdc-dppll-core-tunables", 0x800},
-                  /* Lane origins 0x4500 + n * 0x2800 (t8152_dptx_port.c); +0x24 is live. */
-                  {"lane-shm-regs-0-tunables", 0x4500}, {"lane-shm-regs-1-tunables", 0x6d00},
-                  {"lane-shm-regs-2-tunables", 0x9500}, {"lane-shm-regs-3-tunables", 0xbd00}};
+    } groups[] = {
+        {"asdc-txd-cfg-0-tunables", 0x5500},   {"asdc-txd-cfg-1-tunables", 0x7d00},
+        {"asdc-txd-cfg-2-tunables", 0xa500},   {"asdc-txd-cfg-3-tunables", 0xcd00},
+        {"asdc-txspl-cfg-0-tunables", 0x5180}, {"asdc-txspl-cfg-1-tunables", 0x7980},
+        {"asdc-txspl-cfg-2-tunables", 0xa180}, {"asdc-txspl-cfg-3-tunables", 0xc980},
+        {"lane-shm-regs-0-tunables", 0x4500},  {"lane-shm-regs-1-tunables", 0x6d00},
+        {"lane-shm-regs-2-tunables", 0x9500},  {"lane-shm-regs-3-tunables", 0xbd00},
+        {"asdc-dppll-core-tunables", 0x800},   {"asdc-dppll-top-tunables", 0x600},
+        {"asdc-aux-shm-tunables", 0x1400},     {"asdc-cmn-tunables", 0x1c00},
+    };
     int node = adt_path_offset(adt, "/arm-io/dptx-phy");
     for (size_t g = 0; g < ARRAY_SIZE(groups); g++) {
         u32 len = 0;
