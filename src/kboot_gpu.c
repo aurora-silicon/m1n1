@@ -2,6 +2,7 @@
 
 #include "kboot.h"
 #include "adt.h"
+#include "g18g_identity.h"
 #include "assert.h"
 #include "firmware.h"
 #include "malloc.h"
@@ -9,6 +10,7 @@
 #include "pmgr.h"
 #include "soc.h"
 #include "utils.h"
+#include "xnuboot.h"
 
 #include "libfdt/libfdt.h"
 
@@ -580,10 +582,324 @@ disable:
     return 0;
 }
 
+/*
+ * T8152 (J873 Mac mini M6, G18G). Port of the GPU part of aurora-silicon/m1n1-aurora
+ * j873 experiments/j873/installer-prep-26A428/j873-linux-boot.py prepare
+ * --gpu-firmware-receipt, so a normal boot gets the same device tree without the host
+ * loader. Everything is read from this boot's ADT and from DRAM. It performs no MMIO and
+ * never starts an ASC. The kernel (t8152-j873-gpu.dtsi) ships the eight reservations and
+ * both GFX/GFX1 mailbox providers disabled; this function enables them only as the loader
+ * does, and the providers only together with the firmware receipt.
+ */
+enum t8152_region {
+    R_TTBS,
+    R_SHARED,
+    R_L2,
+    R_HANDOFF,
+    R_DATA, /* GFX, then GFX1 */
+    R_DATA1,
+    R_SHARED_RO, /* GFX, then GFX1 */
+    R_SHARED_RO1,
+    R_COUNT,
+};
+
+static const struct {
+    const char *name; /* ADT /arm-io/sgx property prefix */
+    const char *path; /* FDT /reserved-memory node */
+    bool no_map;      /* the four firmware carveouts must stay out of the linear map */
+} t8152_regions[R_COUNT] = {
+    [R_TTBS] = {"gpu-region", "/reserved-memory/uat-ttbs", false},
+    [R_SHARED] = {"gfx-shared-region", "/reserved-memory/uat-pagetables", false},
+    [R_L2] = {"gfx-shared-l2-region", "/reserved-memory/uat-l2-pagetables", false},
+    [R_HANDOFF] = {"gfx-handoff", "/reserved-memory/uat-handoff", false},
+    [R_DATA] = {"gfx-data", "/reserved-memory/gfx-data", true},
+    [R_DATA1] = {"gfx1-data", "/reserved-memory/gfx1-data", true},
+    [R_SHARED_RO] = {"gfx-data-shared-ro", "/reserved-memory/gfx-data-shared-ro", true},
+    [R_SHARED_RO1] = {"gfx1-data-shared-ro", "/reserved-memory/gfx1-data-shared-ro", true},
+};
+
+static const char *const t8152_mailboxes[G18G_ROLES] = {"/soc/mailbox@582600000",
+                                                          "/soc/mailbox@582e00000"};
+
+/* ADT layout pinned from the 26A428 J873 ADT. A changed layout means another machine or firmware. */
+static const struct {
+    const char *node;
+    const char *nub;
+    u64 regs[3][2];
+    u64 mailbox;
+} t8152_roles[G18G_ROLES] = {
+    [G18G_GFX] = {"/arm-io/gfx-asc",
+                  "/arm-io/gfx-asc/iop-gfx-nub",
+                  {{0x582600000, 0x74000}, {0x582050000, 8}, {0x316020000, 0x10000}},
+                  1},
+    [G18G_GFX1] = {"/arm-io/gfx1-asc",
+                   "/arm-io/gfx1-asc/iop-gfx1-nub",
+                   {{0x582e00000, 0x74000}, {0x582850000, 8}, {0x316020000, 0x10000}},
+                   2},
+};
+
+struct t8152_segment {
+    u64 base, virt, phys;
+    u32 size, flags;
+} PACKED;
+
+struct t8152_gpu {
+    u64 base[R_COUNT], size[R_COUNT];
+    u64 rtkit_private_vm_base;
+    struct {
+        u64 wrapper;
+        u64 text_base;
+        u64 text_size;
+    } role[G18G_ROLES];
+};
+
+static bool adt_uint(int node, const char *name, u64 *out)
+{
+    u32 len;
+    const void *p = adt_getprop(adt, node, name, &len);
+
+    if (!p)
+        return false;
+    if (len == sizeof(u32)) {
+        u32 v;
+        memcpy(&v, p, sizeof(v));
+        *out = v;
+    } else if (len == sizeof(u64)) {
+        memcpy(out, p, sizeof(*out));
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/* A string property must equal `want`; a trailing NUL is allowed. */
+static bool adt_string_is(int node, const char *name, const char *want)
+{
+    u32 len;
+    const char *p = adt_getprop(adt, node, name, &len);
+    size_t n = strlen(want);
+
+    return p && (len == n || (len == n + 1 && !p[n])) && !memcmp(p, want, n);
+}
+
+#define t8152_fail(...)                                                                            \
+    do {                                                                                           \
+        printf("ADT: GPU: T8152: " __VA_ARGS__);                                                   \
+        return -1;                                                                                 \
+    } while (0)
+
+/* Validate the whole GPU layout read-only before anything is changed (inspect_gpu_facts). */
+static int t8152_inspect(struct t8152_gpu *g)
+{
+    u64 dram_base, dram_size, value;
+    int chosen = adt_path_offset(adt, "/chosen");
+    int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    int defaults = adt_path_offset(adt, "/defaults");
+
+    if (chosen < 0 || sgx < 0 || defaults < 0)
+        t8152_fail("sgx, defaults or chosen node missing\n");
+    if (!adt_uint(chosen, "dram-base", &dram_base) || !adt_uint(chosen, "dram-size", &dram_size) ||
+        !dram_base || !dram_size || dram_base > UINT64_MAX - dram_size)
+        t8152_fail("invalid DRAM bounds\n");
+    if (!adt_string_is(sgx, "compatible", "gpu,t8152"))
+        t8152_fail("not the T8152 sgx node\n");
+    if (!adt_uint(defaults, "uat-vaddr-size", &value) || value != 43)
+        t8152_fail("UAT virtual-address width changed\n");
+    if (!adt_uint(sgx, "agx-address-space-mgmt-mode", &value) || value != 1)
+        t8152_fail("UAT address-space management mode changed\n");
+    static const char *const shared_rw[] = {
+        "gfx-data-shared-rw-base", "gfx-data-shared-rw-size", "gfx1-data-shared-rw-base",
+        "gfx1-data-shared-rw-size"};
+    for (size_t i = 0; i < ARRAY_SIZE(shared_rw); i++)
+        if (adt_uint(sgx, shared_rw[i], &value) && value)
+            t8152_fail("a shared-rw region appeared; it is not exported\n");
+    if (!adt_uint(sgx, "rtkit-private-vm-region-base", &g->rtkit_private_vm_base))
+        t8152_fail("rtkit-private-vm-region-base missing\n");
+
+    u64 dram_end = dram_base + dram_size;
+    for (int i = 0; i < R_COUNT; i++) {
+        char prop[64];
+
+        snprintf(prop, sizeof(prop), "%s-base", t8152_regions[i].name);
+        if (!adt_uint(sgx, prop, &g->base[i]))
+            t8152_fail("missing %s\n", prop);
+        snprintf(prop, sizeof(prop), "%s-size", t8152_regions[i].name);
+        if (!adt_uint(sgx, prop, &g->size[i]))
+            t8152_fail("missing %s\n", prop);
+
+        u64 base = g->base[i], size = g->size[i];
+        if (!base || !size || ((base | size) & (SZ_16K - 1)) || base < dram_base ||
+            base > UINT64_MAX - size || base + size > dram_end)
+            t8152_fail("invalid boot-local region %s\n", t8152_regions[i].name);
+        if (i == R_SHARED && (size < 0x44000 || (size & 0x7fff)))
+            t8152_fail("page-table reservation too small or not halvable\n");
+        for (int j = 0; j < i; j++)
+            if (base < g->base[j] + g->size[j] && g->base[j] < base + size)
+                t8152_fail("overlapping reservations %s and %s\n", t8152_regions[i].name,
+                           t8152_regions[j].name);
+    }
+
+    for (int r = 0; r < G18G_ROLES; r++) {
+        int path[8];
+        int node = adt_path_offset_trace(adt, t8152_roles[r].node, path);
+        int nub = adt_path_offset(adt, t8152_roles[r].nub);
+        const struct g18g_role_profile *profile = g18g_profile(r);
+        u64 addr, size;
+
+        if (node < 0 || nub < 0)
+            t8152_fail("%s node missing\n", t8152_roles[r].node);
+        if (!adt_string_is(node, "compatible", "iop,ascwrap-v8"))
+            t8152_fail("%s is not an ascwrap-v8 GPU ASC\n", t8152_roles[r].node);
+        for (int i = 0; i < 3; i++)
+            if (adt_get_reg(adt, path, "reg", i, &addr, &size) < 0 ||
+                addr != t8152_roles[r].regs[i][0] || size != t8152_roles[r].regs[i][1])
+                t8152_fail("%s register layout changed\n", t8152_roles[r].node);
+        if (adt_get_reg(adt, path, "reg", 3, &addr, &size) >= 0)
+            t8152_fail("%s has an extra register window\n", t8152_roles[r].node);
+        if (!adt_uint(node, "msgbox-mailbox-num", &value) || value != t8152_roles[r].mailbox ||
+            !adt_string_is(node, "msgbox-using-postoffice", "true"))
+            t8152_fail("%s post-office mailbox changed\n", t8152_roles[r].node);
+        if (!adt_string_is(nub, "uuid", profile->uuid))
+            t8152_fail("%s is not the pinned B-revision firmware\n", t8152_roles[r].node);
+        if (!adt_string_is(node, "segment-names", "__TEXT;__DATA;__DATA_SHARED_RO"))
+            t8152_fail("%s firmware segment layout changed\n", t8152_roles[r].node);
+
+        u32 len;
+        const struct t8152_segment *seg = adt_getprop(adt, node, "segment-ranges", &len);
+        if (!seg || len != 3 * sizeof(*seg))
+            t8152_fail("%s segment-ranges length changed\n", t8152_roles[r].node);
+        for (int i = 0; i < 3; i++) {
+            u64 sbase = seg[i].base, ssize = seg[i].size;
+            if (sbase != seg[i].phys || ((sbase | ssize) & (SZ_16K - 1)) || !ssize ||
+                sbase < dram_base || sbase > UINT64_MAX - ssize || sbase + ssize > dram_end)
+                t8152_fail("%s invalid firmware segment %d\n", t8152_roles[r].node, i);
+            /* The loaded firmware must sit wholly in iBoot's reserved low memory. */
+            if (sbase + ssize > cur_boot_args.phys_base)
+                t8152_fail("%s segment %d is not below Linux RAM\n", t8152_roles[r].node, i);
+        }
+        if (seg[0].size != profile->text_size)
+            t8152_fail("%s TEXT size changed\n", t8152_roles[r].node);
+        enum t8152_region data = r == G18G_GFX ? R_DATA : R_DATA1;
+        enum t8152_region shared_ro = r == G18G_GFX ? R_SHARED_RO : R_SHARED_RO1;
+        if (seg[1].base != g->base[data] || seg[1].size != g->size[data] ||
+            seg[2].base != g->base[shared_ro] || seg[2].size != g->size[shared_ro])
+            t8152_fail("%s DATA segments disagree with the sgx regions\n", t8152_roles[r].node);
+        for (int i = 0; i < R_COUNT; i++)
+            if (seg[0].base < g->base[i] + g->size[i] && g->base[i] < seg[0].base + seg[0].size)
+                t8152_fail("%s TEXT overlaps %s\n", t8152_roles[r].node, t8152_regions[i].name);
+
+        g->role[r].wrapper = t8152_roles[r].regs[0][0];
+        g->role[r].text_base = seg[0].base;
+        g->role[r].text_size = seg[0].size;
+    }
+    return 0;
+}
+
+/* The DTB must declare exactly the reservations and providers the loader expects. */
+static int t8152_check_dt(void *dt)
+{
+    int resv = fdt_path_offset(dt, "/reserved-memory");
+
+    if (resv < 0 || fdt_address_cells(dt, resv) != 2 || fdt_size_cells(dt, resv) != 2)
+        bail("FDT: GPU: /reserved-memory must use two address and two size cells\n");
+    for (int i = 0; i < R_COUNT; i++) {
+        int node = fdt_path_offset(dt, t8152_regions[i].path);
+
+        if (node < 0)
+            bail("FDT: GPU: missing %s\n", t8152_regions[i].path);
+        if (!!fdt_getprop(dt, node, "no-map", NULL) != t8152_regions[i].no_map)
+            bail("FDT: GPU: %s must%s be no-map\n", t8152_regions[i].path,
+                 t8152_regions[i].no_map ? "" : " not");
+    }
+    for (int r = 0; r < G18G_ROLES; r++) {
+        int node = fdt_path_offset(dt, t8152_mailboxes[r]);
+        int len;
+        const char *status;
+
+        if (node < 0 || fdt_node_check_compatible(dt, node, "apple,t8152-gfx-ascwrap-v8"))
+            bail("FDT: GPU: %s is missing or not a T8152 GFX ASC provider\n", t8152_mailboxes[r]);
+        status = fdt_getprop(dt, node, "status", &len);
+        if (!status || strcmp(status, "disabled"))
+            bail("FDT: GPU: %s must ship disabled\n", t8152_mailboxes[r]);
+    }
+    return 0;
+}
+
+static int dt_set_gpu_t8152(void *dt)
+{
+    struct t8152_gpu gpu;
+    int node = fdt_path_offset(dt, "gpu");
+
+    if (node < 0) {
+        printf("FDT: GPU: gpu alias not found in device tree\n");
+        return 0;
+    }
+    if (fdt_node_check_compatible(dt, node, "apple,agx-t8152"))
+        return 0;
+
+    if (t8152_check_dt(dt) || t8152_inspect(&gpu))
+        goto disable;
+    printf("G18G_GPU_ADT_LAYOUT_VERIFIED regions=%d\n", R_COUNT);
+
+    bool qualified = true;
+    for (int r = 0; r < G18G_ROLES; r++) {
+        struct g18g_loader_expect want;
+        char tlv[5] = "";
+        const void *text = (const void *)gpu.role[r].text_base;
+
+        g18g_expected_loader(r, gpu.base[R_SHARED], gpu.size[R_SHARED], gpu.base[R_HANDOFF],
+                             gpu.base[R_L2], gpu.rtkit_private_vm_base, gpu.role[r].wrapper, chip_id,
+                             &want);
+        int rc = g18g_qualify_text(r, text, gpu.role[r].text_size, &want, tlv);
+        if (rc) {
+            printf("ADT: GPU: T8152: firmware role %d rejected: %s %s\n", r,
+                   g18g_result_string(rc), tlv);
+            qualified = false;
+        }
+    }
+
+    for (int i = 0; i < R_COUNT; i++) {
+        if (dt_set_resvmem(dt, t8152_regions[i].path, gpu.base[i], gpu.size[i]))
+            return -1;
+        printf("G18G_GPU_REGION %s: 0x%lx + 0x%lx\n", t8152_regions[i].name, gpu.base[i],
+               gpu.size[i]);
+    }
+    printf("G18G_GPU_REGIONS_WRITTEN regions=%d\n", R_COUNT);
+
+    if (!qualified) {
+        printf("G18G_GPU_FIRMWARE_REJECTED mailboxes=disabled receipt=absent\n");
+        return 0;
+    }
+    printf("G18G_GPU_FIRMWARE_TEXT_QUALIFIED roles=2 runtime_admitted=no\n");
+
+    for (int r = 0; r < G18G_ROLES; r++) {
+        int mailbox = fdt_path_offset(dt, t8152_mailboxes[r]);
+
+        if (mailbox < 0 || fdt_setprop_string(dt, mailbox, "status", "okay"))
+            bail("FDT: GPU: failed to enable %s\n", t8152_mailboxes[r]);
+    }
+    printf("G18G_GPU_MAILBOXES_ENABLED providers=2\n");
+
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0 || fdt_setprop_string(dt, chosen, G18G_CHOSEN_PROPERTY, G18G_PROFILE))
+        bail("FDT: GPU: failed to set /chosen %s\n", G18G_CHOSEN_PROPERTY);
+    printf("G18G_GPU_FIRMWARE_RECEIPT_SET %s %s\n", G18G_CHOSEN_PROPERTY, G18G_PROFILE);
+    return 0;
+
+disable:
+    node = fdt_path_offset(dt, "gpu");
+    if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
+        return -1;
+    printf("FDT: GPU: invalid T8152 ADT or DT data, disabling GPU\n");
+    return 0;
+}
+
 int dt_set_gpu(void *dt)
 {
     if (chip_id == T8140)
         return dt_set_gpu_t8140(dt);
+    if (chip_id == T8152)
+        return dt_set_gpu_t8152(dt);
 
     bool has_cs_afr = false;
     int (*calc_power)(u32 count, u32 table_count, const struct perf_state *core,

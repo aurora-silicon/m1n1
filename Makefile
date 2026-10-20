@@ -174,6 +174,7 @@ OBJECTS := \
 	exception.o exception_asm.o \
 	fb.o font.o font_retina.o \
 	firmware.o \
+	g18g_identity.o \
 	gxf.o gxf_asm.o \
 	heapblock.o \
 	i2c.o \
@@ -195,6 +196,7 @@ OBJECTS := \
 	rtkit.o \
 	sart.o \
 	sep.o \
+	sha256.o \
 	stage1_config.o \
 	stage1_proxy.o \
 	sio.o \
