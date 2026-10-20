@@ -363,18 +363,19 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
 }
 
 /*
- * T8152 (Apple M6) APCIe, PHY half only.
+ * T8152 (Apple M6) APCIe: PHY half, root complex enable and per-port bring-up.
  *
- * The register sequences come from AppleT8152PCIe (macOS 27.0.1, kernel 26A425), decoded
- * offline: _apcieCommonInit, _apcieGPInit (apcie-phy-tunables, _initializeAUS5Phys, PHY common
- * enable). The root complex and port bring-up of _enableRootComplex are not decoded, so this
- * code never brings a link up. Nothing here has run on hardware.
+ * The register sequences come from AppleT8152PCIe and its Gen5 port class (macOS 27.0.1, kernel
+ * 26A425), decoded offline: _apcieCommonInit, _apcieGPInit, _enableRootComplex, then per port
+ * initializeRefclkBuffer, _resetPortHardware, enablePortHardware and setLtssmEnable. Nothing here
+ * has run on hardware. Not implemented: whatever sets the PHY/PLL lane rate (no decoded function
+ * writes one), and the endpoint PERST# GPIO.
  *
  * Stages, each gated by the one before:
  *   1. ADT preflight: no MMIO. Compatible, board, port count, reg geometry, window relations,
- *      tunable records.
+ *      lane-cfg, bridge nodes, tunable records.
  *   2. Power the controller, then read every register the sequences touch under an exception
- *      guard. A fault, or a PHY that is not in the expected idle state, stops here.
+ *      guard. A fault, a PHY that is not idle, or a port whose link is already up stops there.
  *   3. Writes, only when built with PCIE_T8152_WRITES=1. Every poll has a timeout.
  */
 #ifndef PCIE_T8152_WRITES
@@ -410,6 +411,38 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
 #define T8152_CLKGEN_AUX      0x800
 #define T8152_PHYCMN_OFFSET   0x4000 /* from the PHY base window; inferred */
 #define T8152_PHYCMN_ENABLE   BIT(0)
+
+/* Port windows: ADT reg index 10 + 6 * port + k. */
+#define T8152_PORT_REG0    10
+#define T8152_PORT_REGS    6
+#define T8152_PORT_CFG     0 /* config window: readConfigReg/writeConfigReg */
+#define T8152_PORT_LANE    2 /* PHY lane window, inside PHYBASE */
+#define T8152_PORT_INTR    3 /* Intr2AXI */
+#define T8152_LANE_STRIDE  0x4000
+#define T8152_LANE_BASEOFF 0x10000
+
+#define T8152_CFG_LTSSM_EN  0x080
+#define T8152_CFG_PIPE_STS  0x0a8
+#define T8152_CFG_LINKSTS   0x208
+#define T8152_CFG_APPCLK    0x800
+#define T8152_CFG_STATUS    0x804
+#define T8152_CFG_PERST     0x82c
+#define T8152_CFG_PERST_REL BIT(0)
+#define T8152_CFG_PERST_RET BIT(16)
+#define T8152_LANE_CTRL     0x000
+#define T8152_COMMON_LANECFG 0x004
+#define T8152_COMMON_GTB     0x048
+#define T8152_COMMON_RC      0x04c
+
+struct t8152_ports {
+    u32 present;
+    u32 lane_cfg;
+    u64 ecam;
+    u64 cfg[T8152_PORTS];
+    u64 lane[T8152_PORTS];
+    u64 intr[T8152_PORTS];
+    char bridge[T8152_PORTS][64];
+};
 
 static const struct {
     const char *name;
@@ -490,6 +523,115 @@ static bool t8152_probe_read(u64 addr, u32 *value)
     return true;
 }
 
+static int t8152_ports_preflight(const char *path, int *adt_path, const struct t8152_regs *r,
+                                 struct t8152_ports *p)
+{
+    int node = adt_path_offset(adt, path);
+    u64 ecam_size;
+
+    memset(p, 0, sizeof(*p));
+    if (adt_get_reg(adt, adt_path, "reg", 0, &p->ecam, &ecam_size) ||
+        ecam_size < ((u64)T8152_PORTS << 15)) {
+        printf("pcie: T8152 preflight: bad ECAM window\n");
+        return -1;
+    }
+    /* The lane pipe-reset mask below was derived for lane-cfg 0 only. */
+    if (ADT_GETPROP(adt, node, "lane-cfg", &p->lane_cfg) < 0 || p->lane_cfg != 0) {
+        printf("pcie: T8152 preflight: lane-cfg is not 0\n");
+        return -1;
+    }
+
+    for (u32 port = 0; port < T8152_PORTS; port++) {
+        u64 base[4], size[4];
+        int bridge_offset;
+
+        snprintf(p->bridge[port], sizeof(p->bridge[port]), "%s/pci-bridge%d", path, port);
+        bridge_offset = adt_path_offset(adt, p->bridge[port]);
+        if (bridge_offset < 0)
+            continue;
+        if (!adt_is_compatible(adt, bridge_offset, "apcie-bridge")) {
+            printf("pcie: T8152 preflight: port %d bridge is not apcie-bridge\n", port);
+            return -1;
+        }
+        for (u32 k = 0; k < 4; k++) {
+            if (adt_get_reg(adt, adt_path, "reg", T8152_PORT_REG0 + T8152_PORT_REGS * port + k,
+                            &base[k], &size[k]) ||
+                size[k] < (k == T8152_PORT_CFG ? 0x8000 : 0x4000)) {
+                printf("pcie: T8152 preflight: port %d reg window %d invalid\n", port, k);
+                return -1;
+            }
+        }
+        if (base[T8152_PORT_LANE] !=
+            r->base[T8152_REG_PHYBASE] + T8152_LANE_BASEOFF + T8152_LANE_STRIDE * port) {
+            printf("pcie: T8152 preflight: port %d lane window is not inside PHYBASE\n", port);
+            return -1;
+        }
+        if (tunables_validate_local(p->bridge[port], "apcie-config-tunables", size[T8152_PORT_CFG]) < 0 ||
+            tunables_validate_local(p->bridge[port], "pcie-rc-tunables", 1 << 15) < 0 ||
+            tunables_validate_local(p->bridge[port], "pcie-rc-gen3-shadow-tunables", 1 << 15) < 0 ||
+            tunables_validate_local(p->bridge[port], "pcie-rc-gen4-shadow-tunables", 1 << 15) < 0) {
+            printf("pcie: T8152 preflight: port %d tunable records malformed\n", port);
+            return -1;
+        }
+        p->cfg[port] = base[T8152_PORT_CFG];
+        p->lane[port] = base[T8152_PORT_LANE];
+        p->intr[port] = base[T8152_PORT_INTR];
+        p->present |= BIT(port);
+    }
+    if (!p->present) {
+        printf("pcie: T8152 preflight: no port bridge nodes\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* Read-only: every register the port sequence touches first. A port whose link is up is dropped. */
+static int t8152_ports_recon(struct t8152_ports *p, const struct t8152_regs *r)
+{
+    u32 v;
+    static const struct {
+        const char *name;
+        u32 off;
+    } cfg_regs[] = {
+        {"cfg+0x080", T8152_CFG_LTSSM_EN}, {"cfg+0x0a8", T8152_CFG_PIPE_STS},
+        {"cfg+0x208", T8152_CFG_LINKSTS},  {"cfg+0x800", T8152_CFG_APPCLK},
+        {"cfg+0x804", T8152_CFG_STATUS},   {"cfg+0x82c", T8152_CFG_PERST},
+    };
+    static const u32 common_regs[] = {T8152_COMMON_LANECFG, T8152_COMMON_GTB, T8152_COMMON_RC};
+
+    for (size_t i = 0; i < ARRAY_SIZE(common_regs); i++) {
+        if (!t8152_probe_read(r->base[T8152_REG_COMMON] + common_regs[i], &v)) {
+            printf("pcie: T8152 recon: common+0x%03x faulted; stopping\n", common_regs[i]);
+            return -1;
+        }
+        printf("pcie: T8152 recon: common+0x%03x = 0x%08x\n", common_regs[i], v);
+    }
+    for (u32 port = 0; port < T8152_PORTS; port++) {
+        if (!(p->present & BIT(port)))
+            continue;
+        for (size_t i = 0; i < ARRAY_SIZE(cfg_regs); i++) {
+            if (!t8152_probe_read(p->cfg[port] + cfg_regs[i].off, &v)) {
+                printf("pcie: T8152 recon: port %d %s faulted; stopping\n", port, cfg_regs[i].name);
+                return -1;
+            }
+            printf("pcie: T8152 recon: port %d %-10s = 0x%08x\n", port, cfg_regs[i].name, v);
+            if (cfg_regs[i].off == T8152_CFG_LINKSTS && (v & APCIE_PORT_LINKSTS_UP)) {
+                printf("pcie: T8152 recon: port %d link already up; leaving it alone\n", port);
+                p->present &= ~BIT(port);
+                break;
+            }
+        }
+        if (!(p->present & BIT(port)))
+            continue;
+        if (!t8152_probe_read(p->lane[port] + T8152_LANE_CTRL, &v)) {
+            printf("pcie: T8152 recon: port %d lane+0x000 faulted; stopping\n", port);
+            return -1;
+        }
+        printf("pcie: T8152 recon: port %d lane+0x000  = 0x%08x\n", port, v);
+    }
+    return p->present ? 0 : -1;
+}
+
 #if PCIE_T8152_WRITES
 static int t8152_phy_init(const char *path, int adt_offset, const struct t8152_regs *r)
 {
@@ -524,6 +666,120 @@ static int t8152_phy_init(const char *path, int adt_offset, const struct t8152_r
     set32(r->base[T8152_REG_PHYBASE] + T8152_PHYCMN_OFFSET, T8152_PHYCMN_ENABLE);
     return 0;
 }
+
+/* _enableRootComplex(true). COMMON[4] is `this[0x1a4]`, which _setLaneCfg stores (the ADT lane-cfg). */
+static void t8152_rc_enable(const struct t8152_regs *r, const struct t8152_ports *p)
+{
+    u64 common = r->base[T8152_REG_COMMON];
+
+    write32(common + T8152_COMMON_LANECFG, p->lane_cfg);
+    write32(common + T8152_COMMON_RC, 0x140);
+    set32(common + T8152_COMMON_GTB, BIT(0)); /* _enableGTBToPTM(true) */
+}
+
+/* _resetPortHardware: values as written by the kext, in order. */
+static const struct {
+    u32 off, val;
+} t8152_port_reset[] = {
+    {0x088, 0x110},      {0x100, 0xffffffff}, {0x148, 0xffffffff}, {0x210, 0xffffffff},
+    {0x080, 0x0},        {0x084, 0x0},        {0x104, 0xfffffff0}, {0x124, 0x100},
+    {0x16c, 0x0},        {0x13c, 0x0},        {0x800, 0x100100},   {0x808, 0x1001ff},
+    {0x82c, 0x10000},
+};
+static const struct {
+    u32 off, val;
+} t8152_port_reset_tail[] = {
+    {0x130, 0x208}, {0x140, 0x10}, {0x144, 0x253770}, {0x21c, 0x0}, {0x834, 0x0}, {0x83c, 0x0},
+};
+
+static int t8152_port_init(const struct t8152_ports *p, u32 port, int bridge_offset)
+{
+    const char *bridge = p->bridge[port];
+    u64 cfg = p->cfg[port];
+    u64 lane = p->lane[port];
+    u64 dbi = p->ecam + ((u64)port << 15);
+    u32 max_speed;
+
+    /* initializeRefclkBuffer (PHY lane window). */
+    set32(lane + T8152_LANE_CTRL, BIT(0));
+    if (poll32(lane + T8152_LANE_CTRL, BIT(2), BIT(2), 50000))
+        goto timeout;
+    set32(lane + T8152_LANE_CTRL, BIT(1));
+    if (poll32(lane + T8152_LANE_CTRL, BIT(3), BIT(3), 50000))
+        goto timeout;
+    clear32(lane + T8152_LANE_CTRL, BIT(4));
+    set32(lane + T8152_LANE_CTRL, BIT(9));
+    set32(lane + T8152_LANE_CTRL, BIT(10));
+
+    /* _resetPortHardware */
+    for (size_t i = 0; i < ARRAY_SIZE(t8152_port_reset); i++)
+        write32(cfg + t8152_port_reset[i].off, t8152_port_reset[i].val);
+    for (u32 i = 0; i < 16; i++)
+        write32(cfg + 0x3000 + 4 * i, 0);
+    for (u32 i = 0; i < 256; i++)
+        write32(cfg + 0x3800 + 4 * i, 0);
+    for (size_t i = 0; i < ARRAY_SIZE(t8152_port_reset_tail); i++)
+        write32(cfg + t8152_port_reset_tail[i].off, t8152_port_reset_tail[i].val);
+
+    /* The kext applies tunables here through a slot whose property it was not possible to read. */
+    if (tunables_apply_local_addr(bridge, "apcie-config-tunables", cfg)) {
+        printf("pcie: T8152 port %d config tunables failed\n", port);
+        return -1;
+    }
+
+    /* enablePortHardware: setPortEnable(true), PERST# release, lane pipe reset (mask 1). */
+    set32(cfg + T8152_CFG_APPCLK, BIT(0));
+    if (poll32(cfg + T8152_CFG_STATUS, BIT(0), BIT(0), 50000))
+        goto timeout;
+    set32(cfg + T8152_CFG_PERST, T8152_CFG_PERST_REL);
+    if (poll32(cfg + T8152_CFG_PIPE_STS, BIT(16), 0, 20000))
+        goto timeout;
+    clear32(cfg + T8152_CFG_PERST, T8152_CFG_PERST_RET);
+    if (poll32(cfg + T8152_CFG_STATUS, BIT(0), BIT(0), T8152_POLL_US))
+        goto timeout;
+
+    /* _initializeRootComplex: DBI registers through the ECAM window, as for the other Gen5 parts. */
+    set32(dbi + DWC_DBI_RO_WR, DWC_DBI_RO_WR_EN);
+    if (tunables_apply_local_addr(bridge, "pcie-rc-tunables", dbi) ||
+        tunables_apply_local_addr(bridge, "pcie-rc-gen3-shadow-tunables", dbi) ||
+        tunables_apply_local_addr(bridge, "pcie-rc-gen4-shadow-tunables", dbi)) {
+        printf("pcie: T8152 port %d rc tunables failed\n", port);
+        return -1;
+    }
+    if (ADT_GETPROP(adt, bridge_offset, "maximum-link-speed", &max_speed) >= 0 && max_speed >= 1 &&
+        max_speed <= 4) {
+        mask32(dbi + PCIE_CAP_BASE + PCIE_LNKCAP, PCIE_LNKCAP_SLS,
+               FIELD_PREP(PCIE_LNKCAP_SLS, max_speed));
+        mask32(dbi + PCIE_CAP_BASE + PCIE_LNKCAP2, PCIE_LNKCAP2_SLS,
+               FIELD_PREP(PCIE_LNKCAP2_SLS, (1 << max_speed) - 1));
+        mask16(dbi + PCIE_CAP_BASE + PCIE_LNKCTL2, PCIE_LNKCTL2_TLS,
+               FIELD_PREP(PCIE_LNKCTL2_TLS, max_speed));
+        set32(dbi + DWC_DBI_LINK_WIDTH_SPEED_CONTROL, DWC_DBI_SPEED_CHANGE);
+    }
+    /* One lane: the kext derives the width from the lane config; x1 is assumed here. */
+    mask32(dbi + DWC_DBI_PORT_LINK_CONTROL, DWC_DBI_PORT_LINK_MODE,
+           FIELD_PREP(DWC_DBI_PORT_LINK_MODE, DWC_DBI_PORT_LINK_MODE_1_LANE));
+    mask32(dbi + DWC_DBI_LINK_WIDTH_SPEED_CONTROL, DWC_DBI_LINK_WIDTH,
+           FIELD_PREP(DWC_DBI_LINK_WIDTH, 1));
+    mask32(dbi + PCIE_CAP_BASE + PCIE_LNKCAP, PCIE_LNKCAP_MLW, FIELD_PREP(PCIE_LNKCAP_MLW, 1));
+    clear32(dbi + DWC_DBI_RO_WR, DWC_DBI_RO_WR_EN);
+
+    /* _writeIntr2AxiReg(0x80, 1), then enableLinkTraining -> setLtssmEnable(true). */
+    write32(p->intr[port] + 0x80, 1);
+    set32(cfg + T8152_CFG_LTSSM_EN, BIT(0));
+    if (poll32(cfg + T8152_CFG_LINKSTS, APCIE_PORT_LINKSTS_UP, APCIE_PORT_LINKSTS_UP, T8152_POLL_US))
+        printf("pcie: T8152 port %d: link not up after %d ms (endpoint reset GPIO is not driven)\n",
+               port, T8152_POLL_US / 1000);
+    else
+        printf("pcie: T8152 port %d: link up, status 0x%x\n", port, read32(cfg + T8152_CFG_LINKSTS));
+    return 0;
+
+timeout:
+    printf("pcie: T8152 port %d: poll timed out (cfg+0x800 0x%x +0x804 0x%x +0x82c 0x%x +0x0a8 0x%x)\n",
+           port, read32(cfg + T8152_CFG_APPCLK), read32(cfg + T8152_CFG_STATUS),
+           read32(cfg + T8152_CFG_PERST), read32(cfg + T8152_CFG_PIPE_STS));
+    return -1;
+}
 #endif
 
 /* Returns 1 when skipped or read-only, -1 when the controller was touched and no link exists. */
@@ -545,6 +801,12 @@ static int pcie_t8152_init(const char *path)
     if (t8152_preflight(path, adt_path, adt_offset, &r))
         return 1;
     printf("pcie: T8152 ADT preflight passed\n");
+
+    struct t8152_ports ports;
+    if (t8152_ports_preflight(path, adt_path, &r, &ports))
+        return 1;
+    printf("pcie: T8152 port preflight passed (ports 0x%x, lane-cfg %d)\n", ports.present,
+           ports.lane_cfg);
 
     if (pmgr_adt_power_enable(path)) {
         printf("pcie: T8152 power enable failed\n");
@@ -582,8 +844,13 @@ static int pcie_t8152_init(const char *path)
         return -1;
     }
 
+    if (t8152_ports_recon(&ports, &r)) {
+        printf("pcie: T8152 port recon: nothing to bring up; no writes\n");
+        return -1;
+    }
+
 #if PCIE_T8152_WRITES
-    printf("pcie: T8152 recon passed; running the PHY sequence\n");
+    printf("pcie: T8152 recon passed; running PHY, root complex and port sequences\n");
     t8152_dirty = true;
     if (t8152_phy_init(path, adt_offset, &r))
         return -1;
@@ -591,7 +858,15 @@ static int pcie_t8152_init(const char *path)
            read32(r.base[T8152_REG_PHY] + T8152_PHY_CTRL0),
            read32(r.base[T8152_REG_PHY] + T8152_PHY_CTRL4),
            read32(r.base[T8152_REG_PHY] + T8152_PHY_STATUS));
-    printf("pcie: T8152 root complex and port bring-up are not implemented; no link\n");
+    t8152_rc_enable(&r, &ports);
+    for (u32 port = 0; port < T8152_PORTS; port++) {
+        if (!(ports.present & BIT(port)))
+            continue;
+        printf("pcie: T8152 initializing port %d\n", port);
+        if (t8152_port_init(&ports, port, adt_path_offset(adt, ports.bridge[port])))
+            return -1;
+    }
+    printf("pcie: T8152 sequences done; the controller is left as is and not reported as initialized\n");
     return -1;
 #else
     printf("pcie: T8152 recon passed; writes disabled (build with PCIE_T8152_WRITES=1)\n");
