@@ -24,6 +24,12 @@ int t8152_dptx_activate_phy(u64 base)
     /* 0xfffffe0009138fb4. phyPowerUp at 0xfffffe000913a34c is ret and is not called. */
     set_field(base, 0x1c00, 4, 0x3f0, 0x3c);
     set_field(base, 0, 0, 0x1, 1);
+    /* activatePll 0x9138fb0 also sets bit 1 of +0x0. */
+    set_field(base, 0, 1, 0x2, 1);
+    /* pll/phy half-link setters 0x91398a0/0x91398e4 write !half: +0x0 bit 17 and 0x2400 bit 3.
+     * This driver only runs full links. */
+    set_field(base, 0, 17, 0x20000, 1);
+    set_field(base, 0x2400, 3, 0x8, 1);
     return 0;
 }
 
