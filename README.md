@@ -84,11 +84,13 @@ Supported compression formats:
 
 ### T8152 USB2 calibration
 
-The Linux devicetree must provide `usb2phy2` and `usbdrd2` aliases for the front USB2 port.
+The Linux devicetree must provide `usb2phy3` and `usbdrd3` aliases for the USB-C port4 (drd3).
 The nodes must use `apple,t8152-usb2-phy` and `apple,t8152-dwc3`, respectively.
-m1n1 exports the PHY and host calibration from the matching ADT nodes into these existing nodes.
+m1n1 exports the PHY and host calibration from the matching ADT nodes
+(`/arm-io/atc-phy3` and `/arm-io/usb-drd3`) into these existing nodes.
 Each calibration record contains a bank-relative byte offset, a clear mask and a set value.
 The Linux drivers select the register bank and apply the calibration.
+This USB2-only path does not configure DP/USB3 lanes.
 
 ## License
 
