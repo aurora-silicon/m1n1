@@ -365,10 +365,14 @@ int dptx_phy_set_drive_settings(dptx_phy_t *phy, const dptx_drive_settings_t *se
 {
     if (!phy)
         return -1;
+    if (phy->type == DPTX_PHY_T8152_ATC)
+        return atc_phy_set_drive_settings(phy->atc, settings, count);
     /* ponytail: non-ATC PHYs keep their reset swing/pre-emphasis, as m1n1 does on the M2 Pro.
      * Program the T8152 lane registers if training needs levels above 0. */
-    return phy->type == DPTX_PHY_T8152_ATC ? atc_phy_set_drive_settings(phy->atc, settings, count)
-                                           : 0;
+    for (u32 i = 0; settings && i < count; i++)
+        printf("dptx: drive lane %u fmt %u v %u pe %u\n", i, settings[i].format,
+               settings[i].voltage, settings[i].pre_emphasis);
+    return 0;
 }
 
 int dptx_phy_set_link_rate(dptx_phy_t *phy, u32 link_rate)
