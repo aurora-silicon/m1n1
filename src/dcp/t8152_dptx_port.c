@@ -141,6 +141,25 @@ int t8152_dptx_latch_rate(u64 base, u32 link_rate_mbps)
     return 0;
 }
 
+/* pllPowerUp 0x9139934-0x9139bf0: request power (0x408 bit 6, bits 2:0 = 7, bit 3), poll
+ * bit 19 (lock) up to 10 times 16 us apart, drop bits 3 and 6, then check 0x438 bit 30. */
+static int t8152_dptx_pll_power_up(u64 base)
+{
+    set_field(base, 0x408, 6, 0x40, 1);
+    set_field(base, 0x408, 0, 0x7, 7);
+    set_field(base, 0x408, 3, 0x8, 1);
+    u32 polls = 0;
+    do
+        udelay(16);
+    while (!(read32(base + 0x408) & BIT(19)) && ++polls < 10);
+    bool locked = read32(base + 0x408) & BIT(19);
+    set_field(base, 0x408, 3, 0x8, 0);
+    set_field(base, 0x408, 6, 0x40, 0);
+    printf("dptx: pll %s after %u polls, 0x408 %x 0x438 %x\n", locked ? "locked" : "NOT locked",
+           polls, read32(base + 0x408), read32(base + 0x438));
+    return locked ? 0 : -1;
+}
+
 int t8152_dptx_program_rate(u64 port, u64 block0, u32 link_rate_mbps)
 {
     if (!block0)
@@ -149,6 +168,7 @@ int t8152_dptx_program_rate(u64 port, u64 block0, u32 link_rate_mbps)
         return -1;
     if (t8152_dptx_shadow_update(block0))
         return -1;
+    t8152_dptx_pll_power_up(port);
     if (t8152_dptx_latch_rate(port, link_rate_mbps))
         return -1;
     return t8152_dptx_calibrate(port);
