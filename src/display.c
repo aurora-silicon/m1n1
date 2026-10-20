@@ -634,13 +634,9 @@ static int display_init_t8152_route(const char *path)
     }
 
     int ret = -1;
-    /* The HDMI dptx-phy names its DCP DPTX remote port in its ADT port-number (1). ATC PHY
-     * port-numbers are Type-C port indices (atc-phy3 says 4), not DPTX ports: those keep 0. */
+    /* DPTX remote port 0 drives the HDMI dptx-phy. The ADT port-number (1) is not the DCP port:
+     * with 1 (inc54-61) the DCP never called ACTIVATE or trained and reported no sink at once. */
     u32 port = 0;
-    int node = adt_path_offset(adt, path);
-    const u32 *pn = node < 0 ? NULL : adt_getprop(adt, node, "port-number", NULL);
-    if (pn && !strcmp(path, "/arm-io/dptx-phy"))
-        port = *pn;
     printf("display: %s uses DPTX port %u\n", path, port);
     if (!strcmp(path, "/arm-io/dptx-phy"))
         dcp_dp2hdmi_power_on(dcp, "/arm-io/dp2hdmi-gpio0");
