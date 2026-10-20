@@ -4,6 +4,7 @@
 #include "exception.h"
 #include "pcie.h"
 #include "pmgr.h"
+#include "smc.h"
 #include "string.h"
 #include "tunables.h"
 #include "utils.h"
@@ -368,8 +369,9 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
  * The register sequences come from AppleT8152PCIe and its Gen5 port class (macOS 27.0.1, kernel
  * 26A425), decoded offline: _apcieCommonInit, _apcieGPInit, _enableRootComplex, then per port
  * initializeRefclkBuffer, _resetPortHardware, enablePortHardware and setLtssmEnable. Nothing here
- * has run on hardware. Not implemented: whatever sets the PHY/PLL lane rate (no decoded function
- * writes one), and the endpoint PERST# GPIO.
+ * has run on hardware. Per port it also drives the endpoint PERST# GPIO and, where the ADT names
+ * one, the SMC radio power key, in the order the base kext uses. Not implemented: whatever sets
+ * the PHY/PLL lane rate (no decoded function writes one).
  *
  * Stages, each gated by the one before:
  *   1. ADT preflight: no MMIO. Compatible, board, port count, reg geometry, window relations,
@@ -442,6 +444,15 @@ struct t8152_ports {
     u64 lane[T8152_PORTS];
     u64 intr[T8152_PORTS];
     char bridge[T8152_PORTS][64];
+    u64 gpio_base;
+    u32 perst; /* ports with a function-perst GPIO */
+    u32 radio; /* ports with an SMC function-reset (radio power) */
+    u32 perst_pin[T8152_PORTS];
+    u32 t_refclk_to_perst[T8152_PORTS]; /* us */
+    u32 perst_to_config[T8152_PORTS];   /* ms */
+    u32 radio_key[T8152_PORTS];
+    u32 radio_w0[T8152_PORTS];
+    u32 radio_w1[T8152_PORTS];
 };
 
 static const struct {
@@ -523,6 +534,55 @@ static bool t8152_probe_read(u64 addr, u32 *value)
     return true;
 }
 
+/* function-perst {gpio phandle, 'GPIO', pin, flags}; function-reset {smc phandle, 'pKW8', key, w0, w1}. */
+static int t8152_port_functions(struct t8152_ports *p, u32 port, int bridge_offset)
+{
+    u32 len = 0, v;
+    const u32 *f = adt_getprop(adt, bridge_offset, "function-perst", &len);
+
+    p->t_refclk_to_perst[port] = 100;
+    p->perst_to_config[port] = 100;
+    if (ADT_GETPROP(adt, bridge_offset, "t-refclk-to-perst", &v) >= 0)
+        p->t_refclk_to_perst[port] = v;
+    if (ADT_GETPROP(adt, bridge_offset, "perst-to-config", &v) >= 0)
+        p->perst_to_config[port] = v;
+
+    if (f && len >= 16) {
+        int gpio = adt_path_offset(adt, "/arm-io/gpio0");
+        int gpio_path[8];
+        u32 phandle, pins;
+
+        if (gpio < 0 || ADT_GETPROP(adt, gpio, "AAPL,phandle", &phandle) < 0 || phandle != f[0] ||
+            ADT_GETPROP(adt, gpio, "#gpio-pins", &pins) < 0 || f[2] >= pins) {
+            printf("pcie: T8152 preflight: port %d function-perst does not name /arm-io/gpio0\n", port);
+            return -1;
+        }
+        if (!p->gpio_base && (adt_path_offset_trace(adt, "/arm-io/gpio0", gpio_path) < 0 ||
+                              adt_get_reg(adt, gpio_path, "reg", 0, &p->gpio_base, NULL))) {
+            printf("pcie: T8152 preflight: no gpio0 register window\n");
+            return -1;
+        }
+        p->perst_pin[port] = f[2];
+        p->perst |= BIT(port);
+    }
+
+    f = adt_getprop(adt, bridge_offset, "function-reset", &len);
+    if (f && len >= 20) {
+        if (memcmp(&f[1], "pKW8", 4) && memcmp(&f[1], "8WKp", 4)) {
+            printf("pcie: T8152 preflight: port %d function-reset is not an SMC pKW8 function\n", port);
+            return -1;
+        }
+        p->radio_key[port] = f[2];
+        p->radio_w0[port] = f[3];
+        p->radio_w1[port] = f[4];
+        p->radio |= BIT(port);
+    }
+    printf("pcie: T8152 preflight: port %d perst %s (pin %d, refclk-to-perst %d us, perst-to-config %d ms), radio power %s\n",
+           port, (p->perst & BIT(port)) ? "gpio" : "none", p->perst_pin[port], p->t_refclk_to_perst[port],
+           p->perst_to_config[port], (p->radio & BIT(port)) ? "smc key" : "none");
+    return 0;
+}
+
 static int t8152_ports_preflight(const char *path, int *adt_path, const struct t8152_regs *r,
                                  struct t8152_ports *p)
 {
@@ -576,6 +636,8 @@ static int t8152_ports_preflight(const char *path, int *adt_path, const struct t
         p->cfg[port] = base[T8152_PORT_CFG];
         p->lane[port] = base[T8152_PORT_LANE];
         p->intr[port] = base[T8152_PORT_INTR];
+        if (t8152_port_functions(p, port, bridge_offset))
+            return -1;
         p->present |= BIT(port);
     }
     if (!p->present) {
@@ -628,6 +690,12 @@ static int t8152_ports_recon(struct t8152_ports *p, const struct t8152_regs *r)
             return -1;
         }
         printf("pcie: T8152 recon: port %d lane+0x000  = 0x%08x\n", port, v);
+        if ((p->perst & BIT(port)) && !t8152_probe_read(p->gpio_base + 4 * p->perst_pin[port], &v)) {
+            printf("pcie: T8152 recon: port %d perst pin %d faulted; stopping\n", port, p->perst_pin[port]);
+            return -1;
+        }
+        if (p->perst & BIT(port))
+            printf("pcie: T8152 recon: port %d perst pin %d reg = 0x%08x\n", port, p->perst_pin[port], v);
     }
     return p->present ? 0 : -1;
 }
@@ -692,6 +760,35 @@ static const struct {
     {0x130, 0x208}, {0x140, 0x10}, {0x144, 0x253770}, {0x21c, 0x0}, {0x834, 0x0}, {0x83c, 0x0},
 };
 
+#define T8152_GPIO_DATA     BIT(0)
+#define T8152_GPIO_MODE     GENMASK(3, 1)
+#define T8152_GPIO_MODE_OUT 1
+
+/* Apple GPIO: one 32-bit register per pin (DATA bit 0, MODE bits 3:1, 1 = output). */
+static void t8152_gpio_drive(const struct t8152_ports *p, u32 port, int level)
+{
+    mask32(p->gpio_base + 4 * p->perst_pin[port], T8152_GPIO_MODE | T8152_GPIO_DATA,
+           FIELD_PREP(T8152_GPIO_MODE, T8152_GPIO_MODE_OUT) | (level ? T8152_GPIO_DATA : 0));
+}
+
+/* AppleSMCPMU pKW8 on: 8 bytes {w0 with its low 16 bits set to 1, w1}, as the DCP code does for HDMI. */
+static int t8152_radio_power_on(const struct t8152_ports *p, u32 port)
+{
+    u32 payload[2] = {(p->radio_w0[port] & ~0xffffu) | 1, p->radio_w1[port]};
+    smc_dev_t *smc = smc_init();
+    int ret;
+
+    if (!smc) {
+        printf("pcie: T8152 port %d: SMC init failed\n", port);
+        return -1;
+    }
+    ret = smc_write(smc, p->radio_key[port], payload, sizeof(payload));
+    smc_shutdown(smc);
+    printf("pcie: T8152 port %d: radio power key %08x write {%08x, %08x} -> %d\n", port,
+           p->radio_key[port], payload[0], payload[1], ret);
+    return ret;
+}
+
 static int t8152_port_init(const struct t8152_ports *p, u32 port, int bridge_offset)
 {
     const char *bridge = p->bridge[port];
@@ -699,6 +796,17 @@ static int t8152_port_init(const struct t8152_ports *p, u32 port, int bridge_off
     u64 lane = p->lane[port];
     u64 dbi = p->ecam + ((u64)port << 15);
     u32 max_speed;
+
+    /*
+     * Power and endpoint reset, as the base kext orders them: the radio is powered, the endpoint
+     * PERST# is held low, and it is released only after the refclk lane init, t-refclk-to-perst,
+     * and at least 100 ms since power (PERST# release is also enforced to be 100 ms after the
+     * reset timestamp in setEndpointReset).
+     */
+    if ((p->radio & BIT(port)) && t8152_radio_power_on(p, port))
+        return -1;
+    if (p->perst & BIT(port))
+        t8152_gpio_drive(p, port, 0);
 
     /* initializeRefclkBuffer (PHY lane window). */
     set32(lane + T8152_LANE_CTRL, BIT(0));
@@ -710,6 +818,14 @@ static int t8152_port_init(const struct t8152_ports *p, u32 port, int bridge_off
     clear32(lane + T8152_LANE_CTRL, BIT(4));
     set32(lane + T8152_LANE_CTRL, BIT(9));
     set32(lane + T8152_LANE_CTRL, BIT(10));
+
+    udelay(p->t_refclk_to_perst[port]);
+    if (p->perst & BIT(port)) {
+        mdelay(100);
+        t8152_gpio_drive(p, port, 1);
+        printf("pcie: T8152 port %d: endpoint PERST# released (pin %d)\n", port, p->perst_pin[port]);
+        mdelay(p->perst_to_config[port]);
+    }
 
     /* _resetPortHardware */
     for (size_t i = 0; i < ARRAY_SIZE(t8152_port_reset); i++)
@@ -768,8 +884,7 @@ static int t8152_port_init(const struct t8152_ports *p, u32 port, int bridge_off
     write32(p->intr[port] + 0x80, 1);
     set32(cfg + T8152_CFG_LTSSM_EN, BIT(0));
     if (poll32(cfg + T8152_CFG_LINKSTS, APCIE_PORT_LINKSTS_UP, APCIE_PORT_LINKSTS_UP, T8152_POLL_US))
-        printf("pcie: T8152 port %d: link not up after %d ms (endpoint reset GPIO is not driven)\n",
-               port, T8152_POLL_US / 1000);
+        printf("pcie: T8152 port %d: link not up after %d ms\n", port, T8152_POLL_US / 1000);
     else
         printf("pcie: T8152 port %d: link up, status 0x%x\n", port, read32(cfg + T8152_CFG_LINKSTS));
     return 0;
