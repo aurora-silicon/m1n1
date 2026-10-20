@@ -965,6 +965,53 @@ timeout:
 }
 #endif
 
+/*
+ * The M6 apcie ADT node has no clock-gates, so pmgr_adt_power_enable() cannot find any device. The APCIe PMGR domains
+ * (pmgr0 offsets, from the r4 DTS t8152-j873-pmgr.dtsi) are normally on at boot; Linux reports only the two OCLA
+ * (on-chip logic analyser) domains as off. Report every domain; with PCIE_T8152_WRITES request ACTIVE for any that is
+ * not, parents first. Nothing here is fatal: the register probe that follows decides.
+ */
+#define T8152_PS_ACTUAL GENMASK(7, 4)
+#define T8152_PS_TARGET GENMASK(3, 0)
+#define T8152_PS_ACTIVE 0xf
+
+static const struct {
+    const char *name;
+    u32 off;
+} t8152_apcie_ps[] = {
+    {"apcie_gp", 0x8c0},         {"apcie_st0", 0xea0},      {"apcie_sys_gp", 0xec0},
+    {"apcie_sys_st0", 0x1280},   {"apcie_sysocla", 0x12a0}, {"apcie_phy_sw", 0x15a0},
+    {"apcie_st0_ocla", 0x15c0},  {"apcie_aon_aus5", 0x1620}, {"apcie_aon_gp", 0x1640},
+    {"apcie_st0_aus5", 0x1660},  {"apcie_gp_aus5", 0x1680},
+};
+
+static void t8152_apcie_pmgr(void)
+{
+    int path[8];
+    u64 base, size;
+
+    if (adt_path_offset_trace(adt, "/arm-io/pmgr", path) < 0 || adt_get_reg(adt, path, "reg", 0, &base, &size) ||
+        !base) {
+        printf("pcie: T8152 pmgr: /arm-io/pmgr reg[0] not found\n");
+        return;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(t8152_apcie_ps); i++) {
+        u64 addr = base + t8152_apcie_ps[i].off;
+        u32 v = read32(addr);
+
+        printf("pcie: T8152 pmgr %-15s = 0x%08x actual %u target %u\n", t8152_apcie_ps[i].name, v,
+               (u32)FIELD_GET(T8152_PS_ACTUAL, v), (u32)FIELD_GET(T8152_PS_TARGET, v));
+#if PCIE_T8152_WRITES
+        if (FIELD_GET(T8152_PS_ACTUAL, v) != T8152_PS_ACTIVE) {
+            mask32(addr, T8152_PS_TARGET, FIELD_PREP(T8152_PS_TARGET, T8152_PS_ACTIVE));
+            int ret = poll32(addr, T8152_PS_ACTUAL, FIELD_PREP(T8152_PS_ACTUAL, T8152_PS_ACTIVE), 10000);
+            printf("pcie: T8152 pmgr %-15s -> %s (0x%08x)\n", t8152_apcie_ps[i].name,
+                   ret < 0 ? "not active" : "active", read32(addr));
+        }
+#endif
+    }
+}
+
 /* Returns 1 when skipped or read-only, -1 when the controller was touched and no link exists. */
 static int pcie_t8152_init(const char *path)
 {
@@ -991,10 +1038,7 @@ static int pcie_t8152_init(const char *path)
     printf("pcie: T8152 port preflight passed (ports 0x%x, lane-cfg %d)\n", ports.present,
            ports.lane_cfg);
 
-    if (pmgr_adt_power_enable(path)) {
-        printf("pcie: T8152 power enable failed\n");
-        return 1;
-    }
+    t8152_apcie_pmgr();
 
     struct {
         const char *name;
