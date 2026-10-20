@@ -106,13 +106,6 @@ int dptx_phy_activate(dptx_phy_t *phy)
                read32(phy->regs[1] + 0x48));
         t8152_hdmi_tunables(phy->regs[0]);
         int aret = t8152_dptx_activate_phy(phy->regs[0]);
-        /* AppleDPTX laneReset (0xa203f74): PMA_LANE_RESET_N is bit 2, its override bit 3.
-         * Live 2026-10-20: both bits stick only at +0x0 of the 16 lane sub-units
-         * (0x4500 + n * 0x2800 + k * 0x100), which reset to 0 = lanes held in reset. */
-        for (u32 n = 0; n < 4; n++)
-            for (u32 k = 0; k < 4; k++)
-                mask32(phy->regs[0] + 0x4500 + n * 0x2800 + k * 0x100, 0xc, 0xc);
-        printf("dptx: lane reset released, lane0 +0x0 %x\n", read32(phy->regs[0] + 0x4500));
         phy->powered = !aret;
         return aret;
     }
