@@ -360,22 +360,11 @@ int dptx_phy_set_drive_settings(dptx_phy_t *phy, const dptx_drive_settings_t *se
         return -1;
     if (phy->type == DPTX_PHY_T8152_ATC)
         return atc_phy_set_drive_settings(phy->atc, settings, count);
-    if (phy->type != DPTX_PHY_T8152_HDMI)
-        return 0;
-    if (count > 4 || (!settings && count))
-        return -1;
-    /* AppleDPTX TXEQ_2 (0xa1f5d94): SWING_OV in bits [5:0], override enable bit 6, at +0x0c of
-     * each lane's TXD sub-unit (reg0 0x4500 + n * 0x2800 + 0xc00); resets to swing 0 with no
-     * override. Same preset encoding as the ATC path. Validate every lane before any write. */
-    u32 presets[4];
-    for (u32 i = 0; i < count; i++)
-        if (atc_phy_drive_preset(&settings[i], &presets[i]))
-            return -1;
-    for (u32 i = 0; i < count; i++)
-        mask32(phy->regs[0] + 0x4500 + i * 0x2800 + 0xc0c, 0x7f, (presets[i] & 0x3f) | 0x40);
-    if (count)
-        printf("dptx: swing v%u pe%u -> txeq2 %x\n", settings[0].voltage, settings[0].pre_emphasis,
-               read32(phy->regs[0] + 0x4500 + 0xc0c));
+    /* ponytail: non-ATC PHYs keep their reset swing/pre-emphasis, as m1n1 does on the M2 Pro.
+     * Program the T8152 lane registers if training needs levels above 0. */
+    for (u32 i = 0; settings && i < count; i++)
+        printf("dptx: drive lane %u fmt %u v %u pe %u\n", i, settings[i].format,
+               settings[i].voltage, settings[i].pre_emphasis);
     return 0;
 }
 
