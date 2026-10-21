@@ -716,6 +716,21 @@ static int dt_set_cpus(void)
     if (cpus < 0)
         bail("FDT: /cpus node not found in devtree\n");
 
+    /* w74 diagnostic: expose the secondary-CPU start result to Linux. */
+    {
+        extern u64 smp_started_mask, smp_start_fail_mask;
+        u64 alive = 0;
+        for (int i = 0; i < MAX_CPUS; i++)
+            if (smp_is_alive(i))
+                alive |= BIT(i);
+        int chosen = fdt_path_offset(dt, "/chosen");
+        if (chosen >= 0) {
+            fdt_setprop_u64(dt, chosen, "m1n1,smp-started", smp_started_mask);
+            fdt_setprop_u64(dt, chosen, "m1n1,smp-failed", smp_start_fail_mask);
+            fdt_setprop_u64(dt, chosen, "m1n1,smp-alive", alive);
+        }
+    }
+
     uint32_t *pruned_phandles = calloc(MAX_CPUS, sizeof(uint32_t));
     size_t pruned = 0;
     if (!pruned_phandles)
