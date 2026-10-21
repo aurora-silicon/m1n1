@@ -410,6 +410,8 @@ void hexdump(const void *d, size_t len);
 void regdump(u64 addr, size_t len);
 int snprintf(char *str, size_t size, const char *fmt, ...);
 int debug_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void debug_capture_start(char *buf, u32 size);
+u32 debug_capture_stop(void);
 void udelay(u32 d);
 
 static inline u64 get_ticks(void)

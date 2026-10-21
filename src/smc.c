@@ -141,8 +141,17 @@ static bool smc_read_guarded(u64 addr, u32 *val)
     return exc_count == before;
 }
 
+/* The shared buffer found by the first session. A second session in the same m1n1 run reads the same pcIO value into it,
+ * so the changed-word scan finds nothing and writes would fail (T8152: HDMI power opens the SMC before PCIe does). */
+static void *smc_shmem_known;
+
 static void smc_find_shmem(smc_dev_t *smc)
 {
+    if (smc_shmem_known) {
+        smc->shmem = smc_shmem_known;
+        printf("SMC: reusing shared buffer %lx\n", (u64)smc_shmem_known);
+        return;
+    }
     u32 words = SMC_SRAM_SCAN_SIZE / 4;
     u32 *before = malloc(SMC_SRAM_SCAN_SIZE);
     u8 *ok = malloc(words);
@@ -180,6 +189,7 @@ static void smc_find_shmem(smc_dev_t *smc)
     /* One changed word at a page start is iBoot's shared buffer (live 2026-10-19: 0x30de70000). */
     if (shown == 1 && !(hit & 0xfff)) {
         smc->shmem = (void *)hit;
+        smc_shmem_known = smc->shmem;
         printf("SMC: using shared buffer %lx\n", hit);
         u32 plt[2] = {0};
         int r = smc_read_u64(smc, 0x52506c74, plt); /* "RPlt": 8-byte platform name */
