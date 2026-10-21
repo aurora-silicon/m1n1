@@ -110,6 +110,14 @@ int boot_cpu_idx SMP_SHARED = -1;
 u64 boot_cpu_mpidr SMP_SHARED = 0;
 static u64 installed_relay SMP_SHARED;
 
+/*
+ * w74: B imm26 reaches only +-128 MiB; the retired stage sits ~160 MiB below the relocated
+ * loader on T8152, so the relay is an absolute veneer at the old reset vector:
+ *   +0x00 ldr x16, #8   +0x04 br x16   +0x08 .quad new _vectors_start
+ */
+#define SMP_VENEER_LDR 0x58000050u /* ldr x16, #8 */
+#define SMP_VENEER_BR  0xd61f0200u /* br x16 */
+
 /* w74: why smp_old_vector_owned refused (bit n = check n failed), exported via /chosen. */
 u32 smp_relay_why;
 u32 smp_relay_oldvec[4];
@@ -159,7 +167,8 @@ static bool smp_old_vector_owned(u64 locked)
         goto out;
     }
     for (u64 off = 0; off <= 0x180; off += 0x80) {
-        if (read32(locked + off) != read32((u64)_vectors_start + off))
+        u32 w = read32(locked + off);
+        if (w != read32((u64)_vectors_start + off) && !(off == 0 && w == SMP_VENEER_LDR))
             why |= BIT(6);
     }
     if (why)
@@ -187,6 +196,36 @@ static int smp_prepare_rvbar(const struct cpu_info *cpu)
     if ((chip_id != T8140 && chip_id != T8152) || !(rvbar & RVBAR_LOCK)) {
         printf("SMP: RVBAR 0x%lx differs from vector 0x%lx; refusing start\n", locked, target);
         return -1;
+    }
+
+    if (chip_id == T8152) {
+        if (installed_relay == locked)
+            return read64(locked + 8) == target && read32(locked) == SMP_VENEER_LDR ? 0 : -1;
+        if (!smp_old_vector_owned(locked)) {
+            printf("SMP: RVBAR 0x%lx is not a verified retired image vector\n", locked);
+            return -1;
+        }
+        u64 page = ALIGN_DOWN(locked, get_page_size());
+        if (mmu_active())
+            mmu_add_mapping(page, page, get_page_size(), MAIR_IDX_NORMAL, PERM_RW);
+        write64(locked + 8, target);
+        write32(locked + 4, SMP_VENEER_BR);
+        write32(locked, SMP_VENEER_LDR);
+        dc_cvac_range((void *)locked, 16);
+        sysop("dsb sy");
+        ic_ivau_range((void *)locked, 16);
+        sysop("dsb sy");
+        sysop("isb");
+        if (mmu_active())
+            mmu_add_mapping(page, page, get_page_size(), MAIR_IDX_NORMAL, PERM_RX);
+        if (read64(locked + 8) != target || read32(locked + 4) != SMP_VENEER_BR ||
+            read32(locked) != SMP_VENEER_LDR) {
+            printf("SMP: RVBAR veneer read-back failed at 0x%lx\n", locked);
+            return -1;
+        }
+        installed_relay = locked;
+        printf("SMP: installed RVBAR veneer at 0x%lx -> 0x%lx\n", locked, target);
+        return 0;
     }
 
     int64_t distance = (int64_t)target - (int64_t)locked;
