@@ -716,21 +716,34 @@ static int dt_set_cpus(void)
     if (cpus < 0)
         bail("FDT: /cpus node not found in devtree\n");
 
-    /* w74 diagnostic: expose the secondary-CPU start result to Linux. */
+
+    /* w74 diagnostic v2: SMP start masks + each CPU's RVBAR as read by m1n1 (index = cpu-id). */
     {
         extern u64 smp_started_mask, smp_start_fail_mask;
         u64 alive = 0;
+        u64 rvbar[12] = {0};
         for (int i = 0; i < MAX_CPUS; i++)
             if (smp_is_alive(i))
                 alive |= BIT(i);
+        int an = adt_path_offset(adt, "/cpus");
+        if (an >= 0 && chip_id == T8152) {
+            int cn = an;
+            ADT_FOREACH_CHILD(adt, cn) {
+                u32 id;
+                u64 impl[2];
+                if (ADT_GETPROP(adt, cn, "cpu-id", &id) == sizeof(id) && id < 12 &&
+                    ADT_GETPROP_ARRAY(adt, cn, "cpu-impl-reg", impl) == sizeof(impl) && impl[1] >= 8)
+                    rvbar[id] = read64(impl[0]);
+            }
+        }
         int chosen = fdt_path_offset(dt, "/chosen");
         if (chosen >= 0) {
             fdt_setprop_u64(dt, chosen, "m1n1,smp-started", smp_started_mask);
             fdt_setprop_u64(dt, chosen, "m1n1,smp-failed", smp_start_fail_mask);
             fdt_setprop_u64(dt, chosen, "m1n1,smp-alive", alive);
+            fdt_setprop(dt, chosen, "m1n1,smp-rvbar", rvbar, sizeof(rvbar));
         }
     }
-
     uint32_t *pruned_phandles = calloc(MAX_CPUS, sizeof(uint32_t));
     size_t pruned = 0;
     if (!pruned_phandles)
