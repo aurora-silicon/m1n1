@@ -110,36 +110,70 @@ int boot_cpu_idx SMP_SHARED = -1;
 u64 boot_cpu_mpidr SMP_SHARED = 0;
 static u64 installed_relay SMP_SHARED;
 
+/* w74: why smp_old_vector_owned refused (bit n = check n failed), exported via /chosen. */
+u32 smp_relay_why;
+u32 smp_relay_oldvec[4];
+
 static bool smp_old_vector_owned(u64 locked)
 {
-    u64 ro_start, ro_end;
+    u64 ro_start = UINT64_MAX, ro_end;
     u64 inherited_top = cur_boot_args.top_of_kernel_data;
     u64 image_start = (u64)_base;
     u64 image_end = (u64)_end;
+    u32 why = 0;
 
-    if (memory_fw_ro_range(&ro_start, &ro_end) != 1 || !cur_boot_args.mem_size ||
-        cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size ||
-        locked < cur_boot_args.phys_base ||
-        locked >= cur_boot_args.phys_base + cur_boot_args.mem_size || locked >= ro_start ||
-        locked >= inherited_top || (locked >= image_start && locked < image_end))
-        return false;
+    /*
+     * w74: memory_fw_ro_range() only exists for T8140 (it returns 0 elsewhere), which made
+     * this proof unreachable on T8152. T8152 has no firmware RO range check here: the
+     * write below is still read back, and every other ownership check stays.
+     */
+    if (memory_fw_ro_range(&ro_start, &ro_end) != 1) {
+        if (chip_id != T8152)
+            why |= BIT(0);
+        ro_start = UINT64_MAX;
+    }
+    if (!cur_boot_args.mem_size || cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size)
+        why |= BIT(0);
+    if (locked < cur_boot_args.phys_base ||
+        locked >= cur_boot_args.phys_base + cur_boot_args.mem_size)
+        why |= BIT(1);
+    if (locked >= ro_start)
+        why |= BIT(2);
+    if (locked >= inherited_top)
+        why |= BIT(3);
+    if (locked >= image_start && locked < image_end)
+        why |= BIT(4);
+    if (why)
+        goto out;
+
+    for (int i = 0; i < 4; i++)
+        smp_relay_oldvec[i] = read32(locked + 0x80 * i);
 
     /* A retired m1n1 image has the same four vector slot tags and bare tail. */
     u64 limit = min(ro_start, inherited_top);
     limit = min(limit, locked + min((u64)16 * SZ_1M, UINT64_MAX - locked));
     if (image_start > locked)
         limit = min(limit, image_start);
-    if (limit - locked < 0x200 + sizeof("STACKBOT") - 1)
-        return false;
+    if (limit - locked < 0x200 + sizeof("STACKBOT") - 1) {
+        why |= BIT(5);
+        goto out;
+    }
     for (u64 off = 0; off <= 0x180; off += 0x80) {
         if (read32(locked + off) != read32((u64)_vectors_start + off))
-            return false;
+            why |= BIT(6);
     }
+    if (why)
+        goto out;
+    why |= BIT(7);
     for (u64 p = locked + 0x200; p <= limit - (sizeof("STACKBOT") - 1); p += 8) {
-        if (!memcmp((const void *)p, "STACKBOT", sizeof("STACKBOT") - 1))
-            return true;
+        if (!memcmp((const void *)p, "STACKBOT", sizeof("STACKBOT") - 1)) {
+            why &= ~BIT(7);
+            break;
+        }
     }
-    return false;
+out:
+    smp_relay_why = why;
+    return !why;
 }
 
 static int smp_prepare_rvbar(const struct cpu_info *cpu)
