@@ -150,7 +150,7 @@ static int smp_prepare_rvbar(const struct cpu_info *cpu)
 
     if (locked == target || (!(rvbar & RVBAR_LOCK) && cpu_features->apple_sysregs_unlocked))
         return 0;
-    if (chip_id != T8140 || !(rvbar & RVBAR_LOCK)) {
+    if ((chip_id != T8140 && chip_id != T8152) || !(rvbar & RVBAR_LOCK)) {
         printf("SMP: RVBAR 0x%lx differs from vector 0x%lx; refusing start\n", locked, target);
         return -1;
     }
@@ -704,7 +704,9 @@ static void smp_start_t8152(void)
             continue;
         const struct cpu_info *cpu = &cpu_info[i];
         u64 rvbar = read64(cpu->impl_reg);
-        if ((rvbar & RVBAR_LOCK) && (rvbar & RVBAR_ADDR) != (u64)_vectors_start) {
+        /* w74: a locked RVBAR left by a retired m1n1 stage gets the T8140 relay branch. */
+        if ((rvbar & RVBAR_LOCK) && (rvbar & RVBAR_ADDR) != (u64)_vectors_start &&
+            smp_prepare_rvbar(cpu)) {
             smp_start_fail_mask |= BIT(i);
             break;
         }
