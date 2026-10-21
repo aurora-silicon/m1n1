@@ -708,7 +708,7 @@ static void smp_start_t8152(void)
         if ((rvbar & RVBAR_LOCK) && (rvbar & RVBAR_ADDR) != (u64)_vectors_start &&
             smp_prepare_rvbar(cpu)) {
             smp_start_fail_mask |= BIT(i);
-            break;
+            continue;
         }
         dc_civac_range(secondary_stacks[i], SECONDARY_STACK_SIZE);
         if (!(rvbar & RVBAR_LOCK))
@@ -728,7 +728,7 @@ static void smp_start_t8152(void)
         }
         if (waited == 1000) {
             smp_start_fail_mask |= BIT(i);
-            break;
+            continue;
         }
         smp_started_mask |= BIT(i);
     }
