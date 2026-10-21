@@ -742,6 +742,12 @@ static int dt_set_cpus(void)
             fdt_setprop_u64(dt, chosen, "m1n1,smp-failed", smp_start_fail_mask);
             fdt_setprop_u64(dt, chosen, "m1n1,smp-alive", alive);
             fdt_setprop(dt, chosen, "m1n1,smp-rvbar", rvbar, sizeof(rvbar));
+            {
+                extern u32 smp_relay_why, smp_relay_oldvec[4];
+                fdt_setprop_u32(dt, chosen, "m1n1,smp-relay-why", smp_relay_why);
+                fdt_setprop(dt, chosen, "m1n1,smp-relay-oldvec", smp_relay_oldvec,
+                            sizeof(smp_relay_oldvec));
+            }
         }
     }
     uint32_t *pruned_phandles = calloc(MAX_CPUS, sizeof(uint32_t));
