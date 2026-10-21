@@ -5356,6 +5356,47 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_memory())
         return -1;
 
+    /*
+     * w74: T8152 final CPU pass. Linux saw cpu-release-addr = 0 on every started CPU, so make
+     * the spin-table hand-off independent of dt_set_cpus(): for the Nth cpu@ node (DT order =
+     * ADT cpu-id order = m1n1 index), if m1n1 has that CPU alive, store its real MPIDR as reg
+     * and its spin-table release address. Records what was in the DT before and after.
+     */
+    if (chip_id == T8152) {
+        u64 before[12] = {0}, after[12] = {0}, mp[12] = {0};
+        u32 changed = 0, nodes = 0;
+        int cpus_n = fdt_path_offset(dt, "/cpus");
+        int cn = cpus_n >= 0 ? fdt_first_subnode(dt, cpus_n) : -1;
+        for (; cn >= 0; cn = fdt_next_subnode(dt, cn)) {
+            const char *nm = fdt_get_name(dt, cn, NULL);
+            if (strncmp(nm, "cpu@", 4))
+                continue;
+            int idx = nodes++;
+            if (idx >= 12)
+                continue;
+            const fdt64_t *rel = fdt_getprop(dt, cn, "cpu-release-addr", NULL);
+            before[idx] = rel ? fdt64_ld(rel) : ~0ULL;
+            if (idx == boot_cpu_idx || !smp_is_alive(idx))
+                continue;
+            mp[idx] = smp_get_mpidr(idx);
+            after[idx] = smp_get_release_addr(idx);
+            if (fdt_setprop_inplace_u64(dt, cn, "reg", mp[idx]) ||
+                fdt_setprop_inplace_u64(dt, cn, "cpu-release-addr", after[idx])) {
+                after[idx] = ~0ULL;
+                continue;
+            }
+            changed++;
+        }
+        int chosen2 = fdt_path_offset(dt, "/chosen");
+        if (chosen2 >= 0) {
+            fdt_setprop(dt, chosen2, "m1n1,smp-dt-before", before, sizeof(before));
+            fdt_setprop(dt, chosen2, "m1n1,smp-dt-mpidr", mp, sizeof(mp));
+            fdt_setprop(dt, chosen2, "m1n1,smp-dt-rel", after, sizeof(after));
+            fdt_setprop_u32(dt, chosen2, "m1n1,smp-dt-changed", changed);
+            fdt_setprop_u32(dt, chosen2, "m1n1,smp-dt-nodes", nodes);
+        }
+    }
+
     /* T8140 PCIe status is known only after pcie_init() in kboot_boot(). */
     if (chip_id != T8140 && fdt_pack(dt))
         bail("FDT: fdt_pack() failed\n");
