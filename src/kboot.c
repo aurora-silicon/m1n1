@@ -5398,15 +5398,16 @@ int kboot_boot(void *kernel)
     }
 
     if (chip_id == T8152) {
-        /* VL822 hub reset line: nub-gpio pin 39 (0x308800000 + 39 * 4),
+        /* VL822 hub reset line: nub-gpio pin 39 (0x3081f0000 + 39 * 4),
          * active low. One assert/release cycle re-runs the hub firmware
-         * load from its SPI NOR; 300 ms settle per the native updater. */
-        void *pin = (void *)(0x308800000 + 39 * 4);
+         * load from its SPI NOR; native arg0 timing is a 120 ms assert and
+         * a 300 ms settle after release. */
+        void *pin = (void *)(0x3081f0000 + 39 * 4);
         u32 reg = read32(pin);
 
         printf("VL822: hub reset assert (pin 39 was 0x%08x)\n", reg);
         write32((reg & ~0xfu) | 2, pin);
-        mdelay(100);
+        mdelay(120);
         write32(read32(pin) | 1, pin);
         mdelay(300);
         printf("VL822: hub reset released (pin 39 now 0x%08x)\n", read32(pin));
