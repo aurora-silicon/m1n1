@@ -906,8 +906,11 @@ static int t8152_port_init(const struct t8152_ports *p, u32 port, int bridge_off
 
     /* enablePortHardware: setPortEnable(true), PERST# release, lane pipe reset (mask 1). */
     set32(cfg + T8152_CFG_APPCLK, BIT(0));
-    if (poll32(cfg + T8152_CFG_STATUS, BIT(0), BIT(0), 50000))
-        goto timeout;
+    /* The generic Apple flow (t8103..t8140) releases the RC PERST bit before it waits for RUN, and the decoded kext poll
+     * (3b) sits in an arm whose condition was not decoded. M6 2026-10-21: this poll timed out with 0x804 = 0xc. */
+    if (poll32(cfg + T8152_CFG_STATUS, BIT(0), BIT(0), 2000))
+        printf("pcie: T8152 port %d: RUN not set before PERST release (status 0x%x); continuing\n", port,
+               read32(cfg + T8152_CFG_STATUS));
     set32(cfg + T8152_CFG_PERST, T8152_CFG_PERST_REL);
     if (poll32(cfg + T8152_CFG_PIPE_STS, BIT(16), 0, 20000))
         goto timeout;
@@ -959,6 +962,12 @@ timeout:
     printf("pcie: T8152 port %d: poll timed out (cfg+0x800 0x%x +0x804 0x%x +0x82c 0x%x +0x0a8 0x%x)\n",
            port, read32(cfg + T8152_CFG_APPCLK), read32(cfg + T8152_CFG_STATUS),
            read32(cfg + T8152_CFG_PERST), read32(cfg + T8152_CFG_PIPE_STS));
+    for (u32 off = 0x800; off < 0x840; off += 16)
+        printf("pcie: T8152 port %d: cfg+0x%03x: %08x %08x %08x %08x\n", port, off, read32(cfg + off),
+               read32(cfg + off + 4), read32(cfg + off + 8), read32(cfg + off + 12));
+    printf("pcie: T8152 port %d: cfg+0x080 %08x +0x208 %08x lane+0x000: %08x %08x %08x %08x\n", port,
+           read32(cfg + T8152_CFG_LTSSM_EN), read32(cfg + T8152_CFG_LINKSTS), read32(lane), read32(lane + 4),
+           read32(lane + 8), read32(lane + 12));
     return -1;
 }
 #endif
@@ -988,9 +997,9 @@ static void t8152_apcie_pmgr(void)
     int path[8];
     u64 base, size;
 
-    if (adt_path_offset_trace(adt, "/arm-io/pmgr", path) < 0 || adt_get_reg(adt, path, "reg", 0, &base, &size) ||
+    if (adt_path_offset_trace(adt, "/arm-io/pmgr-child", path) < 0 || adt_get_reg(adt, path, "reg", 0, &base, &size) ||
         !base) {
-        printf("pcie: T8152 pmgr: /arm-io/pmgr reg[0] not found\n");
+        printf("pcie: T8152 pmgr: /arm-io/pmgr-child reg[0] not found\n");
         return;
     }
     for (size_t i = 0; i < ARRAY_SIZE(t8152_apcie_ps); i++) {
