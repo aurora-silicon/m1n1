@@ -8,42 +8,14 @@
 #include "string.h"
 #include "tunables.h"
 #include "utils.h"
-#include "vsprintf.h"
 
 /*
- * Copy every "pcie:" console line into a buffer that kboot publishes as /chosen "m1n1,pcie-log" (a string list),
- * because the m1n1 console is not on screen when Linux runs.
+ * Everything the console prints during pcie_init() (pcie:, pmgr:, SMC: ...) is kept here and published by kboot as
+ * /chosen "m1n1,pcie-log" (a NUL-separated string list), because the m1n1 console is not on screen when Linux runs.
  */
-#define PCIE_LOG_SIZE 6144
+#define PCIE_LOG_SIZE 12288
 static char pcie_log_buf[PCIE_LOG_SIZE];
 static u32 pcie_log_len;
-
-static int pcie_logged_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static int pcie_logged_printf(const char *fmt, ...)
-{
-    char line[256];
-    va_list ap;
-
-    va_start(ap, fmt);
-    int n = vsnprintf(line, sizeof(line), fmt, ap);
-    va_end(ap);
-    debug_printf("%s", line);
-
-    size_t len = strlen(line);
-    if (!strncmp(line, "pcie:", 5)) {
-        while (len && line[len - 1] == '\n')
-            len--;
-        if (pcie_log_len + len + 1 <= PCIE_LOG_SIZE) {
-            memcpy(pcie_log_buf + pcie_log_len, line, len);
-            pcie_log_buf[pcie_log_len + len] = 0;
-            pcie_log_len += len + 1;
-        }
-    }
-    return n;
-}
-
-#undef printf
-#define printf(...) pcie_logged_printf(__VA_ARGS__)
 
 const char *pcie_log_get(u32 *len)
 {
@@ -864,7 +836,7 @@ static int t8152_port_init(const struct t8152_ports *p, u32 port, int bridge_off
      */
 #if !PCIE_T8152_HANDOFF
     if ((p->radio & BIT(port)) && t8152_radio_power_on(p, port))
-        return -1;
+        printf("pcie: T8152 port %d: radio power failed; continuing with PERST# and link training\n", port);
     if (p->perst & BIT(port))
         t8152_gpio_drive(p, port, 0);
 #endif
@@ -1091,7 +1063,7 @@ static int pcie_t8152_init(const char *path)
             continue;
         printf("pcie: T8152 initializing port %d\n", port);
         if (t8152_port_init(&ports, port, adt_path_offset(adt, ports.bridge[port])))
-            return -1;
+            printf("pcie: T8152 port %d: bring-up failed; continuing with the next port\n", port);
     }
     printf("pcie: T8152 sequences done; the controller is left as is and not reported as initialized\n");
     return -1;
@@ -1784,7 +1756,7 @@ static int pcie_init_controller(int controller, const char *path)
     return 0;
 }
 
-int pcie_init(void)
+static int pcie_init_body(void)
 {
     bool success = false;
 
@@ -1829,6 +1801,14 @@ int pcie_init(void)
         pcie_initialized = true;
 
     return success ? 0 : -1;
+}
+
+int pcie_init(void)
+{
+    debug_capture_start(pcie_log_buf, PCIE_LOG_SIZE);
+    int ret = pcie_init_body();
+    pcie_log_len = debug_capture_stop();
+    return ret;
 }
 
 int pcie_shutdown(void)
