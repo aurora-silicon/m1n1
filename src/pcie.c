@@ -412,6 +412,21 @@ static int pcie_t8140_preflight(const char *path, int *adt_path, u32 ports, u32 
 #ifndef PCIE_T8152_HANDOFF
 #define PCIE_T8152_HANDOFF 0
 #endif
+/*
+ * Isolation flags for hardware bring-up (all default off):
+ *   PCIE_T8152_PORT_MASK=N      bring up only the ports in bitmask N (default 0x5 = ports 0 and 2)
+ *   PCIE_T8152_NO_RADIO=1       never open the SMC: skip the radio power step
+ *   PCIE_T8152_STOP_AFTER_RADIO=1  return from a port right after its radio power step (no PERST#, no LTSSM)
+ */
+#ifndef PCIE_T8152_PORT_MASK
+#define PCIE_T8152_PORT_MASK 0x5
+#endif
+#ifndef PCIE_T8152_NO_RADIO
+#define PCIE_T8152_NO_RADIO 0
+#endif
+#ifndef PCIE_T8152_STOP_AFTER_RADIO
+#define PCIE_T8152_STOP_AFTER_RADIO 0
+#endif
 
 #define T8152_PORTS       3
 #define T8152_REG_ENTRIES 28 /* 10 shared windows + 6 per port */
@@ -801,6 +816,7 @@ static void t8152_gpio_drive(const struct t8152_ports *p, u32 port, int level)
            FIELD_PREP(T8152_GPIO_MODE, T8152_GPIO_MODE_OUT) | (level ? T8152_GPIO_DATA : 0));
 }
 
+#if !PCIE_T8152_NO_RADIO
 /* AppleSMCPMU pKW8 on: 8 bytes {w0 with its low 16 bits set to 1, w1}, as the DCP code does for HDMI. */
 static int t8152_radio_power_on(const struct t8152_ports *p, u32 port)
 {
@@ -819,6 +835,7 @@ static int t8152_radio_power_on(const struct t8152_ports *p, u32 port)
     return ret;
 }
 #endif
+#endif
 
 static int t8152_port_init(const struct t8152_ports *p, u32 port, int bridge_offset)
 {
@@ -835,8 +852,17 @@ static int t8152_port_init(const struct t8152_ports *p, u32 port, int bridge_off
      * reset timestamp in setEndpointReset).
      */
 #if !PCIE_T8152_HANDOFF
+#if PCIE_T8152_NO_RADIO
+    if (p->radio & BIT(port))
+        printf("pcie: T8152 port %d: radio power skipped (PCIE_T8152_NO_RADIO)\n", port);
+#else
     if ((p->radio & BIT(port)) && t8152_radio_power_on(p, port))
         printf("pcie: T8152 port %d: radio power failed; continuing with PERST# and link training\n", port);
+#endif
+#if PCIE_T8152_STOP_AFTER_RADIO
+    printf("pcie: T8152 port %d: stopping after the radio power step (PCIE_T8152_STOP_AFTER_RADIO)\n", port);
+    return 0;
+#endif
     if (p->perst & BIT(port))
         t8152_gpio_drive(p, port, 0);
 #endif
@@ -1059,7 +1085,7 @@ static int pcie_t8152_init(const char *path)
            read32(r.base[T8152_REG_PHY] + T8152_PHY_STATUS));
     t8152_rc_enable(&r, &ports);
     for (u32 port = 0; port < T8152_PORTS; port++) {
-        if (!(ports.present & BIT(port)))
+        if (!(ports.present & BIT(port) & PCIE_T8152_PORT_MASK))
             continue;
         printf("pcie: T8152 initializing port %d\n", port);
         if (t8152_port_init(&ports, port, adt_path_offset(adt, ports.bridge[port])))
