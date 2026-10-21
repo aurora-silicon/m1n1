@@ -5375,6 +5375,14 @@ int kboot_boot(void *kernel)
         const char *log = pcie_log_get(&log_len);
         int chosen = fdt_path_offset(dt, "/chosen");
         if (log_len && chosen >= 0) {
+            int room = (int)dt_bufsize - (int)fdt_totalsize(dt) - 1024;
+            if (room < 0)
+                room = 0;
+            if (log_len > (u32)room) {
+                printf("kboot: m1n1,pcie-log truncated to its last %d of %u bytes\n", room, log_len);
+                log += log_len - room;
+                log_len = room;
+            }
             if (fdt_open_into(dt, dt, dt_bufsize) || fdt_setprop(dt, chosen, "m1n1,pcie-log", log, log_len) ||
                 fdt_pack(dt))
                 printf("kboot: could not publish m1n1,pcie-log (%u bytes)\n", log_len);

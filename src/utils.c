@@ -71,6 +71,28 @@ int snprintf(char *buffer, size_t size, const char *fmt, ...)
     return i;
 }
 
+static char *debug_capture_buf;
+static u32 debug_capture_size;
+static u32 debug_capture_len;
+
+/* Copy console text into buf (newlines become NUL, so it is a string list) until debug_capture_stop(). */
+void debug_capture_start(char *buf, u32 size)
+{
+    debug_capture_buf = buf;
+    debug_capture_size = size;
+    debug_capture_len = 0;
+}
+
+u32 debug_capture_stop(void)
+{
+    u32 len = debug_capture_len;
+
+    if (debug_capture_buf && len && debug_capture_buf[len - 1] && len < debug_capture_size)
+        debug_capture_buf[len++] = 0;
+    debug_capture_buf = NULL;
+    return len;
+}
+
 int debug_printf(const char *fmt, ...)
 {
     va_list args;
@@ -81,7 +103,11 @@ int debug_printf(const char *fmt, ...)
     i = vsnprintf(buffer, sizeof(buffer), fmt, args);
     va_end(args);
 
-    iodev_console_write(buffer, min(i, (int)(sizeof(buffer) - 1)));
+    int n = min(i, (int)(sizeof(buffer) - 1));
+    iodev_console_write(buffer, n);
+
+    for (int k = 0; debug_capture_buf && k < n && debug_capture_len + 1 < debug_capture_size; k++)
+        debug_capture_buf[debug_capture_len++] = buffer[k] == '\n' ? 0 : buffer[k];
 
     return i;
 }
