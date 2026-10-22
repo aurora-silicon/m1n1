@@ -207,6 +207,12 @@ static const struct adt_tunable_info atc_tunables_t8152_usb2_dev[] = {
 };
 
 /*
+ * T8152 ATC PHY SuperSpeed / CIO calibration (apple,t8152-atcphy): one property per ADT list, offsets relative to the register block of the list, which the
+ * Linux driver knows. Generated from the driver's layout table.
+ */
+#include "kboot_atc_t8152_ss.h"
+
+/*
  * The DRD lists live in several distinct ADT resources, not one: each entry
  * names the reg index of the bank that holds it, and its window is that
  * bank's own size less the native header in front of the calibration.
@@ -783,6 +789,35 @@ static void dt_copy_atc_t6030_dp_tunables(void *dt, int adt_node, int fdt_node,
     printf("FDT: Copied the DP calibration for %s\n", adt_path);
 }
 
+/*
+ * T8152 ATC PHY (apple,t8152-atcphy) calibration for the SuperSpeed and CIO bring-up. Lists the ADT does not carry are skipped like macOS skips them; the two
+ * efuse lists are required. Any failure drops every property: half-filled calibration is worse than none (the driver then refuses to power the lanes).
+ */
+static void dt_copy_atc_t8152_ss_tunables(void *dt, int adt_node, int fdt_node, const char *adt_path)
+{
+    if (!adt_is_compatible_at(adt, adt_node, "atc-phy,t8152", 0)) {
+        printf("kboot: %s is not a T8152 ATC PHY\n", adt_path);
+        return;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_ss); ++i)
+        fdt_delprop(dt, fdt_node, atc_tunables_t8152_ss[i].fdt_name);
+
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_ss); ++i) {
+        if (dt_append_atc_tunable(dt, adt_node, fdt_node, &atc_tunables_t8152_ss[i]))
+            goto cleanup;
+    }
+
+    printf("FDT: Copied the SuperSpeed/CIO calibration for %s\n", adt_path);
+    return;
+
+cleanup:
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t8152_ss); ++i)
+        fdt_delprop(dt, fdt_node, atc_tunables_t8152_ss[i].fdt_name);
+
+    printf("FDT: Unable to copy the SuperSpeed/CIO calibration for %s\n", adt_path);
+}
+
 static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_alias, int port)
 {
     int ret;
@@ -805,6 +840,11 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
     dt_export_j700_atc(dt, adt_node, fdt_node);
     if (adt_node < 0)
         return;
+
+    if (!fdt_node_check_compatible(dt, fdt_node, "apple,t8152-atcphy")) {
+        dt_copy_atc_t8152_ss_tunables(dt, adt_node, fdt_node, adt_path);
+        return;
+    }
 
     if (!fdt_node_check_compatible(dt, fdt_node, "apple,t6030-atcphy-dp")) {
         if (adt_is_compatible_at(adt, adt_node, "atc-phy,t8122", 0))
