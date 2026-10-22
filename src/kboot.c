@@ -1329,8 +1329,8 @@ static const struct adt_tunable_info usb4_rc_tunables[] = {
     {"lbw_fabric_tunables", "apple,tunable-rc", 0x8000, 0x4000, true},
 };
 
-/* Type 7 firmware does not supply the four per-direction fabric tables. */
-static const struct adt_tunable_info usb4_t8142_nhi_tunables[] = {
+/* T8142 (type 7) and T8152 firmware do not supply the four per-direction fabric tables (PROVEN for the J873 ADT). */
+static const struct adt_tunable_info usb4_nhi_tunables_no_dir[] = {
     {"hi_up_tx_desc_fabric_tunables", "apple,tunable-nhi", 0xe8000, 0x4000, false},
     {"hi_up_tx_data_fabric_tunables", "apple,tunable-nhi", 0xec000, 0x4000, false},
     {"hi_up_rx_desc_fabric_tunables", "apple,tunable-nhi", 0xf0000, 0x4000, false},
@@ -1500,9 +1500,9 @@ static int dt_set_acio_tunables(void)
     const struct adt_tunable_info *nhi_tunables = usb4_nhi_tunables;
     size_t n_nhi_tunables = ARRAY_SIZE(usb4_nhi_tunables);
 
-    if (chip_id == T8142) {
-        nhi_tunables = usb4_t8142_nhi_tunables;
-        n_nhi_tunables = ARRAY_SIZE(usb4_t8142_nhi_tunables);
+    if (chip_id == T8142 || chip_id == T8152) {
+        nhi_tunables = usb4_nhi_tunables_no_dir;
+        n_nhi_tunables = ARRAY_SIZE(usb4_nhi_tunables_no_dir);
     }
 
     if (!router_uuid)
@@ -1518,6 +1518,8 @@ static int dt_set_acio_tunables(void)
                               sizeof(usb4_rc_tunables) / sizeof(*usb4_rc_tunables));
 
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_pcie_adapter", i);
+        if (!fdt_get_alias(dt, fdt_alias))
+            snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-pcie-adapter", i);
         dt_copy_acio_tunables(adt_path, fdt_alias, usb4_pcie_adapter_tunables,
                               sizeof(usb4_pcie_adapter_tunables) /
                                   sizeof(*usb4_pcie_adapter_tunables));
@@ -1596,6 +1598,8 @@ static int dt_set_pcie_tunables(void)
 
         memset(fdt_alias, 0, sizeof(adt_path));
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_pcie", i);
+        if (!fdt_get_alias(dt, fdt_alias))
+            snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-pcie", i);
 
         dt_copy_pciec_tunables(adt_path, fdt_alias);
     }
