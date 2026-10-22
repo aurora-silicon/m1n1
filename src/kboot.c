@@ -5321,7 +5321,9 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_disable_missing_devs("usb-drd", "usb@", 8, 0))
         return -1;
-    if (dt_disable_missing_devs("acio", "cio@", 8, 2))
+    /* The DT cio@ node starts at the rc block. In the M1/M2 ADT that is /arm-io/acioN reg[2]; in the M6 ADT reg[0] is the NHI
+     * and reg[1] is the rc block (reg[2] is its second 0x4000 chunk), so the M6 node was disabled as "missing" (w71, r22 window). */
+    if (dt_disable_missing_devs("acio", "cio@", 8, chip_id == T8152 ? 1 : 2))
         return -1;
     if (dt_disable_missing_devs("i2c", "i2c@", 8, 0))
         return -1;
