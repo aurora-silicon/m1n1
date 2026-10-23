@@ -5219,6 +5219,13 @@ int kboot_prepare_dt(void *fdt)
         if (fdt_setprop(dt, node, "reg", reg, sizeof(reg)) || fdt_setprop_empty(dt, node, "no-map"))
             bail("FDT: couldn't describe firmware RO node\n");
         printf("FDT: reserved firmware RO [0x%lx, 0x%lx)\n", ro_start, ro_end);
+    } else if (!cpu_features->apple_sysregs_unlocked && !in_el2()) {
+        /*
+         * A guest under the m1n1 hypervisor runs at EL1 and cannot read the
+         * EL2 CTRR bounds; the host keeps that range and starts no
+         * secondaries for the guest from it.
+         */
+        printf("FDT: running at EL1, leaving the M4+ SMP-RO range to the host\n");
     } else if (!cpu_features->apple_sysregs_unlocked) {
         // On M4* / A18 Pro / M5*, there is a CTRR instance left enabled only
         // on the secondary (non-boot) cores. Add a reserved-memory region to
