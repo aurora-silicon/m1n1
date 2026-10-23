@@ -4749,6 +4749,11 @@ static int dt_disable_missing_devs(const char *adt_prefix, const char *dt_prefix
         }
 
         int soc = fdt_path_offset(dt, path);
+        if (soc < 0 && die_count == 1) {
+            /* Newer trees (e.g. T6040) place their devices at the root. */
+            soc = fdt_path_offset(dt, "/");
+            snprintf(path, sizeof(path), "/");
+        }
         if (soc < 0)
             bail("FDT: %s node not found in devtree\n", path);
 
