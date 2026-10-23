@@ -30,12 +30,13 @@ int pmu_clear_panic_counter(void)
         int node = bnode;
         ADT_FOREACH_CHILD(adt, node)
         {
-            u32 primary = 0, scrpad, reg[1];
+            u32 primary = 0, scrpad, reg_len = 0;
             if (!adt_is_compatible(adt, node, "pmu,spmi") ||
                 ADT_GETPROP(adt, node, "is-primary", &primary) < 0 || primary != 1)
                 continue;
-            if (ADT_GETPROP(adt, node, "info-leg_scrpad", &scrpad) < 0 ||
-                ADT_GETPROP_ARRAY(adt, node, "reg", reg) < 0) {
+            /* reg is several words; only the first (the SPMI address) is used. */
+            const u32 *reg = adt_getprop(adt, node, "reg", &reg_len);
+            if (ADT_GETPROP(adt, node, "info-leg_scrpad", &scrpad) < 0 || !reg || reg_len < 4) {
                 printf("pmu: %s/%s lacks leg_scrpad or reg\n", bus, adt_get_name(adt, node));
                 return -1;
             }
