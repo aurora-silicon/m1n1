@@ -150,6 +150,33 @@ int dapf_init(const char *path, int index)
     if (pwr && (pmgr_adt_power_enable(path) < 0))
         return -1;
 
+    /*
+     * The ADT's "instance" property names each reg entry as 8-byte
+     * (byte-reversed FOURCC, name) pairs, e.g. "TRAD" "DART", "FPAD" "DAPF",
+     * "FPAG" "PS_PROT". When it is present, use the entry tagged DAPF rather
+     * than a fixed index: T6040's dart-pmp has only DART and PS_PROT entries,
+     * and programming its second reg as a DAPF raises an SError.
+     */
+    int inst_len;
+    const char *inst = adt_getprop(adt, node, "instance", &inst_len);
+    if (inst && inst_len >= 16 && !(inst_len % 16)) {
+        int found = -1;
+        for (int i = 0; i < inst_len / 16; i++) {
+            if (!memcmp(inst + i * 16, "FPAD", 4)) {
+                found = i;
+                break;
+            }
+        }
+        if (found < 0) {
+            printf("dapf: %s has no DAPF instance; leaving it to firmware\n", path);
+            ret = 0;
+            goto out_nodapf;
+        }
+        if (found != index)
+            printf("dapf: %s: using DAPF reg %d from the ADT (not %d)\n", path, found, index);
+        index = found;
+    }
+
     u64 base;
     if (adt_get_reg(adt, dart_path, "reg", index, &base, NULL) < 0) {
         printf("dapf: Error getting DAPF %s base address.\n", path);
@@ -177,6 +204,13 @@ out:
         printf("dapf: Initialized %s\n", path);
 
     return ret;
+
+out_nodapf:
+    if (pwr && pmgr_adt_power_disable(path)) {
+        printf("dapf: failed to power down %s\n", path);
+        return -1;
+    }
+    return 0;
 }
 
 struct entry {
