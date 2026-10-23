@@ -302,7 +302,7 @@ def test_isp_fdt_fails_closed_and_exports_heap(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     source = (repo / "src/kboot.c").read_text()
     start = source.index("static int dt_set_isp_fwdata(void)")
-    end = source.index("static int dt_disable_missing_devs(", start)
+    end = source.index("\nstatic ", start + 1)
     helper = source[start:end]
     harness = r"""
 #include <assert.h>

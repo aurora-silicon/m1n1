@@ -2485,6 +2485,50 @@ struct dt_t8140_dram {
     u64 base, size;
 };
 
+/* These opaque disp0 inputs are described by the public apple,dcp binding.
+ * Keep their firmware byte order; they are not FDT integer cells. */
+static int dt_t8140_copy_provider_props(const char *dcp_path)
+{
+    static const struct {
+        const char *name;
+        u32 size;
+    } props[] = {
+        {"power-lut-data-x", 4},
+        {"power-lut-data-y", 4},
+        {"power-lut-data-xindex", 52},
+        {"power-lut-data-yindex", 4},
+        {"power-lut-data-lut", 52},
+    };
+    const void *values[ARRAY_SIZE(props)];
+    int disp = adt_path_offset(adt, "/arm-io/disp0");
+    if (disp < 0)
+        return 0; /* Leave absent data to the kernel's qualified fallback. */
+
+    /* Validate all present inputs before modifying the transactional FDT. */
+    for (size_t i = 0; i < ARRAY_SIZE(props); i++) {
+        u32 size = 0;
+        values[i] = adt_getprop(adt, disp, props[i].name, &size);
+        if (values[i] && size != props[i].size) {
+            printf("FDT: disp0 %s has %u bytes, expected %u\n", props[i].name, size,
+                   props[i].size);
+            return -FDT_ERR_BADVALUE;
+        }
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(props); i++) {
+        if (!values[i])
+            continue;
+        int node = fdt_path_offset(dt, dcp_path);
+        if (node < 0)
+            return node;
+        char name[64];
+        snprintf(name, sizeof(name), "apple,%s", props[i].name);
+        int ret = fdt_setprop(dt, node, name, values[i], props[i].size);
+        if (ret)
+            return ret;
+    }
+    return 0;
+}
+
 static bool dt_t8140_in_physical_dram(const struct dt_t8140_dram *dram, u64 base, u64 size)
 {
     return size && base >= dram->base && base <= dram->base + dram->size &&
@@ -2510,9 +2554,6 @@ static int dt_t8140_reserve_carveout(const char *dcp_path, const char *disp_path
                dcp_path, name, region_id, pair[0], pair[1], dram->base, dram->base + dram->size);
         return -1;
     }
-
-    printf("FDT: T8140 %s/%s: check ADT %s PA 0x%lx size 0x%lx\n", dcp_path, name, region_id,
-           pair[0], pair[1]);
 
     struct disp_mapping map = {0};
     struct mem_region region = {pair[0], pair[1]};
@@ -2559,10 +2600,6 @@ static int dt_t8140_reserve_data(const char *dcp_path, const char *nub_path, con
                dcp_path, name, nub_path, seg[1].phys, seg[1].size, region_id, pair[0], pair[1]);
         return -1;
     }
-
-    printf("FDT: T8140 %s/%s: check ADT %s PA 0x%lx size 0x%lx,"
-           " tail PA 0x%lx size 0x%x\n",
-           dcp_path, name, region_id, pair[0], pair[1], seg[1].phys, seg[1].size);
 
     struct mem_region regions[2] = {{pair[0], pair[1] - seg[1].size}, {seg[1].phys, seg[1].size}};
     struct disp_mapping maps[2] = {0};
@@ -3238,124 +3275,8 @@ static int dt_t8140_refuse_display(void)
     return 0;
 }
 
-/* A bounded observation of register descriptions, not firmware contents.
- * IDs and lengths make absent Linux aliases diagnosable without exporting ADT. */
-static void dt_t8140_external_metadata(void)
-{
-    static const char *const paths[] = {
-        "/arm-io/dcpext", "/arm-io/dart-dcpext", "/arm-io/dart-dispext0",
-        "/arm-io/dcpext/iop-dcpext-nub",
-        "/arm-io/dart-dcpext0", "/arm-io/dispext0", "/arm-io/disp-ext0",
-    };
-    static const struct {
-        const char *name;
-        bool cells;
-    } props[] = {
-        {"reg", true}, {"interrupts", true}, {"clock-gates", true},
-        {"device-id", true}, {"AAPL,phandle", true},
-        {"#address-cells", true}, {"#size-cells", true},
-        {"ranges", false}, {"dpxbar-parent", false},
-        {"dp-switch-dfp-port", false}, {"dp-switch-dfp-endpoint", false},
-        {"atc-dp-link", false}, {"service-gates", false},
-        {"segment-ranges", false}, {"segment-names", false},
-        {"iommu-parent", true},
-    };
-    fdt32_t translated[2 + ARRAY_SIZE(paths) * 34];
-    size_t translated_used = 0;
-    fdt32_t words[1024];
-    size_t used = 0;
-    int chosen = fdt_path_offset(dt, "/chosen");
-    if (chosen < 0 || !adt || adt_get_size() > 16 * SZ_1M)
-        return;
-    words[used++] = cpu_to_fdt32(1);
-    words[used++] = cpu_to_fdt32(ARRAY_SIZE(paths));
-    translated[translated_used++] = cpu_to_fdt32(1);
-    translated[translated_used++] = cpu_to_fdt32(ARRAY_SIZE(paths));
-    for (size_t i = 0; i < ARRAY_SIZE(paths); i++) {
-        int trace[8] = {0};
-        int node = adt_path_offset_trace(adt, paths[i], trace);
-        translated[translated_used++] = cpu_to_fdt32(i);
-        size_t count_offset = translated_used++;
-        u32 registers = 0;
-        /* The public ADT translator applies every parent bus range. Never
-         * infer physical addresses from the raw bus-relative reg cells. */
-        for (unsigned reg = 0; node >= 0 && reg < 8; reg++) {
-            u64 address, size;
-            if (adt_get_reg(adt, trace, "reg", reg, &address, &size) < 0)
-                break;
-            translated[translated_used++] = cpu_to_fdt32(address >> 32);
-            translated[translated_used++] = cpu_to_fdt32(address);
-            translated[translated_used++] = cpu_to_fdt32(size >> 32);
-            translated[translated_used++] = cpu_to_fdt32(size);
-            registers++;
-        }
-        translated[count_offset] = cpu_to_fdt32(registers);
-        words[used++] = cpu_to_fdt32(i);
-        words[used++] = cpu_to_fdt32(node >= 0);
-        words[used++] = cpu_to_fdt32(ARRAY_SIZE(props));
-        for (size_t j = 0; j < ARRAY_SIZE(props); j++) {
-            u32 length = 0;
-            const void *value = node >= 0 ? adt_getprop(adt, node, props[j].name, &length) : NULL;
-            /* Only public register/cell descriptions have a numeric payload.
-             * Segments, routes and every unknown encoding remain size-only. */
-            size_t count = value && props[j].cells && length <= 128 && !(length & 3)
-                               ? length / sizeof(u32) : 0;
-            if (used + 4 + count > ARRAY_SIZE(words)) {
-                printf("FDT: external metadata exceeds bounded output\n");
-                return;
-            }
-            words[used++] = cpu_to_fdt32(j);
-            words[used++] = cpu_to_fdt32(value != NULL);
-            words[used++] = cpu_to_fdt32(value ? length : 0);
-            words[used++] = cpu_to_fdt32(count);
-            for (size_t k = 0; k < count; k++) {
-                u32 cell;
-                memcpy(&cell, (const u8 *)value + k * sizeof(cell), sizeof(cell));
-                words[used++] = cpu_to_fdt32(cell);
-            }
-        }
-    }
-    if (fdt_setprop(dt, chosen, "asahi,external-display-metadata", words,
-                    used * sizeof(words[0])))
-        printf("FDT: external metadata observation unavailable\n");
-    /* Mapper phandle/stream pairs are public ADT cell descriptions. Export
-     * neither names nor arbitrary child properties, and cap both traversal
-     * and output even if the firmware describes an unexpected topology. */
-    fdt32_t mappers[2 + 2 * (2 + 16 * 3)];
-    size_t mapper_used = 0;
-    mappers[mapper_used++] = cpu_to_fdt32(1);
-    mappers[mapper_used++] = cpu_to_fdt32(2);
-    for (unsigned bank = 0; bank < 2; bank++) {
-        int node = adt_path_offset(adt, paths[bank ? 2 : 4]);
-        mappers[mapper_used++] = cpu_to_fdt32(bank ? 2 : 4);
-        size_t count_offset = mapper_used++;
-        unsigned accepted = 0;
-        int child = node >= 0 ? adt_first_child_offset(adt, node) : -1;
-        int children = node >= 0 ? adt_get_child_count(adt, node) : 0;
-        for (int seen = 0; child >= 0 && seen < children && seen < 64 && accepted < 16;
-             seen++, child = adt_next_sibling_offset(adt, child)) {
-            u32 phandle, stream;
-            if (adt_getprop_copy(adt, child, "AAPL,phandle", &phandle, sizeof(phandle)) < 0 ||
-                adt_getprop_copy(adt, child, "reg", &stream, sizeof(stream)) < 0)
-                continue;
-            mappers[mapper_used++] = cpu_to_fdt32(seen);
-            mappers[mapper_used++] = cpu_to_fdt32(phandle);
-            mappers[mapper_used++] = cpu_to_fdt32(stream);
-            accepted++;
-        }
-        mappers[count_offset] = cpu_to_fdt32(accepted);
-    }
-    if (fdt_setprop(dt, chosen, "asahi,external-display-mappers", mappers,
-                    mapper_used * sizeof(mappers[0])))
-        printf("FDT: external mapper observation unavailable\n");
-    if (fdt_setprop(dt, chosen, "asahi,external-display-registers", translated,
-                    translated_used * sizeof(translated[0])))
-        printf("FDT: translated external register observation unavailable\n");
-}
-
 static int dt_set_display_t8140(void)
 {
-    dt_t8140_external_metadata();
     int ret = -1;
     const char *reason = "validation failed";
     const char *step = "preflight";
@@ -3378,7 +3299,6 @@ static int dt_set_display_t8140(void)
     adt_path[depth + 1] = 0;
     base = size = 0;
     int reg_ret = adt_get_reg(adt, adt_path, "reg", 0, &base, &size);
-    printf("FDT: T8140 /vram: ADT reg PA 0x%lx size 0x%lx (ret %d)\n", base, size, reg_ret);
     if (reg_ret < 0 || !size || (base & (SZ_16K - 1)) || (size & (SZ_16K - 1)) ||
         base > UINT64_MAX - size) {
         reason = "invalid ADT /vram reg or alignment";
@@ -3394,8 +3314,6 @@ static int dt_set_display_t8140(void)
 
     end = base + size;
     fb_size = cur_boot_args.video.stride * cur_boot_args.video.height;
-    printf("FDT: T8140 framebuffer: PA 0x%lx size 0x%lx; /vram PA 0x%lx size 0x%lx\n",
-           cur_boot_args.video.base, fb_size, base, size);
     if (cur_boot_args.video.base < base || cur_boot_args.video.base > end ||
         fb_size > end - cur_boot_args.video.base) {
         reason = "boot framebuffer lies outside /vram";
@@ -3412,8 +3330,6 @@ static int dt_set_display_t8140(void)
         dram.base = 0x800000000;
     if (ADT_GETPROP(adt, node, "dram-size", &dram.size) < 0)
         dram.size = mem_size_actual;
-    printf("FDT: T8140 physical DRAM: PA 0x%lx size 0x%lx; /vram PA 0x%lx size 0x%lx\n", dram.base,
-           dram.size, base, size);
     if (!dram.size || dram.base > UINT64_MAX - dram.size) {
         reason = "invalid physical DRAM extent";
         goto refuse;
@@ -3422,7 +3338,6 @@ static int dt_set_display_t8140(void)
         reason = "/vram lies outside physical DRAM";
         goto refuse;
     }
-    printf("FDT: T8140 framebuffer: sub-range of /vram validated\n");
 
     /* On the measured J700 ADT, /vram exactly matches carveout region 14
      * and an opaque DCP nub segment. Check both independent ADT descriptions
@@ -3430,9 +3345,6 @@ static int dt_set_display_t8140(void)
     node = adt_path_offset(adt, "/chosen/carveout-memory-map");
     u64 carveout[2] = {0};
     int carveout_len = node < 0 ? -1 : ADT_GETPROP_ARRAY(adt, node, "region-id-14", carveout);
-    printf("FDT: T8140 region-id-14: ADT PA 0x%lx size 0x%lx (len %d);"
-           " /vram PA 0x%lx size 0x%lx\n",
-           carveout[0], carveout[1], carveout_len, base, size);
     if (carveout_len != sizeof(carveout) || carveout[0] != base || carveout[1] != size) {
         reason = "ADT region-id-14 differs from /vram";
         goto refuse;
@@ -3448,9 +3360,6 @@ static int dt_set_display_t8140(void)
     }
     bool segment_found = false;
     for (u32 i = 0; i < seg_len / sizeof(*seg); i++) {
-        printf("FDT: T8140 DCP nub segment %u: PA 0x%lx size 0x%x;"
-               " /vram PA 0x%lx size 0x%lx\n",
-               i, seg[i].phys, seg[i].size, base, size);
         if (seg[i].phys == base && seg[i].size == size)
             segment_found = true;
     }
@@ -3509,6 +3418,10 @@ static int dt_set_display_t8140(void)
         goto refuse;
     }
 
+    step = "internal DCP provider properties";
+    if (dt_t8140_copy_provider_props("dcp"))
+        goto rollback;
+
     step = "internal DCP ASC and mailboxes";
     if (!dt_t8140_validate_dcp_asc("/arm-io/dcp", "dcp", false)) {
         reason = "inherited DCP ASC is not live with healthy empty mailboxes";
@@ -3560,6 +3473,10 @@ static int dt_set_display_t8140(void)
             step = "DCPEXT region-id-234 reservation";
             ext_step = 6;
             ret = dt_t8140_reserve_carveout(ext, NULL, "region-id-234", "region234", false, &dram);
+        }
+        if (!ret) {
+            step = "DCPEXT provider properties";
+            ret = dt_t8140_copy_provider_props(ext);
         }
         if (!ret) {
             step = "DCPEXT ASC and mailboxes";
