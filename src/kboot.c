@@ -740,8 +740,24 @@ static int dt_set_cpus(void)
         if (dt_mpidr == (mrs(MPIDR_EL1) & 0xFFFFFF))
             goto next_cpu;
 
-        if (!smp_is_alive(cpu)) {
-            printf("FDT: CPU %d is not alive, disabling...\n", cpu);
+        /*
+         * DT and ADT CPU numbering can differ: J616s has no ADT cpu9, while
+         * its DT numbers the cores contiguously. Match by MPIDR when the
+         * positional CPU is absent or is a different core.
+         */
+        int idx = cpu;
+        if (!smp_is_alive(idx) || smp_get_mpidr(idx) != dt_mpidr) {
+            idx = -1;
+            for (int i = 0; i < MAX_CPUS; i++) {
+                if (smp_is_alive(i) && smp_get_mpidr(i) == dt_mpidr) {
+                    idx = i;
+                    break;
+                }
+            }
+        }
+
+        if (idx < 0) {
+            printf("FDT: CPU %d (MPIDR 0x%lx) is not alive, disabling...\n", cpu, dt_mpidr);
             pruned_phandles[pruned++] = fdt_get_phandle(dt, node);
 
             int next = fdt_next_subnode(dt, node);
@@ -751,12 +767,8 @@ static int dt_set_cpus(void)
             continue;
         }
 
-        u64 mpidr = smp_get_mpidr(cpu);
-
-        if (dt_mpidr != mpidr)
-            bail_cleanup("FDT: DT CPU %d MPIDR mismatch: 0x%lx != 0x%lx\n", cpu, dt_mpidr, mpidr);
-
-        u64 release_addr = smp_get_release_addr(cpu);
+        u64 mpidr = smp_get_mpidr(idx);
+        u64 release_addr = smp_get_release_addr(idx);
         if (fdt_setprop_inplace_u64(dt, node, "cpu-release-addr", release_addr))
             bail_cleanup("FDT: couldn't set cpu-release-addr property\n");
 
