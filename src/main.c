@@ -22,6 +22,7 @@
 #include "pcie.h"
 #include "pmgr.h"
 #include "sep.h"
+#include "pmu_counter.h"
 #include "smp.h"
 #include "stage1_config.h"
 #include "stage1_proxy.h"
@@ -249,6 +250,10 @@ void m1n1_main(void)
 
     cpufreq_fixup();
 #endif
+
+    /* T6040: nothing else in an m1n1 tether chain clears iBoot's failed-boot count. */
+    if (chip_id == T6040)
+        pmu_clear_panic_counter();
 
     printf("Initialization complete.\n");
 

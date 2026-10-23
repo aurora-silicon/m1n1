@@ -200,7 +200,7 @@ OBJECTS := \
 	sio.o \
 	smc.o \
 	smp.o \
-	spmi.o ace3.o \
+	spmi.o pmu_counter.o ace3.o \
 	start.o \
 	startup.o \
 	string.o \
