@@ -82,6 +82,7 @@ struct adt_segment_ranges { u64 phys, iova, remap; u32 size, unk; };
 static struct adt_segment_ranges segments[2];
 static u64 region[6][2];
 static u32 base_pstate = 1;
+static u32 base_length = sizeof(u32);
 static u32 raw_count = 16, raw_tables = 2, raw_max_state = 15;
 static bool have_base_pstate, efuse_fault, sgx_fault, missing_asc;
 static u32 map_a[16], map_b[16];
@@ -106,6 +107,7 @@ static int adt_get_reg(void *tree, int *path, const char *prop, int index, u64 *
 static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
 {
     (void)tree; (void)node;
+    if (!strcmp(name, "gpu-perf-base-pstate") && have_base_pstate) { *len = base_length; return &base_pstate; }
     if (!strcmp(name, "segment-ranges")) { *len = sizeof(segments); return segments; }
     if (!strcmp(name, "perf-states")) { *len = sizeof(states); return states; }
     if (!strcmp(name, "cs-perf-states")) { *len = sizeof(cs); return &cs; }
@@ -237,7 +239,7 @@ static void world(void)
     memcpy(map_a, good_a, sizeof(map_a));
     memcpy(map_b, good_b, sizeof(map_b));
     raw_count = 16; raw_tables = 2; raw_max_state = 15;
-    base_pstate = 1;
+    base_pstate = 1; base_length = sizeof(u32);
     have_base_pstate = true;
     efuse_fault = sgx_fault = missing_asc = false;
     sgx_on = false;
@@ -289,15 +291,19 @@ int main(void)
     }
     int gpu = fdt_path_offset(dt, "gpu"), len;
     const fdt32_t *rel = fdt_getprop(dt, gpu, "apple,perf-relative-a", &len);
-    assert(rel && len == 11 * 4 && fdt32_ld(&rel[0]) == 0 && fdt32_ld(&rel[10]) == 100);
+    assert(rel && len == 16 * 4 && fdt32_ld(&rel[0]) == 0 && fdt32_ld(&rel[10]) == 100);
     for (int i = 1; i < 11; i++)
         assert(fdt32_ld(&rel[i]) >= fdt32_ld(&rel[i - 1]) && fdt32_ld(&rel[i]) <= 100);
     const fdt32_t *map = fdt_getprop(dt, gpu, "apple,perf-map-a", &len);
-    assert(map && len == 11 * 4 && fdt32_ld(&map[1]) == 1 && fdt32_ld(&map[10]) == 15);
+    assert(map && len == 16 * 4 && fdt32_ld(&map[1]) == 1 && fdt32_ld(&map[10]) == 15);
+    for (int i = 11; i < 16; i++) {
+        assert(fdt32_ld(&rel[i]) == 0);
+        assert(fdt32_ld(&map[i]) == 0);
+    }
     const fdt32_t *mw = fdt_getprop(dt, gpu, "apple,max-power-mw", &len);
     assert(mw && len == 4 && fdt32_ld(mw) > 0);
     const fdt32_t *version = fdt_getprop(dt, gpu, "apple,t6040-handoff-version", &len);
-    assert(version && len == 4 && fdt32_ld(version) == 1);
+    assert(version && len == 4 && fdt32_ld(version) == 2);
     const fdt32_t *mask = fdt_getprop(dt, gpu, "apple,core-mask", &len);
     assert(mask && len == 4 && fdt32_ld(mask) == 0xfffff);
     puts("PASS accepted");
@@ -329,7 +335,12 @@ int main(void)
     world(); missing_asc = true;
     expect_refused("missing GFX ASC", 0);
     world(); have_base_pstate = false;
-    expect_refused("missing base pstate", 0);
+    assert(dt_set_gpu_t6040(dt) == 0 && !strcmp(status("gpu"), "okay"));
+    puts("PASS absent base uses first-active policy");
+    world(); base_length = 0;
+    expect_refused("empty present base property", 0);
+    world(); base_length = 8;
+    expect_refused("oversized present base property", 0);
     world(); region[0][0] = 1UL << 42;
     expect_refused("region outside physical address width", 0);
     world(); map_a[1] = 0;
@@ -393,4 +404,4 @@ def test_t6040_gpu_fill(tmp_path):
                     str(cfile), *sources, "-lm", "-o", str(binary)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS") == 27, result.stdout
+    assert result.stdout.count("PASS") == 29, result.stdout

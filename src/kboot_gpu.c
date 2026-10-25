@@ -3242,7 +3242,11 @@ static int t6040_perf_map(u64 base, u32 *index)
         index[i + 1] = (w >> 16) & 0xf;
     }
     /* The supported firmware map has 11 entries; refuse nonzero unused fields. */
-    const u32 n = T6040_MAP_STATES;
+    u32 n = T6040_OPPS;
+    while (n > 1 && !index[n - 1])
+        n--;
+    if (n != T6040_MAP_STATES)
+        return -1;
     if (index[0] != 0)
         return -1;
     for (u32 i = 1; i < n; i++)
@@ -3370,11 +3374,17 @@ static int dt_set_gpu_t6040(void *dt)
                 goto disable;
     }
 
-    u32 base_pstate;
-    /* The B ladder is relative to an operating state below the top one. */
-    if (ADT_GETPROP(adt, sgx, "gpu-perf-base-pstate", &base_pstate) != sizeof(base_pstate) ||
-        base_pstate < 1 || base_pstate >= T6040_MAP_STATES - 1) {
-        printf("FDT: GPU: missing or invalid T6040 gpu-perf-base-pstate\n");
+    /* Base policy defaults to the first active state, as in the T6040 power policy.
+     * Absence is valid; a malformed present value must not fall back to that policy. */
+    u32 base_pstate = 1;
+    const u32 *base_prop = adt_getprop(adt, sgx, "gpu-perf-base-pstate", &len);
+    if (base_prop) {
+        if (len != sizeof(base_pstate))
+            goto disable;
+        memcpy(&base_pstate, base_prop, sizeof(base_pstate));
+    }
+    if (base_pstate < 1 || base_pstate >= T6040_MAP_STATES - 1) {
+        printf("FDT: GPU: invalid T6040 gpu-perf-base-pstate\n");
         goto disable;
     }
 
@@ -3490,7 +3500,8 @@ static int dt_set_gpu_t6040(void *dt)
             goto disable;
     }
 
-    u32 rel_a[T6040_MAP_STATES], rel_b[T6040_MAP_STATES];
+    /* Keep the unpopulated selector slots explicit and zero in the handoff. */
+    u32 rel_a[T6040_OPPS] = {0}, rel_b[T6040_OPPS] = {0};
     u64 span_p = power[n - 1] - power[0], span_f = freq[n - 1] - freq[base_pstate];
     if (!span_p || !span_f)
         goto disable;
@@ -3522,10 +3533,10 @@ static int dt_set_gpu_t6040(void *dt)
         t6040_set_floats(dt, gpu, "apple,sram-leak-coef", sram_leak, T6040_CLUSTERS) ||
         t6040_set_floats(dt, gpu, "apple,cs-leak-coef", &cs_leak, 1) ||
         t6040_set_floats(dt, gpu, "apple,afr-leak-coef", &afr_leak, 1) ||
-        t6040_set_u32s(dt, gpu, "apple,perf-map-a", index_a, n) ||
-        t6040_set_u32s(dt, gpu, "apple,perf-map-b", index_b, n) ||
-        t6040_set_u32s(dt, gpu, "apple,perf-relative-a", rel_a, n) ||
-        t6040_set_u32s(dt, gpu, "apple,perf-relative-b", rel_b, n) ||
+        t6040_set_u32s(dt, gpu, "apple,perf-map-a", index_a, count) ||
+        t6040_set_u32s(dt, gpu, "apple,perf-map-b", index_b, count) ||
+        t6040_set_u32s(dt, gpu, "apple,perf-relative-a", rel_a, count) ||
+        t6040_set_u32s(dt, gpu, "apple,perf-relative-b", rel_b, count) ||
         fdt_setprop_u32(dt, gpu, "apple,perf-base-pstate", base_pstate) ||
         fdt_setprop_u32(dt, gpu, "apple,max-power-mw", power[n - 1]) ||
         fdt_setprop_u32(dt, gpu, "apple,core-mask", masks[0]))
@@ -3538,7 +3549,7 @@ static int dt_set_gpu_t6040(void *dt)
     }
 
     gpu = fdt_path_offset(dt, "gpu");
-    if (fdt_setprop_u32(dt, gpu, "apple,t6040-handoff-version", 1))
+    if (fdt_setprop_u32(dt, gpu, "apple,t6040-handoff-version", 2))
         goto disable;
 
     printf("FDT: GPU: T6040 cores %u+%u, max power %u mW, OS firmware %s\n", active[0], active[1],
