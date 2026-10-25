@@ -122,17 +122,21 @@ static int pcie_fdt_bypass_sid(void *dt, int host, u8 sid, u8 *bypass)
     }
     if (len <= 0 || len % (int)sizeof(*managed))
         return -1;
+
+    /* Admit the whole list before using it: a bad cell anywhere refuses it. */
+    bool member = false;
     for (int i = 0; i < len / (int)sizeof(*managed); i++) {
         u32 managed_sid = fdt32_ld(&managed[i]);
 
-        if (managed_sid == PCIE_STATIC_BYPASS_SID)
+        if (managed_sid == PCIE_STATIC_BYPASS_SID || managed_sid > 0xff)
             return -1;
-        if (managed_sid == sid) {
-            *bypass = PCIE_STATIC_BYPASS_SID;
-            return 0;
-        }
+        if (managed_sid == sid)
+            member = true;
     }
-    return -1;
+    if (!member)
+        return -1;
+    *bypass = PCIE_STATIC_BYPASS_SID;
+    return 0;
 }
 
 static bool pcie_fdt_t8132_port(void *dt, int host, int port, u32 *phandle, u8 *bypass)

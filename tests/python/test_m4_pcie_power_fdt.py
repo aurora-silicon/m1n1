@@ -156,7 +156,10 @@ static void test_managed_streams(void *dt)
   {1, {cpu_to_fdt32(1), cpu_to_fdt32(2)}, 2, true},
   {2, {cpu_to_fdt32(1), cpu_to_fdt32(2)}, 2, true},
   {3, {cpu_to_fdt32(1), cpu_to_fdt32(2)}, 2, false}, /* Mapped outside the list. */
-  {1, {cpu_to_fdt32(16), cpu_to_fdt32(1)}, 2, false}, /* SID16 is never managed. */
+  {1, {cpu_to_fdt32(16), cpu_to_fdt32(1)}, 2, false}, /* SID16 is never managed, */
+  {1, {cpu_to_fdt32(1), cpu_to_fdt32(16)}, 2, false}, /* in either order, */
+  {1, {cpu_to_fdt32(1), cpu_to_fdt32(2), cpu_to_fdt32(16)}, 3, false}, /* nor last. */
+  {1, {cpu_to_fdt32(1), cpu_to_fdt32(0x100)}, 2, false}, /* A trailing cell that is no SID. */
   {1, {cpu_to_fdt32(1)}, 1, true},
   {1, {0}, 0, false}, /* An empty list is malformed, not absent. */
  };
