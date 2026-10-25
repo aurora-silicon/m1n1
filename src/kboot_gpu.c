@@ -3383,7 +3383,7 @@ static int dt_set_gpu_t6040(void *dt)
             goto disable;
         memcpy(&base_pstate, base_prop, sizeof(base_pstate));
     }
-    if (base_pstate < 1 || base_pstate >= T6040_MAP_STATES - 1) {
+    if (base_pstate != 1) {
         printf("FDT: GPU: invalid T6040 gpu-perf-base-pstate\n");
         goto disable;
     }

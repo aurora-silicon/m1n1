@@ -357,6 +357,8 @@ int main(void)
     expect_refused("power falls along the A map", 1);
     world(); have_base_pstate = true; base_pstate = 0;
     expect_refused("base state is the off state", 0);
+    world(); have_base_pstate = true; base_pstate = 2;
+    expect_refused("base policy differs from the supported firmware encoder", 0);
     world(); have_base_pstate = true; base_pstate = 10;
     expect_refused("base state is the top state", 0);
     world(); region[4][1] = 0x4100;
@@ -404,4 +406,4 @@ def test_t6040_gpu_fill(tmp_path):
                     str(cfile), *sources, "-lm", "-o", str(binary)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS") == 29, result.stdout
+    assert result.stdout.count("PASS") == 30, result.stdout
