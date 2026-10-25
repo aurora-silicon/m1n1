@@ -315,6 +315,8 @@ int main(void)
     world(); segments[0].phys = region[0][0];
     expect_refused("TEXT overlaps handoff", 0);
 
+    world(); states[0].freq = 100000000;
+    expect_refused("off operating point has a clock", 0);
     world(); missing_asc = true;
     expect_refused("missing GFX ASC", 0);
     world(); have_base_pstate = false;
@@ -382,4 +384,4 @@ def test_t6040_gpu_fill(tmp_path):
                     str(cfile), *sources, "-lm", "-o", str(binary)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS") == 22, result.stdout
+    assert result.stdout.count("PASS") == 23, result.stdout

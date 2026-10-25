@@ -3340,6 +3340,9 @@ static int dt_set_gpu_t6040(void *dt)
     if (!states || len != count * tables * sizeof(*states))
         goto disable;
     for (u32 j = 0; j < tables; j++)
+        if (states[j * count].freq)
+            goto disable;
+    for (u32 j = 0; j < tables; j++)
         for (u32 i = 1; i < count; i++)
             if (!states[j * count + i].freq || states[j * count + i].freq != states[i].freq ||
                 states[j * count + i].volt < 400 || states[j * count + i].volt > 1300)
