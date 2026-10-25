@@ -2068,3 +2068,11 @@ int main(int argc, char **argv)
     }
     return strcmp(argv[1], "list") ? 2 : 0;
 }
+
+/* These fixtures exercise G15/M3 only. Fail if dispatch unexpectedly reaches M4. */
+int dt_set_gpu_m4(void *dt)
+{
+    (void)dt;
+    assert(!"unexpected M4 dispatch in the G15/M3 host fixture");
+    return -1;
+}

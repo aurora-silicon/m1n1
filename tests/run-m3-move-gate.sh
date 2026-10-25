@@ -47,13 +47,16 @@ ins = []
 for l in lines[start + 1:]:
     m = re.match(r"\s*([0-9a-f]+):\s+(.*)", l)
     if not m:
-        break
+        # The chainload header and local labels can interrupt objdump's listing
+        # before the M3 move. They are not the end of the .init section.
+        continue
     ins.append((int(m.group(1), 16), m.group(2).split("//")[0].strip()))
 mrs = next(i for i, (_, t) in enumerate(ins) if re.fullmatch(r"mrs\s+x1, MIDR_EL1", t))
 ldr = next(i for i, (_, t) in enumerate(ins) if i > mrs and re.match(r"ldr\s+x21, \[x19, #0x20\]", t))
 gate = ins[mrs + 1:ldr]
 targets = {int(re.search(r"0x([0-9a-f]+)", t).group(1), 16) for _, t in gate if t.startswith("b.")}
 assert len(gate) == 7 and len(targets) == 1, (gate, targets)
+assert all(gate[i][0] == gate[0][0] + 4 * i for i in range(len(gate))), gate
 lo, skip = gate[0][0], targets.pop()
 assert skip > ins[ldr][0], "the gate must skip the whole move"
 blob = open(f"{tmp}/init.bin", "rb").read()
