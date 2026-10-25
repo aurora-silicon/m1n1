@@ -82,13 +82,13 @@ struct adt_segment_ranges { u64 phys, iova, remap; u32 size, unk; };
 static struct adt_segment_ranges segments[2];
 static u64 region[6][2];
 static u32 base_pstate = 1;
-static bool have_base_pstate, efuse_fault, sgx_fault;
+static bool have_base_pstate, efuse_fault, sgx_fault, missing_asc;
 static u32 map_a[16], map_b[16];
 static const char *const region_names[5] = {
     "gfx-handoff", "gfx-shared-l2-region", "gfx-shared-region", "gpu-region", "gfx-data",
 };
 
-static int adt_path_offset(void *tree, const char *path) { (void)tree; return !strcmp(path, "/arm-io/gfx-asc") ? 2 : -1; }
+static int adt_path_offset(void *tree, const char *path) { (void)tree; return !missing_asc && !strcmp(path, "/arm-io/gfx-asc") ? 2 : -1; }
 
 static int adt_path_offset_trace(void *tree, const char *path, int *trace)
 {
@@ -236,7 +236,8 @@ static void world(void)
     memcpy(map_a, good_a, sizeof(map_a));
     memcpy(map_b, good_b, sizeof(map_b));
     base_pstate = 1;
-    have_base_pstate = efuse_fault = sgx_fault = false;
+    have_base_pstate = true;
+    efuse_fault = sgx_fault = missing_asc = false;
     sgx_on = false;
     enables = restores = exc_count = 0;
 }
@@ -314,6 +315,12 @@ int main(void)
     world(); segments[0].phys = region[0][0];
     expect_refused("TEXT overlaps handoff", 0);
 
+    world(); missing_asc = true;
+    expect_refused("missing GFX ASC", 0);
+    world(); have_base_pstate = false;
+    expect_refused("missing base pstate", 0);
+    world(); region[0][0] = 1UL << 42;
+    expect_refused("region outside physical address width", 0);
     world(); map_a[1] = 0;
     expect_refused("A map selects the off state", 1);
     world(); map_b[1] = 0;
@@ -375,4 +382,4 @@ def test_t6040_gpu_fill(tmp_path):
                     str(cfile), *sources, "-lm", "-o", str(binary)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS") == 19, result.stdout
+    assert result.stdout.count("PASS") == 22, result.stdout

@@ -3359,15 +3359,17 @@ static int dt_set_gpu_t6040(void *dt)
                 goto disable;
     }
 
-    u32 base_pstate = 1;
-    ADT_GETPROP(adt, sgx, "gpu-perf-base-pstate", &base_pstate);
+    u32 base_pstate;
     /* The B ladder is relative to an operating state below the top one. */
-    if (base_pstate < 1 || base_pstate >= T6040_STATES - 1)
+    if (ADT_GETPROP(adt, sgx, "gpu-perf-base-pstate", &base_pstate) != sizeof(base_pstate) ||
+        base_pstate < 1 || base_pstate >= T6040_STATES - 1)
         goto disable;
 
     int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
+    if (asc < 0)
+        goto disable;
     const struct adt_segment_ranges *segments = adt_getprop(adt, asc, "segment-ranges", &len);
-    if (asc < 0 || !segments || len != 2 * sizeof(*segments))
+    if (!segments || len != 2 * sizeof(*segments))
         goto disable;
 
     /* The reserved regions, the OPP tables and the GPU node must all take the fill. */
@@ -3387,6 +3389,7 @@ static int dt_set_gpu_t6040(void *dt)
         }
         if (!region_base[i] || !region_size[i] || (region_base[i] & (SZ_16K - 1)) ||
             (region_size[i] & (SZ_16K - 1)) || region_base[i] > UINT64_MAX - region_size[i] ||
+            region_base[i] + region_size[i] > (1ULL << 42) ||
             fdt_path_offset(dt, t6040_regions[i].path) < 0)
             goto disable;
         for (size_t j = 0; j < i; j++)
