@@ -82,6 +82,7 @@ struct adt_segment_ranges { u64 phys, iova, remap; u32 size, unk; };
 static struct adt_segment_ranges segments[2];
 static u64 region[6][2];
 static u32 base_pstate = 1;
+static u32 raw_count = 16, raw_tables = 2, raw_max_state = 15;
 static bool have_base_pstate, efuse_fault, sgx_fault, missing_asc;
 static u32 map_a[16], map_b[16];
 static const char *const region_names[5] = {
@@ -114,9 +115,9 @@ static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
 static int adt_copy(const char *name, void *out, size_t size)
 {
     u32 value;
-    if (!strcmp(name, "perf-state-count")) value = 16;
-    else if (!strcmp(name, "perf-state-table-count")) value = 2;
-    else if (!strcmp(name, "gpu-num-perf-states")) value = 10;
+    if (!strcmp(name, "perf-state-count")) value = raw_count;
+    else if (!strcmp(name, "perf-state-table-count")) value = raw_tables;
+    else if (!strcmp(name, "gpu-num-perf-states")) value = raw_max_state;
     else if (!strcmp(name, "gpu-perf-base-pstate") && have_base_pstate) value = base_pstate;
     else {
         for (int i = 0; i < 5; i++) {
@@ -235,6 +236,7 @@ static void world(void)
     segments[1] = (struct adt_segment_ranges){.phys = region[4][0], .size = region[4][1]};
     memcpy(map_a, good_a, sizeof(map_a));
     memcpy(map_b, good_b, sizeof(map_b));
+    raw_count = 16; raw_tables = 2; raw_max_state = 15;
     base_pstate = 1;
     have_base_pstate = true;
     efuse_fault = sgx_fault = missing_asc = false;
@@ -308,8 +310,15 @@ int main(void)
     puts("PASS public power reference");
 
     world(); map_a[15] = 3; map_b[15] = 7;
-    assert(dt_set_gpu_t6040(dt) == 0 && !strcmp(status("gpu"), "okay"));
-    puts("PASS unused map fields");
+    expect_refused("nonzero unused map fields", 1);
+    world(); map_a[10] = 14;
+    expect_refused("map does not reach the raw top OPP", 1);
+    world(); raw_max_state = 10;
+    expect_refused("logical count in the raw ADT count", 0);
+    world(); raw_count = 15;
+    expect_refused("wrong raw OPP count", 0);
+    world(); raw_tables = 1;
+    expect_refused("wrong cluster table count", 0);
     world(); segments[1].phys += 0x4000;
     expect_refused("DATA segment disagrees with gfx-data", 0);
     world(); segments[0].phys = region[0][0];
@@ -384,4 +393,4 @@ def test_t6040_gpu_fill(tmp_path):
                     str(cfile), *sources, "-lm", "-o", str(binary)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS") == 23, result.stdout
+    assert result.stdout.count("PASS") == 27, result.stdout

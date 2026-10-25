@@ -3052,11 +3052,11 @@ disable:
  * The fill runs only when the device tree enables the GPU, so a tree that keeps the GPU off
  * leaves the hardware untouched. Anything unexpected disables the GPU node again.
  */
-#define T6040_OPPS     16
-#define T6040_CLUSTERS 2
-#define T6040_CORES    10
-#define T6040_STATES   11
-#define T6040_EFUSE    0x508374000UL /* efuse page; the leakage fields are at 0xc10..0xc2b */
+#define T6040_OPPS       16
+#define T6040_CLUSTERS   2
+#define T6040_CORES      10
+#define T6040_MAP_STATES 11
+#define T6040_EFUSE      0x508374000UL /* efuse page; the leakage fields are at 0xc10..0xc2b */
 
 /* Rounding barrier: keeps the compiler from fusing a multiply into a following add. */
 #define T6040_ROUND(x) __asm__("" : "+w"(x))
@@ -3241,12 +3241,17 @@ static int t6040_perf_map(u64 base, u32 *index)
         index[i] = w & 0xf;
         index[i + 1] = (w >> 16) & 0xf;
     }
-    /* Only gpu-num-perf-states + 1 entries are meaningful; ignore unused fields. */
-    const u32 n = T6040_STATES;
+    /* The supported firmware map has 11 entries; refuse nonzero unused fields. */
+    const u32 n = T6040_MAP_STATES;
     if (index[0] != 0)
         return -1;
     for (u32 i = 1; i < n; i++)
         if (index[i] <= index[i - 1])
+            return -1;
+    if (index[n - 1] != T6040_OPPS - 1)
+        return -1;
+    for (u32 i = n; i < T6040_OPPS; i++)
+        if (index[i])
             return -1;
     return n;
 }
@@ -3326,14 +3331,17 @@ static int dt_set_gpu_t6040(void *dt)
     size_t touched = 0;
     int sgx_path[8];
     int sgx = adt_path_offset_trace(adt, "/arm-io/sgx", sgx_path);
+    /* ADT counts raw operating points, independently of the SGX selector maps. */
     u32 count, tables, num_states, len;
     u64 sgx_base;
     if (sgx < 0 || adt_get_reg(adt, sgx_path, "reg", 0, &sgx_base, NULL) < 0 ||
         ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
         ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) ||
         ADT_GETPROP(adt, sgx, "gpu-num-perf-states", &num_states) != sizeof(num_states) ||
-        num_states != T6040_STATES - 1 || count != T6040_OPPS || tables != T6040_CLUSTERS)
+        count != T6040_OPPS || num_states != count - 1 || tables != T6040_CLUSTERS) {
+        printf("FDT: GPU: invalid T6040 raw OPP counts\n");
         goto disable;
+    }
 
     /* Operating point 0 is the off state; every other one is checked here before any use. */
     const struct perf_state *states = adt_getprop(adt, sgx, "perf-states", &len);
@@ -3365,8 +3373,10 @@ static int dt_set_gpu_t6040(void *dt)
     u32 base_pstate;
     /* The B ladder is relative to an operating state below the top one. */
     if (ADT_GETPROP(adt, sgx, "gpu-perf-base-pstate", &base_pstate) != sizeof(base_pstate) ||
-        base_pstate < 1 || base_pstate >= T6040_STATES - 1)
+        base_pstate < 1 || base_pstate >= T6040_MAP_STATES - 1) {
+        printf("FDT: GPU: missing or invalid T6040 gpu-perf-base-pstate\n");
         goto disable;
+    }
 
     int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
     if (asc < 0)
@@ -3461,7 +3471,7 @@ static int dt_set_gpu_t6040(void *dt)
             goto disable;
 
     /* Maximum power of each logical A state, and the relative tables. State 0 stays at 0. */
-    u32 power[T6040_STATES] = {0}, freq[T6040_STATES] = {0};
+    u32 power[T6040_MAP_STATES] = {0}, freq[T6040_MAP_STATES] = {0};
     for (int i = 1; i < n; i++)
         freq[i] = states[index_a[i]].freq / 1000000;
     for (int i = 1; i < n; i++) {
@@ -3480,7 +3490,7 @@ static int dt_set_gpu_t6040(void *dt)
             goto disable;
     }
 
-    u32 rel_a[T6040_STATES], rel_b[T6040_STATES];
+    u32 rel_a[T6040_MAP_STATES], rel_b[T6040_MAP_STATES];
     u64 span_p = power[n - 1] - power[0], span_f = freq[n - 1] - freq[base_pstate];
     if (!span_p || !span_f)
         goto disable;
