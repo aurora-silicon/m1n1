@@ -615,7 +615,13 @@ static double t6040_f64(u64 w)
     return d;
 }
 
-/* Binary32 words (A, B, C) of the GPU cluster power model, by voltage band (< 701, < 901, more). */
+/*
+ * The power model below, with its constants and the efuse fields read in dt_set_gpu_t6040(),
+ * reproduces the J616s device tree's maximum power (69116 mW), its power ladder and both
+ * relative tables exactly.
+ *
+ * Binary32 words (A, B, C) of the GPU cluster power model, by voltage band (< 701, < 901, more).
+ */
 static const u32 t6040_gpu_coef[3][3] = {
     {0x3c44f3b6, 0x3aa07f54, 0x406dcd8c},
     {0x3c367d9a, 0x3abd2472, 0x40671cc1},
@@ -761,7 +767,11 @@ static int t6040_read32(u64 addr, u32 *val)
     return exc_count == before ? 0 : -1;
 }
 
-/* Performance-state map: two 4-bit operating-point indices per 32-bit word. */
+/*
+ * Performance-state map: two 4-bit operating-point indices per 32-bit word. Logical state 0 is
+ * off and selects operating point 0; every later state selects a strictly higher operating point,
+ * so no map entry past state 0 can reach the off state.
+ */
 static int t6040_perf_map(u64 base, u32 *index)
 {
     u32 n = 0;
@@ -778,7 +788,7 @@ static int t6040_perf_map(u64 base, u32 *index)
             n = i + 1;
     if (n != T6040_STATES || index[0] != 0)
         return -1;
-    for (u32 i = 2; i < n; i++)
+    for (u32 i = 1; i < n; i++)
         if (index[i] <= index[i - 1])
             return -1;
     return n;
@@ -805,6 +815,38 @@ static int t6040_set_floats(void *dt, int node, const char *name, const float *v
     return t6040_set_u32s(dt, node, name, words, count);
 }
 
+/* An OPP table that the in-place writes below can fill: `count` entries of the expected sizes. */
+static int t6040_opp_table(void *dt, int gpu, const char *prop, u32 count, int volt_len)
+{
+    int len;
+    const fdt32_t *ph = fdt_getprop(dt, gpu, prop, &len);
+    if (!ph || len != sizeof(*ph))
+        return -1;
+    int table = fdt_node_offset_by_phandle(dt, fdt32_ld(ph));
+    if (table < 0)
+        return -1;
+    int opp;
+    u32 n = 0;
+    fdt_for_each_subnode(opp, dt, table)
+    {
+        if (++n > count || !fdt_getprop(dt, opp, "opp-hz", &len) || len != sizeof(u64) ||
+            !fdt_getprop(dt, opp, "opp-microvolt", &len) || len != volt_len)
+            return -1;
+    }
+    return n == count ? table : -1;
+}
+
+static const struct {
+    const char *name;
+    const char *path;
+} t6040_regions[] = {
+    {"gfx-handoff", "/reserved-memory/uat-handoff"},
+    {"gfx-shared-l2-region", "/reserved-memory/uat-l2-pagetables"},
+    {"gfx-shared-region", "/reserved-memory/uat-pagetables"},
+    {"gpu-region", "/reserved-memory/uat-ttbs"},
+    {"gfx-data", "/reserved-memory/gpu-fw-data"},
+};
+
 static int dt_set_gpu_t6040(void *dt)
 {
     int gpu = fdt_path_offset(dt, "gpu");
@@ -819,6 +861,7 @@ static int dt_set_gpu_t6040(void *dt)
         return 0;
     }
 
+    size_t touched = 0;
     int sgx_path[8];
     int sgx = adt_path_offset_trace(adt, "/arm-io/sgx", sgx_path);
     u32 count, tables, len;
@@ -829,6 +872,7 @@ static int dt_set_gpu_t6040(void *dt)
         count != T6040_OPPS || tables != T6040_CLUSTERS)
         goto disable;
 
+    /* Operating point 0 is the off state; every other one is checked here before any use. */
     const struct perf_state *states = adt_getprop(adt, sgx, "perf-states", &len);
     if (!states || len != count * tables * sizeof(*states))
         goto disable;
@@ -854,7 +898,32 @@ static int dt_set_gpu_t6040(void *dt)
 
     u32 base_pstate = 1;
     ADT_GETPROP(adt, sgx, "gpu-perf-base-pstate", &base_pstate);
-    if (base_pstate >= T6040_STATES)
+    /* The B ladder is relative to an operating state below the top one. */
+    if (base_pstate < 1 || base_pstate >= T6040_STATES - 1)
+        goto disable;
+
+    /* The reserved regions, the OPP tables and the GPU node must all take the fill. */
+    u64 region_base[ARRAY_SIZE(t6040_regions)], region_size[ARRAY_SIZE(t6040_regions)];
+    for (size_t i = 0; i < ARRAY_SIZE(t6040_regions); i++) {
+        char prop[64];
+        snprintf(prop, sizeof(prop), "%s-base", t6040_regions[i].name);
+        if (ADT_GETPROP(adt, sgx, prop, &region_base[i]) != sizeof(u64))
+            goto disable;
+        snprintf(prop, sizeof(prop), "%s-size", t6040_regions[i].name);
+        if (ADT_GETPROP(adt, sgx, prop, &region_size[i]) != sizeof(u64) || !region_base[i] ||
+            !region_size[i] || (region_base[i] & (SZ_16K - 1)) || (region_size[i] & (SZ_16K - 1)) ||
+            region_base[i] > UINT64_MAX - region_size[i] ||
+            fdt_path_offset(dt, t6040_regions[i].path) < 0)
+            goto disable;
+        for (size_t j = 0; j < i; j++)
+            if (region_base[i] < region_base[j] + region_size[j] &&
+                region_base[j] < region_base[i] + region_size[i])
+                goto disable;
+    }
+    int table =
+        t6040_opp_table(dt, gpu, "operating-points-v2", count, T6040_CLUSTERS * sizeof(u32));
+    if (table < 0 || t6040_opp_table(dt, gpu, "apple,cs-opp", aux[0]->count, sizeof(u32)) < 0 ||
+        t6040_opp_table(dt, gpu, "apple,afr-opp", aux[1]->count, sizeof(u32)) < 0)
         goto disable;
 
     /* Leakage from the efuse page: two cluster cores, the shared SRAM, CS and AFR. */
@@ -877,14 +946,23 @@ static int dt_set_gpu_t6040(void *dt)
     float cs_leak = (float)(raw[3] + 1);
     float afr_leak = (float)(raw[4] + 1) * 1.5f;
 
-    /* Core mask and the A/B maps are SGX registers: the GPU must be powered to read them. */
-    if (pmgr_adt_power_enable("/arm-io/sgx") < 0)
+    /*
+     * The core mask and the A/B maps are SGX registers, so the GPU must be powered to read
+     * them. Put every power state the enable changed back as it was once they are read.
+     */
+    struct pmgr_saved_modes sgx_power;
+    if (pmgr_adt_power_enable_traced_saved("/arm-io/sgx", &sgx_power) < 0)
+        goto disable;
+    u32 masks[3], index_a[16], index_b[16];
+    int read_failed = 0;
+    for (int i = 0; i < 3; i++)
+        read_failed |= t6040_read32(sgx_base + 0xe01500 + 4 * i, &masks[i]);
+    int n = read_failed ? -1 : t6040_perf_map(sgx_base + 0xe01400, index_a);
+    int n_b = n < 0 ? -1 : t6040_perf_map(sgx_base + 0xe01480, index_b);
+    pmgr_restore_modes(&sgx_power);
+    if (n < 0 || n_b != n)
         goto disable;
 
-    u32 masks[3];
-    for (int i = 0; i < 3; i++)
-        if (t6040_read32(sgx_base + 0xe01500 + 4 * i, &masks[i]))
-            goto disable;
     if (masks[1] || masks[2] || (masks[0] >> (T6040_CLUSTERS * T6040_CORES)))
         goto disable;
     u32 active[T6040_CLUSTERS];
@@ -894,14 +972,15 @@ static int dt_set_gpu_t6040(void *dt)
             goto disable;
     }
 
-    u32 index_a[16], index_b[16];
-    int n = t6040_perf_map(sgx_base + 0xe01400, index_a);
-    if (n < 0 || t6040_perf_map(sgx_base + 0xe01480, index_b) != n)
-        goto disable;
+    /* Both maps must climb in frequency, so the B ladder below cannot wrap. */
+    for (int i = 2; i < n; i++)
+        if (states[index_a[i]].freq <= states[index_a[i - 1]].freq ||
+            states[index_b[i]].freq <= states[index_b[i - 1]].freq)
+            goto disable;
 
-    /* Maximum power of each logical A state, and the relative tables. */
+    /* Maximum power of each logical A state, and the relative tables. State 0 stays at 0. */
     u32 power[T6040_STATES] = {0}, freq[T6040_STATES] = {0};
-    for (int i = 0; i < n; i++)
+    for (int i = 1; i < n; i++)
         freq[i] = states[index_a[i]].freq / 1000000;
     for (int i = 1; i < n; i++) {
         const struct perf_state *s = &states[index_a[i]];
@@ -910,9 +989,13 @@ static int dt_set_gpu_t6040(void *dt)
             t6040_cs_mw(aux[0]->states[c].volt / 1000, aux[0]->states[c].freq / 1000000, cs_leak);
         for (int j = 0; j < T6040_CLUSTERS; j++) {
             float r = (float)active[j] / 10.0f;
+            /* Half the CS power per cluster, truncated as in the reference tables. */
             power[i] += t6040_cluster_mw(s[j * count].volt, s->freq / 1000000, core_leak[j], r) +
                         cs / T6040_CLUSTERS;
         }
+        /* A power ladder that falls would put the relative-A table above 100. */
+        if (power[i] < power[i - 1])
+            goto disable;
     }
 
     u32 rel_a[T6040_STATES], rel_b[T6040_STATES];
@@ -925,21 +1008,12 @@ static int dt_set_gpu_t6040(void *dt)
             i < (int)base_pstate ? 0 : (u32)(100ULL * (freq[i] - freq[base_pstate]) / span_f);
     }
 
-    /* Operating points, in the order of the ADT table, one voltage per cluster. */
-    int ph_len;
-    const fdt32_t *opp_ph = fdt_getprop(dt, gpu, "operating-points-v2", &ph_len);
-    if (!opp_ph || ph_len != sizeof(*opp_ph))
-        goto disable;
-    int table = fdt_node_offset_by_phandle(dt, fdt32_ld(opp_ph));
-    if (table < 0)
-        goto disable;
+    /* Everything is validated. Fill the GPU node, then publish the reserved regions last. */
     int opp;
     u32 i = 0;
     fdt_for_each_subnode(opp, dt, table)
     {
         fdt32_t volts[T6040_CLUSTERS];
-        if (i >= count)
-            goto disable;
         for (u32 j = 0; j < T6040_CLUSTERS; j++)
             volts[j] = cpu_to_fdt32(states[i + j * count].volt * 1000);
         if (fdt_setprop_inplace(dt, opp, "opp-microvolt", volts, sizeof(volts)) ||
@@ -947,22 +1021,10 @@ static int dt_set_gpu_t6040(void *dt)
             goto disable;
         i++;
     }
-    if (i != count)
-        goto disable;
     if (fdt_set_aux_opp(dt, gpu, "apple,cs-opp", aux[0], 1) ||
         fdt_set_aux_opp(dt, gpu, "apple,afr-opp", aux[1], 1))
         goto disable;
 
-    if (dt_set_region(dt, sgx, "gfx-handoff", "/reserved-memory/uat-handoff") ||
-        dt_set_region(dt, sgx, "gfx-shared-l2-region", "/reserved-memory/uat-l2-pagetables") ||
-        dt_set_region(dt, sgx, "gfx-shared-region", "/reserved-memory/uat-pagetables") ||
-        dt_set_region(dt, sgx, "gpu-region", "/reserved-memory/uat-ttbs") ||
-        dt_set_region(dt, sgx, "gfx-data", "/reserved-memory/gpu-fw-data"))
-        goto disable;
-
-    gpu = fdt_path_offset(dt, "gpu");
-    if (gpu < 0)
-        return -1;
     if (firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware) ||
         t6040_set_floats(dt, gpu, "apple,core-leak-coef", core_leak, T6040_CLUSTERS) ||
         t6040_set_floats(dt, gpu, "apple,sram-leak-coef", sram_leak, T6040_CLUSTERS) ||
@@ -976,11 +1038,23 @@ static int dt_set_gpu_t6040(void *dt)
         fdt_setprop_u32(dt, gpu, "apple,max-power-mw", power[n - 1]))
         goto disable;
 
+    while (touched < ARRAY_SIZE(t6040_regions)) {
+        size_t r = touched++;
+        if (dt_set_resvmem(dt, t6040_regions[r].path, region_base[r], region_size[r]))
+            goto disable;
+    }
+
     printf("FDT: GPU: T6040 cores %u+%u, max power %u mW, OS firmware %s\n", active[0], active[1],
            power[n - 1], os_firmware.string);
     return 0;
 
 disable:
+    /* A region published before a failure would stay reserved for a disabled GPU. */
+    for (size_t r = 0; r < touched; r++) {
+        int node = fdt_path_offset(dt, t6040_regions[r].path);
+        if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
+            return -1;
+    }
     gpu = fdt_path_offset(dt, "gpu");
     if (gpu >= 0 && fdt_setprop_string(dt, gpu, "status", "disabled"))
         return -1;

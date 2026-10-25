@@ -358,7 +358,7 @@ void pmgr_restore_modes(struct pmgr_saved_modes *saved)
         if ((FIELD_GET(PMGR_PS_ACTUAL, reg) != entry->target ||
              FIELD_GET(PMGR_PS_TARGET, reg) != entry->target) &&
             pmgr_set_mode(entry->addr, entry->target))
-            printf("pmgr: failed to restore 0x%lx after ISP error\n", entry->addr);
+            printf("pmgr: failed to restore 0x%lx to its saved mode\n", entry->addr);
     }
 }
 
