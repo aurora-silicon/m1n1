@@ -149,6 +149,38 @@ static void test_iommu_admission(void *dt)
  assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/dart"), "compatible", "apple,t8103-dart"));
  check_admission(dt, false);
 }
+/* 7.3 trees map the radio to managed ordinary streams; SID16 is still bypassed. */
+static void test_managed_streams(void *dt)
+{
+ const struct { u32 base; fdt32_t managed[3]; int count; bool valid; } cases[] = {
+  {1, {cpu_to_fdt32(1), cpu_to_fdt32(2)}, 2, true},
+  {2, {cpu_to_fdt32(1), cpu_to_fdt32(2)}, 2, true},
+  {3, {cpu_to_fdt32(1), cpu_to_fdt32(2)}, 2, false}, /* Mapped outside the list. */
+  {1, {cpu_to_fdt32(16), cpu_to_fdt32(1)}, 2, false}, /* SID16 is never managed. */
+  {1, {cpu_to_fdt32(1)}, 1, true},
+  {1, {0}, 0, false}, /* An empty list is malformed, not absent. */
+ };
+ for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); i++) {
+  setup(dt, true, 0);
+  int host = fdt_path_offset(dt, "/pcie");
+  fdt32_t map[] = {cpu_to_fdt32(0x100), cpu_to_fdt32(2), cpu_to_fdt32(cases[i].base),
+                   cpu_to_fdt32(1)};
+  assert(!fdt_setprop(dt, host, "iommu-map", map, sizeof(map)));
+  assert(!fdt_setprop_u32(dt, host, "iommu-map-mask", 0xffff));
+  assert(!fdt_setprop(dt, fdt_path_offset(dt, "/pcie"), "apple,managed-sids", cases[i].managed,
+                      cases[i].count * sizeof(fdt32_t)));
+  expected_sid = 16;
+  check_admission(dt, cases[i].valid);
+ }
+ /* A list that is not whole cells is refused, even when its first cell matches. */
+ setup(dt, true, 0);
+ fdt32_t map[] = {cpu_to_fdt32(0x100), cpu_to_fdt32(2), cpu_to_fdt32(1), cpu_to_fdt32(1)};
+ assert(!fdt_setprop(dt, fdt_path_offset(dt, "/pcie"), "iommu-map", map, sizeof(map)));
+ assert(!fdt_setprop_u32(dt, fdt_path_offset(dt, "/pcie"), "iommu-map-mask", 0xffff));
+ assert(!fdt_setprop(dt, fdt_path_offset(dt, "/pcie"), "apple,managed-sids", "\0\0\0\1\0", 5));
+ expected_sid = 16;
+ check_admission(dt, false);
+}
 static void test_smc_failure_admission(void *dt)
 {
  /* smc_cmd returns a positive firmware status, not a negative errno. */
@@ -185,6 +217,7 @@ int main(void)
   assert(!pcie_prepare_fdt(blob) && !pcie_handoff_fdt(blob));
  }
  test_iommu_admission(blob);
+ test_managed_streams(blob);
  test_smc_failure_admission(blob);
  return 0;
 }

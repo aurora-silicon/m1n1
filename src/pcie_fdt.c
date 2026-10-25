@@ -101,9 +101,46 @@ static int pcie_fdt_resolve_iommu(void *dt, int host, int port, u32 *phandle, u8
     return -1;
 }
 
-static bool pcie_fdt_t8132_port(void *dt, int host, int port, u32 *phandle, u8 *sid)
+/*
+ * Trees that list the radio's ordinary streams in apple,managed-sids leave them
+ * to the OS, which adopts them only while they are inactive; the radio's
+ * boot-time DMA goes through the DART's static SID16 bypass role instead
+ * (bindings: apple,pcie.yaml and apple,dart.yaml). Older trees map the endpoint
+ * to SID16 directly. Either way SID16 is the stream to bypass, and a mapped
+ * stream outside the managed list is refused.
+ */
+#define PCIE_STATIC_BYPASS_SID 16
+
+static int pcie_fdt_bypass_sid(void *dt, int host, u8 sid, u8 *bypass)
 {
-    if (pcie_fdt_resolve_iommu(dt, host, port, phandle, sid))
+    int len;
+    const fdt32_t *managed = fdt_getprop(dt, host, "apple,managed-sids", &len);
+
+    if (!managed) {
+        *bypass = sid;
+        return len == -FDT_ERR_NOTFOUND ? 0 : -1;
+    }
+    if (len <= 0 || len % (int)sizeof(*managed))
+        return -1;
+    for (int i = 0; i < len / (int)sizeof(*managed); i++) {
+        u32 managed_sid = fdt32_ld(&managed[i]);
+
+        if (managed_sid == PCIE_STATIC_BYPASS_SID)
+            return -1;
+        if (managed_sid == sid) {
+            *bypass = PCIE_STATIC_BYPASS_SID;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static bool pcie_fdt_t8132_port(void *dt, int host, int port, u32 *phandle, u8 *bypass)
+{
+    u8 sid;
+
+    if (pcie_fdt_resolve_iommu(dt, host, port, phandle, &sid) ||
+        pcie_fdt_bypass_sid(dt, host, sid, bypass))
         return false;
 
     int dart = fdt_node_offset_by_phandle(dt, *phandle);
