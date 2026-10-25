@@ -596,7 +596,7 @@ disable:
 #define T6040_CLUSTERS 2
 #define T6040_CORES    10
 #define T6040_STATES   11
-#define T6040_EFUSE    0x508374c00UL
+#define T6040_EFUSE    0x508374000UL /* efuse page; the leakage fields are at 0xc10..0xc2b */
 
 /* Rounding barrier: keeps the compiler from fusing a multiply into a following add. */
 #define T6040_ROUND(x) __asm__("" : "+w"(x))
