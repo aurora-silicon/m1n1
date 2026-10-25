@@ -26,6 +26,9 @@ int pmgr_adt_path_offset_trace(const void *adt_ptr, int *path);
 int pmgr_adt_is_powered(const char *path);
 int pmgr_adt_power_enable(const char *path);
 int pmgr_adt_power_disable(const char *path);
+int pmgr_adt_power_disable_recursive(const char *path);
+/* 1: all real devices in this path's parent closure are power-gated; 0: active; -1: unknown. */
+int pmgr_adt_power_is_off(const char *path);
 int pmgr_adt_power_enable_traced(const char *path);
 struct pmgr_saved_mode {
     uintptr_t addr;
@@ -42,6 +45,21 @@ void pmgr_restore_modes(struct pmgr_saved_modes *saved);
 int pmgr_adt_power_enable_index(const char *path, u32 index);
 int pmgr_adt_power_disable_index(const char *path, u32 index);
 int pmgr_adt_reset(const char *path);
+
+/* One PMGR device, as an ADT clock-gates/power-gates entry or a parent names it. Read only. */
+struct pmgr_gate {
+    u32 entry; /* die and device id, as in the ADT */
+    u16 id;
+    u8 die;
+    bool found;       /* the id is a device of the ADT's PMGR table */
+    bool virt;        /* a virtual device: no power state register of its own */
+    const char *name; /* up to 16 chars, not always NUL-terminated: print with %.16s */
+    u64 psreg;        /* power state register, 0 if virtual or unknown */
+    u16 parent[2];    /* parent device ids, 0 for none */
+};
+
+int pmgr_adt_gate(const char *path, const char *prop, u32 index, struct pmgr_gate *gate);
+int pmgr_device_gate(u8 die, u16 id, struct pmgr_gate *gate);
 
 int pmgr_reset(int die, const char *name);
 int pmgr_power_on(int die, const char *name);

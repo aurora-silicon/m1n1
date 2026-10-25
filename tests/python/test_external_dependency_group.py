@@ -10,6 +10,7 @@ class ExternalDependencyGroup(unittest.TestCase):
         root = pathlib.Path(__file__).parents[2]
         source = (root / 'src/kboot.c').read_text()
         code = 'static int dt_t8140_power_paths' + source.split('static int dt_t8140_power_paths', 1)[1].split('/* A specifier occupies', 1)[0]
+        handed = source[source.index('/* A display DART is published only'):source.index('static bool dt_t8140_node_enabled(')]
         prefix = r'''
 #include <assert.h>
 #include <stdlib.h>
@@ -34,6 +35,9 @@ static int add(const char *name,unsigned phandle,int status) {
 static void fixture(int omit) {
  memset(storage,0,sizeof(storage)); assert(!fdt_create_empty_tree(dt,sizeof(storage)));
  add("dart0",1,1);add("dart1",2,!omit);add("mbox",3,1);add("external",4,1);
+ /* Reservation publishes the firmware-root handoff before the group enable. */
+ assert(!fdt_setprop_u32(dt,fdt_path_offset(dt,"/dart0"),"apple,firmware-root-handoff",1));
+ assert(!fdt_setprop_u32(dt,fdt_path_offset(dt,"/dart1"),"apple,firmware-root-handoff",1));
  int n=fdt_path_offset(dt,"/external");
  fdt32_t iommu[]={cpu_to_fdt32(1),cpu_to_fdt32(23)};
  assert(!fdt_setprop(dt,n,"iommus",iommu,sizeof(iommu)));
@@ -65,12 +69,20 @@ int main(void) {
  assert(dt_t8140_enable_external("/external")<0);assert(!memcmp(before,dt,sizeof(storage)));
  fixture(1);assert(!fdt_pack(dt));memcpy(before,dt,sizeof(storage));
  assert(dt_t8140_enable_external("/external")<0);assert(!memcmp(before,dt,sizeof(storage)));
- puts("dependency group success, dangling mailbox and mid-update FDT rollback PASS");
+ /* A DART without reserved firmware tables is never published. */
+ for(unsigned d=0;d<4;d++){
+  fixture(0);n=fdt_path_offset(dt,d&1?"/dart1":"/dart0");
+  if(d<2) assert(!fdt_delprop(dt,n,"apple,firmware-root-handoff"));
+  else assert(!fdt_setprop_u32(dt,n,"apple,firmware-root-handoff",2));
+  memcpy(before,dt,sizeof(storage));
+  assert(dt_t8140_enable_external("/external")<0);assert(!memcmp(before,dt,sizeof(storage)));
+ }
+ puts("dependency group success, dangling mailbox, unreserved DART and mid-update FDT rollback PASS");
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:
             c = pathlib.Path(tmp) / 'test.c'
-            c.write_text(prefix + code + suffix)
+            c.write_text(prefix + handed + code + suffix)
             exe = pathlib.Path(tmp) / 'test'
             library = root / 'src/libfdt'
             subprocess.run(['clang', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I'+str(library), str(c), *[str(library / name) for name in ('fdt.c', 'fdt_ro.c', 'fdt_rw.c', 'fdt_sw.c', 'fdt_wip.c', 'fdt_empty_tree.c', 'fdt_check.c')], '-o', str(exe)], check=True)

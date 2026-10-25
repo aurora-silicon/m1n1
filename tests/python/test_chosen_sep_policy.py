@@ -26,6 +26,12 @@ typedef uint8_t u8;
 #define T6000 0x6000
 #define T6001 0x6001
 #define T6002 0x6002
+#define T8140 0x8140
+#define T8132 0x8132
+#define T6040 0x6040
+#define T6041 0x6041
+#define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
+static struct { bool apple_sysregs_unlocked; } features = {true}, *cpu_features = &features;
 static unsigned char blob[4096];
 static void *dt = blob, *adt = blob;
 static int chip_id, uuid_len, sep_calls, adt_calls, sep_error, adt_error;
@@ -94,6 +100,22 @@ int main(void)
     reset(); uuid = expected; uuid_len = 2;
     assert(chosen_tail() == 0);
     assert(!fdt_getprop(dt, fdt_path_offset(dt, "/chosen"), "apfs-preboot-uuid", NULL));
+
+    /* With locked system registers, only chips without their own idle policy get idle=nop. */
+    features.apple_sysregs_unlocked = false;
+    int locked[] = {0x8132, 0x6040, 0x6041, 0x8140, 0x8142, 0x8152};
+    for (unsigned i = 0; i < sizeof(locked) / sizeof(locked[0]); i++) {
+        chip_id = locked[i];
+        reset();
+        int chosen = fdt_path_offset(dt, "/chosen");
+        assert(!fdt_setprop_string(dt, chosen, "bootargs", "console=tty0"));
+        assert(chosen_tail() == 0);
+        const char *args = fdt_getprop(dt, fdt_path_offset(dt, "/chosen"), "bootargs", NULL);
+        bool own_policy = i < 4;
+        assert(args && !strcmp(args, own_policy ? "console=tty0"
+                                                : "console=tty0 idle=nop arm64.nowfxt"));
+    }
+    features.apple_sysregs_unlocked = true;
     return 0;
 }
 '''
@@ -105,7 +127,7 @@ int main(void)
     binary = tmp_path / "chosen-sep-policy"
     subprocess.run(
         ["cc", "-D_GNU_SOURCE", "-std=c11", "-Wall", "-Wextra", "-Werror",
-         "-Wno-unused-parameter", "-I", str(libfdt), "-x", "c", "-",
+         "-Wno-unused-parameter", "-Wno-sizeof-pointer-memaccess", "-I", str(libfdt), "-x", "c", "-",
          *map(str, sources), "-o", str(binary)],
         input=harness, text=True, check=True,
     )

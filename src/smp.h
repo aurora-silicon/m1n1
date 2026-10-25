@@ -30,6 +30,9 @@ int smp_call4(int cpu, void *func, u64 arg0, u64 arg1, u64 arg2, u64 arg3);
 int smp_wait_timed(int cpu, u64 *retval, u32 timeout_ms);
 /* A NULL result discards the callback value, never the completion status. */
 int smp_wait(int cpu, u64 *retval);
+/* Join even a timed-out or busy dispatch; never treat an ACK timeout as cancellation. */
+int smp_call_sync0(int cpu, void *func);
+bool smp_has_pending_calls(void);
 
 bool smp_is_alive(int cpu);
 uint64_t smp_get_mpidr(int cpu);

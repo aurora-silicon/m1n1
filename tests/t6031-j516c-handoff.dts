@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Stand-in for the display and GPU parts of the T6031 J516C kernel device tree (t6031-dcp.dtsi and
+ * t6031-gpu.dtsi), for tests/t6031_host.c. Written the way the T6030 and T8122 device trees of
+ * integration/aurora are, with the T6031 addresses of the J516C ADT. What m1n1's T6031 handoff
+ * requires of the real ones:
+ *  - aliases dcp, disp0, disp0-piodma and gpu;
+ *  - dcp (apple,t6031-dcp) and display-subsystem (apple,t6031-display-subsystem), both disabled,
+ *    with 2+2 cells on dcp's parent and on dcp (for its piodma child); dcp iommus <&dcp_dart 5>,
+ *    display iommus <&disp0_dart 0>, piodma iommus <&disp0_dart 4>;
+ *  - dcp_dart and disp0_dart: apple,t8110-dart compatible, disabled, #iommu-cells 1, reg at
+ *    0x3_8530_c000 and 0x3_8530_4000, apple,dma-range <0x100 0x0 0x10 0x0>;
+ *  - a disabled dcp mailbox in dcp's mboxes;
+ *  - none of memory-region, memory-region-names, apple,t6031-handoff or apple,firmware-uuid on
+ *    dcp, display or piodma (the handoff adds them);
+ *  - gpu (apple,agx-t6031), disabled, reg-names "asc" (0x4_0a40_0000) and "sgx" (0x4_0800_0000),
+ *    memory-region and memory-region-names with one name per entry, operating-points-v2,
+ *    apple,cs-opp and apple,afr-opp naming OPP tables, mboxes naming a mailbox;
+ *  - /reserved-memory with 2+2 cells and uat-handoff, uat-pagetables, uat-ttbs and
+ *    uat-pagetables-l2 nodes with a 2+2 cell reg;
+ *  - no pmp node: the kernel's display gate adds the PMP itself.
+ */
+/dts-v1/;
+
+/ {
+	compatible = "apple,j516c", "apple,t6031", "apple,arm-platform";
+	model = "Apple MacBook Pro (16-inch, M3 Max, 2023)";
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	chosen {
+		bootargs = "";
+	};
+
+	aliases {
+		dcp = &dcp;
+		disp0 = &display;
+		disp0-piodma = &disp0_piodma;
+		gpu = &gpu;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+
+		uat_pagetables_l2: uat-pagetables-l2 {
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+	};
+
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microwatt = <0>;
+		};
+	};
+
+	gpu_cs_opp: opp-table-gpu-cs {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+	};
+
+	gpu_afr_opp: opp-table-gpu-afr {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		dcp_mbox: mailbox@386c08000 {
+			compatible = "apple,t6031-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0x86c08000 0x0 0x4000>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		dcp_dart: iommu@38530c000 {
+			compatible = "apple,t6031-dart", "apple,t8110-dart";
+			reg = <0x3 0x8530c000 0x0 0x4000>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+			status = "disabled";
+		};
+
+		disp0_dart: iommu@385304000 {
+			compatible = "apple,t6031-dart", "apple,t8110-dart";
+			reg = <0x3 0x85304000 0x0 0x4000>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+			status = "disabled";
+		};
+
+		dcp: dcp@386c00000 {
+			compatible = "apple,t6031-dcp";
+			mboxes = <&dcp_mbox>;
+			mbox-names = "mbox";
+			iommus = <&dcp_dart 5>;
+			reg-names = "coproc", "iop-vbar";
+			reg = <0x3 0x86c00000 0x0 0x4000>,
+			      <0x3 0x86850000 0x0 0x4000>;
+			#address-cells = <2>;
+			#size-cells = <2>;
+			status = "disabled";
+
+			disp0_piodma: piodma {
+				iommus = <&disp0_dart 4>;
+			};
+		};
+
+		display: display-subsystem {
+			compatible = "apple,t6031-display-subsystem";
+			iommus = <&disp0_dart 0>;
+			status = "disabled";
+		};
+
+		agx_mbox: mbox@40a408000 {
+			compatible = "apple,t6031-agx-asc-mailbox";
+			reg = <0x4 0x0a408000 0x0 0x4000>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		gpu: gpu@40a400000 {
+			compatible = "apple,agx-t6031";
+			reg = <0x4 0x0a400000 0x0 0x6c000>,
+			      <0x4 0x08000000 0x0 0x1000000>;
+			reg-names = "asc", "sgx";
+			mboxes = <&agx_mbox>;
+			memory-region = <&uat_ttbs>, <&uat_pagetables>,
+					<&uat_handoff>, <&uat_pagetables_l2>;
+			memory-region-names = "ttbs", "pagetables", "handoff",
+					      "pagetables-l2";
+			apple,firmware-abi = <0 0 0>;
+			apple,firmware-version = <0 0 0>;
+			apple,firmware-compat = <0 0 0>;
+			operating-points-v2 = <&gpu_opp>;
+			apple,cs-opp = <&gpu_cs_opp>;
+			apple,afr-opp = <&gpu_afr_opp>;
+			status = "disabled";
+		};
+	};
+};

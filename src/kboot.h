@@ -22,9 +22,23 @@ struct kernel_header {
 
 void kboot_set_initrd(void *start, size_t size);
 int kboot_set_chosen(const char *name, const char *value);
+void kboot_delete_chosen(const char *name);
 int kboot_set_uboot(const char *name, const char *value);
+int dt_gpu_t8122_26_calibrate(void *dt);
+int dt_set_gpu_t8122_26(void *dt);
 int kboot_prepare_dt(void *fdt);
 int kboot_boot(void *kernel);
+
+/* Boot-args RAM range and boot framebuffer base, for the kboot_* SoC helpers */
+u64 kboot_ram_base(void);
+u64 kboot_ram_size(void);
+u64 kboot_fb_base(void);
+
+/*
+ * Where stage 1 loaded the file part of this image (the part start.S copies when it moves the
+ * image above the chainloaded one): the old base if it moved, otherwise where it runs.
+ */
+void kboot_loaded_file_part(u64 *base, u64 *size);
 
 // from rust/usb4.rs
 u64 rust_usb4_router_uuid(void);

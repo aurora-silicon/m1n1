@@ -20,7 +20,10 @@ TRAINING = (
 def test_j700_atc_dp_bytes_and_rejection(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     source = (repo / "src/kboot_atc.c").read_text()
-    helper = source[source.index("/* J700's DP lists"):source.index("static void dt_copy_atc_t6030_dp_tunables")]
+    # End at the exporter's own closing brace, excluding later PHY helpers.
+    export_start = source.index("static void dt_export_j700_atc(")
+    export_end = source.index("\n}", export_start) + 2
+    helper = source[source.index("/* J700's DP lists"):export_end]
     fixture = json.loads(FIXTURE.read_text())
     props = {name: bytes.fromhex(raw) for name, raw in fixture["properties"].items()}
     ranges = list(struct.iter_unpack("<QQQ", bytes.fromhex(fixture["ranges_le_hex"])))

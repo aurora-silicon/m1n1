@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: MIT */
 #ifndef AURA_BOOT_OPTIONS_H
 #define AURA_BOOT_OPTIONS_H
 #include <stdbool.h>

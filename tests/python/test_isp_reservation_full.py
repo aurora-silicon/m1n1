@@ -5,11 +5,18 @@ import subprocess
 
 
 def test_isp_reservation_no_space(tmp_path):
-    source = (Path(__file__).resolve().parents[2] / "src/kboot.c").read_text()
-    firmware = source[source.index("static int dt_reserve_asc_firmware("):
-                      source.index("static int dt_set_ave(")]
-    heap = source[source.index("static int dt_set_isp_fwdata(void)"):
-                  source.index("static int dt_disable_missing_devs(")]
+    repo = Path(__file__).resolve().parents[2]
+    source = (repo / "src/kboot.c").read_text()
+    header = (repo / "src/adt.h").read_text()
+    layout_start = header.index("struct adt_segment_ranges {")
+    layout = header[layout_start:header.index("} PACKED;", layout_start) + len("} PACKED;")]
+    def definition(signature):
+        start = source.index(signature)
+        return source[start:source.index("\n}", start) + 2]
+
+    firmware = definition("static int dt_reserve_asc_segments(") + "\n" + \
+        definition("static int dt_reserve_asc_firmware(")
+    heap = definition("static int dt_set_isp_fwdata(void)")
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -19,13 +26,20 @@ def test_isp_reservation_no_space(tmp_path):
 typedef unsigned long u64;
 typedef uint32_t u32;
 #define SZ_16K 0x4000
+#define T6030 0x6030
+#define T8132 0x8132
+/* Only the dram_only segment filter reads properties this way. */
+#define ADT_GETPROP(a, n, k, v) ((size_t)0)
+static u32 chip_id;
+static unsigned int mappings, links;
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define V13_5 0
 #define V13_6_1 1
 #define bail(...) do { return -1; } while (0)
 struct fw_version_info { int version; };
 static struct fw_version_info os_firmware = {0}, fw_versions[2];
-struct adt_segment_ranges { u64 phys, iova, remap; u32 size, flags; };
+#define PACKED __attribute__((packed))
+''' + layout + r'''
 static struct adt_segment_ranges segment = {0x100000, 0x200000, 0, 0x4000, 0};
 static void *dt, *adt;
 static int fdt_path_offset(const void *tree, const char *path)
@@ -45,9 +59,9 @@ static int dt_get_or_add_reserved_mem(const char *name, const char *compat,
 { (void)name; (void)compat; (void)no_map; (void)phys; (void)size; return -3; }
 static int dt_device_set_reserved_mem(int node, const char *name, u32 handle,
                                       u64 iova, u64 size)
-{ (void)node; (void)name; (void)handle; (void)iova; (void)size; return 0; }
+{ (void)node; (void)name; (void)handle; (void)iova; (void)size; mappings++; return 0; }
 static int dt_device_add_mem_region(const char *path, u32 handle, const char *name)
-{ (void)path; (void)handle; (void)name; return 0; }
+{ (void)path; (void)handle; (void)name; links++; return 0; }
 static int firmware_set_fdt(void *tree, int node, const char *name,
                             const struct fw_version_info *version)
 { (void)tree; (void)node; (void)name; (void)version; return 0; }
@@ -57,11 +71,15 @@ static const void *fdt_getprop(const void *tree, int node, const char *name, int
 { (void)tree; (void)node; (void)name; (void)len; return "okay"; }
 static int fdt_setprop_string(void *tree, int node, const char *name, const char *value)
 { (void)tree; (void)node; (void)name; (void)value; return 0; }
+static int fdt_setprop_empty(void *tree, int node, const char *name)
+{ (void)tree; (void)node; (void)name; assert(0); return -1; }
 ''' + firmware + heap + r'''
 int main(void)
 {
-    assert(dt_reserve_asc_firmware("/arm-io/isp", NULL, "isp", false, 0) == -1);
+    assert(dt_reserve_asc_firmware("/arm-io/isp", NULL, "isp", false, 0) == -3);
+    assert(!mappings && !links);
     assert(dt_set_isp_fwdata() == -1);
+    assert(!mappings && !links);
     return 0;
 }
 '''

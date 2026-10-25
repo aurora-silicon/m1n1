@@ -21,6 +21,30 @@ void rust_free_image(void *image, size_t size);
 extern u8 _chainload_stub_start[];
 extern u8 _chainload_stub_end[];
 
+_Static_assert(sizeof(struct chainload_header) == CHAINLOAD_HDR_SIZE, "load header size");
+_Static_assert(offsetof(struct chainload_header, footprint) == CHAINLOAD_HDR_FOOTPRINT_OFF,
+               "load header footprint offset");
+_Static_assert(offsetof(struct chainload_header, run_base) == CHAINLOAD_HDR_RUN_BASE_OFF,
+               "load header run_base offset");
+
+/*
+ * Return how many bytes from its base an image needs to run at a run_base below its staged copy
+ * (chainload.h), or 0 if it does not support that.
+ */
+static u64 chainload_run_footprint(const void *image, size_t size)
+{
+    struct chainload_header hdr;
+
+    if (size < CHAINLOAD_HDR_OFFSET + sizeof(hdr))
+        return 0;
+    memcpy(&hdr, (const u8 *)image + CHAINLOAD_HDR_OFFSET, sizeof(hdr));
+    if (hdr.magic != CHAINLOAD_HDR_MAGIC || hdr.version != CHAINLOAD_HDR_VERSION ||
+        !(hdr.flags & CHAINLOAD_HDR_F_RUN_BASE) || hdr.run_base || !hdr.footprint ||
+        (hdr.footprint & (SZ_16K - 1)) || hdr.footprint > size)
+        return 0;
+    return hdr.footprint;
+}
+
 int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
 {
     u64 new_base = (u64)_base;
@@ -60,6 +84,20 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
         return -1;
 
     u64 fw_bootargs_off = ALIGN_UP(sepfw[1], SZ_16K);
+#ifdef J613_ESP_STAGE1
+    /* Match the qualified proxy loader's optional preoslog preservation. */
+    u64 preoslog[2] = {0};
+    const void *log_prop = adt_getprop(adt, anode, "preoslog", NULL);
+    if (log_prop && ADT_GETPROP_ARRAY(adt, anode, "preoslog", preoslog) < 0)
+        return -1;
+    if (preoslog[1] &&
+        (preoslog[0] < cur_boot_args.phys_base || preoslog[1] > cur_boot_args.mem_size ||
+         preoslog[0] - cur_boot_args.phys_base > cur_boot_args.mem_size - preoslog[1] ||
+         preoslog[1] > UINT64_MAX - fw_bootargs_off - (SZ_16K - 1)))
+        return -1;
+    u64 fw_preoslog_off = fw_bootargs_off;
+    fw_bootargs_off = ALIGN_UP(fw_bootargs_off + preoslog[1], SZ_16K);
+#endif
     if (fw_bootargs_off > UINT64_MAX - SZ_16K)
         return -1;
     u64 fw_size = fw_bootargs_off + SZ_16K;
@@ -68,18 +106,34 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
 
     u64 image_end = new_base + image_size;
     u64 packed_end = image_end + fw_size;
-    if (packed_end > ram_end || (ro_status == 1 && image_end > ro_start && new_base < ro_end)) {
+    u64 run_base = 0, footprint = 0;
+    if (ro_status == 1 && image_end > ro_start && new_base < ro_end) {
+        /*
+         * T8140: the firmware RO range lies about 10 MiB above our base on a J700, and the
+         * locked RVBAR of the secondary cores points at our base. Stage an image that does not
+         * fit below the range after the live heap instead, and have it run its code from our
+         * base (start.S) while its payload, SEPFW and boot_args stay in the staged copy, below
+         * the new high-water.
+         */
+        footprint = chainload_run_footprint(image, size);
+        if (!footprint || (new_base & (SZ_16K - 1)) || new_base >= ro_start ||
+            footprint > ro_start - new_base) {
+            printf("chainload: image overlaps firmware RO and cannot run below it\n");
+            return -1;
+        }
+        run_base = new_base;
+    } else if (packed_end > ram_end) {
         printf("chainload: image destination is invalid or overlaps firmware RO\n");
         return -1;
-    }
-    if (live_heap > inherited_top && image_end > inherited_top && new_base < live_heap) {
+    } else if (live_heap > inherited_top && image_end > inherited_top && new_base < live_heap) {
         printf("chainload: image span overlaps the live heap\n");
         return -1;
     }
 
     bool park_fw =
-        (ro_status == 1 && packed_end > ro_start && image_end < ro_end) ||
-        (live_heap > inherited_top && packed_end > inherited_top && image_end < live_heap);
+        !run_base &&
+        ((ro_status == 1 && packed_end > ro_start && image_end < ro_end) ||
+         (live_heap > inherited_top && packed_end > inherited_top && image_end < live_heap));
     u8 *parked = NULL;
     u64 fw_base = image_end;
     if (park_fw) {
@@ -104,8 +158,27 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
         free(parked);
         return -1;
     }
+    if (run_base) {
+        /*
+         * The staged copy is the destination: the stub copies it onto itself. The stub runs from
+         * just after it, so the whole allocation must stay in RAM and clear of firmware RO.
+         */
+        new_base = (u64)new_image;
+        if (new_base < run_base + footprint || new_base > ram_end ||
+            copy_size + stub_size > ram_end - new_base ||
+            (new_base < ro_end && new_base + copy_size + stub_size > ro_start)) {
+            printf("chainload: no room to stage the image above firmware RO\n");
+            free(new_image);
+            return -1;
+        }
+        image_end = new_base + image_size;
+        fw_base = image_end;
+    }
     memset(new_image, 0, copy_size);
     memcpy(new_image, image, size);
+    if (run_base)
+        memcpy(new_image + CHAINLOAD_HDR_OFFSET + CHAINLOAD_HDR_RUN_BASE_OFF, &run_base,
+               sizeof(run_base));
 
     u8 *p = new_image + size;
     for (size_t i = 0; i < var_cnt; i++) {
@@ -118,6 +191,10 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
     u8 *fw_data = parked ? parked : new_image + image_size;
     memset(fw_data, 0, fw_size);
     memcpy(fw_data, (void *)sepfw[0], sepfw[1]);
+#ifdef J613_ESP_STAGE1
+    if (preoslog[1])
+        memcpy(fw_data + fw_preoslog_off, (void *)preoslog[0], preoslog[1]);
+#endif
     struct boot_args *new_boot_args = (struct boot_args *)(fw_data + fw_bootargs_off);
     *new_boot_args = cur_boot_args;
     u64 high_water = max(image_end, fw_base + fw_size);
@@ -133,6 +210,22 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
         free(parked);
         return -1;
     }
+#ifdef J613_ESP_STAGE1
+    if (preoslog[1]) {
+        preoslog[0] = fw_base + fw_preoslog_off;
+        if (adt_setprop(adt, anode, "preoslog", preoslog, sizeof(preoslog)) < 0) {
+            free(new_image);
+            free(parked);
+            return -1;
+        }
+    }
+    u64 bootargs_map[2] = {fw_base + fw_bootargs_off, SZ_16K};
+    if (adt_setprop(adt, anode, "BootArgs", bootargs_map, sizeof(bootargs_map)) < 0) {
+        free(new_image);
+        free(parked);
+        return -1;
+    }
+#endif
     if (parked) {
         dc_cvac_range(parked, fw_size);
         sysop("dsb sy");
@@ -148,12 +241,15 @@ int chainload_image(void *image, size_t size, char **vars, size_t var_cnt)
 
     printf("chainload: image 0x%lx bytes; firmware block at 0x%lx; high-water 0x%lx\n", copy_size,
            fw_base, high_water);
+    if (run_base)
+        printf("chainload: image staged at 0x%lx runs its first 0x%lx bytes at 0x%lx\n", new_base,
+               footprint, run_base);
     next_stage.entry = stub;
     next_stage.args[0] = fw_base + fw_bootargs_off;
     next_stage.args[1] = (u64)new_image;
     next_stage.args[2] = new_base;
     next_stage.args[3] = copy_size;
-    next_stage.args[4] = new_base + 0x800;
+    next_stage.args[4] = new_base + CHAINLOAD_ENTRY_OFFSET;
     next_stage.restore_logo = false;
     return 0;
 }

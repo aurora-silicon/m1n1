@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Display subgraph of the J700 device tree, composed from SiliconForest Linux
+ * e4b97a383d11749300e72a40032c363db7e6c4c0 (arch/arm64/boot/dts/apple/
+ * t8140-j700.dts and its includes), whose sources carry the licence above.
+ *
+ * It keeps both DCP controllers with their children, the display subsystem,
+ * the USB-C connector linked from the external route, and the transitive
+ * iommus/mboxes/power-domains providers, with their properties and phandles
+ * unchanged. Ancestors keep only cell sizes, ranges and compatible. The
+ * aliases keep the display entries. Regenerate it from the composed DTB with
+ * tests/data/t8140-j700-display.py rather than editing it.
+ */
+
+/dts-v1/;
+
+/ {
+	compatible = "apple,j700", "apple,t8140", "apple,arm-platform";
+	#address-cells = <0x2>;
+	#size-cells = <0x2>;
+	model = "Apple MacBook Neo";
+	display-subsystem {
+		compatible = "apple,t8140-display-subsystem", "apple,display-subsystem";
+		iommus = <0xe 0x0 0xf 0x0>;
+		phandle = <0x10>;
+	};
+	reserved-memory {
+		#address-cells = <0x2>;
+		#size-cells = <0x2>;
+		ranges;
+	};
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <0x2>;
+		#size-cells = <0x2>;
+		ranges;
+		iommu@416300000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x16300000 0x0 0xc000>;
+			interrupt-parent = <0xd>;
+			interrupts = <0x0 0x302 0x4>;
+			#iommu-cells = <0x1>;
+			status = "disabled";
+			phandle = <0xf>;
+		};
+		iommu@416340000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x16340000 0x0 0xc000>;
+			interrupt-parent = <0xd>;
+			interrupts = <0x0 0x302 0x4>;
+			#iommu-cells = <0x1>;
+			status = "disabled";
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+			phandle = <0xa5>;
+		};
+		mailbox@416e08000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x4 0x16e08000 0x0 0x4000>;
+			interrupt-parent = <0xd>;
+			interrupts = <0x0 0x2ef 0x4 0x0 0x2f0 0x4 0x0 0x2f1 0x4 0x0 0x2f2 0x4>;
+			interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+			#mbox-cells = <0x0>;
+			power-domains = <0x18>;
+			status = "disabled";
+			phandle = <0xa4>;
+		};
+		power-management@300700000 {
+			compatible = "apple,t8140-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+			#address-cells = <0x1>;
+			#size-cells = <0x1>;
+			power-controller@280 {
+				compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x280 0x4>;
+				#power-domain-cells = <0x0>;
+				#reset-cells = <0x0>;
+				label = "disp_sys";
+				phandle = <0x25>;
+			};
+			power-controller@288 {
+				compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x288 0x4>;
+				#power-domain-cells = <0x0>;
+				#reset-cells = <0x0>;
+				label = "dispext0_sys";
+				status = "disabled";
+				phandle = <0x26>;
+			};
+			power-controller@318 {
+				compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x318 0x4>;
+				#power-domain-cells = <0x0>;
+				#reset-cells = <0x0>;
+				label = "disp_fe";
+				power-domains = <0x25>;
+				phandle = <0x2e>;
+			};
+			power-controller@320 {
+				compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x320 0x4>;
+				#power-domain-cells = <0x0>;
+				#reset-cells = <0x0>;
+				label = "dispext0_fe";
+				power-domains = <0x26>;
+				status = "disabled";
+				phandle = <0x27>;
+			};
+			power-controller@328 {
+				compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x328 0x4>;
+				#power-domain-cells = <0x0>;
+				#reset-cells = <0x0>;
+				label = "dispext0_cpu";
+				power-domains = <0x27>;
+				status = "disabled";
+				apple,always-on;
+				phandle = <0x18>;
+			};
+			power-controller@10000 {
+				compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x10000 0x4>;
+				#power-domain-cells = <0x0>;
+				#reset-cells = <0x0>;
+				label = "disp_cpu";
+				power-domains = <0x2e>;
+				apple,always-on;
+				apple,firmware-owned;
+				phandle = <0x71>;
+			};
+		};
+		spmi@308908000 {
+			compatible = "apple,t8140-spmi", "apple,t8103-spmi";
+			#address-cells = <0x2>;
+			#size-cells = <0x0>;
+			usb-pd@c {
+				compatible = "apple,sn201202x";
+				connector {
+					compatible = "usb-c-connector";
+					label = "USB-C Left-back";
+					power-role = "dual";
+					data-role = "host";
+					phandle = <0x113>;
+					ports {
+						#address-cells = <0x1>;
+						#size-cells = <0x0>;
+						port@0 {
+							reg = <0x0>;
+							endpoint {
+								remote-endpoint = <0x47>;
+								phandle = <0x67>;
+							};
+						};
+						port@1 {
+							reg = <0x1>;
+							endpoint {
+								remote-endpoint = <0x48>;
+								phandle = <0x69>;
+							};
+						};
+						port@3 {
+							reg = <0x3>;
+							endpoint {
+								remote-endpoint = <0x49>;
+								phandle = <0xa7>;
+							};
+						};
+					};
+				};
+			};
+		};
+		iommu@412300000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x12300000 0x0 0xc000>;
+			interrupt-parent = <0xd>;
+			interrupts = <0x0 0x2ba 0x4>;
+			#iommu-cells = <0x1>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+			status = "disabled";
+			phandle = <0xe>;
+		};
+		iommu@412340000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x4 0x12340000 0x0 0xc000>;
+			interrupt-parent = <0xd>;
+			interrupts = <0x0 0x2ba 0x4>;
+			#iommu-cells = <0x1>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+			status = "disabled";
+			phandle = <0x74>;
+		};
+		mailbox@412e08000 {
+			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x4 0x12e08000 0x0 0x4000>;
+			interrupt-parent = <0xd>;
+			interrupts = <0x0 0x2a7 0x4 0x0 0x2a8 0x4 0x0 0x2a9 0x4 0x0 0x2aa 0x4>;
+			interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+			#mbox-cells = <0x0>;
+			power-domains = <0x71>;
+			status = "okay";
+			phandle = <0x73>;
+		};
+		dcp@412e00000 {
+			compatible = "apple,t8140-dcp", "apple,dcp";
+			reg = <0x4 0x12e00000 0x0 0x4000 0x4 0x10000000 0x0 0xafc000 0x4 0x12240000 0x0 0x10000 0x4 0x123a8000 0x0 0x4000 0x4 0x123ac000 0x0 0x4000 0x4 0x12800000 0x0 0x800000 0x4 0x12850000 0x0 0x4000>;
+			reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4", "iop-vbar";
+			mboxes = <0x73>;
+			mbox-names = "mbox";
+			iommus = <0x74 0x17>;
+			power-domains = <0x71>;
+			clocks = <0x75 0x76>;
+			clock-names = "clock-154", "clock-194";
+			apple,bw-scratch = <0x77 0x0 0x5 0x0>;
+			apple,bw-doorbell = <0x77 0x1 0x6>;
+			apple,iomfb-surfaces = <0x0>;
+			phandle = <0x78>;
+			#address-cells = <0x2>;
+			#size-cells = <0x2>;
+			ranges;
+			status = "disabled";
+			piodma {
+				iommus = <0xe 0x10>;
+				phandle = <0x79>;
+			};
+			panel {
+				compatible = "apple,panel-j700", "apple,panel";
+				width-mm = <0x117>;
+				height-mm = <0xaf>;
+				apple,max-brightness = <0x20d>;
+				phandle = <0xa8>;
+			};
+		};
+		dcp@416e00000 {
+			compatible = "apple,t8140-dcpext", "apple,dcp";
+			reg = <0x4 0x16e00000 0x0 0x4000 0x4 0x14000000 0x0 0xafc000 0x4 0x16240000 0x0 0x10000 0x4 0x163ac000 0x0 0x4000 0x4 0x16800000 0x0 0x800000 0x3 0x2800000 0x0 0xbc000 0x4 0x16850000 0x0 0x4000>;
+			reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4", "iop-vbar";
+			mboxes = <0xa4>;
+			mbox-names = "mbox";
+			iommus = <0xa5 0x17>;
+			power-domains = <0x18>;
+			apple,connector-type = "USB-C";
+			status = "disabled";
+			#address-cells = <0x2>;
+			#size-cells = <0x2>;
+			ranges;
+			clocks = <0x75 0x76>;
+			clock-names = "clock-154", "clock-194";
+			phys = <0x65 0x6>;
+			phy-names = "typec0";
+			mux-controls = <0xa6 0x0>;
+			mux-control-names = "typec0";
+			apple,typec-mux-indices = <0x2>;
+			apple,typec-dptx-phys = <0x0>;
+			apple,dcp-index = <0x1>;
+			phandle = <0x128>;
+			piodma {
+				iommus = <0xf 0x10>;
+				phandle = <0x129>;
+			};
+			typec-routes {
+				#address-cells = <0x1>;
+				#size-cells = <0x0>;
+				route@0 {
+					reg = <0x0>;
+					status = "okay";
+					mode-switch;
+					port {
+						endpoint {
+							remote-endpoint = <0xa7>;
+							phandle = <0x49>;
+						};
+					};
+				};
+			};
+		};
+	};
+	aliases {
+		dcp = "/soc/dcp@412e00000";
+		disp0 = "/display-subsystem";
+		disp0-piodma = "/soc/dcp@412e00000/piodma";
+	};
+	chosen {
+		#address-cells = <0x2>;
+		#size-cells = <0x2>;
+		ranges;
+	};
+};

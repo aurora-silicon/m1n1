@@ -265,9 +265,45 @@ const display_config_t *display_get_config(void)
     return conf;
 }
 
+/*
+ * Whether this stage or an earlier one may have mapped into the inherited tables
+ * of a locked display DART (dart_init_adt_display()). T8140 and T8132 never get
+ * that far: display_init() returns before any DCP or DART work on them, in every
+ * stage, and kboot keeps their retained heap separately.
+ */
+bool display_dart_tables_inherited(void)
+{
+    if (chip_id == T8140 || chip_id == T8132)
+        return false;
+
+    const display_config_t *conf = display_get_config();
+    return conf && (dart_adt_locked(conf->dcp_dart, 0) || dart_adt_locked(conf->disp_dart, 0));
+}
+
+/*
+ * On T6030 the internal DCP is left exactly as iBoot started it (see kboot_display_handoff.c). The
+ * modeset below is untested there, and its fallback config names a power domain T6030 does not
+ * have, so it must never run (display= variable, non-retina heuristic, proxy).
+ */
+static bool display_t6030_hands_off(const char *what)
+{
+    if (chip_id != T6030)
+        return false;
+    printf("display: T6030: %s skipped, keeping the display iBoot set up\n", what);
+    return true;
+}
+
 int display_start_dcp(void)
 {
     if (iboot)
+        return 0;
+
+    if (dcp_left_running()) {
+        printf("display: a DCP did not stop; not starting it again\n");
+        return -1;
+    }
+
+    if (display_t6030_hands_off("DCP start"))
         return 0;
 
 #ifdef NO_DISPLAY
@@ -403,6 +439,9 @@ int display_configure(const char *config)
     return 0;
 #endif
 
+    if (display_t6030_hands_off("DCP modeset"))
+        return 0;
+
     display_parse_mode(config, &want, &opts);
 
     u64 start_time = get_ticks();
@@ -440,9 +479,10 @@ int display_configure(const char *config)
     while (retries++ < (DISPLAY_STATUS_RETRIES(display_is_dptx))) {
         dcp_work(dcp);
         hpd = dcp_ib_get_hpd(iboot, &timing_cnt, &color_cnt);
-        if (hpd < 0)
-            ret = hpd;
-        else if (hpd && timing_cnt && color_cnt)
+        /* Only the latest status query decides; the power requests above are
+         * best effort and an earlier failed query may be followed by a good one. */
+        ret = hpd < 0 ? hpd : 0;
+        if (hpd > 0 && timing_cnt && color_cnt)
             break;
         if (retries < DISPLAY_STATUS_RETRIES(display_is_dptx))
             mdelay(DISPLAY_STATUS_DELAY);
@@ -756,18 +796,20 @@ int display_init(void)
     }
 }
 
-void display_shutdown(dcp_shutdown_mode mode)
+int display_shutdown(dcp_shutdown_mode mode)
 {
     /* Linux owns the live J700/J713 controllers. Keep the inherited ASC session
      * and scanout intact at both the Stage 1 and Linux boundaries. */
     if (chip_id == T8140 || chip_id == T8132)
-        return;
+        return 0;
 
     /* We have no DCP, so just exit */
     if (!has_dcp)
-        return;
+        return 0;
 
     if (iboot) {
+        /* An endpoint that does not stop stays registered, so dcp_shutdown()
+         * retries it with the rest and reports the DCP as still running. */
         dcp_ib_shutdown(iboot);
         switch (mode) {
             case DCP_QUIESCED:
@@ -788,4 +830,7 @@ void display_shutdown(dcp_shutdown_mode mode)
         }
         iboot = NULL;
     }
+
+    /* A DCP that did not stop at any point may still use its buffers. */
+    return dcp_left_running() ? -1 : 0;
 }

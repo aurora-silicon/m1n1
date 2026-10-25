@@ -7,8 +7,10 @@ import subprocess
 def test_sio_reservation_no_space(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     source = (repo / "src/kboot.c").read_text()
-    helper = source[source.index("static int dt_set_sio_fwdata("):
-                    source.index("struct isp_segment_ranges {", source.index("static int dt_set_sio_fwdata("))]
+    start = source.index("static int dt_set_sio_fwdata(")
+    # dt_set_sio_fwdata() and dt_setup_sio(), up to the closing brace of the latter.
+    setup = source.index("static int dt_setup_sio(void)", start)
+    helper = source[start:source.index("\n}", setup) + 2] + "\n"
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>

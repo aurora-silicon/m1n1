@@ -145,8 +145,8 @@ enum stage1_proxy_result uartproxy_wait_stage1(unsigned int timeout_ms)
         bool kis_sync = serial_port != IODEV_MAX;
         enum stage1_proxy_result result = stage1_proxy_window_step(
             &window, elapsed > 0xffffffffu ? 0xffffffffu : elapsed,
-            chip_id != T8140 || usb_cdc_ready(),
-            schedule_failed || usb_cdc_failed(), carrier_owned, cdc_sync, kis_sync);
+            chip_id != T8140 || usb_cdc_ready(), schedule_failed || usb_cdc_failed(), carrier_owned,
+            cdc_sync, kis_sync);
 
         if (result == STAGE1_PROXY_CDC) {
             presynced_iodev = usb_port;

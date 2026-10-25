@@ -18,11 +18,16 @@
 #include "iodev.h"
 #include "isp.h"
 #include "kboot_atc.h"
+#include "kboot_display_facts.h"
+#include "kboot_gpu_t8122.h"
+#include "kboot_pmp_t8122.h"
+#include "kboot_t6031.h"
 #include "malloc.h"
 #include "mcc.h"
 #include "memory.h"
 #include "pcie.h"
 #include "pmgr.h"
+#include "rtkit.h"
 #include "sep.h"
 #include "sio.h"
 #include "smp.h"
@@ -54,8 +59,31 @@ static char *chosen_params[MAX_CHOSEN_PARAMS][2];
 static char *uboot_config[MAX_UBOOT_CONFIGS][2];
 
 extern const char *const m1n1_version;
+extern u64 relocated_from;
 
 int dt_set_gpu(void *dt);
+int dt_set_display_handoff(void *dt);
+
+u64 kboot_ram_base(void)
+{
+    return cur_boot_args.phys_base;
+}
+
+u64 kboot_ram_size(void)
+{
+    return cur_boot_args.mem_size;
+}
+
+u64 kboot_fb_base(void)
+{
+    return cur_boot_args.video.base;
+}
+
+void kboot_loaded_file_part(u64 *base, u64 *size)
+{
+    *base = relocated_from ? relocated_from : (u64)_base;
+    *size = (u64)_file_end - (u64)_base;
+}
 
 #define DT_ALIGN 16384
 
@@ -109,6 +137,23 @@ void get_notchless_fb(u64 *fb_base, u64 *fb_height)
 
     *fb_base += cur_boot_args.video.stride * offset;
     *fb_height = new_height;
+}
+
+/*
+ * chosen.asahi,show-notch=1 (m1n1 config): the OS drives the full panel, notch rows
+ * included (on J613: appledrm.t6030_show_notch=1). Keep iBoot's full framebuffer then, so
+ * the boot framebuffer covers the same rows as the display driver later does and early
+ * users (fbcon, Plymouth) do not shift by the notch height at the handoff.
+ */
+static bool kboot_show_notch(void)
+{
+    for (int i = 0; i < MAX_CHOSEN_PARAMS; i++) {
+        if (!chosen_params[i][0])
+            break;
+        if (!strcmp(chosen_params[i][0], "asahi,show-notch"))
+            return chosen_params[i][1] && !strcmp(chosen_params[i][1], "1");
+    }
+    return false;
 }
 
 static int dt_set_rng_seed_sep(int node)
@@ -199,6 +244,13 @@ static int dt_set_fb(void)
 
     u64 fb_base, fb_height;
     get_notchless_fb(&fb_base, &fb_height);
+    u64 notch_height = cur_boot_args.video.height - fb_height;
+    if (notch_height && kboot_show_notch()) {
+        printf("display: keeping the notch rows (chosen.asahi,show-notch=1), %lux%lu\n",
+               cur_boot_args.video.width, cur_boot_args.video.height);
+        fb_base = cur_boot_args.video.base;
+        fb_height = cur_boot_args.video.height;
+    }
     u64 fb_size = cur_boot_args.video.stride * fb_height;
     u64 fbreg[2] = {cpu_to_fdt64(fb_base), cpu_to_fdt64(fb_size)};
     char fbname[32];
@@ -247,12 +299,12 @@ static int dt_set_fb(void)
     // We do not need to reserve the framebuffer, as it will be excluded from the usable RAM
     // range already.
 
-    // save notch height in the dcp node if present
-    if (cur_boot_args.video.height - fb_height) {
+    // save notch height in the dcp node if present (also when the notch rows are kept,
+    // so that a display driver hiding the notch still can)
+    if (notch_height) {
         int dcp = fdt_path_offset(dt, "dcp");
         if (dcp >= 0)
-            if (fdt_appendprop_u32(dt, dcp, "apple,notch-height",
-                                   cur_boot_args.video.height - fb_height))
+            if (fdt_appendprop_u32(dt, dcp, "apple,notch-height", notch_height))
                 printf("FDT: couldn't set apple,notch-height\n");
     }
 
@@ -382,8 +434,8 @@ static int dt_set_chosen(void)
                     const u8 *b = prop;
                     snprintf(uuid_str, sizeof(uuid_str),
                              "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10],
-                             b[11], b[12], b[13], b[14], b[15]);
+                             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                             b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
                     if (fdt_setprop(dt, node, "apfs-preboot-uuid", uuid_str, sizeof(uuid_str)) < 0)
                         printf("FDT: warning: couldn't set apfs-preboot-uuid\n");
                     else
@@ -408,16 +460,51 @@ static int dt_set_chosen(void)
      * state, causing the SEP firmware to refuse subsequent biometric commands.
      * M1 SoCs (T8103, T600x) rely on cold boot and do not have this restriction.
      */
-    bool sep_warm_active =
-        (chip_id != T8103 && chip_id != T6000 && chip_id != T6001 && chip_id != T6002);
+    bool sep_warm_active = (chip_id != T8103 && chip_id != T6000 &&
+                            chip_id != T6001 && chip_id != T6002);
 
     if (sep_warm_active) {
         printf("SEP: Preserving iBoot warm registration; seeding RNG from ADT\n");
-        return dt_set_rng_seed_adt(node);
+        if (dt_set_rng_seed_adt(node))
+            bail("FDT: couldn't set random seed");
+    } else if (dt_set_rng_seed_sep(node)) {
+        if (dt_set_rng_seed_adt(node))
+            bail("FDT: couldn't set random seed");
     }
 
-    if (dt_set_rng_seed_sep(node))
-        return dt_set_rng_seed_adt(node);
+    /*
+     * Upstream adds these on every chip with locked Apple system registers,
+     * for kernels that cannot survive WFI state loss. Aurora's kernels for
+     * T8132, T6040 and T6041 boot without them, and idle=nop would keep every
+     * idle CPU spinning. T8140 adds only arm64.nowfxt, in dt_set_wfx_args().
+     */
+    if (!cpu_features->apple_sysregs_unlocked && chip_id != T8140 && chip_id != T8132 &&
+        chip_id != T6040 && chip_id != T6041) {
+        /*
+         * M4 and later lose architectural state in WFI and WFIT. Add the
+         * bootargs to prevent Linux from crashing in the idle loop and delay
+         * function.
+         */
+        const char to_append[] = " idle=nop arm64.nowfxt";
+        printf("FDT: appending to bootargs:%s\n", to_append);
+
+        /*
+         * fdt_appendprop_string would create another property value:
+         * "a", "b". But we want "ab", so manually create or grow the prop,
+         * then overwrite the \0 of the existing string.
+         */
+        int oldlen, newlen;
+        void *prop_data;
+
+        if (!fdt_get_property(dt, node, "bootargs", &oldlen) || oldlen < 1)
+            oldlen = 1;
+        newlen = oldlen + sizeof(to_append) - 1;
+
+        if (fdt_setprop_placeholder(dt, node, "bootargs", newlen, &prop_data))
+            bail("FDT: failed to append to 'bootargs' property\n");
+
+        strncpy(prop_data + oldlen - 1, to_append, sizeof(to_append));
+    }
 
     return 0;
 }
@@ -574,8 +661,8 @@ static int dt_set_memory(void)
             if (!reg)
                 continue;
 
-            u64 resv_start = fdt64_to_cpu(reg[0]);
-            u64 resv_len = fdt64_to_cpu(reg[1]);
+            u64 resv_start = fdt64_ld(&reg[0]);
+            u64 resv_len = fdt64_ld(&reg[1]);
             u64 resv_end = resv_start + resv_len;
 
             if (resv_start < dram_min) {
@@ -1533,6 +1620,8 @@ static int dt_set_acio_tunables(void)
                               sizeof(usb4_rc_tunables) / sizeof(*usb4_rc_tunables));
 
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_pcie_adapter", i);
+        if (!fdt_get_alias(dt, fdt_alias))
+            snprintf(fdt_alias, sizeof(fdt_alias), "usb4-%d-pcie-adapter", i);
         dt_copy_acio_tunables(adt_path, fdt_alias, usb4_pcie_adapter_tunables,
                               sizeof(usb4_pcie_adapter_tunables) /
                                   sizeof(*usb4_pcie_adapter_tunables));
@@ -1718,8 +1807,27 @@ static int dt_disable_pcie_mappers(int parent)
     return 0;
 }
 
+static int dt_disable_t8140_piodma(void)
+{
+    static const char *const compatibles[] = {
+        "apple,t8140-piodma-diagnostic", "apple,t8140-pcie-piodma",
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(compatibles); i++) {
+        int node = -1;
+        while ((node = fdt_node_offset_by_compatible(dt, node, compatibles[i])) >= 0) {
+            if (fdt_setprop_string(dt, node, "status", "disabled"))
+                return -1;
+        }
+        if (node != -FDT_ERR_NOTFOUND)
+            return -1;
+    }
+    return 0;
+}
+
 static int dt_disable_t8140_pcie(void)
 {
+    if (dt_disable_t8140_piodma())
+        return -1;
     int nodes[64];
     int count = 0;
     int node = -1;
@@ -2003,6 +2111,80 @@ static int dt_set_dcp_firmware(const char *alias)
     return 0;
 }
 
+/*
+ * The T600x loader owns the external DCP handoff. Publish its explicitly
+ * disabled Type-C routes and controller together, after firmware reservation.
+ * Keep other chips' route ownership (notably the T8122 kernel gate) intact.
+ */
+static int dt_enable_dcp_with_typec_routes(const char *alias)
+{
+    int node = fdt_path_offset(dt, alias);
+    if (node < 0)
+        return node;
+    /* Other SoCs keep the original single-property enable path. */
+    if (chip_id != T6000 && chip_id != T6001 && chip_id != T6002)
+        return fdt_setprop_string(dt, node, "status", "okay");
+
+    int routes = fdt_subnode_offset(dt, node, "typec-routes");
+    if (routes < 0 && routes != -FDT_ERR_NOTFOUND)
+        return routes;
+    /* A controller without routes, such as the internal DCP, has nothing to publish with it. */
+    if (routes == -FDT_ERR_NOTFOUND)
+        return fdt_setprop_string(dt, node, "status", "okay");
+
+    void *original = dt;
+    size_t capacity = fdt_totalsize(original);
+    void *scratch = malloc(capacity);
+    if (!scratch) {
+        /* Without the transaction, enable the controller as before; leave route statuses alone. */
+        printf("FDT: no memory to publish the %s Type-C routes; leaving route statuses unchanged\n",
+               alias);
+        return fdt_setprop_string(dt, node, "status", "okay");
+    }
+    memcpy(scratch, original, capacity);
+    dt = scratch;
+
+    int ret = 0;
+    node = fdt_path_offset(dt, alias);
+    routes = node < 0 ? node : fdt_subnode_offset(dt, node, "typec-routes");
+    if (routes < 0) {
+        ret = routes;
+        goto out;
+    }
+    int route;
+    fdt_for_each_subnode(route, dt, routes)
+    {
+        int len = 0;
+        const char *status = fdt_getprop(dt, route, "status", &len);
+        if (!status) {
+            if (len == -FDT_ERR_NOTFOUND)
+                continue;
+            ret = len;
+            goto out;
+        }
+        /* Do not turn a reserved, failed or malformed route on. */
+        if (len != sizeof("disabled") || memcmp(status, "disabled", len))
+            continue;
+        ret = fdt_setprop_string(dt, route, "status", "okay");
+        if (ret)
+            goto out;
+    }
+    if (route != -FDT_ERR_NOTFOUND) {
+        ret = route;
+        goto out;
+    }
+
+    /* Resolve the owner again after editing its route properties. */
+    node = fdt_path_offset(dt, alias);
+    ret = node < 0 ? node : fdt_setprop_string(dt, node, "status", "okay");
+out:
+    dt = original;
+    if (!ret)
+        memcpy(original, scratch, capacity);
+    free(scratch);
+    return ret;
+}
+
 struct disp_mapping {
     char region_adt[24];
     char mem_fdt[24];
@@ -2077,7 +2259,7 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
         int mem_node =
             dt_get_or_add_reserved_mem(node_name, compat, true, region[i].paddr, region[i].size);
         if (mem_node < 0) {
-            ret = -1;
+            ret = mem_node;
             goto err;
         }
 
@@ -2138,10 +2320,11 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
         if (fdt_setprop_string(dt, dart_disp0, "status", "okay") < 0)
             bail_cleanup("FDT: failed to enable 'dart-disp0'\n");
     }
-    /* enable dcp* */
+    /* T8140 admission is published by its ownership-aware handoff. */
     if (chip_id != T8140) {
-        int dcp_node = fdt_path_offset(dt, dcp_alias);
-        if (dcp_node < 0 || fdt_setprop_string(dt, dcp_node, "status", "okay") < 0)
+        /* Enable the owner and its loader-controlled routes atomically. */
+        ret = dt_enable_dcp_with_typec_routes(dcp_alias);
+        if (ret)
             bail_cleanup("FDT: failed to enable '%s'\n", dcp_alias);
     }
 
@@ -2257,6 +2440,12 @@ static int dt_reserve_asc_segments(const char *adt_path, const char *adt_path_al
     if (node < 0)
         bail("ADT: '%s' not found\n", adt_path);
 
+    u32 segments_len = 0;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &segments_len);
+    if (!seg || !segments_len || segments_len % sizeof(*seg))
+        bail("ADT: invalid ASC firmware segment list for %s\n", fdt_path);
+    unsigned int num_maps = segments_len / sizeof(*seg);
+
     u64 dram_base = 0, dram_end = 0;
     if (dram_only) {
         int chosen = adt_path_offset(adt, "/chosen");
@@ -2277,12 +2466,6 @@ static int dt_reserve_asc_segments(const char *adt_path, const char *adt_path_al
         if (ret != 0)
             bail("FDT: couldn't set '%s.phandle' property: %d\n", fdt_path, ret);
     }
-
-    const struct adt_segment_ranges *seg;
-    u32 segments_len;
-
-    seg = adt_getprop(adt, node, "segment-ranges", &segments_len);
-    unsigned int num_maps = segments_len / sizeof(*seg);
 
     for (unsigned i = 0; i < num_maps; i++, seg++) {
         if (dram_only) {
@@ -2309,7 +2492,7 @@ static int dt_reserve_asc_segments(const char *adt_path, const char *adt_path_al
         int mem_node =
             dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, seg->phys, seg_size);
         if (mem_node < 0)
-            return -1;
+            return mem_node;
         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
 
         /*
@@ -2447,8 +2630,88 @@ static const char dcpext_aliases[][8] = {
     "dcpext4", "dcpext5", "dcpext6", "dcpext7",
 };
 
-static int dt_reserve_dcpext_firmware(void)
+/* Commit a complete FDT update, or discard every partial edit. */
+static int dt_display_transaction(int (*apply)(unsigned int), unsigned int index)
 {
+    void *original = dt;
+    size_t capacity = fdt_totalsize(original);
+    void *scratch = malloc(capacity);
+    if (!scratch)
+        return -1;
+    memcpy(scratch, original, capacity);
+    dt = scratch;
+    int ret = apply(index);
+    dt = original;
+    if (!ret)
+        memcpy(original, scratch, capacity);
+    free(scratch);
+    return ret;
+}
+
+#define T8122_DCPEXT_READY "apple,t8122-dcpext-firmware-ready"
+
+static int dt_reserve_t8122_dcpext_one(unsigned int n)
+{
+    if (n >= ARRAY_SIZE(dcpext_aliases))
+        return -1;
+    const char *alias = dcpext_aliases[n];
+    char path[48];
+    snprintf(path, sizeof(path), "/arm-io/%s/iop-%s-nub", alias, alias);
+    int nub = adt_path_offset(adt, path);
+    int chosen = adt_path_offset(adt, "/chosen");
+    u32 len = 0;
+    const struct adt_segment_ranges *segments =
+        nub < 0 ? NULL : adt_getprop(adt, nub, "segment-ranges", &len);
+    u64 dram_base = 0, dram_size = 0;
+    if (!segments || !len || len % sizeof(*segments) || len / sizeof(*segments) > 64 ||
+        chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) || !dram_size ||
+        dram_base > UINT64_MAX - dram_size)
+        return -1;
+    for (u32 i = 0; i < len / sizeof(*segments); i++) {
+        u64 size = ALIGN_UP((u64)segments[i].size, SZ_16K);
+        if (!size || (segments[i].phys & (SZ_16K - 1)) || segments[i].phys < dram_base ||
+            size > dram_size || segments[i].phys - dram_base > dram_size - size ||
+            segments[i].remap > UINT64_MAX - size)
+            return -1;
+    }
+    if (dt_reserve_asc_firmware(path, NULL, alias, true, 0) || dt_set_dcp_firmware(alias))
+        return -1;
+    int node = fdt_path_offset(dt, alias);
+    return node < 0 ? node : fdt_setprop_u32(dt, node, T8122_DCPEXT_READY, 1);
+}
+
+/*
+ * T8122: reserve the external DCP firmware for the kernel's gate only with the boot.bin config
+ * line chosen.asahi,t8122-dcpext=1, and only when the internal display was handed over
+ * (apple,t8122-handoff on dcp), the one case where the kernel would enable it. Off by default:
+ * on an M3 Air with 14.x firmware, a published marker lets the kernel enable dcpext, and the
+ * internal DCP then crashes after disp0 DART faults, leaving the panel dark.
+ */
+static bool dt_t8122_dcpext_armed(void)
+{
+    int chosen = fdt_path_offset(dt, "/chosen");
+    int len = 0;
+    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,t8122-dcpext", &len);
+
+    if (!opt || len != 2 || opt[0] != '1' || opt[1] != '\0')
+        return false;
+    int dcp = fdt_path_offset(dt, "dcp");
+    return dcp >= 0 && fdt_getprop(dt, dcp, "apple,t8122-handoff", NULL);
+}
+
+/*
+ * T8122 firmware-ready handoff adapted from Marius Gehrmann's public patch.
+ * Copyright (c) 2026 Marius Gehrmann; additional MIT notice:
+ * 3rdparty_licenses/LICENSE.Marius-Gehrmann.
+ *
+ * With enable=false, leave the controller disabled for the kernel's gate, and reserve its
+ * firmware only when dt_t8122_dcpext_armed(). A previous promise is withdrawn either way.
+ */
+static int dt_reserve_dcpext_firmware(bool enable)
+{
+    if (!enable && (chip_id != T8122 || fdt_node_check_compatible(dt, 0, "apple,t8122")))
+        return 0;
     /* reserve asc for all  */
     for (size_t n = 0; n < ARRAY_SIZE(dcpext_aliases); n++) {
         const char *dcpext_alias = dcpext_aliases[n];
@@ -2458,12 +2721,36 @@ static int dt_reserve_dcpext_firmware(void)
                  dcpext_alias);
         adt_path[sizeof(adt_path) - 1] = '\0';
 
-        if (adt_path_offset(adt, adt_path) < 0)
+        if (enable && adt_path_offset(adt, adt_path) < 0)
             continue;
 
         int dcpext_node = fdt_path_offset(dt, dcpext_alias);
         if (dcpext_node < 0)
             continue;
+
+        if (!enable) {
+            /* Withdraw a previous promise before attempting a fresh transaction. */
+            int ret = fdt_delprop(dt, dcpext_node, T8122_DCPEXT_READY);
+            if (ret && ret != -FDT_ERR_NOTFOUND)
+                return ret;
+            if (!dt_t8122_dcpext_armed()) {
+                printf("FDT: '%s' firmware not reserved (needs chosen.asahi,t8122-dcpext=1 "
+                       "and the internal display handoff); kernel gate remains closed\n",
+                       dcpext_alias);
+                continue;
+            }
+            dcpext_node = fdt_path_offset(dt, dcpext_alias);
+            int len = 0;
+            const char *status = fdt_getprop(dt, dcpext_node, "status", &len);
+            if (!status || len != sizeof("disabled") || strcmp(status, "disabled") ||
+                fdt_node_check_compatible(dt, dcpext_node, "apple,t8122-dcpext"))
+                continue;
+            if (dt_display_transaction(dt_reserve_t8122_dcpext_one, n))
+                printf("FDT: '%s' firmware not ready; kernel gate remains closed\n", dcpext_alias);
+            else
+                printf("FDT: '%s' firmware reserved, left to the kernel\n", dcpext_alias);
+            continue;
+        }
 
         int ret = dt_reserve_asc_firmware(adt_path, NULL, dcpext_alias, true, 0);
         if (ret < 0)
@@ -2473,9 +2760,8 @@ static int dt_reserve_dcpext_firmware(void)
         if (ret)
             continue;
 
-        // refresh dcpext_node
-        dcpext_node = fdt_path_offset(dt, dcpext_alias);
-        if ((dcpext_node < 0) || (fdt_setprop_string(dt, dcpext_node, "status", "okay") < 0))
+        ret = dt_enable_dcp_with_typec_routes(dcpext_alias);
+        if (ret)
             printf("FDT: failed to enable '%s'\n", dcpext_alias);
     }
 
@@ -2656,6 +2942,84 @@ static int dt_t8140_reserve_data(const char *dcp_path, const char *nub_path, con
     return dt_add_reserved_regions(dcp_path, NULL, NULL, "apple,asc-mem", maps, regions, 2);
 }
 
+/* The DART helpers below read each specifier as <phandle stream>: require that width. */
+static bool dt_t8140_one_cell_iommu(int provider)
+{
+    int len;
+    const fdt32_t *cells = fdt_getprop(dt, provider, "#iommu-cells", &len);
+    return cells && len == sizeof(*cells) && fdt32_to_cpu(*cells) == 1;
+}
+
+/* A display DART is published only with its firmware tables reserved. */
+static bool dt_t8140_dart_handed_off(int dart)
+{
+    int len;
+    const fdt32_t *cell =
+        dart < 0 ? NULL : fdt_getprop(dt, dart, "apple,firmware-root-handoff", &len);
+    return cell && len == sizeof(*cell) && fdt32_to_cpu(*cell) == 1;
+}
+
+static bool dt_t8140_node_enabled(int node)
+{
+    int length;
+    const char *status = fdt_getprop(dt, node, "status", &length);
+    if (!status)
+        return length == -FDT_ERR_NOTFOUND;
+    return (length == 5 && !memcmp(status, "okay", 5)) || (length == 3 && !memcmp(status, "ok", 3));
+}
+
+static int dt_t8140_audit_iommus(int node)
+{
+    int len;
+    const fdt32_t *refs = fdt_getprop(dt, node, "iommus", &len);
+    if (!refs)
+        return len == -FDT_ERR_NOTFOUND ? 0 : -1;
+    if (len <= 0 || len % (2 * sizeof(*refs)))
+        return -1;
+    for (int i = 0; i < len / (int)sizeof(*refs); i += 2) {
+        int dart = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(refs[i]));
+        if (dart < 0 || !dt_t8140_one_cell_iommu(dart) || !dt_t8140_node_enabled(dart) ||
+            !dt_t8140_dart_handed_off(dart))
+            return -1;
+    }
+    return 0;
+}
+
+/* Linux drops every translation of a consumer whose IOMMU list names a
+ * disabled DART. Before publication, each enabled display consumer and its
+ * PIODMA child may reference only enabled DARTs with reserved tables. */
+static int dt_t8140_audit_display_iommus(void)
+{
+    static const char *const compatibles[] = {
+        "apple,t8140-dcp",
+        "apple,t8140-dcpext",
+        "apple,display-subsystem",
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(compatibles); i++) {
+        int node = -1;
+        while ((node = fdt_node_offset_by_compatible(dt, node, compatibles[i])) >= 0) {
+            if (!dt_t8140_node_enabled(node))
+                continue;
+            if (dt_t8140_audit_iommus(node)) {
+                printf("FDT: T8140 %s references an unpublished DART\n",
+                       fdt_get_name(dt, node, NULL));
+                return -1;
+            }
+            int piodma = fdt_subnode_offset(dt, node, "piodma");
+            if (piodma < 0 && piodma != -FDT_ERR_NOTFOUND)
+                return -1;
+            if (piodma >= 0 && dt_t8140_audit_iommus(piodma)) {
+                printf("FDT: T8140 %s/piodma references an unpublished DART\n",
+                       fdt_get_name(dt, node, NULL));
+                return -1;
+            }
+        }
+        if (node != -FDT_ERR_NOTFOUND)
+            return -1;
+    }
+    return 0;
+}
+
 static int dt_t8140_enable_consumer(const char *path)
 {
     int node = fdt_path_offset(dt, path);
@@ -2666,6 +3030,10 @@ static int dt_t8140_enable_consumer(const char *path)
     int dart = dt_get_iommu_node(node, 0);
     if (dart < 0) {
         printf("FDT: T8140 %s: IOMMU node missing (%d)\n", path, dart);
+        return -1;
+    }
+    if (!dt_t8140_dart_handed_off(dart)) {
+        printf("FDT: T8140 %s: IOMMU has no reserved firmware tables\n", path);
         return -1;
     }
     int ret = fdt_setprop_string(dt, dart, "status", "okay");
@@ -2680,16 +3048,228 @@ static int dt_t8140_enable_consumer(const char *path)
     return ret;
 }
 
-static bool dt_t8140_validate_dcp_asc(const char *path, const char *name, bool allow_idle)
+static bool dt_t8140_validate_dcp_asc(const char *path, const char *name,
+                                      enum asc_inherited_state state)
 {
     asc_dev_t *asc = asc_init(path);
     if (!asc) {
         printf("FDT: T8140 %s: ASC unavailable at %s\n", name, path);
         return false;
     }
-    bool ready = asc_validate_inherited_dcp(asc, name, allow_idle);
+    bool ready = asc_validate_inherited_dcp(asc, name, state);
     asc_free(asc);
     return ready;
+}
+
+static bool dt_t8140_table_reservations_fit(void)
+{
+    u64 start = cur_boot_args.phys_base;
+    if (start > UINT64_MAX - cur_boot_args.mem_size)
+        return false;
+    u64 end = start + cur_boot_args.mem_size;
+    int parent = fdt_path_offset(dt, "/reserved-memory"), node;
+    unsigned int regions = 1;
+    fdt_for_each_subnode(node, dt, parent)
+    {
+        const char *status = fdt_getprop(dt, node, "status", NULL);
+        if ((status && !strcmp(status, "disabled")) || fdt_getprop(dt, node, "no-map", NULL))
+            continue;
+        int len;
+        const fdt64_t *reg = fdt_getprop(dt, node, "reg", &len);
+        if (!reg)
+            continue;
+        if (len < 2 * (int)sizeof(*reg))
+            return false;
+        u64 base = fdt64_ld(&reg[0]), size = fdt64_ld(&reg[1]);
+        if (base > UINT64_MAX - size)
+            return false;
+        if (base >= start && base + size <= end)
+            continue;
+        if ((base < start && base + size > start) || (base < end && base + size > end) ||
+            (base | size) & (SZ_16K - 1) || ++regions > MAX_MEM_REGIONS)
+            return false;
+    }
+    return true;
+}
+
+/* The display subsystem lists the internal and external scanout DARTs
+ * together. A DART referenced by the external controller or its PIODMA child
+ * belongs to the external display; every other display DART is internal.
+ * Each half reserves and publishes only the DARTs it owns, so the internal
+ * handoff never depends on external translations. */
+struct dt_t8140_external_darts {
+    u32 phandles[16];
+    size_t count;
+};
+
+static int dt_t8140_collect_external_darts(struct dt_t8140_external_darts *ext)
+{
+    ext->count = 0;
+    int controller = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
+    if (controller < 0)
+        return controller == -FDT_ERR_NOTFOUND ? 0 : -1;
+    int piodma = fdt_subnode_offset(dt, controller, "piodma");
+    if (piodma < 0 && piodma != -FDT_ERR_NOTFOUND)
+        return -1;
+    const int nodes[] = {controller, piodma};
+    for (size_t n = 0; n < ARRAY_SIZE(nodes); n++) {
+        if (nodes[n] < 0)
+            continue;
+        int len;
+        const fdt32_t *refs = fdt_getprop(dt, nodes[n], "iommus", &len);
+        if (!refs) {
+            if (len != -FDT_ERR_NOTFOUND)
+                return -1;
+            continue;
+        }
+        if (len <= 0 || len % (2 * sizeof(*refs)))
+            return -1;
+        for (int i = 0; i < len / (int)sizeof(*refs); i += 2) {
+            u32 phandle = fdt32_to_cpu(refs[i]);
+            int provider = fdt_node_offset_by_phandle(dt, phandle);
+            if (provider < 0 || !dt_t8140_one_cell_iommu(provider))
+                return -1;
+            size_t j = 0;
+            while (j < ext->count && ext->phandles[j] != phandle)
+                j++;
+            if (j < ext->count)
+                continue;
+            if (ext->count == ARRAY_SIZE(ext->phandles))
+                return -1;
+            ext->phandles[ext->count++] = phandle;
+        }
+    }
+    return 0;
+}
+
+static bool dt_t8140_external_dart(const struct dt_t8140_external_darts *ext, u32 phandle)
+{
+    for (size_t i = 0; i < ext->count; i++)
+        if (ext->phandles[i] == phandle)
+            return true;
+    return false;
+}
+
+static int dt_t8140_reserve_tables(const char *alias, const struct dt_t8140_dram *dram,
+                                   const struct dt_t8140_external_darts *ext, bool external)
+{
+    int node = fdt_path_offset(dt, alias), len;
+    const fdt32_t *prop = node < 0 ? NULL : fdt_getprop(dt, node, "iommus", &len);
+    if (!prop || len <= 0 || len % (2 * sizeof(*prop)) || len > (int)(16 * sizeof(*prop)))
+        return -1;
+    fdt32_t iommus[16];
+    memcpy(iommus, prop, len);
+    u64 *pages = malloc(2049 * sizeof(*pages));
+    if (!pages)
+        return -1;
+    int ret = -1;
+    for (int i = 0; i < len / (int)sizeof(*prop); i += 2) {
+        ret = -1;
+        int provider = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(iommus[i]));
+        if (provider < 0 || !dt_t8140_one_cell_iommu(provider) ||
+            fdt32_to_cpu(iommus[i + 1]) >= 256)
+            goto out;
+        if (dt_t8140_external_dart(ext, fdt32_to_cpu(iommus[i])) != external)
+            continue;
+        dart_dev_t *dart = dart_init_fdt_locked(dt, fdt32_to_cpu(iommus[i]),
+                                               fdt32_to_cpu(iommus[i + 1]));
+        size_t count;
+        if (!dart)
+            goto out;
+        ret = dart_collect_locked_tables(dart, dram->base, dram->size, pages, 2049, &count);
+        dart_shutdown(dart);
+        if (ret)
+            goto out;
+        for (size_t j = 1; j < count; j++) {
+            u64 page = pages[j];
+            size_t k = j;
+            while (k && pages[k - 1] > page) {
+                pages[k] = pages[k - 1];
+                k--;
+            }
+            pages[k] = page;
+        }
+        for (size_t j = 0; j < count;) {
+            u64 base = pages[j], size = SZ_16K;
+            while (++j < count && pages[j] == base + size)
+                size += SZ_16K;
+            char name[64];
+            snprintf(name, sizeof(name), "dart-tables@%lx", base);
+            int parent = fdt_path_offset(dt, "/reserved-memory");
+            int existing = parent < 0 ? parent : fdt_subnode_offset(dt, parent, name);
+            int reg_len;
+            const fdt64_t *reg = existing < 0 ? NULL : fdt_getprop(dt, existing, "reg", &reg_len);
+            if (reg) {
+                if (reg_len != 2 * sizeof(*reg) || fdt64_ld(&reg[0]) != base ||
+                    fdt64_ld(&reg[1]) > dram->size ||
+                    !dt_t8140_in_physical_dram(dram, base, fdt64_ld(&reg[1]))) {
+                    ret = -1;
+                    goto out;
+                }
+                if (fdt64_ld(&reg[1]) > size)
+                    size = fdt64_ld(&reg[1]);
+            }
+            int region = dt_get_or_add_reserved_mem(name, "apple,firmware-dart-tables", false,
+                                                    base, size);
+            if (region < 0 || fdt_getprop(dt, region, "no-map", NULL)) {
+                ret = -1;
+                goto out;
+            }
+        }
+        if (!dt_t8140_table_reservations_fit()) {
+            ret = -1;
+            goto out;
+        }
+        int target = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(iommus[i]));
+        if (target < 0 || fdt_setprop_u32(dt, target, "apple,firmware-root-handoff", 1)) {
+            ret = -1;
+            goto out;
+        }
+    }
+    ret = 0;
+out:
+    free(pages);
+    return ret;
+}
+
+static int dt_t8140_reserve_piodma_tables(const char *alias, bool required,
+                                          const struct dt_t8140_dram *dram,
+                                          const struct dt_t8140_external_darts *ext, bool external)
+{
+    int parent = fdt_path_offset(dt, alias);
+    int child = parent < 0 ? parent : fdt_subnode_offset(dt, parent, "piodma");
+    if (child == -FDT_ERR_NOTFOUND && !required)
+        return 0;
+    char path[128];
+    if (child < 0 || fdt_get_path(dt, child, path, sizeof(path)))
+        return -1;
+    return dt_t8140_reserve_tables(path, dram, ext, external);
+}
+
+/* Reserve the external streams of every scanout master. */
+static int dt_t8140_reserve_master_tables(const struct dt_t8140_dram *dram,
+                                          const struct dt_t8140_external_darts *ext)
+{
+    char paths[8][128];
+    size_t count = 0;
+    int node = -1;
+    while ((node = fdt_node_offset_by_compatible(dt, node, "apple,display-subsystem")) >= 0) {
+        int len;
+        if (!fdt_getprop(dt, node, "iommus", &len)) {
+            if (len != -FDT_ERR_NOTFOUND)
+                return -1;
+            continue;
+        }
+        if (count == ARRAY_SIZE(paths) || fdt_get_path(dt, node, paths[count], sizeof(paths[0])))
+            return -1;
+        count++;
+    }
+    if (node != -FDT_ERR_NOTFOUND)
+        return -1;
+    for (size_t i = 0; i < count; i++)
+        if (dt_t8140_reserve_tables(paths[i], dram, ext, true))
+            return -1;
+    return 0;
 }
 
 static int dt_t8140_disable_refs(int node, const char *prop, const char *cells_prop)
@@ -2718,6 +3298,14 @@ static int dt_t8140_disable_refs(int node, const char *prop, const char *cells_p
     }
     for (size_t i = 0; i < count; i++) {
         int target = fdt_node_offset_by_phandle(dt, phandles[i]);
+        if (target < 0)
+            return -1;
+        if (!strcmp(cells_prop, "#iommu-cells")) {
+            int ret = fdt_delprop(dt, target, "apple,firmware-root-handoff");
+            if (ret && ret != -FDT_ERR_NOTFOUND)
+                return -1;
+            target = fdt_node_offset_by_phandle(dt, phandles[i]);
+        }
         if (target < 0 || fdt_setprop_string(dt, target, "status", "disabled"))
             return -1;
     }
@@ -2735,8 +3323,7 @@ static int dt_t8140_alias_offset(const char *alias)
     if (!path)
         return length;
     /* Relative aliases can recurse, and malformed strings can overrun the property. */
-    if (length < 2 || path[0] != '/' ||
-        memchr(path, '\0', length) != path + length - 1)
+    if (length < 2 || path[0] != '/' || memchr(path, '\0', length) != path + length - 1)
         return -FDT_ERR_BADVALUE;
     int node = fdt_path_offset(dt, path);
     return node == -FDT_ERR_NOTFOUND ? -FDT_ERR_BADVALUE : node;
@@ -2760,8 +3347,7 @@ static int dt_t8140_disable_typec_routes(const char *dcp_path)
     {
         int length;
         const char *name = fdt_get_name(dt, route, &length);
-        if (!name || length < 0 || (size_t)length >= sizeof(names[0]) ||
-            count == ARRAY_SIZE(names))
+        if (!name || length < 0 || (size_t)length >= sizeof(names[0]) || count == ARRAY_SIZE(names))
             return -1;
         memcpy(names[count++], name, length + 1);
     }
@@ -2818,17 +3404,19 @@ static int dt_t8140_enable_external(const char *path)
     int display_dart = piodma < 0 ? piodma : dt_get_iommu_node(piodma, 0);
     int length = 0;
     const fdt32_t *mailbox = fdt_getprop(dt, node, "mboxes", &length);
-    if (piodma < 0 || dcp_dart < 0 || display_dart < 0 || !mailbox ||
-        length != sizeof(*mailbox))
+    if (piodma < 0 || dcp_dart < 0 || display_dart < 0 || !mailbox || length != sizeof(*mailbox))
         return -1;
     int mbox = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(*mailbox));
     if (mbox < 0)
+        return -1;
+    /* Both external DARTs keep firmware translations Linux adopts. */
+    if (!dt_t8140_dart_handed_off(dcp_dart) || !dt_t8140_dart_handed_off(display_dart))
         return -1;
 
     int nodes[] = {dcp_dart, display_dart, mbox, piodma, node};
     char paths[8][128];
     int power_count = dt_t8140_power_paths(node, &paths[ARRAY_SIZE(nodes)],
-                                             ARRAY_SIZE(paths) - ARRAY_SIZE(nodes));
+                                           ARRAY_SIZE(paths) - ARRAY_SIZE(nodes));
     if (power_count <= 0)
         return -1;
     size_t count = ARRAY_SIZE(nodes) + power_count;
@@ -2860,8 +3448,7 @@ static int dt_t8140_iommu_width(const fdt32_t *cells, int remaining)
         return -1;
     int provider = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(cells[0]));
     int length;
-    const fdt32_t *args = provider < 0 ? NULL :
-        fdt_getprop(dt, provider, "#iommu-cells", &length);
+    const fdt32_t *args = provider < 0 ? NULL : fdt_getprop(dt, provider, "#iommu-cells", &length);
     if (!args || length != sizeof(*args))
         return -1;
     u32 count = fdt32_to_cpu(*args);
@@ -2950,9 +3537,9 @@ static int dt_t8140_withdraw_external_scanout(int external)
     int ret = 0;
     for (int i = 0; i < n_edits; i++) {
         master = fdt_path_offset(dt, edits[i].path);
-        ret = master < 0 ? master :
-            fdt_setprop(dt, master, "iommus", edits[i].cells,
-                        edits[i].count * sizeof(fdt32_t));
+        ret = master < 0 ? master
+                         : fdt_setprop(dt, master, "iommus", edits[i].cells,
+                                       edits[i].count * sizeof(fdt32_t));
         if (ret)
             break;
     }
@@ -2970,8 +3557,7 @@ struct dt_t8140_refusal_group {
     int count[4];
 };
 
-static int dt_t8140_ref_nodes(int node, const char *prop, const char *cells_prop,
-                              int *nodes)
+static int dt_t8140_ref_nodes(int node, const char *prop, const char *cells_prop, int *nodes)
 {
     int length;
     const fdt32_t *refs = fdt_getprop(dt, node, prop, &length);
@@ -2983,8 +3569,7 @@ static int dt_t8140_ref_nodes(int node, const char *prop, const char *cells_prop
     for (int i = 0; i < cells;) {
         int provider = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(refs[i]));
         int size;
-        const fdt32_t *args = provider < 0 ? NULL :
-            fdt_getprop(dt, provider, cells_prop, &size);
+        const fdt32_t *args = provider < 0 ? NULL : fdt_getprop(dt, provider, cells_prop, &size);
         if (!args || size != sizeof(*args))
             return -1;
         u32 width = fdt32_to_cpu(*args);
@@ -2996,8 +3581,7 @@ static int dt_t8140_ref_nodes(int node, const char *prop, const char *cells_prop
     return count;
 }
 
-static bool dt_t8140_group_has(const struct dt_t8140_refusal_group *group,
-                               int role, int node)
+static bool dt_t8140_group_has(const struct dt_t8140_refusal_group *group, int role, int node)
 {
     for (int i = 0; i < group->count[role]; i++)
         if (group->providers[role][i] == node)
@@ -3005,26 +3589,34 @@ static bool dt_t8140_group_has(const struct dt_t8140_refusal_group *group,
     return false;
 }
 
-static int dt_t8140_refusal_group(const char *compatible,
-                                  struct dt_t8140_refusal_group *group)
+/* An alias must not select a different controller with a valid absolute path. */
+static int dt_t8140_unique_controller(const char *compatible)
+{
+    int node = fdt_node_offset_by_compatible(dt, -1, compatible);
+    if (node < 0)
+        return node;
+    if (fdt_node_offset_by_compatible(dt, node, compatible) != -FDT_ERR_NOTFOUND)
+        return -FDT_ERR_BADVALUE;
+    return node;
+}
+
+static int dt_t8140_refusal_group(const char *compatible, struct dt_t8140_refusal_group *group)
 {
     memset(group, 0, sizeof(*group));
-    group->controller = fdt_node_offset_by_compatible(dt, -1, compatible);
+    group->controller = dt_t8140_unique_controller(compatible);
     group->piodma = -FDT_ERR_NOTFOUND;
     if (group->controller < 0)
         return group->controller == -FDT_ERR_NOTFOUND ? 0 : -1;
-    /* An alias cannot choose among multiple controllers of the same role. */
-    if (fdt_node_offset_by_compatible(dt, group->controller, compatible) != -FDT_ERR_NOTFOUND)
-        return -1;
     group->piodma = fdt_subnode_offset(dt, group->controller, "piodma");
     if (group->piodma < 0 && group->piodma != -FDT_ERR_NOTFOUND)
         return -1;
-    group->count[0] = dt_t8140_ref_nodes(group->controller, "iommus", "#iommu-cells",
-                                        group->providers[0]);
-    group->count[1] = group->piodma < 0 ? 0 :
-        dt_t8140_ref_nodes(group->piodma, "iommus", "#iommu-cells", group->providers[1]);
-    group->count[2] = dt_t8140_ref_nodes(group->controller, "mboxes", "#mbox-cells",
-                                        group->providers[2]);
+    group->count[0] =
+        dt_t8140_ref_nodes(group->controller, "iommus", "#iommu-cells", group->providers[0]);
+    group->count[1] = group->piodma < 0 ? 0
+                                        : dt_t8140_ref_nodes(group->piodma, "iommus",
+                                                             "#iommu-cells", group->providers[1]);
+    group->count[2] =
+        dt_t8140_ref_nodes(group->controller, "mboxes", "#mbox-cells", group->providers[2]);
     char paths[3][128];
     group->count[3] = dt_t8140_power_paths(group->controller, paths, ARRAY_SIZE(paths));
     for (int role = 0; role < 4; role++) {
@@ -3035,8 +3627,9 @@ static int dt_t8140_refusal_group(const char *compatible,
             if (node < 0)
                 return -1;
             group->providers[role][i] = node;
-            const char *type = role < 2 ? "apple,t8140-dart" :
-                role == 2 ? "apple,t8140-asc-mailbox" : "apple,t8140-pmgr-pwrstate";
+            const char *type = role < 2    ? "apple,t8140-dart"
+                               : role == 2 ? "apple,t8140-asc-mailbox"
+                                           : "apple,t8140-pmgr-pwrstate";
             if (fdt_node_check_compatible(dt, node, type))
                 return -1;
         }
@@ -3080,8 +3673,7 @@ static int dt_t8140_refusal_identity(void)
             for (; sibling >= 0 && sibling != node; sibling = fdt_next_subnode(dt, sibling)) {
                 int length;
                 const char *other = fdt_get_name(dt, sibling, &length);
-                if (!other || length < 0 ||
-                    (length == name_length && !memcmp(name, other, length)))
+                if (!other || length < 0 || (length == name_length && !memcmp(name, other, length)))
                     return -1;
             }
             if (sibling != node)
@@ -3112,19 +3704,17 @@ static int dt_t8140_refusal_identity(void)
     return node == -FDT_ERR_NOTFOUND || (node >= 0 && depth < 0) ? 0 : -1;
 }
 
-static int dt_t8140_refusal_preflight(bool whole,
-                                     struct dt_t8140_refusal_group *internal,
-                                     struct dt_t8140_refusal_group *external)
+static int dt_t8140_refusal_preflight(bool whole, struct dt_t8140_refusal_group *internal,
+                                      struct dt_t8140_refusal_group *external)
 {
-    if (dt_t8140_refusal_identity() ||
-        dt_t8140_refusal_group("apple,t8140-dcp", internal) ||
+    if (dt_t8140_refusal_identity() || dt_t8140_refusal_group("apple,t8140-dcp", internal) ||
         dt_t8140_refusal_group("apple,t8140-dcpext", external))
         return -1;
     if (internal->controller >= 0 && internal->controller == external->controller)
         return -1;
     static const char *const aliases[] = {
         "dcpext", "dispext0", "dcpext_dart", "dispext0_dart", "dcpext_mbox",
-        "dcp", "disp0", "dcp_dart", "disp0_dart", "dcp_mbox",
+        "dcp",    "disp0",    "dcp_dart",    "disp0_dart",    "dcp_mbox",
     };
     for (size_t i = 0; i < (whole ? ARRAY_SIZE(aliases) : 5); i++) {
         int node = dt_t8140_alias_offset(aliases[i]);
@@ -3134,9 +3724,9 @@ static int dt_t8140_refusal_preflight(bool whole,
             return -1;
         const struct dt_t8140_refusal_group *group = i < 5 ? external : internal;
         size_t role = i % 5;
-        bool owned = role == 0 ? node == group->controller :
-            role == 1 ? dt_t8140_refusal_master(node, internal, external, i < 5) == 1 :
-            dt_t8140_group_has(group, role - 2, node);
+        bool owned = role == 0   ? node == group->controller
+                     : role == 1 ? dt_t8140_refusal_master(node, internal, external, i < 5) == 1
+                                 : dt_t8140_group_has(group, role - 2, node);
         if (!owned)
             return -1;
     }
@@ -3162,8 +3752,8 @@ static int dt_t8140_refusal_preflight(bool whole,
                 const struct dt_t8140_refusal_group *group = ext ? external : internal;
                 bool owned = node == group->controller || node == group->piodma;
                 if (p == 2)
-                    owned |= dt_t8140_group_has(group, 2, node) ||
-                             dt_t8140_group_has(group, 3, node);
+                    owned |=
+                        dt_t8140_group_has(group, 2, node) || dt_t8140_group_has(group, 3, node);
                 if (p == 0 && dt_t8140_group_has(group, 1, refs[i]))
                     owned |= !fdt_node_check_compatible(dt, node, "apple,display-subsystem");
                 if (!owned)
@@ -3275,13 +3865,19 @@ static int dt_t8140_refuse_display(void)
             return -1;
     }
     /* Ownership and the complete owned path set were checked before edits. */
-    if (dt_t8140_disable_dcpext())
+    int ret = fdt_delprop(dt, chosen, "apple,firmware-root-handoff");
+    if (ret && ret != -FDT_ERR_NOTFOUND)
+        return -1;
+    ret = fdt_delprop(dt, chosen, "apple,dcp-rtkit-live");
+    if (ret && ret != -FDT_ERR_NOTFOUND)
+        return -1;
+    ret = fdt_delprop(dt, chosen, "apple,dcp-rtkit-quiesced");
+    if (ret && ret != -FDT_ERR_NOTFOUND)
         return -1;
     chosen = fdt_path_offset(dt, "/chosen");
-    if (chosen < 0)
+    if (chosen < 0 || fdt_setprop_string(dt, chosen, "apple,dcp-handoff-reason", "withdrawn"))
         return -1;
-    int ret = fdt_delprop(dt, chosen, "apple,dcp-rtkit-quiesced");
-    if (ret && ret != -FDT_ERR_NOTFOUND)
+    if (dt_t8140_disable_dcpext())
         return -1;
     for (size_t i = 0; i < count; i++) {
         int node = fdt_path_offset(dt, paths[i]);
@@ -3322,26 +3918,114 @@ static int dt_t8140_refuse_display(void)
     return 0;
 }
 
+/* Validate roles before metadata export, reservation or DART access. A master
+ * belongs to the internal display through its scanout IOMMU references, not
+ * through its name. A separate external-only master remains valid.
+ *
+ * Each alias the handoff follows must name one absolute path: libfdt follows
+ * a relative alias recursively. Only the external controller's alias is
+ * optional.
+ *
+ * Returns 1, and sets *absent, when the tree does not describe the internal
+ * display: no internal controller, or no dcp or disp0 alias. The caller keeps
+ * simplefb then. Returns -1 when a description is present but inconsistent. */
+static int dt_t8140_display_alias_roles(const char **absent)
+{
+    int internal = dt_t8140_unique_controller("apple,t8140-dcp");
+    int external = dt_t8140_unique_controller("apple,t8140-dcpext");
+    int dcp = dt_t8140_alias_offset("dcp");
+    int disp0 = dt_t8140_alias_offset("disp0");
+    int alias = dt_t8140_alias_offset("dcpext");
+    /* Whatever is present must be consistent, absent parts or not. */
+    if ((internal < 0 && internal != -FDT_ERR_NOTFOUND) ||
+        (external < 0 && external != -FDT_ERR_NOTFOUND) || (dcp < 0 && dcp != -FDT_ERR_NOTFOUND) ||
+        (disp0 < 0 && disp0 != -FDT_ERR_NOTFOUND) || (alias < 0 && alias != -FDT_ERR_NOTFOUND) ||
+        (internal >= 0 && internal == external) || (dcp >= 0 && dcp != internal) ||
+        (alias >= 0 && alias != external) ||
+        (disp0 >= 0 && fdt_node_check_compatible(dt, disp0, "apple,display-subsystem")))
+        return -1;
+    if (internal == -FDT_ERR_NOTFOUND) {
+        *absent = "FDT T8140 DCP absent";
+        return 1;
+    }
+    if (dcp == -FDT_ERR_NOTFOUND) {
+        *absent = "FDT dcp alias absent";
+        return 1;
+    }
+
+    int piodma = fdt_subnode_offset(dt, internal, "piodma");
+    if (piodma < 0 && piodma != -FDT_ERR_NOTFOUND)
+        return -1;
+    int scanout[64];
+    int count = piodma < 0 ? 0 : dt_t8140_ref_nodes(piodma, "iommus", "#iommu-cells", scanout);
+    if (count < 0)
+        return -1;
+    /* Without a scanout reference or a disp0 alias, the tree describes no display pipeline. */
+    if (!count) {
+        if (disp0 == -FDT_ERR_NOTFOUND) {
+            *absent = "FDT disp0 alias absent";
+            return 1;
+        }
+        return -1;
+    }
+
+    int master = -FDT_ERR_NOTFOUND;
+    int node = -1;
+    while ((node = fdt_node_offset_by_compatible(dt, node, "apple,display-subsystem")) >= 0) {
+        int refs[64];
+        int nrefs = dt_t8140_ref_nodes(node, "iommus", "#iommu-cells", refs);
+        if (nrefs < 0)
+            return -1;
+        bool owned = false;
+        for (int i = 0; i < nrefs; i++)
+            for (int j = 0; j < count; j++)
+                owned |= refs[i] == scanout[j];
+        if (owned) {
+            if (master >= 0)
+                return -1;
+            master = node;
+        }
+    }
+    if (node != -FDT_ERR_NOTFOUND)
+        return -1;
+    if (disp0 == -FDT_ERR_NOTFOUND) {
+        *absent = "FDT disp0 alias absent";
+        return 1;
+    }
+    if (master < 0 || disp0 != master)
+        return -1;
+    return 0;
+}
+
 /* A bounded observation of register descriptions, not firmware contents.
  * IDs and lengths make absent Linux aliases diagnosable without exporting ADT. */
 static void dt_t8140_external_metadata(void)
 {
     static const char *const paths[] = {
-        "/arm-io/dcpext", "/arm-io/dart-dcpext", "/arm-io/dart-dispext0",
-        "/arm-io/dcpext/iop-dcpext-nub",
-        "/arm-io/dart-dcpext0", "/arm-io/dispext0", "/arm-io/disp-ext0",
+        "/arm-io/dcpext",        "/arm-io/dart-dcpext",
+        "/arm-io/dart-dispext0", "/arm-io/dcpext/iop-dcpext-nub",
+        "/arm-io/dart-dcpext0",  "/arm-io/dispext0",
+        "/arm-io/disp-ext0",
     };
     static const struct {
         const char *name;
         bool cells;
     } props[] = {
-        {"reg", true}, {"interrupts", true}, {"clock-gates", true},
-        {"device-id", true}, {"AAPL,phandle", true},
-        {"#address-cells", true}, {"#size-cells", true},
-        {"ranges", false}, {"dpxbar-parent", false},
-        {"dp-switch-dfp-port", false}, {"dp-switch-dfp-endpoint", false},
-        {"atc-dp-link", false}, {"service-gates", false},
-        {"segment-ranges", false}, {"segment-names", false},
+        {"reg", true},
+        {"interrupts", true},
+        {"clock-gates", true},
+        {"device-id", true},
+        {"AAPL,phandle", true},
+        {"#address-cells", true},
+        {"#size-cells", true},
+        {"ranges", false},
+        {"dpxbar-parent", false},
+        {"dp-switch-dfp-port", false},
+        {"dp-switch-dfp-endpoint", false},
+        {"atc-dp-link", false},
+        {"service-gates", false},
+        {"segment-ranges", false},
+        {"segment-names", false},
         {"iommu-parent", true},
     };
     fdt32_t translated[2 + ARRAY_SIZE(paths) * 34];
@@ -3383,7 +4067,8 @@ static void dt_t8140_external_metadata(void)
             /* Only public register/cell descriptions have a numeric payload.
              * Segments, routes and every unknown encoding remain size-only. */
             size_t count = value && props[j].cells && length <= 128 && !(length & 3)
-                               ? length / sizeof(u32) : 0;
+                               ? length / sizeof(u32)
+                               : 0;
             if (used + 4 + count > ARRAY_SIZE(words)) {
                 printf("FDT: external metadata exceeds bounded output\n");
                 return;
@@ -3399,8 +4084,7 @@ static void dt_t8140_external_metadata(void)
             }
         }
     }
-    if (fdt_setprop(dt, chosen, "asahi,external-display-metadata", words,
-                    used * sizeof(words[0])))
+    if (fdt_setprop(dt, chosen, "asahi,external-display-metadata", words, used * sizeof(words[0])))
         printf("FDT: external metadata observation unavailable\n");
     /* Mapper phandle/stream pairs are public ADT cell descriptions. Export
      * neither names nor arbitrary child properties, and cap both traversal
@@ -3439,10 +4123,18 @@ static void dt_t8140_external_metadata(void)
 
 static int dt_set_display_t8140(void)
 {
-    dt_t8140_external_metadata();
     int ret = -1;
     const char *reason = "validation failed";
     const char *step = "preflight";
+    int roles = dt_t8140_display_alias_roles(&reason);
+    if (roles < 0) {
+        printf("FDT: T8140 display aliases do not identify unique display roles\n");
+        return -1;
+    }
+    /* The observation also diagnoses a tree that describes no display. */
+    dt_t8140_external_metadata();
+    if (roles)
+        goto refuse;
     u64 base, size, end, fb_size;
     struct dt_t8140_dram dram = {0};
     int adt_path[4];
@@ -3543,11 +4235,6 @@ static int dt_set_display_t8140(void)
         goto refuse;
     }
 
-    if (!fdt_get_alias(dt, "dcp") || !fdt_get_alias(dt, "disp0")) {
-        reason = !fdt_get_alias(dt, "dcp") ? "FDT dcp alias absent" : "FDT disp0 alias absent";
-        goto refuse;
-    }
-
     /* The upstream helpers mutate the FDT as they go. Restore the complete
      * tree if a DART span or any property write fails. */
     void *saved = malloc(dt_bufsize);
@@ -3593,11 +4280,21 @@ static int dt_set_display_t8140(void)
         goto refuse;
     }
 
+    /* H17P keeps its locked translations and live RTKit session. Linux
+     * performs INIT/HELLO; stage 2 must not change AP/IOP power first. */
     step = "internal DCP ASC and mailboxes";
-    if (!dt_t8140_validate_dcp_asc("/arm-io/dcp", "dcp", false)) {
+    if (!dt_t8140_validate_dcp_asc("/arm-io/dcp", "dcp", ASC_INHERITED_RUNNING)) {
         reason = "inherited DCP ASC is not live with healthy empty mailboxes";
         goto rollback;
     }
+
+    step = "internal firmware DART table reservation";
+    struct dt_t8140_external_darts ext_darts;
+    if (dt_t8140_collect_external_darts(&ext_darts) ||
+        dt_t8140_reserve_tables("dcp", &dram, &ext_darts, false) ||
+        dt_t8140_reserve_tables("disp0", &dram, &ext_darts, false) ||
+        dt_t8140_reserve_piodma_tables("dcp", true, &dram, &ext_darts, false))
+        goto rollback;
 
     /* External firmware has its own DART. It is optional for the internal
      * panel, so a failed external validation only rolls back that controller. */
@@ -3608,15 +4305,12 @@ static int dt_set_display_t8140(void)
     }
     memcpy(ext_saved, dt, dt_bufsize);
     char ext_path[128];
-    const char *ext = fdt_get_alias(dt, "dcpext");
-    if (ext) {
-        snprintf(ext_path, sizeof(ext_path), "%s", ext);
-        ext = ext_path;
-    } else {
+    const char *ext = NULL;
+    node = dt_t8140_alias_offset("dcpext");
+    if (node == -FDT_ERR_NOTFOUND)
         node = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
-        if (node >= 0 && fdt_get_path(dt, node, ext_path, sizeof(ext_path)) == 0)
-            ext = ext_path;
-    }
+    if (node >= 0 && fdt_get_path(dt, node, ext_path, sizeof(ext_path)) == 0)
+        ext = ext_path;
     bool ext_ready = false;
     u32 ext_step = ext ? 1 : 0;
     if (ext && pmgr_power_is_on(0, "DISPEXT0_CPU") == 1) {
@@ -3648,7 +4342,17 @@ static int dt_set_display_t8140(void)
         if (!ret) {
             step = "DCPEXT ASC and mailboxes";
             ext_step = 7;
-            ret = dt_t8140_validate_dcp_asc("/arm-io/dcpext", "dcpext", true) ? 0 : -1;
+            bool idle = dt_t8140_validate_dcp_asc("/arm-io/dcpext", "dcpext", ASC_INHERITED_IDLE);
+            ret = idle ? 0 : -1;
+        }
+        if (!ret) {
+            step = "external firmware DART table reservation";
+            ext_step = 8;
+            ret = dt_t8140_reserve_tables(ext, &dram, &ext_darts, true);
+            if (!ret)
+                ret = dt_t8140_reserve_piodma_tables(ext, true, &dram, &ext_darts, true);
+            if (!ret)
+                ret = dt_t8140_reserve_master_tables(&dram, &ext_darts);
         }
         ext_ready = !ret;
         if (ret) {
@@ -3665,7 +4369,7 @@ static int dt_set_display_t8140(void)
         goto rollback;
     if (ext_ready) {
         step = "enable DCPEXT dependency group";
-        ext_step = 8;
+        ext_step = 9;
         if (dt_t8140_enable_external(ext)) {
             printf("FDT: T8140 external dependencies unavailable; internal panel continues\n");
             ext_ready = false;
@@ -3695,20 +4399,30 @@ static int dt_set_display_t8140(void)
                 goto rollback;
         }
     }
-    step = "publish apple,dcp-rtkit-quiesced claim";
+    step = "audit published display IOMMUs";
+    if (dt_t8140_audit_display_iommus())
+        goto rollback;
+    step = "publish live RTKit and firmware-root handoff";
     node = fdt_path_offset(dt, "/chosen");
     if (node < 0)
         goto rollback;
-    if (fdt_setprop_u32(dt, node, "apple,dcp-rtkit-quiesced", 1) < 0)
+    ret = fdt_delprop(dt, node, "apple,dcp-rtkit-quiesced");
+    if (ret && ret != -FDT_ERR_NOTFOUND)
+        goto rollback;
+    node = fdt_path_offset(dt, "/chosen");
+    if (fdt_setprop_string(dt, node, "apple,dcp-handoff-reason", "live-session") < 0)
+        goto rollback;
+    node = fdt_path_offset(dt, "/chosen");
+    if (fdt_setprop_u32(dt, node, "apple,dcp-rtkit-live", 1) < 0)
         goto rollback;
     /* A diagnostic result for this preflight, not a hardware-ready claim.
-     * 0: absent, 1: power off, 2..7: validation stage, 8: dependencies. */
-    if (fdt_setprop_u32(dt, node, "asahi,external-display-preflight",
-                        ext_ready ? 0x100 : ext_step))
+     * 0: absent, 1: power off, 2..7: validation stage, 8: firmware DART
+     * table reservation, 9: dependencies. */
+    if (fdt_setprop_u32(dt, node, "asahi,external-display-preflight", ext_ready ? 0x100 : ext_step))
         printf("FDT: external preflight observation unavailable\n");
     free(saved);
-    printf("FDT: T8140 DCP enabled with validated framebuffer, firmware and live ASC%s;"
-           " /chosen/apple,dcp-rtkit-quiesced=1\n",
+    printf("FDT: T8140 DCP enabled with validated framebuffer, firmware and live inherited RTKit session%s;"
+           " /chosen/apple,dcp-rtkit-live=1\n",
            ext_ready ? " (dcpext enabled)" : "");
     return 0;
 
@@ -3720,7 +4434,46 @@ rollback:
 
 refuse:
     printf("FDT: T8140 display refused at %s: %s; retaining simplefb\n", step, reason);
-    return dt_t8140_refuse_display();
+    if (dt_t8140_refuse_display())
+        return -1;
+    node = fdt_path_offset(dt, "/chosen");
+    if (node < 0 || fdt_setprop_string(dt, node, "apple,dcp-handoff-reason", reason))
+        return -1;
+    return 0;
+}
+
+static int dt_t8140_recheck_display(void)
+{
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0)
+        return -1;
+    if (!fdt_getprop(dt, chosen, "apple,dcp-rtkit-live", NULL))
+        return 0;
+
+    bool healthy = dt_t8140_validate_dcp_asc("/arm-io/dcp", "dcp", ASC_INHERITED_RUNNING);
+    int ext = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
+    const char *status = ext < 0 ? NULL : fdt_getprop(dt, ext, "status", NULL);
+    if (!healthy) {
+        printf("kboot: DCP changed state before handoff; disabling display\n");
+        if (dt_t8140_refuse_display() || fdt_pack(dt))
+            return -1;
+    } else if (status && !strcmp(status, "okay") &&
+               (pmgr_power_is_on(0, "DISPEXT0_CPU") != 1 ||
+                !dt_t8140_validate_dcp_asc("/arm-io/dcpext", "dcpext", ASC_INHERITED_IDLE))) {
+        /* The internal panel does not depend on the external DCP. */
+        printf("kboot: DCPEXT changed state before handoff; disabling it\n");
+        if (dt_t8140_disable_dcpext())
+            return -1;
+        if (dt_t8140_audit_display_iommus()) {
+            printf(
+                "kboot: display IOMMUs inconsistent after DCPEXT withdrawal; disabling display\n");
+            if (dt_t8140_refuse_display())
+                return -1;
+        }
+        if (fdt_pack(dt))
+            return -1;
+    }
+    return 0;
 }
 
 /* T8142 display carveouts: DCP uses SID 23, the display pipe SID 0 and
@@ -3925,7 +4678,7 @@ static int dt_set_t6030_display_maps(const struct adt_segment_ranges *segments, 
     };
     u32 phandles[2];
     int adt_path[8];
-    u64 adt_base;
+    u64 adt_base, adt_size;
     int len;
 
     /* The frontend DART's registers, as described by both trees. */
@@ -3937,15 +4690,18 @@ static int dt_set_t6030_display_maps(const struct adt_segment_ranges *segments, 
     if (!reg || len < 16)
         return t6030_display_handoff_fail("disp0 DART has no reg");
     u64 dart_base = ((u64)fdt32_ld(&reg[0]) << 32) | fdt32_ld(&reg[1]);
+    u64 dart_size = ((u64)fdt32_ld(&reg[2]) << 32) | fdt32_ld(&reg[3]);
     if (adt_path_offset_trace(adt, "/arm-io/dart-disp0", adt_path) < 0 ||
-        adt_get_reg(adt, adt_path, "reg", 0, &adt_base, NULL) < 0)
+        adt_get_reg(adt, adt_path, "reg", 0, &adt_base, &adt_size) < 0)
         return t6030_display_handoff_fail("ADT has no /arm-io/dart-disp0 reg");
+    if (adt_size < 0x1440 || dart_size < 0x1440 || dart_base > UINT64_MAX - 0x1440)
+        return t6030_display_handoff_fail("disp0 DART register window is too small");
     if (adt_base != dart_base)
         return t6030_display_handoff_fail("DART base: FDT 0x%lx, ADT 0x%lx", dart_base, adt_base);
 
     for (u32 n = 0; n < 2; n++) {
-        if (dart_walk_locked_t8110(dart_base, streams[n], dram_base, dram_size, t6030_display_page,
-                                   &maps[n])) {
+        if (dart_walk_locked_t8110(dart_base, min(adt_size, dart_size), streams[n], dram_base,
+                                   dram_size, t6030_display_page, &maps[n])) {
             if (maps[n].rejected)
                 return t6030_display_handoff_fail("SID%u: no segment for iova 0x%lx -> 0x%lx",
                                                   streams[n], maps[n].rejected_iova,
@@ -4037,7 +4793,7 @@ static int dt_set_t6030_dcp_handoff(void)
 {
     int dcp = fdt_path_offset(dt, "dcp");
     if (dcp < 0)
-        return 0; /* no display coprocessor described: boot framebuffer only */
+        return -1; /* no display coprocessor described: boot framebuffer only */
     if (chip_id != T6030 || fdt_node_check_compatible(dt, 0, "apple,j514s") ||
         fdt_node_check_compatible(dt, dcp, "apple,t6030-dcp"))
         bail("FDT: unsupported T6030 DCP handoff target\n");
@@ -4054,8 +4810,8 @@ static int dt_set_t6030_dcp_handoff(void)
 
     int chosen = adt_path_offset(adt, "/chosen");
     u64 dram_base, dram_size;
-    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) < 0 ||
-        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) < 0)
+    if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size))
         bail("ADT: missing J514S DRAM bounds\n");
     u64 dram_end = dram_base + dram_size;
     if (!dram_size || dram_end <= dram_base)
@@ -4080,7 +4836,7 @@ static int dt_set_t6030_dcp_handoff(void)
             qualified = true;
     if (!qualified) {
         printf("FDT: J514S DCP firmware %s not supported; keeping the boot framebuffer\n", uuid);
-        return 0;
+        return -1;
     }
     if (fdt_setprop_string(dt, dcp, "apple,firmware-uuid", uuid))
         bail("FDT: cannot publish the J514S DCP firmware UUID\n");
@@ -4097,7 +4853,7 @@ static int dt_set_t6030_dcp_handoff(void)
     dcp = fdt_path_offset(dt, "dcp");
     if (fdt_getprop(dt, dcp, "apple,j514s-native-piodma", NULL)) {
         if (dt_set_t6030_display_maps(segments, count, dram_base, dram_size))
-            printf("FDT: J514S frontend handoff refused; PIODMA and scanout stay disabled\n");
+            return -1; /* The transaction discards partial consumer enablement. */
         chosen = fdt_path_offset(dt, "/chosen");
         if (chosen < 0 ||
             fdt_setprop_string(dt, chosen, "aurora,j514s-display-handoff", t6030_display_handoff))
@@ -4164,7 +4920,8 @@ static int dt_t6030_dcpext_validate(unsigned int n, const char *nub_path, char *
     int chosen = adt_path_offset(adt, "/chosen");
     u64 dram_base = 0, dram_size = 0;
     if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base) ||
-        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) || !dram_size)
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) || !dram_size ||
+        dram_base > UINT64_MAX - dram_size)
         bail("ADT: J514S DCPEXT%u: no DRAM bounds\n", n);
 
     for (unsigned int i = 0; i < T6030_DCPEXT_SEGMENTS; i++) {
@@ -4191,8 +4948,8 @@ static int dt_t6030_dcpext_validate(unsigned int n, const char *nub_path, char *
         }
 
         if (seg.unk != t6030_dcpext_seg_flags[i] || seg.remap != remap || !seg.size ||
-            (seg.phys & (SZ_16K - 1)) || seg.phys < dram_base ||
-            seg.phys + size > dram_base + dram_size)
+            (seg.phys & (SZ_16K - 1)) || seg.phys < dram_base || size > dram_size ||
+            seg.phys - dram_base > dram_size - size)
             bail("ADT: J514S DCPEXT%u: unexpected segment %u: PA 0x%lx remap 0x%lx size 0x%x "
                  "flags 0x%x\n",
                  n, i, seg.phys, seg.remap, seg.size, seg.unk);
@@ -4218,7 +4975,8 @@ static int dt_t6030_dcpext_validate(unsigned int n, const char *nub_path, char *
 
         snprintf(prop, sizeof(prop), "region-id-%u", t6030_dcpext_table_regions[n][i]);
         if (cmap < 0 || ADT_GETPROP_ARRAY(adt, cmap, prop, region) != sizeof(region) ||
-            !region[1] || (region[0] & (SZ_16K - 1)))
+            !region[1] || (region[0] | region[1]) & (SZ_16K - 1) || region[0] < dram_base ||
+            region[1] > dram_size || region[0] - dram_base > dram_size - region[1])
             bail("ADT: J514S DCPEXT%u: no DART table storage %s\n", n, prop);
     }
 
@@ -4227,8 +4985,9 @@ static int dt_t6030_dcpext_validate(unsigned int n, const char *nub_path, char *
     if (!uuid || !len || len > 64 || strnlen(uuid, len) != 36)
         bail("ADT: J514S DCPEXT%u: no firmware UUID\n", n);
     int dcp = fdt_path_offset(dt, "dcp");
-    const char *panel = dcp < 0 ? NULL : fdt_getprop(dt, dcp, "apple,firmware-uuid", NULL);
-    if (!panel)
+    int panel_len = 0;
+    const char *panel = dcp < 0 ? NULL : fdt_getprop(dt, dcp, "apple,firmware-uuid", &panel_len);
+    if (!panel || panel_len != 37)
         bail("FDT: J514S DCPEXT%u: the internal display firmware was not handed over\n", n);
     if (strncmp(uuid, panel, 36) || panel[36])
         bail("FDT: J514S DCPEXT%u: firmware %.36s is not the panel's %s\n", n, uuid, panel);
@@ -4281,9 +5040,21 @@ static int dt_t6030_dcpext_enable(const char *alias)
     if (routes >= 0)
         fdt_for_each_subnode(route, dt, routes)
         {
+            int len = 0;
+            const char *status = fdt_getprop(dt, route, "status", &len);
+            if (!status) {
+                if (len == -FDT_ERR_NOTFOUND)
+                    continue;
+                return len;
+            }
+            /* Preserve unavailable and malformed route policy from the DT. */
+            if (len != sizeof("disabled") || memcmp(status, "disabled", len))
+                continue;
             if (fdt_setprop_string(dt, route, "status", "okay"))
                 return -1;
         }
+    if (routes >= 0 && route != -FDT_ERR_NOTFOUND)
+        return route;
 
     node = fdt_path_offset(dt, alias);
     if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
@@ -4292,42 +5063,81 @@ static int dt_t6030_dcpext_enable(const char *alias)
     return 0;
 }
 
-static void dt_set_t6030_dcpext(unsigned int n)
+static int dt_set_t6030_dcpext(unsigned int n)
 {
     char alias[16], nub_path[48], uuid[40];
 
+    if (n >= 2)
+        return -1;
+
     snprintf(alias, sizeof(alias), "dcpext%u", n);
     if (!fdt_get_alias(dt, alias))
-        return; /* not described by this device tree */
+        return 0; /* not described by this device tree */
 
     int node = fdt_path_offset(dt, alias);
     if (node < 0)
-        return;
-    const char *status = fdt_getprop(dt, node, "status", NULL);
-    if (status && !strcmp(status, "okay")) {
+        return -1;
+    int status_len = 0;
+    const char *status = fdt_getprop(dt, node, "status", &status_len);
+    if (status && status_len == sizeof("okay") && !memcmp(status, "okay", status_len)) {
         printf("FDT: J514S DCPEXT%u already enabled; leaving it alone\n", n);
-        return;
+        return 0;
     }
+    if (status && (status_len != sizeof("disabled") || memcmp(status, "disabled", status_len)))
+        return -1;
+    if (!status && status_len != -FDT_ERR_NOTFOUND)
+        return status_len;
 
     snprintf(nub_path, sizeof(nub_path), "/arm-io/%s/iop-%s-nub", alias, alias);
     if (dt_t6030_dcpext_validate(n, nub_path, uuid))
-        return;
+        return -1;
 
     /* Everything validated: from here on only FDT updates. */
     if (dt_t6030_dcpext_reserve_tables(n) ||
         dt_reserve_asc_firmware(nub_path, NULL, alias, true, 0) || dt_set_dcp_firmware(alias)) {
         printf("FDT: J514S DCPEXT%u: cannot reserve the firmware\n", n);
-        return;
+        return -1;
     }
 
     node = fdt_path_offset(dt, alias);
     if (node < 0 || fdt_setprop_string(dt, node, "apple,firmware-uuid", uuid) ||
         dt_t6030_dcpext_enable(alias)) {
         printf("FDT: J514S DCPEXT%u: cannot publish the controller\n", n);
-        return;
+        return -1;
     }
 
     printf("FDT: J514S DCPEXT%u firmware %s handed over\n", n, uuid);
+    return 0;
+}
+
+/* Native handoffs publish a complete dependency group or leave the live DT
+ * byte-for-byte unchanged. No hardware is changed by these callbacks. */
+static int dt_t6030_panel(unsigned int unused)
+{
+    (void)unused;
+    /* The frontend mapping check replaces this with its own result. */
+    snprintf(t6030_display_handoff, sizeof(t6030_display_handoff), "DCP firmware handoff refused");
+    return dt_set_t6030_dcp_handoff();
+}
+
+/* The native path of the matched J514S development DT: the panel, then each external controller. */
+static void dt_set_j514s_native(void)
+{
+    /* The panel step replaces this as it starts. */
+    snprintf(t6030_display_handoff, sizeof(t6030_display_handoff),
+             "no memory for the handoff transaction");
+    if (dt_display_transaction(dt_t6030_panel, 0)) {
+        printf("FDT: J514S native handoff refused; keeping the boot framebuffer\n");
+        /* The refused transaction discarded its edits, its result with them. */
+        int chosen = fdt_path_offset(dt, "/chosen");
+        if (chosen < 0 ||
+            fdt_setprop_string(dt, chosen, "aurora,j514s-display-handoff", t6030_display_handoff))
+            printf("FDT: cannot record the J514S display handoff result\n");
+        return;
+    }
+    for (unsigned int n = 0; n < 2; n++)
+        if (dt_display_transaction(dt_set_t6030_dcpext, n))
+            printf("FDT: J514S DCPEXT%u handoff refused\n", n);
 }
 
 struct j713_display_maps {
@@ -4365,8 +5175,8 @@ static int dt_set_j713_display_maps(const struct adt_segment_ranges *segments, u
 
     /* Exact J713 register block; reading tables must not enable/reset streams. */
     for (u32 n = 0; n < 2; n++) {
-        if (dart_walk_locked_t8110(0x30a300000, streams[n], dram_start, dram_size,
-                                    j713_display_page, &maps[n]))
+        if (dart_walk_locked_t8110(0x30a300000, 0xc000, streams[n], dram_start, dram_size,
+                                   j713_display_page, &maps[n]))
             return -1;
         u32 regions = 0;
         for (u32 i = 0; i < count; i++) {
@@ -4575,23 +5385,37 @@ static int dt_set_display(void)
             return ret;
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6022")) {
         /* noop */
+    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6030") &&
+               !fdt_node_check_compatible(dt, 0, "apple,j514s")) {
+        /* Keep unconditional live-log reservations and the legacy handoff.
+         * Only the matched development DT asks for native consumer enablement. */
+        dt_set_display_handoff(dt);
+        int dcp = fdt_path_offset(dt, "dcp");
+        if (dcp < 0 || !fdt_getprop(dt, dcp, "apple,j514s-native-piodma", NULL))
+            return 0;
+        dt_set_j514s_native();
+        return 0;
+    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6030") ||
+               !fdt_node_check_compatible(dt, 0, "apple,t8122") ||
+               !fdt_node_check_compatible(dt, 0, "apple,t6031")) {
+        /*
+         * Fail-soft handoff (kboot_display_handoff.c): it always returns 0, never uses the
+         * helpers above (they bail out of kboot or enable nodes) and never enables a node.
+         * On T8122 it does nothing unless chosen.asahi,t8122-dcp=1; the external DCP firmware is
+         * reserved only with chosen.asahi,t8122-dcpext=1 and that handoff. On T6031 it does nothing
+         * unless the board is a J514C or J516C, and reserves only __OS_LOG unless
+         * chosen.asahi,t6031-dcp=1.
+         */
+        ret = dt_set_display_handoff(dt);
+        if (!fdt_node_check_compatible(dt, 0, "apple,t8122"))
+            dt_reserve_dcpext_firmware(false);
+        return ret;
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
         ret = dt_carveout_reserved_regions("dcp", "disp0", "disp0_piodma",
                                           disp_reserved_regions_t8142,
                                           ARRAY_SIZE(disp_reserved_regions_t8142));
         if (ret)
             return ret;
-    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6030")) {
-        /*
-         * The running display is adopted as iBoot left it: no display reset, no
-         * framebuffer remapping. A refused handoff keeps the boot framebuffer.
-         */
-        if (dt_set_t6030_dcp_handoff())
-            printf("FDT: J514S DCP handoff not published; keeping the boot framebuffer\n");
-        /* The external controllers run the panel's image: never fatal either. */
-        for (unsigned int n = 0; n < 2; n++)
-            dt_set_t6030_dcpext(n);
-        return 0;
     } else {
         printf("FDT: unknown compatible, skip display reserved-memory setup\n");
         return 0;
@@ -4607,7 +5431,7 @@ static int dt_set_display(void)
         !fdt_node_check_compatible(dt, 0, "apple,t6020") ||
         !fdt_node_check_compatible(dt, 0, "apple,t6021") ||
         !fdt_node_check_compatible(dt, 0, "apple,t6022"))
-        dt_reserve_dcpext_firmware();
+        dt_reserve_dcpext_firmware(true);
 
     const display_config_t *disp_cfg = display_get_config();
 
@@ -4633,8 +5457,67 @@ static bool skip_pmp_prop(const char *prop_name)
     return false;
 }
 
+/* Reads a u32 ADT property only if it is exactly four bytes long. */
+static int adt_get_u32_exact(int node, const char *name, u32 *val)
+{
+    u32 len = 0;
+    const void *p = adt_getprop(adt, node, name, &len);
+
+    if (!p || len != sizeof(*val))
+        return -1;
+    memcpy(val, p, sizeof(*val));
+    return 0;
+}
+
+/*
+ * Copies this Mac's PMP values from the ADT onto the FDT node @pmp_node, for dt_pass_pmp() on
+ * T6030 and T8122. Stricter than dt_set_pmp(), which M1 and M2 Macs with a pmp node take: every
+ * value must be exactly a u32.
+ */
+static int dt_fill_pmp(int pmp_node)
+{
+    int chosen_anode = adt_path_offset(adt, "/chosen");
+    if (chosen_anode < 0)
+        bail("ADT: /chosen not found \n");
+    int pmp_iop_anode = adt_path_offset(adt, "/arm-io/pmp/iop-pmp-nub");
+    if (pmp_iop_anode < 0)
+        bail("ADT: /arm-io/pmp/iop-pmp-nub not found \n");
+
+    u32 board_id, dram_vendor_id, dram_capacity = 0xFFFFFFFF;
+    if (adt_get_u32_exact(chosen_anode, "board-id", &board_id))
+        bail("ADT: failed to get board id\n");
+    if (adt_get_u32_exact(chosen_anode, "dram-vendor-id", &dram_vendor_id))
+        bail("ADT: failed to get dram vendor id\n");
+    if (adt_getprop(adt, pmp_iop_anode, "dram-capacity", NULL) &&
+        adt_get_u32_exact(pmp_iop_anode, "dram-capacity", &dram_capacity))
+        bail("ADT: dram-capacity is not a u32\n");
+
+    if (fdt_setprop_u32(dt, pmp_node, "apple,board-id", board_id))
+        bail("FDT: failed to set board id\n");
+    if (fdt_setprop_u32(dt, pmp_node, "apple,dram-vendor-id", dram_vendor_id))
+        bail("FDT: failed to set dram vendor id\n");
+    if (dram_capacity != 0xFFFFFFFF &&
+        fdt_setprop_u32(dt, pmp_node, "apple,dram-capacity", dram_capacity))
+        bail("FDT: failed to set dram capacity\n");
+
+    ADT_FOREACH_PROPERTY(adt, pmp_iop_anode, prop)
+    {
+        if (skip_pmp_prop(prop->name))
+            continue;
+        char prop_name[128];
+        snprintf(prop_name, sizeof(prop_name), "apple,tunable-%s", prop->name);
+        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
+            bail("FDT: failed to transfer pmp tunable\n");
+    }
+    return 0;
+}
+
+/* The device tree's pmp node (M1 Pro/Max/Ultra, M2, M2 Pro/Max/Ultra): as upstream has it */
 static int dt_set_pmp(void)
 {
+    /* J613 25G83 static topology is enabled only by the kernel handoff gate. */
+    if (chip_id == T8122)
+        return 0;
     int pmp_node = fdt_path_offset(dt, "pmp");
     if (pmp_node < 0) {
         printf("FDT: pmp not found in devtree\n");
@@ -4676,20 +5559,129 @@ static int dt_set_pmp(void)
     return 0;
 }
 
+/*
+ * T6030 and T8122: the kernel's display gate adds the PMP itself, halted until
+ * the display needs it, so the device tree has no pmp node for dt_set_pmp().
+ * The gate needs this Mac's PMP values for it: copy them as dt_set_pmp() does,
+ * into /chosen/asahi,<soc>-pmp, and leave the PMP alone. Only when the PMP and
+ * its DART are where the gate puts them. Fail-soft: without the node the gate
+ * keeps the display on the boot framebuffer, except on a J516S, which has
+ * built-in values.
+ */
+struct pmp_values_soc {
+    const char *compat; /* SoC compatible of the FDT root */
+    const char *node;   /* the /chosen subnode */
+    const char *name;
+    u32 irqs[4];        /* /arm-io/pmp interrupts, in ADT order */
+    u64 dart_addr, dart_size;
+};
+
+static const struct pmp_values_soc pmp_values_t6030 = {
+    "apple,t6030", "asahi,t6030-pmp", "T6030", {731, 730, 733, 732}, 0x350300000, 0x4000,
+};
+
+static const struct pmp_values_soc pmp_values_t8122 = {
+    "apple,t8122", "asahi,t8122-pmp", "T8122", {622, 621, 624, 623}, 0x2d0300000, 0x4000,
+};
+
+static void dt_pass_pmp(const struct pmp_values_soc *soc)
+{
+    int dart_path[8];
+    const void *irqs;
+    u64 dart_addr = 0, dart_size = 0;
+    u32 len = 0;
+    int pmp_anode, chosen, node;
+    bool where;
+    char path[40];
+
+    if (fdt_node_check_compatible(dt, 0, soc->compat) ||
+        (fdt_path_offset(dt, "pmp") >= 0 && chip_id != T8122))
+        return;
+
+    chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0)
+        return;
+    node = fdt_add_subnode(dt, chosen, soc->node);
+    if (node < 0) {
+        printf("FDT: %s PMP values not passed: %d\n", soc->name, node);
+        return;
+    }
+
+    pmp_anode = adt_path_offset(adt, "/arm-io/pmp");
+    irqs = pmp_anode < 0 ? NULL : adt_getprop(adt, pmp_anode, "interrupts", &len);
+    where = irqs && len == sizeof(soc->irqs) && !memcmp(irqs, soc->irqs, sizeof(soc->irqs)) &&
+            adt_path_offset_trace(adt, "/arm-io/dart-pmp", dart_path) >= 0 &&
+            !adt_get_reg(adt, dart_path, "reg", 0, &dart_addr, &dart_size) &&
+            dart_addr == soc->dart_addr && dart_size == soc->dart_size;
+    if (!where) {
+        /* An empty node: the kernel refuses the PMP rather than using built-in values. */
+        printf("FDT: %s PMP is not where the kernel expects it; no PMP values passed\n",
+               soc->name);
+        return;
+    }
+    snprintf(path, sizeof(path), "/chosen/%s", soc->node);
+    if (dt_fill_pmp(node)) {
+        node = fdt_path_offset(dt, path);
+        if (node >= 0)
+            fdt_del_node(dt, node);
+        printf("FDT: %s PMP values not passed\n", soc->name);
+        return;
+    }
+    printf("FDT: %s PMP values passed in %s\n", soc->name, path);
+}
+
+static int dt_set_pmp_t6030(void)
+{
+    dt_pass_pmp(&pmp_values_t6030);
+    return 0;
+}
+
+/* T6031: on every boot of a J514C or J516C; the PMP and its DART are where the kernel puts them */
+static const struct pmp_values_soc pmp_values_t6031 = {
+    "apple,t6031", "asahi,t6031-pmp", "T6031", {1181, 1180, 1183, 1182}, 0x290300000, 0x4000,
+};
+
+static int dt_set_pmp_t6031(void)
+{
+    if (t6031_board(dt))
+        dt_pass_pmp(&pmp_values_t6031);
+    return 0;
+}
+
+/*
+ * T8122: pass this Mac's PMP values on either M3 Air with the display
+ * handoff switch, chosen.asahi,t8122-dcp=1.
+ */
+static int dt_set_pmp_t8122(void)
+{
+    int chosen = fdt_path_offset(dt, "/chosen");
+    int len = 0;
+    const char *opt = chosen < 0 ? NULL : fdt_getprop(dt, chosen, "asahi,t8122-dcp", &len);
+
+    if (!opt || len != 2 || opt[0] != '1' || opt[1] != '\0' ||
+        (fdt_node_check_compatible(dt, 0, "apple,j613") &&
+         fdt_node_check_compatible(dt, 0, "apple,j615")))
+        return 0;
+    dt_pass_pmp(&pmp_values_t8122);
+    return 0;
+}
+
 static int dt_set_sep(void)
 {
-    const char *alias = fdt_get_alias(dt, "sep");
+    int aliases = fdt_path_offset(dt, "/aliases");
+    int alias_len = 0;
+    const char *alias = aliases < 0 ? NULL : fdt_getprop(dt, aliases, "sep", &alias_len);
     if (alias == NULL) {
         printf("FDT: sep alias not found in devtree\n");
         return 0;
     }
 
-    /* fdt_get_alias() points into the FDT, which the reservation below grows. */
+    /* FDT insertion moves properties. Copy the bounded alias before reserving memory. */
     char path[256];
-    size_t path_len = strnlen(alias, sizeof(path));
-    if (path_len == sizeof(path))
-        bail("FDT: sep alias path is too long\n");
-    memcpy(path, alias, path_len + 1);
+    if (alias_len < 2 || alias_len > (int)sizeof(path) || alias[0] != '/' ||
+        memchr(alias, '\0', alias_len) != alias + alias_len - 1)
+        bail("FDT: invalid sep alias path\n");
+    memcpy(path, alias, alias_len);
 
     u64 dram_base = 0, dram_size = 0;
     if (chip_id == T8140) {
@@ -4956,6 +5948,33 @@ static int dt_set_isp_fwdata(void)
     if (ret < 0)
         return ret;
 
+    return 0;
+}
+
+/*
+ * The camera is optional. Without a valid ADT firmware description, or if its firmware or heap
+ * reservation fails, disable the ISP and boot on without it instead of failing the whole handoff.
+ */
+static int dt_set_isp(void)
+{
+    u64 heap_phys, heap_iova, heap_size;
+
+    /* A T8140 ISP that isp_init() did not bring up has no firmware to reserve. */
+    if (chip_id == T8140 && isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
+        if (!dt_set_isp_fwdata())
+            return 0;
+    } else if (!dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false,
+                                        isp_iova_base()) &&
+               !dt_set_isp_fwdata()) {
+        return 0;
+    }
+
+    int node = fdt_path_offset(dt, "isp");
+    if (node < 0)
+        return -1;
+    printf("FDT: ISP firmware or heap not reserved, disabling the ISP\n");
+    if (fdt_setprop_string(dt, node, "status", "disabled") < 0)
+        return -1;
     return 0;
 }
 
@@ -5573,6 +6592,23 @@ int kboot_set_chosen(const char *name, const char *value)
     return i;
 }
 
+void kboot_delete_chosen(const char *name)
+{
+    if (!name)
+        return;
+
+    for (int i = 0; i < MAX_CHOSEN_PARAMS && chosen_params[i][0]; i++) {
+        if (strcmp(name, chosen_params[i][0]))
+            continue;
+        free(chosen_params[i][0]);
+        free(chosen_params[i][1]);
+        memmove(&chosen_params[i], &chosen_params[i + 1],
+                (MAX_CHOSEN_PARAMS - i - 1) * sizeof(chosen_params[0]));
+        memset(&chosen_params[MAX_CHOSEN_PARAMS - 1], 0, sizeof(chosen_params[0]));
+        return;
+    }
+}
+
 int kboot_set_uboot(const char *name, const char *value)
 {
     int i = 0;
@@ -5686,6 +6722,10 @@ static int dt_setup_mtd_phram(void)
 
 int kboot_prepare_dt(void *fdt)
 {
+    if (smp_has_pending_calls()) {
+        next_stage.entry = NULL;
+        bail("FDT: refusing preparation while secondary callbacks are pending\n");
+    }
     if (dt) {
         free(dt);
         dt = NULL;
@@ -5698,6 +6738,18 @@ int kboot_prepare_dt(void *fdt)
     assert(dt_bufsize);
 
     dt_bufsize += 6 * SZ_16K; // Add 96K of buffer for modifications
+    // A T6030 or T8122 also takes its PMP values
+    if (chip_id == T6030 || chip_id == T8122)
+        dt_bufsize += 2 * SZ_16K;
+    // A T8122 also takes its GPU and PMP facts and the display clock description
+    if (chip_id == T8122)
+        dt_bufsize += 8 * SZ_16K;
+    // A T6030 also takes its display ADT facts (at most 46K, headers and strings included)
+    if (chip_id == T6030)
+        dt_bufsize += 4 * SZ_16K;
+    // A T6031 takes its PMP values (32K) and its display, GPU and firmware handoff (about 16K)
+    if (chip_id == T6031)
+        dt_bufsize += 4 * SZ_16K;
     dt = memalign(DT_ALIGN, dt_bufsize);
 
     if (fdt_open_into(fdt, dt, dt_bufsize) < 0)
@@ -5706,7 +6758,27 @@ int kboot_prepare_dt(void *fdt)
     if (fdt_add_mem_rsv(dt, (u64)dt, dt_bufsize))
         bail("FDT: couldn't add reservation for the devtree\n");
 
+    if (dart_reserve_legacy_tables(dt, cur_boot_args.phys_base, cur_boot_args.mem_size))
+        bail("FDT: couldn't reserve inherited display translation tables\n");
+
     u64 image_end = (u64)_end;
+    if (display_dart_tables_inherited()) {
+        /* chainload_image carries the previous stage's live heap in this
+         * high-water mark. Tables that stage published into a locked display
+         * DART's inherited roots have no local record here, so keep the
+         * inherited prefix as well as our own image. This excludes
+         * allocations made by the current stage. A mark below our own base
+         * covers nothing of this image, which then keeps only itself. */
+        u64 inherited = cur_boot_args.top_of_kernel_data;
+        if (!cur_boot_args.mem_size ||
+            cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size)
+            bail("FDT: invalid inherited RAM extent\n");
+        u64 ram_end = cur_boot_args.phys_base + cur_boot_args.mem_size;
+        if ((u64)_base < cur_boot_args.phys_base || image_end > ram_end || inherited > ram_end)
+            bail("FDT: invalid inherited memory extent\n");
+        if (inherited >= (u64)_base)
+            image_end = max(image_end, inherited);
+    }
     /* Both post-M4 storage paths retain firmware buffers in the m1n1 heap. */
     if (chip_id == T8140 ||
         (chip_id == T8132 && !fdt_node_check_compatible(dt, 0, "apple,j713"))) {
@@ -5736,6 +6808,13 @@ int kboot_prepare_dt(void *fdt)
     if (fdt_add_mem_rsv(dt, (u64)_base, image_end - (u64)_base))
         bail("FDT: couldn't add reservation for m1n1 and inherited high-water\n");
 
+    // m1n1 moved itself (start.S). On M3 it moved above the chainloaded image,
+    // and cores with a locked RVBAR still reset into the forwarding vector at
+    // the old base. On T8140 it moved down to the run base stage 1 gave it;
+    // the old base is the staged copy, already inside the extent above.
+    if (relocated_from && fdt_add_mem_rsv(dt, relocated_from, SZ_16K))
+        bail("FDT: couldn't add reservation for m1n1's old reset vector\n");
+
     if (chip_id == T8140) {
         u64 ro_start, ro_end;
         if (memory_fw_ro_range(&ro_start, &ro_end) != 1)
@@ -5759,9 +6838,9 @@ int kboot_prepare_dt(void *fdt)
         printf("FDT: reserved firmware RO [0x%lx, 0x%lx)\n", ro_start, ro_end);
     } else if (!cpu_features->apple_sysregs_unlocked && !in_el2()) {
         /*
-         * A guest under the m1n1 hypervisor runs at EL1 and cannot read the
-         * EL2 CTRR bounds; the host keeps that range and starts no
-         * secondaries for the guest from it.
+         * A guest under the m1n1 hypervisor runs at EL1. The host keeps the
+         * SMP-RO range and starts the guest's CPUs itself, so the guest
+         * leaves it out. This is how the J616s guest boots.
          */
         printf("FDT: running at EL1, leaving the M4+ SMP-RO range to the host\n");
     } else if (!cpu_features->apple_sysregs_unlocked) {
@@ -5769,8 +6848,8 @@ int kboot_prepare_dt(void *fdt)
         // on the secondary (non-boot) cores. Add a reserved-memory region to
         // prevent Linux from crashing when allocating this memory and writing
         // to it from a secondary core.
-        u64 ro_start = mrs(CTRR_M4_LWR_EL2);
-        u64 ro_end = ALIGN_UP(mrs(CTRR_M4_UPR_EL2), SZ_4K);
+        u64 ro_start = mrs(SYS_IMP_APL_CTRR_C_LWR_EL1);
+        u64 ro_end = ALIGN_UP(mrs(SYS_IMP_APL_CTRR_C_UPR_EL1), SZ_4K);
         if (ro_end - ro_start > 12 * SZ_4K)
             printf("WARNING: M4+ SMP-RO is large (48KB)");
         if (fdt_add_mem_rsv(dt, ro_start, ro_end - ro_start))
@@ -5843,11 +6922,7 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_aop_firmware())
         return -1;
-    u64 isp_heap_phys, isp_heap_iova, isp_heap_size;
-    if ((chip_id != T8140 || !isp_get_heap(&isp_heap_phys, &isp_heap_iova, &isp_heap_size)) &&
-        dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false, isp_iova_base()))
-        return -1;
-    if (dt_set_isp_fwdata())
+    if (dt_set_isp())
         return -1;
     if (dt_set_pmgr())
         return -1;
@@ -5877,6 +6952,31 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_memory())
         return -1;
 
+    /* Last, so that its 15K never takes room the steps above need. */
+    if (dt_set_pmp_t6030())
+        return -1;
+
+    /* Optional export goes last so it cannot consume space needed by fixups. */
+    if (chip_id == T8122)
+        dt_gpu_t8122_diagnostics(dt);
+
+    /* After the GPU export, so that one stays as before. */
+    if (chip_id == T8122) {
+        dt_set_pmp_t8122();
+        dt_pmp_t8122_facts(dt);
+    }
+
+    /* Read-only ADT export, last, in its own buffer room. */
+    if (chip_id == T6030)
+        dt_display_facts_t6030(dt);
+
+    /* T6031 (J514C/J516C): this Mac's PMP values and firmware image UUIDs, in their own room. */
+    if (chip_id == T6031) {
+        dt_set_pmp_t6031();
+        dt_t6031_fw_uuids(dt);
+        dt_t6031_facts(dt);
+    }
+
     /* T8140 PCIe status is known only after pcie_init() in kboot_boot(). */
     if (chip_id != T8140 && fdt_pack(dt))
         bail("FDT: fdt_pack() failed\n");
@@ -5903,6 +7003,10 @@ static int dt_disable_j713_pcie(void)
 
 int kboot_boot(void *kernel)
 {
+    if (smp_has_pending_calls()) {
+        next_stage.entry = NULL;
+        bail("kboot: refusing handoff while secondary callbacks are pending\n");
+    }
     int ret = mcc_enable_cache();
     if (ret && chip_id == T8140) {
         printf("kboot: refusing T8140 handoff after MCC cache failure\n");
@@ -5956,30 +7060,14 @@ int kboot_boot(void *kernel)
 
     printf("Setting SMP mode to WFE...\n");
     smp_set_wfe_mode(true);
-    if (chip_id == T8140) {
-        int chosen = fdt_path_offset(dt, "/chosen");
-        if (chosen < 0)
-            return -1;
-        if (fdt_getprop(dt, chosen, "apple,dcp-rtkit-quiesced", NULL)) {
-            bool healthy = dt_t8140_validate_dcp_asc("/arm-io/dcp", "dcp", false);
-            int ext = fdt_node_offset_by_compatible(dt, -1, "apple,t8140-dcpext");
-            const char *status = ext < 0 ? NULL : fdt_getprop(dt, ext, "status", NULL);
-            if (!healthy) {
-                printf("kboot: DCP changed state before handoff; disabling display\n");
-                if (dt_t8140_refuse_display() || fdt_pack(dt))
-                    return -1;
-            } else if (status && !strcmp(status, "okay") &&
-                       (pmgr_power_is_on(0, "DISPEXT0_CPU") != 1 ||
-                        !dt_t8140_validate_dcp_asc("/arm-io/dcpext", "dcpext", true))) {
-                /* The internal panel does not depend on the external DCP. */
-                printf("kboot: DCPEXT changed state before handoff; disabling it\n");
-                if (dt_t8140_disable_dcpext() || fdt_pack(dt))
-                    return -1;
-            }
-        }
-    }
+    if (chip_id == T8140 && dt_t8140_recheck_display())
+        return -1;
     printf("Preparing to boot kernel at %p with fdt at %p\n", kernel, dt);
 
+    if (smp_has_pending_calls()) {
+        next_stage.entry = NULL;
+        bail("kboot: secondary callback became pending before kernel entry\n");
+    }
     next_stage.entry = kernel;
     next_stage.args[0] = (u64)dt;
     next_stage.args[1] = 0;

@@ -67,6 +67,21 @@ u64 isp_iova_base(void)
     }
 }
 
+static int isp_firmware_end(const struct adt_segment_ranges *segments, u32 length, u64 *end)
+{
+    if (!segments || length < 2 * sizeof(*segments) || length % sizeof(*segments))
+        return -1;
+    *end = 0;
+    for (u32 i = 0; i < length / sizeof(*segments); i++) {
+        if (!segments[i].size || segments[i].iova > UINT64_MAX - segments[i].size)
+            return -1;
+        u64 next = segments[i].iova + segments[i].size;
+        if (next > *end)
+            *end = next;
+    }
+    return 0;
+}
+
 int isp_init(void)
 {
     int err = -1;
@@ -100,6 +115,17 @@ int isp_init(void)
     isp_initialized = false;
     if (node < 0 || isp_node < 0)
         return 0;
+
+    if (!t8140) {
+        u32 segments_len = 0;
+        const struct adt_segment_ranges *segments =
+            adt_getprop(adt, isp_node, "segment-ranges", &segments_len);
+        u64 firmware_end;
+        if (isp_firmware_end(segments, segments_len, &firmware_end)) {
+            printf("isp: invalid firmware segment list\n");
+            return -1;
+        }
+    }
 
     powered = !t8140;
     reason = "ISP ADT power gates failed";
@@ -235,6 +261,14 @@ int isp_init(void)
         case ISP_VER_T8122:
             switch (os_firmware.version) {
                 case V14_7:
+                    selected_top = 0x1000000;
+                    break;
+                case V26_6_2:
+                    /* Only T8122 has a qualified heap on this firmware. */
+                    if (ver_rev != ISP_VER_T8122) {
+                        reason = "unsupported firmware";
+                        goto out;
+                    }
                     selected_top = 0x1000000;
                     break;
                 default:

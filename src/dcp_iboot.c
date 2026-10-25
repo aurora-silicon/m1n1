@@ -148,7 +148,9 @@ dcp_iboot_if_t *dcp_ib_init(dcp_dev_t *dcp)
     return iboot;
 
 err_shutdown:
-    afk_epic_shutdown_ep(iboot->epic);
+    /* Callbacks from an endpoint that did not stop can still reach this. */
+    if (afk_epic_shutdown_ep(iboot->epic) < 0)
+        return NULL;
 err_free:
     free(iboot);
     return NULL;
@@ -156,8 +158,9 @@ err_free:
 
 int dcp_ib_shutdown(dcp_iboot_if_t *iboot)
 {
-    afk_epic_shutdown_ep(iboot->epic);
-
+    /* An endpoint that did not stop can still call back into this interface. */
+    if (afk_epic_shutdown_ep(iboot->epic) < 0)
+        return -1;
     free(iboot);
     return 0;
 }
@@ -167,10 +170,9 @@ static int dcp_ib_cmd(dcp_iboot_if_t *iboot, int op, size_t in_size)
     size_t rxsize = RXBUF_LEN;
     /* The 26A428 AFKEPV2 handlers return only transport status for these
      * setters. Supplying a reply buffer makes firmware try to copy an empty
-     * message and assert in AFKEPCommandContext::enqueueResponse. */
-    bool status_only = afk_epic_is_v2(iboot->epic) &&
-                       (op == IBOOT_SET_POWER || op == IBOOT_SET_MODE ||
-                        op == IBOOT_SET_SURFACE);
+     * message and assert while queueing the response. */
+    bool setter = op == IBOOT_SET_POWER || op == IBOOT_SET_MODE || op == IBOOT_SET_SURFACE;
+    bool status_only = afk_epic_is_v2(iboot->epic) && setter;
     assert(in_size <= TXBUF_LEN - sizeof(struct txcmd));
 
     iboot->txcmd.op = op;
@@ -183,6 +185,13 @@ static int dcp_ib_cmd(dcp_iboot_if_t *iboot, int op, size_t in_size)
     if (ret)
         return ret;
     if (status_only)
+        return 0;
+    /* AFKEPV1 setters can also answer with transport status alone. J293
+     * SET_POWER was observed replying with no bytes at all. SET_MODE and
+     * SET_SURFACE carry no reply payload either (by the iBoot command
+     * contract), so their empty reply is admitted the same way; a non-empty
+     * reply must still be a well-formed header. */
+    if (setter && !rxsize)
         return 0;
     if (rxsize < sizeof(struct rxcmd) || iboot->rxcmd.len < sizeof(struct rxcmd) ||
         iboot->rxcmd.len > rxsize) {

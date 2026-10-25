@@ -19,8 +19,10 @@ def refusal_binary(tmp_path):
     source = (ROOT / "src/kboot.c").read_text()
     iommu = source[source.index("static int dt_get_iommu_node("):
                    source.index("static dart_dev_t *dt_init_dart_by_node(")]
-    helpers = source[source.index("static int dt_t8140_disable_refs("):
-                     source.index("/* A bounded observation of register descriptions")]
+    handed = source[source.index("/* A display DART is published only"):
+                    source.index("static bool dt_t8140_node_enabled(")]
+    helpers = handed + source[source.index("static int dt_t8140_disable_refs("):
+                     source.index("/* Validate roles before metadata export")]
     harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -156,6 +158,8 @@ static void setup(void)
         string(darts[i], "compatible", "apple,t8140-dart");
         cell(darts[i], "#iommu-cells", 1);
         string(darts[i], "status", i < 2 ? "okay" : "disabled");
+        /* Reservation marks every display DART before publication. */
+        cell(darts[i], "apple,firmware-root-handoff", 1);
     }
     iommu("/soc/dcp", 3, 23);
     add("/soc/dcp", "piodma", 0);

@@ -18,6 +18,84 @@ extern "C" fn adt_get_size() -> u32 {
     unsafe { ADT_SIZE }
 }
 
+fn property(blob: &mut Vec<u8>, name: &str, value: &[u8]) {
+    let start = blob.len();
+    blob.resize(start + 36, 0);
+    blob[start..start + name.len()].copy_from_slice(name.as_bytes());
+    blob[start + 32..start + 36].copy_from_slice(&(value.len() as u32).to_le_bytes());
+    blob.extend_from_slice(value);
+    while blob.len() % 4 != 0 {
+        blob.push(0);
+    }
+}
+
+fn register_paths() {
+    let mut blob = Vec::new();
+    let mut offsets = [0i32; 8];
+    for depth in 0..=8 {
+        if depth > 0 {
+            offsets[depth - 1] = blob.len() as i32;
+        }
+        blob.extend_from_slice(&4u32.to_le_bytes());
+        blob.extend_from_slice(&u32::from(depth < 8).to_le_bytes());
+        property(&mut blob, "name", b"node\0");
+        property(&mut blob, "#address-cells", &1u32.to_le_bytes());
+        property(&mut blob, "#size-cells", &1u32.to_le_bytes());
+        let (addr, size): (u32, u32) = if depth == 8 {
+            (0x8000, 0x800)
+        } else {
+            (0x1000, 0x100)
+        };
+        let mut reg = addr.to_le_bytes().to_vec();
+        reg.extend_from_slice(&size.to_le_bytes());
+        property(&mut blob, "reg", &reg);
+    }
+    let reg = CString::new("reg").unwrap();
+    let mut addr = 0;
+    let mut size = 0;
+    unsafe {
+        adt = blob.as_ptr().cast();
+        ADT_SIZE = blob.len() as u32;
+        // A full eight-node path has no terminator inside the C ABI array.
+        assert_eq!(
+            parser::adt_get_reg(
+                adt,
+                offsets.as_mut_ptr(),
+                reg.as_ptr(),
+                0,
+                &mut addr,
+                &mut size
+            ),
+            0
+        );
+        assert_eq!((addr, size), (0x8000, 0x800));
+        offsets[1..].fill(0);
+        assert_eq!(
+            parser::adt_get_reg(
+                adt,
+                offsets.as_mut_ptr(),
+                reg.as_ptr(),
+                0,
+                &mut addr,
+                &mut size
+            ),
+            0
+        );
+        assert_eq!((addr, size), (0x1000, 0x100));
+        assert_eq!(
+            parser::adt_get_reg(
+                adt,
+                offsets.as_mut_ptr(),
+                reg.as_ptr(),
+                1,
+                &mut addr,
+                &mut size
+            ),
+            -15
+        );
+    }
+}
+
 fn main() {
     let mut blob = vec![0u8; 344];
     blob[0..4].copy_from_slice(&1u32.to_le_bytes());
@@ -30,15 +108,115 @@ fn main() {
         adt = blob.as_ptr().cast();
         ADT_SIZE = blob.len() as u32;
 
-        assert_eq!(parser::adt_getprop_copy(adt, 0, name.as_ptr(), out.as_mut_ptr().cast(), 299), -20);
+        assert_eq!(
+            parser::adt_getprop_copy(adt, 0, name.as_ptr(), out.as_mut_ptr().cast(), 299),
+            -20
+        );
         assert!(out.iter().all(|&byte| byte == 0xa5));
-        assert_eq!(parser::adt_getprop_copy(adt, 0, name.as_ptr(), out.as_mut_ptr().cast(), 300), 300);
+        assert_eq!(
+            parser::adt_getprop_copy(adt, 0, name.as_ptr(), out.as_mut_ptr().cast(), 300),
+            300
+        );
         assert!(out.iter().all(|&byte| byte == 0));
 
         blob[40..44].copy_from_slice(&301u32.to_le_bytes());
-        assert_eq!(parser::adt_getprop_copy(adt, 0, name.as_ptr(), out.as_mut_ptr().cast(), 300), -4);
-        assert_eq!(parser::adt_getprop_copy(adt, -1, name.as_ptr(), out.as_mut_ptr().cast(), 300), -4);
+        assert_eq!(
+            parser::adt_getprop_copy(adt, 0, name.as_ptr(), out.as_mut_ptr().cast(), 300),
+            -4
+        );
+        assert_eq!(
+            parser::adt_getprop_copy(adt, -1, name.as_ptr(), out.as_mut_ptr().cast(), 300),
+            -4
+        );
         assert_eq!(parser::adt_first_child_offset(adt, -1), -4);
         assert_eq!(parser::adt_next_sibling_offset(adt, -1), -4);
+
+        let reg = CString::new("reg").unwrap();
+        let mut path = [0i32; 8];
+        let mut addr = 0xa5a5u64;
+        let mut size = 0x5a5au64;
+        assert_eq!(
+            parser::adt_get_reg(
+                adt,
+                path.as_mut_ptr(),
+                reg.as_ptr(),
+                0,
+                &mut addr,
+                &mut size
+            ),
+            -4
+        );
+        path[0] = -1;
+        assert_eq!(
+            parser::adt_get_reg(
+                adt,
+                path.as_mut_ptr(),
+                reg.as_ptr(),
+                0,
+                &mut addr,
+                &mut size
+            ),
+            -4
+        );
+        path[0] = i32::MAX;
+        assert_eq!(
+            parser::adt_get_reg(
+                adt,
+                path.as_mut_ptr(),
+                reg.as_ptr(),
+                0,
+                &mut addr,
+                &mut size
+            ),
+            -4
+        );
+        assert_eq!(
+            parser::adt_get_reg(
+                adt,
+                path.as_mut_ptr(),
+                reg.as_ptr(),
+                -1,
+                &mut addr,
+                &mut size
+            ),
+            -15
+        );
+        assert_eq!(
+            parser::adt_get_reg(
+                adt,
+                std::ptr::null_mut(),
+                reg.as_ptr(),
+                0,
+                &mut addr,
+                &mut size
+            ),
+            -15
+        );
+        assert_eq!((addr, size), (0xa5a5, 0x5a5a));
+        assert_eq!(
+            parser::adt_get_reg(
+                adt,
+                path.as_mut_ptr(),
+                std::ptr::null(),
+                0,
+                &mut addr,
+                &mut size
+            ),
+            -15
+        );
+        let invalid_name = [0xffu8, 0];
+        assert_eq!(
+            parser::adt_get_reg(
+                adt,
+                path.as_mut_ptr(),
+                invalid_name.as_ptr().cast(),
+                0,
+                &mut addr,
+                &mut size
+            ),
+            -15
+        );
+        assert_eq!((addr, size), (0xa5a5, 0x5a5a));
     }
+    register_paths();
 }

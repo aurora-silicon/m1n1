@@ -58,3 +58,8 @@ void usb_cdc_recovery_attempted(struct usb_cdc_recovery *recovery, u64 now_ms)
     else
         recovery->deadline_ms = now_ms + 2000;
 }
+
+bool usb_cdc_dma_may_release(bool active, int end_status, bool reset_complete)
+{
+    return !active || end_status == 0 || reset_complete;
+}

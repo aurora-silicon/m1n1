@@ -30,7 +30,10 @@ void usb_dwc3_ss_flush(dwc3_ss_dev_t *dev, cdc_acm_pipe_id_t pipe);
 
 struct dwc3_dev {
     bool superspeed;
-    union { dwc3_hs_dev_t *hs; dwc3_ss_dev_t *ss; } engine;
+    union {
+        dwc3_hs_dev_t *hs;
+        dwc3_ss_dev_t *ss;
+    } engine;
 };
 
 dwc3_dev_t *usb_dwc3_init_mode(uintptr_t regs, dart_dev_t *dart, bool superspeed)

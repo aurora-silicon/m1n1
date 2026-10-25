@@ -1073,9 +1073,13 @@ pub unsafe extern "C" fn adt_get_reg(
     paddr: *mut u64,
     psize: *mut u64,
 ) -> c_int {
-    let strname: &str = unsafe { CStr::from_ptr(prop).to_str().unwrap() };
-    let o: &[i32];
-    let mut n_offs: usize = 0;
+    if offsets.is_null() || prop.is_null() || i < 0 {
+        return AdtError::BadValue as c_int;
+    }
+    let strname = match unsafe { CStr::from_ptr(prop) }.to_str() {
+        Ok(name) => name,
+        Err(_) => return AdtError::BadValue as c_int,
+    };
     let mut refs: [Option<&'static ADTNode>; ADT_MAX_DEPTH] = [None; ADT_MAX_DEPTH];
 
     unsafe {
@@ -1085,13 +1089,21 @@ pub unsafe extern "C" fn adt_get_reg(
             return AdtError::BadOffset as c_int;
         }
 
-        while *offsets.add(n_offs) != 0 {
-            n_offs += 1;
-        }
-
-        o = core::slice::from_raw_parts_mut(offsets, n_offs);
-        for (i, &offset) in o.iter().enumerate() {
-            refs[i] = Some(ADTNode::from_ptr(adt.add(offset as usize) as *const ADTNode).unwrap());
+        // The C path ABI has at most eight entries; shorter paths end in zero.
+        // Bound the scan; an unbounded i32 sentinel scan can also be lowered
+        // to libc wcslen by LLVM, which is unavailable in this freestanding image.
+        for (depth, slot) in refs.iter_mut().enumerate() {
+            let offset = *offsets.add(depth);
+            if offset == 0 {
+                break;
+            }
+            if offset < 0 {
+                return AdtError::BadOffset as c_int;
+            }
+            *slot = match ADTNode::from_ptr(adt.wrapping_add(offset as usize) as *const ADTNode) {
+                Ok(node) => Some(node),
+                Err(e) => return e as c_int,
+            };
         }
     }
 

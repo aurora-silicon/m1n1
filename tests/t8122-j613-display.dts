@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: MIT
+/*
+ * Host-test fixture: the J613 (MacBook Air 13" M3) internal display nodes, in the shape of the
+ * Aurora kernel's arch/arm64/boot/dts/apple/t8122-dcp.dtsi (release/12.3-prep): the DCP mailbox,
+ * the dcp and disp0 DARTs, the DCP with its piodma child and the display subsystem, all disabled,
+ * plus the root, alias and reserved-memory nodes the handoff and the kernel look up. Nothing else
+ * of the board is here. tests/run-t8122-display-handoff.sh compiles it with dtc; set J613_DTB to
+ * a kernel-built t8122-j613.dtb to run the same checks on the real device tree.
+ */
+
+/dts-v1/;
+
+/ {
+	compatible = "apple,j613", "apple,t8122", "apple,arm-platform";
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	aliases {
+		dcp = &dcp;
+		disp0 = &display;
+		disp0-piodma = &disp0_piodma;
+		disp0_piodma = &disp0_piodma;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		aic: interrupt-controller@2d0000000 {
+			compatible = "apple,t8122-aic", "apple,aic2";
+			#interrupt-cells = <3>;
+			interrupt-controller;
+			reg = <0x2 0xd0000000 0x0 0x180000>;
+		};
+
+		ps_disp_cpu: power-controller@10000 {
+			compatible = "apple,t8122-pmgr-pwrstate", "apple,pmgr-pwrstate";
+			reg = <0x0 0x10000 0x0 0x8>;
+			#power-domain-cells = <0>;
+			label = "disp_cpu";
+		};
+
+		dcp_mbox: mailbox@28ec08000 {
+			compatible = "apple,t8122-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x2 0x8ec08000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <0 537 4>, <0 538 4>, <0 539 4>, <0 540 4>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			power-domains = <&ps_disp_cpu>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		dcp_dart: iommu@28d30c000 {
+			compatible = "apple,t8122-dart", "apple,t8110-dart";
+			reg = <0x2 0x8d30c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <0 557 4>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+			status = "disabled";
+		};
+
+		disp0_dart: iommu@28d304000 {
+			compatible = "apple,t8122-dart", "apple,t8110-dart";
+			reg = <0x2 0x8d304000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <0 557 4>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+			status = "disabled";
+		};
+
+		dcp: dcp@28ec00000 {
+			compatible = "apple,t8122-dcp";
+			mboxes = <&dcp_mbox>;
+			mbox-names = "mbox";
+			iommus = <&dcp_dart 5>;
+			reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3",
+				    "disp-4", "disp-5", "iop-vbar";
+			reg = <0x2 0x8ec00000 0x0 0x4000>,
+			      <0x2 0x8c000000 0x0 0x690000>,
+			      <0x2 0x8c800000 0x0 0x690000>,
+			      <0x2 0x8d320000 0x0 0x4000>,
+			      <0x2 0x8d344000 0x0 0x4000>,
+			      <0x2 0x8e800000 0x0 0x800000>,
+			      <0x2 0xd03d0000 0x0 0x4000>,
+			      <0x2 0x8e850000 0x0 0x4000>;
+			power-domains = <&ps_disp_cpu>;
+			#address-cells = <2>;
+			#size-cells = <2>;
+			status = "disabled";
+
+			disp0_piodma: piodma {
+				iommus = <&disp0_dart 4>;
+			};
+		};
+
+		display: display-subsystem {
+			compatible = "apple,t8122-display-subsystem";
+			iommus = <&disp0_dart 0>;
+			status = "disabled";
+		};
+	};
+};

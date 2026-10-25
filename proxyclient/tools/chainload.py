@@ -27,6 +27,8 @@ from m1n1.setup import *
 from m1n1.tgtypes import BootArgs_r1, BootArgs_r2, BootArgs_r3
 from m1n1.macho import MachO
 from m1n1 import asm
+from m1n1.bootmem import BOOT_BLOBS, find_boot_blobs, copy_boot_blobs
+from construct import Array, Int64ul
 
 new_base = u.base
 
@@ -45,18 +47,14 @@ else:
 if args.quiet:
     p.iodev_set_usage(IODEV.FB, 0)
 
-sepfw_start, sepfw_length = 0, 0
-preoslog_start, preoslog_size = 0, 0
-
-if not args.no_sepfw:
-    sepfw_start, sepfw_length = u.adt["chosen"]["memory-map"].SEPFW
-    if hasattr(u.adt["chosen"]["memory-map"], "preoslog"):
-        preoslog_start, preoslog_size = u.adt["chosen"]["memory-map"].preoslog
+if args.no_sepfw:
+    blob_names = tuple(name for name in BOOT_BLOBS if name != "SEPFW")
+else:
+    blob_names = BOOT_BLOBS
 
 image_only_size = align(len(image))
-sepfw_off = 0
-preoslog_off = align(sepfw_length)
-bootargs_off = preoslog_off + align(preoslog_size)
+# The boot blobs and the boot args form the firmware block, packed after the image or parked.
+blobs, bootargs_off = find_boot_blobs(u.adt["chosen"]["memory-map"]._properties, blob_names, 0)
 bootargs_size = 0x4000
 fw_size = bootargs_off + bootargs_size
 packed_end = new_base + image_only_size + fw_size
@@ -69,8 +67,8 @@ if ram_end > (1 << 64) or packed_end > ram_end or u.ba.top_of_kernel_data >= ram
 
 ro_start = ro_end = 0
 if p.get_chipid() == 0x8140:
-    ro_start = u.mrs("CTRR_M4_LWR_EL2")
-    upper = u.mrs("CTRR_M4_UPR_EL2")
+    ro_start = u.mrs("CTRR_C_LWR_EL2")
+    upper = u.mrs("CTRR_C_UPR_EL2")
     ro_end = upper + 0x1000
     if ((ro_start | upper) & 0xfff or ro_end - ro_start != 0xc000 or
             not (u.ba.phys_base <= ro_start < ro_end <= ram_end) or
@@ -103,21 +101,18 @@ if not image_addr:
     raise MemoryError("No aligned staging block")
 fw_stage = fw_dest if park_fw else image_addr + image_only_size
 
+copy_boot_blobs(p, [(name, src, size, fw_stage + off) for name, src, size, off in blobs])
+
 print(f"Loading kernel image (0x{len(image):x} bytes)...")
 u.compressed_writemem(image_addr, image, True)
 p.dc_cvac(image_addr, len(image))
 
-if not args.no_sepfw:
-    print(f"Copying SEPFW (0x{sepfw_length:x} bytes)...")
-    p.memcpy8(fw_stage + sepfw_off, sepfw_start, sepfw_length)
-    print(f"Adjusting addresses in ADT...")
-    u.adt["chosen"]["memory-map"].SEPFW = (fw_dest + sepfw_off, sepfw_length)
-    u.adt["chosen"]["memory-map"].BootArgs = (fw_dest + bootargs_off, bootargs_size)
-    if hasattr(u.adt["chosen"]["memory-map"], "preoslog"):
-        p.memcpy8(fw_stage + preoslog_off, preoslog_start, preoslog_size)
-        u.adt["chosen"]["memory-map"].preoslog = (fw_dest + preoslog_off, preoslog_size)
-else:
-    u.adt["chosen"]["memory-map"].BootArgs = (fw_dest + bootargs_off, bootargs_size)
+print("Adjusting addresses in ADT...")
+for name, src, size, off in blobs:
+    mm = u.adt["chosen"]["memory-map"]
+    mm._properties[name] = (fw_dest + off, size)
+    mm._types[name] = (Array(2, Int64ul), False)
+u.adt["chosen"]["memory-map"].BootArgs = (fw_dest + bootargs_off, bootargs_size)
 
 if args.xnu:
     def remove_oslog(node):

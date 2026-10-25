@@ -3,8 +3,8 @@
 #include "../build/build_cfg.h"
 
 #include "usb.h"
-#include "boot_options.h"
 #include "adt.h"
+#include "boot_options.h"
 #include "dart.h"
 #include "i2c.h"
 #include "iodev.h"
@@ -332,8 +332,7 @@ void usb_init(void)
     /* This PHY requires a deferred carrier transition; normal boots never
      * enter this fallback path before handing over to the OS. */
     if (chip_id == T8140) {
-        if (!usb_cdc_ready() && !usb_cdc_owns_carrier() &&
-            usb_cdc_schedule(0, 0, BIT(1) | BIT(2)))
+        if (!usb_cdc_ready() && !usb_cdc_owns_carrier() && usb_cdc_schedule(0, 0, BIT(1) | BIT(2)))
             printf("usb: unable to schedule proxy transport\n");
         return;
     }

@@ -9,7 +9,8 @@
 #include <string.h>
 #include <libfdt.h>
 typedef uint32_t u32;
-static unsigned char blob[32768], before[32768];
+/* libfdt requires an eight-byte-aligned blob on every host compiler. */
+_Alignas(8) static unsigned char blob[32768], before[32768];
 static void *dt = blob;
 static size_t dt_bufsize = sizeof(blob);
 static int fail_write, writes;

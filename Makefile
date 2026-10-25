@@ -38,8 +38,9 @@ ARCH ?= aarch64-linux-gnu-
 endif
 
 ifeq ($(USE_CLANG),1)
-CC := $(TOOLCHAIN)clang --target=$(ARCH)
-AS := $(TOOLCHAIN)clang --target=$(ARCH)
+CLANG_TARGET := $(if $(ARCH),--target=$(ARCH))
+CC := $(TOOLCHAIN)clang $(CLANG_TARGET)
+AS := $(TOOLCHAIN)clang $(CLANG_TARGET)
 LD := $(LLDDIR)ld.lld
 OBJCOPY := $(TOOLCHAIN)llvm-objcopy
 CLANG_FORMAT ?= $(TOOLCHAIN)clang-format
@@ -75,6 +76,12 @@ BASE_CFLAGS := -O2 -Wall -g -Wundef -Werror=strict-prototypes -fno-common -fno-P
 CFLAGS := $(BASE_CFLAGS) -mgeneral-regs-only
 
 CFG :=
+ifeq ($(J613_ESP_STAGE1),1)
+ifneq ($(CHAINLOADING),1)
+$(error J613_ESP_STAGE1 requires CHAINLOADING=1)
+endif
+CFG += J613_ESP_STAGE1
+endif
 ifeq ($(RELEASE),1)
 CFG += RELEASE
 endif
@@ -180,8 +187,9 @@ OBJECTS := \
 	iodev.o \
 	iova.o \
 	isp.o \
-	kboot.o kboot_atc.o \
+	kboot.o kboot_atc.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp_t8122.o \
 	kboot_t6020_compat.o \
+	kboot_display_handoff.o kboot_display_facts.o kboot_gpu26.o kboot_gpu_t6031.o kboot_t6031.o \
 	main.o boot_options.o \
 	mitigations.o \
 	mcc.o \
@@ -239,9 +247,9 @@ all: build/$(TARGET) build/$(TARGET_RAW)
 clean:
 	rm -rf build/* build/.deps
 format:
-	$(CLANG_FORMAT) -i src/*.c src/chickens/*.c src/dcp/*.c src/hv/*.c src/math/*.c src/*.h src/dcp/*.h src/hv/*.h src/math/*.h sysinc/*.h
+	$(CLANG_FORMAT) -i src/*.c src/*.inc src/chickens/*.c src/dcp/*.c src/hv/*.c src/math/*.c src/*.h src/dcp/*.h src/hv/*.h src/math/*.h sysinc/*.h
 format-check:
-	$(CLANG_FORMAT) --dry-run --Werror src/*.c src/chickens/*.c src/dcp/*.c src/hv/*.c src/math/*.c src/*.h src/dcp/*.h src/hv/*.h src/math/*.h sysinc/*.h
+	$(CLANG_FORMAT) --dry-run --Werror src/*.c src/*.inc src/chickens/*.c src/dcp/*.c src/hv/*.c src/math/*.c src/*.h src/dcp/*.h src/hv/*.h src/math/*.h sysinc/*.h
 rustfmt:
 	cd rust && cargo fmt
 rustfmt-check:
@@ -254,7 +262,7 @@ build/$(RUST_LIB): src/../build/build_cfg.h rust/src/*.rs rust/src/gpu/*.rs rust
 	$(QUIET)cargo build $(CARGO_FLAGS) --target $(RUSTARCH) --lib --release --manifest-path rust/Cargo.toml --target-dir build
 	$(QUIET)cp "build/$(RUSTARCH)/release/${RUST_LIB}" "$@"
 
-build/%.o: src/%.S
+build/%.o: src/%.S src/../build/build_cfg.h
 	$(QUIET)echo "  AS    $@"
 	$(QUIET)mkdir -p $(DEPDIR)
 	$(QUIET)mkdir -p "$(dir $@)"
@@ -316,6 +324,32 @@ build-cfg src/../build/build_cfg.h &:
 	$(QUIET)echo "#define BUILTIN_LOGO $(BUILTIN_LOGO)" >> build/build_cfg.tmp
 	$(QUIET)cmp -s build/build_cfg.h build/build_cfg.tmp 2>/dev/null || \
 	( mv -f build/build_cfg.tmp build/build_cfg.h && echo "  CFG   build/build_cfg.h" )
+
+# The built-in boot logos are linked gzip-compressed; fb.c inflates them on first use.
+# They are only read, so they go in .rodata: its 64 KiB alignment padding has room for them,
+# while .data counts towards the file part limit in m1n1-raw.ld.
+LOGO_OBJCOPY_FLAGS := --rename-section .data=.rodata,alloc,load,readonly,data,contents
+build/bootlogo_%.bin.gz: data/bootlogo_%.bin
+	$(QUIET)echo "  GZIP  $@"
+	$(QUIET)mkdir -p "$(dir $@)"
+	$(QUIET)gzip -9 -n -c $< > $@
+
+build/bootlogo_%.o: build/bootlogo_%.bin.gz
+	$(QUIET)echo "  BIN   $@"
+	$(QUIET)mkdir -p "$(dir $@)"
+	$(QUIET)$(OBJCOPY) -I binary -B aarch64 -O elf64-littleaarch64 $(LOGO_OBJCOPY_FLAGS) $< $@
+
+ifneq ($(BUILTIN_LOGO),bootlogo)
+build/$(BUILTIN_LOGO)_%.bin.gz: data/$(BUILTIN_LOGO)_%.bin
+	$(QUIET)echo "  GZIP  $@"
+	$(QUIET)mkdir -p "$(dir $@)"
+	$(QUIET)gzip -9 -n -c $< > $@
+
+build/$(BUILTIN_LOGO)_%.o: build/$(BUILTIN_LOGO)_%.bin.gz
+	$(QUIET)echo "  BIN   $@"
+	$(QUIET)mkdir -p "$(dir $@)"
+	$(QUIET)$(OBJCOPY) -I binary -B aarch64 -O elf64-littleaarch64 $(LOGO_OBJCOPY_FLAGS) $< $@
+endif
 
 build/%.bin: data/%.bin
 	$(QUIET)echo "  IMG   $@"

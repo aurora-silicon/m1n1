@@ -142,13 +142,24 @@ static bool smp_old_vector_owned(u64 locked)
     return false;
 }
 
+extern u64 relocated_from;
+
+/* Where a core whose RVBAR is locked to the pre-move base enters (start.S) */
+static u64 old_vectors_start(void)
+{
+    return relocated_from ? relocated_from + ((u64)_vectors_start - (u64)_base) : 0;
+}
+
 static int smp_prepare_rvbar(const struct cpu_info *cpu)
 {
     u64 rvbar = read64(cpu->impl_reg);
     u64 locked = rvbar & RVBAR_ADDR;
     u64 target = (u64)_vectors_start;
 
-    if (locked == target || (!(rvbar & RVBAR_LOCK) && cpu_features->apple_sysregs_unlocked))
+    if (locked == target || cpu_features->apple_sysregs_unlocked)
+        return 0;
+    /* A stage that moved above the chainloaded image keeps entry at its old base. */
+    if (relocated_from && locked == old_vectors_start())
         return 0;
     if (chip_id != T8140 || !(rvbar & RVBAR_LOCK)) {
         printf("SMP: RVBAR 0x%lx differs from vector 0x%lx; refusing start\n", locked, target);
@@ -309,7 +320,7 @@ static int smp_start_cpu(int index, const struct cpu_info *cpu)
 {
     int i;
 
-    if (index >= MAX_CPUS)
+    if (index < 0 || index >= MAX_CPUS)
         return -1;
 
     if (has_el3() && index >= MAX_EL3_CPUS)
@@ -580,6 +591,7 @@ int smp_init(void)
             cpu_start_off = CPU_START_OFF_T8112;
             break;
         case T6031:
+        case T6032:
         case T6034:
         case T6040:
         case T6041:
@@ -779,9 +791,7 @@ int smp_start_secondaries(void)
             failed = true;
     }
 
-    if (chip_id == T8140 && failed)
-        return -1;
-    return 0;
+    return failed ? -1 : 0;
 }
 
 int smp_stop_secondaries(bool deep_sleep)
@@ -872,6 +882,10 @@ int smp_wait_timed(int cpu, u64 *retval, u32 timeout_ms)
     while (target->target) {
         sysop("dmb sy");
         if (ticks_to_msecs(get_ticks() - started) >= timeout_ms) {
+            /* A call that completed by the deadline is complete. */
+            sysop("dmb sy");
+            if (!target->target)
+                break;
             printf("SMP: CPU %d call did not complete\n", cpu);
             return SMP_TIMEOUT;
         }
@@ -885,6 +899,34 @@ int smp_wait(int cpu, u64 *retval)
 {
     u64 ignored;
     return smp_wait_timed(cpu, retval ? retval : &ignored, 300000);
+}
+
+int smp_call_sync0(int cpu, void *func)
+{
+    /*
+     * These setup callbacks contain no device waits. Give slow completion a conservative
+     * margin after the ACK window, without inheriting the general wait's five-minute bound.
+     */
+    const u32 join_ms = 5000;
+    u64 ignored;
+    int dispatched = smp_call4(cpu, func, 0, 0, 0, 0);
+    /* A busy slot can still contain an older callback, so join it too. */
+    int joined = smp_wait_timed(cpu, &ignored, join_ms);
+    if (joined)
+        return joined;
+    /* A missed ACK is harmless only after observing actual completion. */
+    return dispatched == SMP_TIMEOUT ? 0 : dispatched;
+}
+
+bool smp_has_pending_calls(void)
+{
+    sysop("dmb sy");
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (spin_table[cpu].target)
+            return true;
+    }
+    sysop("dmb sy");
+    return false;
 }
 
 void smp_set_wfe_mode(bool new_mode)

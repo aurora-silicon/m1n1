@@ -7,6 +7,7 @@
 
 int cpufreq_init(void);
 void cpufreq_fixup(void);
+void cpufreq_payload_boost(bool enable);
 
 /* Explicit firmware requests; get reports the command state's ADT frequency. */
 u64 cpufreq_get_cluster_hz(unsigned int cluster);

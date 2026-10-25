@@ -702,7 +702,9 @@ dcp_dptx_if_t *dcp_dptx_init(dcp_dev_t *dcp, u32 num_dptxports)
     return dptx;
 
 err_shutdown:
-    afk_epic_shutdown_ep(dptx->epic);
+    /* Callbacks from an endpoint that did not stop can still reach this. */
+    if (afk_epic_shutdown_ep(dptx->epic) < 0)
+        return NULL;
 err_free:
     free(dptx);
     return NULL;
@@ -710,9 +712,11 @@ err_free:
 
 int dcp_dptx_shutdown(dcp_dptx_if_t *dptx)
 {
-    if (dptx) {
-        afk_epic_shutdown_ep(dptx->epic);
-        free(dptx);
-    }
+    if (!dptx)
+        return 0;
+    /* An endpoint that did not stop can still call back into this interface. */
+    if (afk_epic_shutdown_ep(dptx->epic) < 0)
+        return -1;
+    free(dptx);
     return 0;
 }

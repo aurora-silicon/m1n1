@@ -11,8 +11,8 @@ def test_j713_atc_usb3_bundle_and_atomic_rejection(tmp_path):
     definitions = source[source.index("struct atc_tunable {"):source.index("struct atc_fuse_info {")]
     table = source[source.index("static const struct adt_tunable_info atc_tunables_t8132_usb3[]"):
                    source.index("static const struct adt_tunable_info atc_tunables_t8130[]")]
-    append = source[source.index("static int dt_append_atc_tunable("):
-                    source.index("/* J700's DP lists")]
+    start = source.index("static int dt_append_atc_tunable(")
+    append = source[start:source.index("\n}", start) + 2] + "\n"
     copy = source[source.index("static void dt_copy_t8132_usb3_tunables("):
                   source.index("static void dt_copy_atc_tunables(")]
     fixture = json.loads((repo / "tests/data/j713-atc-usb3.json").read_text())
@@ -171,6 +171,12 @@ int main(void)
         cfile = tmp_path / f"j713-atc-{port}.c"
         binary = tmp_path / f"j713-atc-{port}"
         cfile.write_text(harness)
-        subprocess.run(["cc", "-Wall", "-Werror", "-Wno-unused-function", "-I",
-                        str(repo / "src/libfdt"), str(cfile), "-lfdt", "-o", str(binary)], check=True)
+        # Link the in-tree libfdt rather than a host-installed one.
+        libfdt = repo / "src/libfdt"
+        sources = [str(libfdt / name) for name in (
+            "fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_sw.c", "fdt_wip.c", "fdt_empty_tree.c",
+            "fdt_strerror.c",
+        )]
+        subprocess.run(["cc", "-D_GNU_SOURCE", "-Wall", "-Werror", "-Wno-unused-function", "-I",
+                        str(libfdt), str(cfile), *sources, "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True, capture_output=True)

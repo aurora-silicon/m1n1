@@ -3,10 +3,10 @@
 #include "../build/build_cfg.h"
 
 #include "boot_options.h"
-#include "usb_cdc.h"
 #include "string.h"
 #include "tps6598x.h"
 #include "usb.h"
+#include "usb_cdc.h"
 #include "usb_cdc_state.h"
 #include "utils.h"
 #include "wdt.h"
@@ -49,8 +49,7 @@ int usb_cdc_schedule(u32 delay_ms, u32 reserved, u32 flags)
         return -1;
     if (chip_id != T8140)
         return -1;
-    int ret = usb_cdc_state_schedule(&cdc, delay_ms, reserved, flags,
-                                     ticks_to_msecs(get_ticks()));
+    int ret = usb_cdc_state_schedule(&cdc, delay_ms, reserved, flags, ticks_to_msecs(get_ticks()));
     if (!ret && usb_cdc_arm_watchdog()) {
         cdc.state = USB_CDC_IDLE;
         return -1;

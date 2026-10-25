@@ -2,9 +2,13 @@ name: test
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, integration/aurora, integration/neo ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, integration/aurora, integration/neo ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -30,13 +34,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: '3.9'
+          python-version: '3.13'
 
       - name: Install python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest
+          pip install pytest==9.1.1
 
       - name: Install arm64 GCC cross-compiler
         if: matrix.compiler == 'gcc'
@@ -59,8 +63,31 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'llvm'
         env:
           USE_CLANG: '1'
-        run: PATH="$(llvm-config --prefix)/bin:$PATH" pytest
+        run: PATH="$(llvm-config --prefix)/bin:$PATH" pytest tests/python tests/test_t8122_gpu_reader.py tests/test_t8122_gpu_resources.py
 
       - name: Run pytest without clang
         if: matrix.compiler != 'llvm'
-        run: pytest
+        run: pytest tests/python tests/test_t8122_gpu_reader.py tests/test_t8122_gpu_resources.py
+
+  arm64-native:
+    name: Pytest (ubuntu-24.04-arm, native start.S)
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Install pytest
+        run: pip install pytest==9.1.1
+
+      # These run production start.S instructions natively and skip on every other runner
+      - name: Run native arm64 tests
+        run: |
+          set -o pipefail
+          pytest -v -rs tests/python/test_start_run_base.py | tee pytest.log
+          grep -q "test_start_moves_to_run_base PASSED" pytest.log

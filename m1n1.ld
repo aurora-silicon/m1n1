@@ -155,6 +155,9 @@ SECTIONS {
         *(.rela.rodata*)
         *(.rela.dyn)
         _rela_end = .;
+        /* The load header's footprint (start.S) leaves an R_AARCH64_NONE here; keep it inside the
+         * padding and out of the range apply_rela() walks, which only accepts relative entries. */
+        *(.rela.init)
         . = ALIGN(0x10000);
     } :rodata
     _rodata_end = .;
@@ -264,3 +267,6 @@ PROT_WRITE = 0x02;
 PROT_EXECUTE = 0x04;
 
 _va_off = _va_base - _base;
+
+/* Bytes from _base to _end, for the load header (start.S) */
+_image_footprint = ABSOLUTE(_end - _base);

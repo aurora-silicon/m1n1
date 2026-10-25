@@ -656,7 +656,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = display_configure((char *)request->args[0]);
             break;
         case P_DISPLAY_SHUTDOWN:
-            display_shutdown(request->args[0]);
+            reply->retval = display_shutdown(request->args[0]);
             break;
         case P_DISPLAY_START_DCP:
             display_start_dcp();

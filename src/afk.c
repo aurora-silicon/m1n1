@@ -647,7 +647,7 @@ static int afkv2_copy_response(afk_epic_ep_t *epic, void *payload, size_t size,
 }
 
 /* Until the native PHY callbacks are implemented, complete peer commands with
- * kIOReturnUnsupported. AFKEPCommandLocal accepts an empty response; for OOB
+ * kIOReturnUnsupported. The firmware accepts an empty response; for OOB
  * commands retain the descriptor addresses but return zero bytes. Never map or
  * dereference a firmware-supplied address merely to reject an operation. */
 static int afkv2_reject_command(afk_epic_ep_t *epic, const struct afkv2_hdr *hdr,
@@ -781,7 +781,7 @@ static int afkv2_command(afk_epic_ep_t *epic, int channel, u16 type, void *txbuf
             return -1;
         }
         /* Firmware supplies its own token/timestamp in responses. Correlate
-         * by interface, subtype and command ID, as AFKEPInterfaceV2 does. */
+         * by interface, subtype and command ID, as the firmware's V2 interface does. */
         if (hdr->interface == channel && msg->category == AFKV2_RESPONSE &&
             msg->type == type) {
             ret = afkv2_copy_response(epic, payload, size, packet.cmd.id, rxbuf, rxsize);
@@ -1004,8 +1004,12 @@ int afk_epic_shutdown_ep(afk_epic_ep_t *epic)
 
     while (epic->started) {
         int ret = afk_epic_poll(epic->afk, epic->ep, true);
-        if (ret < 0)
-            break;
+        if (ret < 0) {
+            /* A timeout does not show that the firmware stopped using the
+             * rings: keep them, and the endpoint, for the caller to refuse. */
+            printf("EPIC: endpoint 0x%x did not stop; keeping its buffers\n", epic->ep);
+            return -1;
+        }
     }
 
     rtkit_free_buffer(epic->afk->rtk, &epic->buf);
@@ -1238,10 +1242,15 @@ afk_epic_t *afk_epic_init(rtkit_dev_t *rtkit)
 
 int afk_epic_shutdown(afk_epic_t *afk)
 {
+    int ret = 0;
 
     for (int i = 0; i < 0x10; i++)
-        if (afk->endpoint[i])
-            afk_epic_shutdown_ep(afk->endpoint[i]);
+        if (afk->endpoint[i] && afk_epic_shutdown_ep(afk->endpoint[i]) < 0)
+            ret = -1;
+
+    /* An endpoint that did not stop still refers to the context. */
+    if (ret < 0)
+        return ret;
 
     free(afk);
 

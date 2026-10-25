@@ -2,11 +2,12 @@
 
 from pathlib import Path
 import subprocess
+import os
 
 
 def test_t8140_pcie_nodes_disabled(tmp_path):
     repo = Path(__file__).resolve().parents[2]
-    source = (repo / "src/kboot.c").read_text()
+    source = Path(os.environ.get("PCIE_FDT_SOURCE", repo / "src/kboot.c")).read_text()
     start = source.index("static int dt_add_pcie_iommu(")
     end = source.index("static int dt_get_iommu_node(", start)
     helper = source[start:end]
@@ -67,6 +68,13 @@ int main(void)
     add_node(fdt_path_offset(dt, "/iommu@390000000"), "piodma@1");
     add_node(0, "iommu@391000000");
     add_node(0, "iommu@other");
+    add_node(0, "piodma-diagnostic@0");
+    assert(fdt_setprop_string(dt, fdt_path_offset(dt, "/piodma-diagnostic@0"),
+                              "compatible", "apple,t8140-piodma-diagnostic") == 0);
+    assert(fdt_setprop_string(dt, fdt_path_offset(dt, "/piodma-diagnostic@0"),
+                              "status", "okay") == 0);
+    assert(fdt_setprop_string(dt, fdt_path_offset(dt, "/pcie@1/piodma@0"),
+                              "compatible", "apple,t8140-pcie-piodma") == 0);
     set_node("/serial@0", "serial");
     set_node("/pcie@1", "pci");
     set_node("/pcie@1/port@0", "pci");
@@ -102,6 +110,7 @@ int main(void)
     expect_status("/iommu@391000000", "disabled");
     expect_status("/iommu@other", "okay");
     expect_status("/serial@0", "okay");
+    expect_status("/piodma-diagnostic@0", "disabled");
     assert(fdt_pack(dt) == 0);
     assert(fdt_check_header(dt) == 0);
 

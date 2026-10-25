@@ -189,8 +189,19 @@ static int pmgr_validate_parents(u16 id, u16 *ancestors, size_t depth)
     const struct pmgr_device *device;
     u16 parents[2];
 
-    if (depth >= PMGR_MAX_PARENT_DEPTH || pmgr_find_device(id, &device))
+    if (depth >= PMGR_MAX_PARENT_DEPTH)
         return -1;
+    if (pmgr_find_device(id, &device)) {
+        /*
+         * Apple's tables name parents they do not list: C0-USBCTL-V's parent 81 on
+         * base M1, and ISP_CPU_CORE0/1's parent 176 on base M3. As in upstream m1n1, a
+         * missing parent only fails a request that has to power it, not the whole table.
+         */
+        if (!depth)
+            return -1;
+        printf("pmgr: ignoring parent %u, which the ADT does not list\n", id);
+        return 0;
+    }
     for (size_t i = 0; i < depth; i++) {
         if (ancestors[i] == id)
             return -1;
@@ -280,6 +291,31 @@ static int pmgr_set_mode_recursive_inner(u8 die, u16 id, u8 target_mode, bool re
     }
 
     return 0;
+}
+
+static int pmgr_device_is_off_recursive(u8 die, u16 id, unsigned int depth)
+{
+    const struct pmgr_device *device;
+
+    if (!pmgr_initialized || !id || depth > 16 || pmgr_find_device(id, &device))
+        return -1;
+    if (!(device->flags & PMGR_FLAG_VIRTUAL)) {
+        uintptr_t addr = pmgr_device_get_addr(die, device);
+        if (!addr)
+            return -1;
+        if (FIELD_GET(PMGR_PS_ACTUAL, read32(addr)) != PMGR_PS_PWRGATE)
+            return 0;
+    }
+    u16 parents[2];
+    pmgr_adt_get_parents(device, parents);
+    for (int i = 0; i < 2; i++) {
+        if (!parents[i])
+            continue;
+        int ret = pmgr_device_is_off_recursive(die, parents[i], depth + 1);
+        if (ret != 1)
+            return ret;
+    }
+    return 1;
 }
 
 static int pmgr_set_mode_recursive(u8 die, u16 id, u8 target_mode, bool recurse, bool trace)
@@ -436,6 +472,28 @@ int pmgr_adt_power_enable_traced(const char *path)
     return pmgr_adt_devices_set_mode(path, PMGR_PS_ACTIVE, true, true);
 }
 
+int pmgr_adt_power_disable_recursive(const char *path)
+{
+    return pmgr_adt_devices_set_mode(path, PMGR_PS_PWRGATE, true, false);
+}
+
+int pmgr_adt_power_is_off(const char *path)
+{
+    const u32 *devices;
+    u32 n_devices;
+
+    if (pmgr_adt_find_devices(path, &devices, &n_devices) < 0)
+        return -1;
+    for (u32 i = 0; i < n_devices; i++) {
+        u16 device = FIELD_GET(PMGR_DEVICE_ID, devices[i]);
+        u8 die = FIELD_GET(PMGR_DIE_ID, devices[i]);
+        int ret = pmgr_device_is_off_recursive(die, device, 0);
+        if (ret != 1)
+            return ret;
+    }
+    return 1;
+}
+
 int pmgr_adt_power_enable_index(const char *path, u32 index)
 {
     int ret = pmgr_adt_device_set_mode(path, index, PMGR_PS_ACTIVE, true);
@@ -484,6 +542,59 @@ int pmgr_adt_is_powered(const char *path)
     }
 
     return 1;
+}
+
+static void pmgr_gate_fill(u8 die, u16 id, struct pmgr_gate *gate)
+{
+    const struct pmgr_device *device;
+
+    gate->id = id;
+    gate->die = die;
+    gate->found = id && !pmgr_find_device(id, &device);
+    gate->virt = false;
+    gate->name = NULL;
+    gate->psreg = 0;
+    gate->parent[0] = gate->parent[1] = 0;
+    if (!gate->found)
+        return;
+    gate->name = device->name;
+    gate->virt = device->flags & PMGR_FLAG_VIRTUAL;
+    pmgr_adt_get_parents(device, gate->parent);
+    if (!gate->virt)
+        gate->psreg = pmgr_device_get_addr(die, device);
+}
+
+/*
+ * Read only, ADT only: entry `index` of the clock-gates or power-gates list `prop` of the ADT node
+ * at `path`, resolved through the ADT's PMGR table. Returns -1 past the last entry, without that
+ * list, or before pmgr_init(); 0 otherwise, also for an entry that is not a PMGR device.
+ */
+int pmgr_adt_gate(const char *path, const char *prop, u32 index, struct pmgr_gate *gate)
+{
+    u32 len = 0, entry;
+
+    if (!pmgr_initialized)
+        return -1;
+    int node = adt_path_offset(adt, path);
+    if (node < 0)
+        return -1;
+    const u32 *entries = adt_getprop(adt, node, prop, &len);
+    if (!entries || index >= len / 4)
+        return -1;
+    memcpy(&entry, &entries[index], sizeof(entry));
+    gate->entry = entry;
+    pmgr_gate_fill(FIELD_GET(PMGR_DIE_ID, entry), FIELD_GET(PMGR_DEVICE_ID, entry), gate);
+    return 0;
+}
+
+/* Read only, ADT only: PMGR device `id` on `die`, such as a parent of another one */
+int pmgr_device_gate(u8 die, u16 id, struct pmgr_gate *gate)
+{
+    if (!pmgr_initialized || !id)
+        return -1;
+    gate->entry = FIELD_PREP(PMGR_DIE_ID, die) | id;
+    pmgr_gate_fill(die, id, gate);
+    return 0;
 }
 
 static int pmgr_reset_device(int die, const struct pmgr_device *dev)

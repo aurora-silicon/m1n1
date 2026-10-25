@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "hv.h"
+#include "adt.h"
 #include "assert.h"
 #include "cpu_regs.h"
 #include "display.h"
@@ -34,6 +35,65 @@ bool hv_started_cpus[MAX_CPUS];
 u64 hv_cpus_in_guest;
 u64 hv_saved_sp[MAX_CPUS];
 
+static u64 hv_cpu_state_regs[MAX_CPUS];
+
+static bool hv_cpu_state_access(struct exc_info *ctx, u64 ipa, u64 *val, bool write, int width)
+{
+    if (1 << width != 4)
+        return false;
+    if (write)
+        return hv_pa_rw(ctx, ipa, val, write, width);
+
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        u64 base = hv_cpu_state_regs[cpu];
+        if (!base)
+            continue;
+        if (ipa != base)
+            continue;
+
+        /* Clear out the lower byte when the core hasn't been started by the guest yet */
+        if (!hv_pa_rw(ctx, ipa, val, write, width))
+            return false;
+        if (!hv_started_cpus[cpu])
+            *val &= ~0xffUL;
+        return true;
+    }
+
+    return false;
+}
+
+static bool hv_cpu_state_setup_hook(void)
+{
+    int node;
+
+    memset(hv_cpu_state_regs, 0, sizeof(hv_cpu_state_regs));
+
+    node = adt_path_offset(adt, "/cpus");
+    if (node < 0)
+        return false;
+
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        u32 cpu;
+        u64 reg[2];
+
+        if (ADT_GETPROP(adt, node, "cpu-id", &cpu) != sizeof(cpu))
+            return false;
+        if (ADT_GETPROP_ARRAY(adt, node, "cpu-impl-reg", reg) != sizeof(reg))
+            return false;
+
+        hv_cpu_state_regs[cpu] = reg[0] + 0x100;
+        if (hv_map_hook(hv_cpu_state_regs[cpu], hv_cpu_state_access, 8) < 0)
+            return false;
+    }
+
+    sysop("dsb ishst");
+    sysop("tlbi vmalls12e1is");
+    sysop("dsb ish");
+    sysop("isb");
+    return true;
+}
+
 struct hv_secondary_info_t {
     uint64_t hcr;
     uint64_t hacr;
@@ -54,6 +114,17 @@ struct hv_secondary_info_t {
 static struct hv_secondary_info_t hv_secondary_info;
 static u64 hv_secondary_regs[MAX_CPUS][4];
 static bool hv_shutdown_failed;
+static bool hv_setup_pending[MAX_CPUS];
+
+static void hv_enable_sme_zt0(void)
+{
+    u64 sme = FIELD_GET(ID_AA64PFR1_SME, mrs(SYS_ID_AA64PFR1_EL1));
+    if (sme != ID_AA64PFR1_SME2)
+        return;
+
+    /* Don't trap SME instructions to EL2 */
+    reg_set(SYS_SMCR_EL2, SMCR_EZT0);
+}
 
 static int hv_join_cpus(void)
 {
@@ -72,7 +143,7 @@ static int hv_join_cpus(void)
         if (i == boot_cpu_idx)
             continue;
         spin_lock(&bhl);
-        bool started = hv_started_cpus[i];
+        bool started = hv_started_cpus[i] || hv_setup_pending[i];
         spin_unlock(&bhl);
         if (!started)
             continue;
@@ -83,6 +154,7 @@ static int hv_join_cpus(void)
         } else {
             spin_lock(&bhl);
             hv_started_cpus[i] = false;
+            hv_setup_pending[i] = false;
             spin_unlock(&bhl);
         }
     }
@@ -141,6 +213,8 @@ int hv_init(void)
     if (cpu_features->apple_sysregs_unlocked)
         reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK, CYC_OVRD_WFI_MODE(0));
 
+    hv_enable_sme_zt0();
+
     sysop("dsb ishst");
     sysop("tlbi alle1is");
     sysop("dsb ish");
@@ -164,6 +238,11 @@ int hv_start(void *entry, u64 regs[4])
         /* A host may already have started a new watchdog. Cleanup stops it,
          * so do not enter a new guest in this same request. */
         printf("HV: previous session required cleanup; retry guest initialization\n");
+        return -1;
+    }
+
+    if (!hv_cpu_state_setup_hook()) {
+        printf("CPU state hook setup failed, can't start the hypervisor\n");
         return -1;
     }
 
@@ -262,6 +341,8 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     if (cpu_features->apple_sysregs_unlocked)
         reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK, CYC_OVRD_WFI_MODE(0));
 
+    hv_enable_sme_zt0();
+
     // For M3 and up, CNTHCTL_EL2 must be written after the counter redirection
     sysop("isb");
     msr(CNTHCTL_EL2, info->cnthctl);
@@ -288,14 +369,23 @@ static void hv_enter_secondary(void *entry, u64 regs[4])
 
 int hv_start_secondary(int cpu, void *entry, u64 regs[4])
 {
+    if (cpu < 0 || cpu >= MAX_CPUS || cpu == boot_cpu_idx || !regs || hv_shutdown_failed)
+        return -1;
+
     printf("HV: Initializing secondary %d\n", cpu);
     iodev_console_flush();
 
-    if (mmu_init_secondary(cpu))
-        return -1;
+    hv_setup_pending[cpu] = true;
+    int ret = mmu_init_secondary(cpu);
+    if (ret)
+        goto setup_failed;
     iodev_console_flush();
-    if (smp_call4(cpu, hv_init_secondary, (u64)&hv_secondary_info, 0, 0, 0) || smp_wait(cpu, NULL))
-        return -1;
+    ret = smp_call4(cpu, hv_init_secondary, (u64)&hv_secondary_info, 0, 0, 0);
+    if (!ret)
+        ret = smp_wait(cpu, NULL);
+    if (ret)
+        goto setup_failed;
+    hv_setup_pending[cpu] = false;
     iodev_console_flush();
 
     printf("HV: Entering guest secondary %d at %p\n", cpu, entry);
@@ -306,11 +396,20 @@ int hv_start_secondary(int cpu, void *entry, u64 regs[4])
     iodev_console_flush();
     /* An acknowledgement timeout can still have a late guest entry. Retain
      * the guest CPU state so exit waits for it instead of declaring it gone. */
-    int ret = smp_call4(cpu, hv_enter_secondary, (u64)entry, (u64)hv_secondary_regs[cpu], 0, 0);
-    if (ret && ret != SMP_TIMEOUT) {
+    ret = smp_call4(cpu, hv_enter_secondary, (u64)entry, (u64)hv_secondary_regs[cpu], 0, 0);
+    if (ret == SMP_TIMEOUT)
+        hv_shutdown_failed = true;
+    else if (ret) {
         hv_started_cpus[cpu] = false;
         __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(cpu), __ATOMIC_ACQUIRE);
     }
+    return ret;
+
+setup_failed:
+    if (ret == SMP_TIMEOUT)
+        hv_shutdown_failed = true;
+    else
+        hv_setup_pending[cpu] = false;
     return ret;
 }
 

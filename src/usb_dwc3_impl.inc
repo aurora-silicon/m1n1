@@ -10,7 +10,6 @@
 #include "../build/build_cfg.h"
 #include "../build/build_tag.h"
 
-#include "usb_dwc3.h"
 #include "adt.h"
 #include "dart.h"
 #include "malloc.h"
@@ -24,6 +23,7 @@
 #include "usb_cdc_ss_desc.h"
 #include "usb_cdc_ss_regs.h"
 #include "usb_cdc_state.h"
+#include "usb_dwc3.h"
 #include "usb_dwc3_regs.h"
 #include "usb_types.h"
 #include "utils.h"
@@ -476,8 +476,8 @@ static int usb_dwc3_end_transfer(dwc3_dev_t *dev, u8 ep)
     write32(dev->regs + DWC3_DEPCMDPAR1(ep), 0);
     write32(dev->regs + DWC3_DEPCMDPAR2(ep), 0);
     write32(dev->regs + DWC3_DEPCMD(ep), DWC3_DEPCMD_ENDTRANSFER |
-                                              DWC3_DEPCMD_PARAM(dev->endpoints[ep].resource_index) |
-                                              DWC3_DEPCMD_CMDACT);
+                                             DWC3_DEPCMD_PARAM(dev->endpoints[ep].resource_index) |
+                                             DWC3_DEPCMD_CMDACT);
     mdelay(1);
     if (phy & DWC3_GUSB2PHYCFG_SUSPHY)
         set32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_SUSPHY);
@@ -611,8 +611,7 @@ static int usb_dwc3_start_status_phase(dwc3_dev_t *dev, u8 ep)
     uintptr_t trb_iova = usb_dwc3_init_trb(dev, ep, &trb);
 
 #if USB_DWC3_SUPERSPEED
-    trb->ctrl |= dev->ep0_three_stage ? DWC3_TRBCTL_CONTROL_STATUS3
-                                      : DWC3_TRBCTL_CONTROL_STATUS2;
+    trb->ctrl |= dev->ep0_three_stage ? DWC3_TRBCTL_CONTROL_STATUS3 : DWC3_TRBCTL_CONTROL_STATUS2;
 #else
     trb->ctrl |= DWC3_TRBCTL_CONTROL_STATUS2;
 #endif
@@ -691,7 +690,7 @@ static void usb_dwc3_close_pipe(dwc3_dev_t *dev, int pipe)
         u8 ep = endpoints[i];
         if (dev->endpoints[ep].xfer_in_progress) {
             int status = usb_dwc3_end_transfer(dev, ep);
-            if (status) {
+            if (!usb_cdc_dma_may_release(true, status, false)) {
                 usb_dwc3_fail_session(dev);
                 return;
             }
@@ -711,8 +710,8 @@ static int usb_dwc3_configure_cdc_endpoints(dwc3_dev_t *dev)
 {
     /* DEPSTARTCFG(2) discards the old non-control transfer resources. The
      * databook requires a fresh configuration for each SET_CONFIGURATION. */
-    if (usb_dwc3_ep_command(dev, USB_LEP_CTRL_OUT,
-                            DWC3_DEPCMD_DEPSTARTCFG | DWC3_DEPCMD_PARAM(2), 0, 0, 0))
+    if (usb_dwc3_ep_command(dev, USB_LEP_CTRL_OUT, DWC3_DEPCMD_DEPSTARTCFG | DWC3_DEPCMD_PARAM(2),
+                            0, 0, 0))
         return -1;
 
     for (int i = 0; i < CDC_ACM_PIPE_MAX; i++) {
@@ -868,9 +867,8 @@ static void usb_dwc3_ep0_handle_standard_device(dwc3_dev_t *dev,
                 case 1:
 #if USB_DWC3_SUPERSPEED
                     if (dev->cdc_reconfigure) {
-                        write32(dev->regs + DWC3_DALEPENA,
-                                DWC3_DALEPENA_EP(USB_LEP_CTRL_OUT) |
-                                    DWC3_DALEPENA_EP(USB_LEP_CTRL_IN));
+                        write32(dev->regs + DWC3_DALEPENA, DWC3_DALEPENA_EP(USB_LEP_CTRL_OUT) |
+                                                               DWC3_DALEPENA_EP(USB_LEP_CTRL_IN));
                         for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
                             usb_dwc3_close_pipe(dev, i);
                         if (dev->failed || usb_dwc3_configure_cdc_endpoints(dev)) {
@@ -1029,10 +1027,11 @@ static void usb_dwc3_ep0_handle_class(dwc3_dev_t *dev, const union usb_setup_pac
             if (setup->raw.wValue & 1) { // DTR
                 usb_debug_printf("ACM device opened\n");
                 dev->pipe[pipe].ready = true;
+                if (pipe == CDC_ACM_PIPE_0) {
 #if USB_DWC3_SUPERSPEED
-                if (pipe == CDC_ACM_PIPE_0)
                     dev->primary_dtr_pending = true;
 #endif
+                }
             } else {
                 usb_debug_printf("ACM device closed\n");
             }
@@ -1232,6 +1231,8 @@ static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number
 {
     if (!usb_dwc3_trb_available(dev, endpoint_number))
         return;
+    if (dev->endpoints[endpoint_number].xfer_in_progress)
+        return;
 
     if ((endpoint_number == USB_LEP_CDC_BULK_OUT && !dev->pipe[0].ready) ||
         (endpoint_number == USB_LEP_CDC_BULK_OUT_2 && !dev->pipe[1].ready))
@@ -1253,6 +1254,8 @@ static void usb_dwc3_cdc_start_bulk_out_xfer(dwc3_dev_t *dev, u8 endpoint_number
 static void usb_dwc3_cdc_start_bulk_in_xfer(dwc3_dev_t *dev, u8 endpoint_number)
 {
     if (!usb_dwc3_trb_available(dev, endpoint_number))
+        return;
+    if (dev->endpoints[endpoint_number].xfer_in_progress)
         return;
 
     if ((endpoint_number == USB_LEP_CDC_BULK_IN && !dev->pipe[0].ready) ||
@@ -1467,7 +1470,7 @@ static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev, bool rearm_setup)
     for (int i = 2; i < MAX_ENDPOINTS; ++i) {
         if (dev->endpoints[i].xfer_in_progress) {
             int status = usb_dwc3_end_transfer(dev, i);
-            if (status) {
+            if (!usb_cdc_dma_may_release(true, status, false)) {
                 usb_debug_printf("ENDTRANSFER failed for EP %d on reset\n", i);
                 dev->reset_in_progress = false;
                 usb_dwc3_fail_session(dev);
@@ -1496,13 +1499,11 @@ static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev, bool rearm_setup)
 
     /* A live SETUP TRB is already the required post-reset EP0 state. Never
      * clear it or its buffer after a nested event has advanced control. */
-    if (!dev->ep0_progressed_during_reset &&
-        dev->ep0_state != USB_DWC3_EP0_STATE_SETUP_HANDLE) {
+    if (!dev->ep0_progressed_during_reset && dev->ep0_state != USB_DWC3_EP0_STATE_SETUP_HANDLE) {
         bool data_phase = dev->ep0_state == USB_DWC3_EP0_STATE_DATA_SEND_DONE ||
                           dev->ep0_state == USB_DWC3_EP0_STATE_DATA_RECV_DONE;
         for (int i = 0; i <= USB_LEP_CTRL_IN; i++) {
-            if (data_phase && dev->endpoints[i].xfer_in_progress &&
-                usb_dwc3_end_transfer(dev, i)) {
+            if (data_phase && dev->endpoints[i].xfer_in_progress && usb_dwc3_end_transfer(dev, i)) {
                 dev->reset_in_progress = false;
                 usb_dwc3_fail_session(dev);
                 return;
@@ -1513,8 +1514,7 @@ static void usb_dwc3_handle_event_usbrst(dwc3_dev_t *dev, bool rearm_setup)
             dev->endpoints[i].resource_index = 0;
         }
     }
-    if (!dev->ep0_progressed_during_reset &&
-        !dev->endpoints[USB_LEP_CTRL_OUT].xfer_in_progress &&
+    if (!dev->ep0_progressed_during_reset && !dev->endpoints[USB_LEP_CTRL_OUT].xfer_in_progress &&
         !dev->endpoints[USB_LEP_CTRL_IN].xfer_in_progress) {
         dev->ep0_state = USB_DWC3_EP0_STATE_IDLE;
         if (rearm_setup && !usb_dwc3_start_setup_phase(dev))
@@ -1616,8 +1616,10 @@ static int usb_dwc3_reannounce(dwc3_dev_t *dev)
         return -1;
     }
     /* A successful controller reset retires all DMA before state is cleared. */
-    for (int i = 0; i < MAX_ENDPOINTS; i++)
-        dev->endpoints[i].xfer_in_progress = false;
+    for (int i = 0; i < MAX_ENDPOINTS; i++) {
+        if (usb_cdc_dma_may_release(dev->endpoints[i].xfer_in_progress, -1, true))
+            dev->endpoints[i].xfer_in_progress = false;
+    }
     usb_dwc3_handle_event_usbrst(dev, false);
     clear32(dev->regs + DWC3_GUSB2PHYCFG(0), DWC3_GUSB2PHYCFG_SUSPHY);
     clear32(dev->regs + DWC3_GUSB3PIPECTL(0), DWC3_GUSB3PIPECTL_SUSPHY);

@@ -1,10 +1,11 @@
 """Inject dispatch/completion failures into production SMP and its callers."""
 
 from pathlib import Path
+import os
 import subprocess
 
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(os.environ.get("M1N1_SMP_SOURCE", Path(__file__).resolve().parents[2]))
 
 
 def compile_and_run(tmp_path, name, source):
@@ -38,12 +39,13 @@ static int boot_cpu_idx;
 static bool wfe_mode = true;
 static u64 ticks;
 static bool complete;
+static u64 complete_after;
 static u64 callback_result;
 static void smp_send_ipi(int cpu) {}
 static u64 get_ticks(void)
 {
     ticks += 1000;
-    if (complete && spin_table[1].target) {
+    if (complete && ticks >= complete_after && spin_table[1].target) {
         spin_table[1].flag++;
         spin_table[1].retval = callback_result;
         spin_table[1].target = 0;
@@ -84,6 +86,33 @@ int main(void)
     assert(smp_call4(1, callback, 1, 2, 3, 4) == 0);
     assert(smp_wait(1, &result) == 0 && result == 0);
     assert(smp_wait(1, NULL) == 0);
+    assert(!smp_has_pending_calls());
+    complete_after = 4000;
+    ticks = 0;
+    assert(smp_call_sync0(1, callback) == 0); /* ACK times out; completion is joined. */
+    assert(!smp_has_pending_calls() && !spin_table[1].target);
+
+    complete = false;
+    assert(smp_call_sync0(1, callback) == SMP_TIMEOUT);
+    assert(smp_has_pending_calls());
+    pending = spin_table[1];
+    assert(smp_call_sync0(1, callback) == SMP_TIMEOUT); /* Busy and still pending. */
+    assert(!memcmp(&pending, &spin_table[1], sizeof(pending)));
+    complete = true;
+    complete_after = 0;
+    assert(smp_call_sync0(1, callback) == -1); /* Busy request joined, not dispatched. */
+    assert(!smp_has_pending_calls());
+
+    /* The 1 s ACK and 5 s join stay bounded; fake reads advance by 1 s. */
+    complete = false;
+    ticks = 0;
+    assert(smp_call_sync0(1, callback) == SMP_TIMEOUT);
+    assert(ticks <= 9000);
+    /* It still completes later, and is joined then. */
+    complete = true;
+    complete_after = 0;
+    assert(smp_wait(1, &result) == 0);
+    assert(!smp_has_pending_calls());
     return 0;
 }
 '''
@@ -91,6 +120,8 @@ int main(void)
 
 
 def test_internal_callers_stop_on_failure(tmp_path):
+    smp = (REPO / "src/smp.c").read_text()
+    sync = smp[smp.index("int smp_call_sync0("):smp.index("bool smp_has_pending_calls(")]
     memory = (REPO / "src/memory.c").read_text()
     mmu = memory[memory.index("int mmu_init_secondary("):memory.index("void mmu_shutdown(")]
     mitigation = (REPO / "src/mitigations.c").read_text()
@@ -106,6 +137,7 @@ def test_internal_callers_stop_on_failure(tmp_path):
 #include <stdio.h>
 #include <string.h>
 typedef uint64_t u64;
+typedef uint32_t u32;
 #define MAX_CPUS 4
 #define SMP_TIMEOUT -2
 #define BIT(n) (1ULL << (n))
@@ -116,7 +148,7 @@ typedef uint64_t u64;
 #define smp_call0(cpu, fn) smp_call4(cpu, fn, 0, 0, 0, 0)
 static int calls, waits, fail_call, fail_wait, dispatch_error = -1;
 static int boot_cpu_idx;
-static bool hv_started_cpus[MAX_CPUS];
+static bool hv_started_cpus[MAX_CPUS], hv_setup_pending[MAX_CPUS], hv_shutdown_failed;
 static u64 hv_cpus_in_guest;
 static int hv_secondary_info;
 static u64 hv_secondary_regs[MAX_CPUS][4];
@@ -142,12 +174,17 @@ static int smp_call4(int cpu, void *fn, u64 a, u64 b, u64 c, u64 d)
 }
 static int smp_wait(int cpu, u64 *result)
 { return ++waits == fail_wait ? SMP_TIMEOUT : 0; }
-''' + mmu + mitigation + hv + watchdog + r'''
+/* Setup calls keep a five-second join, not smp_wait()'s minutes. */
+static int smp_wait_timed(int cpu, u64 *result, u32 timeout_ms)
+{ assert(timeout_ms == 5000); return smp_wait(cpu, result); }
+''' + mmu + sync + mitigation + hv + watchdog + r'''
 static void reset(void)
 {
     calls = waits = fail_call = fail_wait = 0;
     dispatch_error = -1;
     memset(hv_started_cpus, 0, sizeof(hv_started_cpus));
+    memset(hv_setup_pending, 0, sizeof(hv_setup_pending));
+    hv_shutdown_failed = false;
     hv_cpus_in_guest = 0;
     hv_wdt_active = hv_wdt_enabled = hv_wdt_join_pending = false;
 }
@@ -161,9 +198,9 @@ int main(void)
     assert(mmu_init_secondary(1) == 0);
 
     reset(); fail_call = 1;
-    assert(mitigations_perform() == -1 && waits == 0);
+    assert(mitigations_perform() == -1 && waits == 1);
     reset(); fail_wait = 1;
-    assert(mitigations_perform() == -1);
+    assert(mitigations_perform() == SMP_TIMEOUT);
     reset();
     assert(mitigations_perform() == 0);
 
@@ -174,7 +211,8 @@ int main(void)
         assert(!hv_started_cpus[1] && !hv_cpus_in_guest);
         assert(calls == phase && waits == phase - 1);
         reset(); fail_wait = phase;
-        assert(hv_start_secondary(1, (void *)1, regs) == -1);
+        assert(hv_start_secondary(1, (void *)1, regs) == SMP_TIMEOUT);
+        assert(hv_setup_pending[1] && hv_shutdown_failed);
         assert(!hv_started_cpus[1] && !hv_cpus_in_guest && calls == phase);
     }
     reset();
@@ -182,7 +220,7 @@ int main(void)
     assert(hv_started_cpus[1] && hv_cpus_in_guest == BIT(1));
     reset(); fail_call = 3; dispatch_error = SMP_TIMEOUT;
     assert(hv_start_secondary(1, (void *)1, regs) == SMP_TIMEOUT);
-    assert(hv_started_cpus[1] && hv_cpus_in_guest == BIT(1));
+    assert(hv_started_cpus[1] && hv_cpus_in_guest == BIT(1) && hv_shutdown_failed);
     assert(queued_regs != regs && !memcmp(queued_regs, regs, sizeof(regs)));
     memset(regs, 0, sizeof(regs)); /* The next proxy request reuses its buffer. */
     assert(queued_regs[0] == 11 && queued_regs[3] == 44);
@@ -230,12 +268,13 @@ def test_hv_join_failure_retains_state_and_joins_other_cpus(tmp_path):
 typedef uint64_t u64;
 #define MAX_CPUS 4
 #define BIT(n) (1ULL << (n))
-static bool hv_started_cpus[MAX_CPUS], hv_should_exit[MAX_CPUS];
+static bool hv_started_cpus[MAX_CPUS], hv_should_exit[MAX_CPUS], hv_setup_pending[MAX_CPUS];
 static bool hv_shutdown_failed;
 static u64 hv_cpus_in_guest;
 static int boot_cpu_idx, bhl, locked, waits, failed_cpu = -1, watchdog_error;
 static void spin_lock(int *lock) { assert(!locked); locked = 1; }
 static void spin_unlock(int *lock) { assert(locked); locked = 0; }
+static bool hv_cpu_state_setup_hook(void) { return true; }
 static int smp_id(void) { return boot_cpu_idx; }
 static void udelay(unsigned delay) {}
 static int hv_wdt_stop(void) { return watchdog_error; }
@@ -268,6 +307,12 @@ int main(void)
     watchdog_error = 0;
     assert(check_start(NULL, NULL) == -1 && !hv_shutdown_failed);
     assert(check_start(NULL, NULL) == 0);
+    hv_setup_pending[3] = true;
+    failed_cpu = 3;
+    assert(hv_join_cpus() == -1 && hv_setup_pending[3] && hv_shutdown_failed);
+    failed_cpu = -1;
+    assert(hv_join_cpus() == 0 && !hv_setup_pending[3] && !hv_shutdown_failed);
+    assert(waits & BIT(3));
     return 0;
 }
 '''
@@ -404,3 +449,234 @@ def test_guest_runner_retains_shell_and_attempts_sleep_after_errors():
         "run_shell": lambda *_args: events.append("shell"),
     })
     assert events == ["shell", "stop", "sleep"]
+
+
+def test_mmu_rejected_dispatch_does_not_wait(tmp_path):
+    source = (REPO / "src/memory.c").read_text()
+    start = source.index(" mmu_init_secondary(int cpu)")
+    start = source.rfind("\n", 0, start) + 1
+    mmu = source[start:source.index("void mmu_shutdown(", start)]
+    harness = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <stddef.h>
+typedef uint64_t u64;
+static int calls, waits;
+static void mmu_init_secondary_local(void) {}
+static int smp_call4(int cpu, void *fn, u64 a, u64 b, u64 c, u64 d)
+{ calls++; return -1; }
+static int smp_wait(int cpu, ...) { waits++; return -2; }
+''' + mmu + r'''
+int main(void)
+{
+    mmu_init_secondary(1);
+    assert(calls == 1 && waits == 0);
+    return 0;
+}
+'''
+    compile_and_run(tmp_path, "mmu-rejected-dispatch", harness)
+
+
+def test_dispatch_timeout_is_bounded(tmp_path):
+    source = (REPO / "src/smp.c").read_text()
+    table = source[source.index("struct spin_table {"):source.index("void *_reset_stack")]
+    start = source.index(" smp_call4(int cpu,")
+    start = source.rfind("\n", 0, start) + 1
+    end = source.index("\n}", start) + 2
+    call = source[start:end]
+    harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+typedef uint64_t u64;
+#define MAX_CPUS 4
+#define SMP_TIMEOUT -2
+static int barriers;
+#define sysop(op) assert(++barriers < 12)
+''' + table + r'''
+static struct spin_table spin_table[MAX_CPUS];
+static int boot_cpu_idx;
+static bool wfe_mode = true;
+static u64 ticks;
+static void smp_send_ipi(int cpu) {}
+static u64 get_ticks(void) { return ticks += 1000; }
+static u64 ticks_to_msecs(u64 value) { return value; }
+static void callback(void) {}
+''' + call + r'''
+int main(void)
+{
+    spin_table[1].flag = 1;
+    smp_call4(1, callback, 11, 22, 33, 44);
+    assert(spin_table[1].target == (u64)callback);
+    assert(spin_table[1].args[0] == 11 && spin_table[1].args[3] == 44);
+    return 0;
+}
+'''
+    compile_and_run(tmp_path, "bounded-dispatch", harness)
+
+
+def test_proxy_reports_dispatch_and_completion_failures(tmp_path):
+    source = (REPO / "src/proxy.c").read_text()
+    status_definitions = "\n".join(
+        line for line in (REPO / "src/proxy.h").read_text().splitlines()
+        if line.startswith("#define S_")
+    )
+    cases = source[source.index("        case P_SMP_START_SECONDARIES:"):
+                   source.index("        case P_HEAPBLOCK_ALLOC:")]
+    harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+typedef uint64_t u64;
+enum { P_SMP_START_SECONDARIES, P_SMP_STOP_SECONDARIES, P_SMP_CALL,
+       P_SMP_CALL_SYNC, P_SMP_WAIT, P_SMP_SET_WFE_MODE, P_SMP_IS_ALIVE,
+       P_SMP_CALL_EL1, P_SMP_CALL_EL1_SYNC, P_SMP_CALL_EL0, P_SMP_CALL_EL0_SYNC };
+''' + status_definitions + r'''
+struct request { u64 args[6]; };
+struct reply { int status; u64 retval; };
+static int dispatch_error, wait_error, calls, waits;
+static void el1_call(void) {}
+static void el0_call(void) {}
+static int smp_start_secondaries(void) { return dispatch_error; }
+static int smp_stop_secondaries(bool deep) { return dispatch_error; }
+static void smp_set_wfe_mode(bool mode) {}
+static bool smp_is_alive(int cpu) { return true; }
+static int smp_call4(int cpu, void *fn, u64 a, u64 b, u64 c, u64 d)
+{ calls++; return dispatch_error; }
+static int smp_wait_timed(int cpu, u64 *retval, unsigned timeout)
+{ waits++; if (!wait_error) *retval = 73; return wait_error; }
+static u64 smp_wait(int cpu, ...) { waits++; return 0; }
+static void process(int opcode, struct request *request, struct reply *reply)
+{
+    switch (opcode) {
+''' + cases + r'''
+    }
+}
+int main(void)
+{
+    struct request request = {.args = {1, 2, 3, 4, 5, 6}};
+    int async_ops[] = {P_SMP_CALL, P_SMP_CALL_EL1, P_SMP_CALL_EL0};
+    int sync_ops[] = {P_SMP_CALL_SYNC, P_SMP_CALL_EL1_SYNC, P_SMP_CALL_EL0_SYNC};
+    for (unsigned i = 0; i < 3; i++) {
+        struct reply reply = {.retval = 0xfeed};
+        dispatch_error = -2; calls = waits = 0;
+        process(async_ops[i], &request, &reply);
+        assert(reply.status == S_ERROR && calls == 1 && waits == 0);
+        reply.status = 0; calls = waits = 0;
+        process(sync_ops[i], &request, &reply);
+        assert(reply.status == S_ERROR && reply.retval == 0xfeed && waits == 0);
+        dispatch_error = 0; wait_error = -2;
+        reply.status = 0;
+        process(sync_ops[i], &request, &reply);
+        assert(reply.status == S_ERROR && reply.retval == 0xfeed);
+        wait_error = 0; reply.status = 0;
+        process(sync_ops[i], &request, &reply);
+        assert(reply.status == 0 && reply.retval == 73);
+    }
+    struct reply reply = {.retval = 0xfeed};
+    wait_error = -2;
+    process(P_SMP_WAIT, &request, &reply);
+    assert(reply.status == S_ERROR && reply.retval == 0xfeed);
+    dispatch_error = -1; reply.status = 0;
+    process(P_SMP_START_SECONDARIES, &request, &reply);
+    assert(reply.status == S_ERROR);
+    reply.status = 0;
+    process(P_SMP_STOP_SECONDARIES, &request, &reply);
+    assert(reply.status == S_ERROR);
+    return 0;
+}
+'''
+    compile_and_run(tmp_path, "proxy-smp-status", harness)
+
+
+def test_setup_join_margin_preserves_pending_call(tmp_path):
+    """A fake delayed callback completes after 1 s; no hardware latency claim."""
+    source = (REPO / "src/smp.c").read_text()
+    table = source[source.index("struct spin_table {"):source.index("void *_reset_stack")]
+    functions = source[source.index("int smp_call4("):source.index("void smp_set_wfe_mode(")]
+    harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef uint64_t u64;
+typedef uint32_t u32;
+#define MAX_CPUS 4
+#define SMP_TIMEOUT -2
+#define sysop(op) ((void)0)
+''' + table + r'''
+static struct spin_table spin_table[MAX_CPUS];
+static int boot_cpu_idx;
+static bool wfe_mode = true;
+static u64 ticks, acknowledge_at, complete_at;
+static bool acknowledged;
+static void smp_send_ipi(int cpu) {}
+static u64 get_ticks(void)
+{
+    ++ticks;
+    if (spin_table[1].target && !acknowledged && ticks >= acknowledge_at) {
+        spin_table[1].flag++;
+        acknowledged = true;
+    }
+    if (spin_table[1].target && ticks >= complete_at) {
+        spin_table[1].retval = 73;
+        spin_table[1].target = 0;
+    }
+    return ticks;
+}
+static u64 ticks_to_msecs(u64 value) { return value; }
+static void callback(void) {}
+''' + functions + r'''
+static void reset(u64 ack, u64 completion)
+{
+    memset(spin_table, 0, sizeof(spin_table));
+    spin_table[1].flag = 1;
+    ticks = 0;
+    acknowledged = false;
+    acknowledge_at = ack;
+    complete_at = completion;
+}
+int main(void)
+{
+    /* The ACK is prompt; completion takes longer than the old 1 s join. */
+    reset(5, 2500);
+    assert(smp_call_sync0(1, callback) == 0);
+    assert(ticks >= 2500 && ticks < 5000);
+    assert(spin_table[1].retval == 73 && !smp_has_pending_calls());
+
+    /* Completion on the join deadline is still success, not a false timeout. */
+    reset(5, 5006);
+    assert(smp_call_sync0(1, callback) == 0);
+    assert(ticks == 5006 && !smp_has_pending_calls());
+
+    /* Even a missed ACK can be recovered by observing actual completion. */
+    reset(UINT64_MAX, 2500);
+    assert(smp_call_sync0(1, callback) == 0);
+    assert(ticks >= 2500 && ticks < 6005 && !smp_has_pending_calls());
+
+    /* Neither timeout consumes or clears a call still owned by a secondary. */
+    reset(UINT64_MAX, UINT64_MAX);
+    assert(smp_call_sync0(1, callback) == SMP_TIMEOUT);
+    assert(ticks >= 6000 && ticks <= 6005);
+    struct spin_table pending = spin_table[1];
+    assert(smp_has_pending_calls());
+    u64 before = ticks;
+    assert(smp_call_sync0(1, callback) == SMP_TIMEOUT);
+    assert(ticks - before >= 5000 && ticks - before <= 5005);
+    assert(!memcmp(&pending, &spin_table[1], sizeof(pending)));
+    assert(smp_has_pending_calls());
+
+    /* Join the old slot without dispatching the new request over it. */
+    before = ticks;
+    complete_at = ticks + 2500;
+    assert(smp_call_sync0(1, callback) == -1);
+    assert(ticks - before >= 2500 && ticks - before < 5000);
+    assert(!spin_table[1].target && spin_table[1].retval == 73);
+    assert(!memcmp(pending.args, spin_table[1].args, sizeof(pending.args)));
+    assert(!smp_has_pending_calls());
+    return 0;
+}
+'''
+    compile_and_run(tmp_path, "smp-setup-join-margin", harness)

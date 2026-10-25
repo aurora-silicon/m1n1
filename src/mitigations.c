@@ -95,8 +95,11 @@ int mitigations_perform(void)
         if (i == boot_cpu_idx)
             continue;
         if (smp_is_alive(i)) {
-            if (smp_call0(i, apply_mitigations) || smp_wait(i, NULL)) {
+            int ret = smp_call_sync0(i, apply_mitigations);
+            if (ret) {
                 printf("Mitigations: CPU %d initialization failed\n", i);
+                if (ret == SMP_TIMEOUT)
+                    return ret;
                 failed = true;
             }
         }

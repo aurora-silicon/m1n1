@@ -200,6 +200,13 @@ bool rtkit_send(rtkit_dev_t *rtk, const struct rtkit_message *msg)
     return asc_send(rtk->asc, &asc_msg);
 }
 
+/* A failed handshake can already have granted host storage to firmware. */
+bool rtkit_has_owned_buffers(const rtkit_dev_t *rtk)
+{
+    return rtk && (rtk->syslog_bfr.owned || rtk->crashlog_bfr.owned || rtk->ioreport_bfr.owned ||
+                   rtk->oslog_bfr.owned);
+}
+
 bool rtkit_map(rtkit_dev_t *rtk, void *phys, size_t sz, u64 *dva)
 {
     sz = ALIGN_UP(sz, 16384);

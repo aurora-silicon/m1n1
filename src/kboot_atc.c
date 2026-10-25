@@ -505,6 +505,49 @@ static int dt_append_atc_tunable(void *dt, int adt_node, int fdt_node,
     return 0;
 }
 
+/*
+ * T6030 atc-phy3 drives only the HDMI port, as a DisplayPort PHY. Its USB and CIO lane tunables
+ * are optional: if the ADT does not have them, the common tunables (which DisplayPort needs) are
+ * still passed, and the kernel keeps the PHY to DisplayPort. Every other PHY needs every required
+ * entry, as before.
+ */
+static bool atc_lanes_optional(int port)
+{
+    return chip_id == T6030 && port == 3;
+}
+
+static bool atc_lane_tunable(const struct adt_tunable_info *t)
+{
+    static const char prefix[] = "apple,tunable-lane";
+    return !strncmp(t->fdt_name, prefix, sizeof(prefix) - 1);
+}
+
+/* The absent optional entries, for one log line: a ';'-separated list, cut short with "..." */
+struct atc_absent {
+    char list[192];
+    int count;
+    bool cut;
+};
+
+static void atc_note_absent(struct atc_absent *a, const char *name)
+{
+    size_t used = strlen(a->list);
+    size_t sep = used ? 1 : 0;
+
+    a->count++;
+    if (a->cut)
+        return;
+    /* Keep room for ";..." */
+    if (used + sep + strlen(name) + 4 >= sizeof(a->list)) {
+        strcpy(a->list + used, sep ? ";..." : "...");
+        a->cut = true;
+        return;
+    }
+    if (sep)
+        a->list[used++] = ';';
+    strcpy(a->list + used, name);
+}
+
 /* J700's DP lists use the same native ATC records as the USB lists above, but
  * their grouping and destination windows are distinct. Keep this map in the
  * order in which the Linux ATC PHY consumes the lists. */
@@ -808,6 +851,8 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
     int ret;
     const struct adt_tunable_info *tunables;
     size_t tunable_count;
+    bool lanes_optional = atc_lanes_optional(port);
+    struct atc_absent absent = {0};
 
     const char *fdt_path = fdt_get_alias(dt, dt_alias);
     if (fdt_path == NULL) {
@@ -860,6 +905,11 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
     }
 
     for (size_t i = 0; i < tunable_count; ++i) {
+        if (lanes_optional && atc_lane_tunable(&tunables[i]) &&
+            !adt_getprop(adt, adt_node, tunables[i].adt_name, NULL)) {
+            atc_note_absent(&absent, tunables[i].adt_name);
+            continue;
+        }
         if (chip_id == T8140 && !fdt_node_check_compatible(dt, 0, "apple,j700") &&
             !strcmp(tunables[i].fdt_name, "apple,tunable-axi2af"))
             continue;
@@ -867,6 +917,9 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
         if (ret)
             goto cleanup;
     }
+    if (absent.count)
+        printf("kboot: %s: %d optional lane tunables absent (%s); common tunables passed\n",
+               adt_path, absent.count, absent.list);
 
     if (adt_is_compatible_at(adt, adt_node, "atc-phy,t8142", 0) ||
         adt_is_compatible_at(adt, adt_node, "atc-phy,t8122", 0) ||
@@ -874,6 +927,9 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
         static const char *fdt_names[] = {"apple,tunable-lane0-cio", "apple,tunable-lane1-cio"};
         static const u32 lane_offsets[] = {0x9000, 0x10000};
         for (size_t i = 0; i < 2; i++) {
+            /* A lane without its CIO tunables gets none */
+            if (lanes_optional && !fdt_getprop(dt, fdt_node, fdt_names[i], NULL))
+                continue;
             if (fdt_appendprop_u32(dt, fdt_node, fdt_names[i],
                                    lane_offsets[i] + AUSPMA_RX_TOP_PMAFSM_RX_CTRL) < 0)
                 goto cleanup;

@@ -21,7 +21,13 @@ bool asc_is_v8(asc_dev_t *asc);
 void asc_cpu_start(asc_dev_t *asc);
 void asc_cpu_stop(asc_dev_t *asc);
 bool asc_cpu_running(asc_dev_t *asc);
-bool asc_validate_inherited_dcp(asc_dev_t *asc, const char *name, bool allow_idle);
+/* Inherited display coprocessor states accepted for a handoff. */
+enum asc_inherited_state {
+    ASC_INHERITED_RUNNING, /* started and not stopped */
+    ASC_INHERITED_IDLE,    /* started, stopped and idle */
+};
+
+bool asc_validate_inherited_dcp(asc_dev_t *asc, const char *name, enum asc_inherited_state state);
 
 bool asc_can_recv(asc_dev_t *asc);
 bool asc_can_send(asc_dev_t *asc);

@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
-import sys
 import tempfile
 import unittest
 
@@ -21,17 +20,20 @@ class ExternalScanoutWithdrawal(unittest.TestCase):
         cc = shlex.split(os.environ.get("CC", "cc"))
         flags = shlex.split(os.environ.get("CPPFLAGS", ""))
         link = shlex.split(os.environ.get("LDFLAGS", ""))
-        if sys.platform == "darwin" and Path("/opt/homebrew/include/libfdt.h").is_file():
-            flags += ["-I/opt/homebrew/include"]
-            link += ["-L/opt/homebrew/lib"]
+        # Exercise the production libfdt rather than a host-installed version.
+        library = root / "src/libfdt"
+        sources = [library / name for name in (
+            "fdt.c", "fdt_ro.c", "fdt_rw.c", "fdt_sw.c", "fdt_wip.c",
+            "fdt_empty_tree.c", "fdt_strerror.c",
+        )]
         fixture = root / "tests/data/t8140-iommu-withdrawal.c"
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             (work / "helper.c").write_text(source[start:end])
             binary = work / "withdrawal-test"
-            subprocess.run(cc + ["-std=c11", "-Wall", "-Wextra", "-Werror"] + flags +
-                           ["-I" + directory, str(fixture)] + link +
-                           ["-lfdt", "-o", str(binary)], check=True)
+            subprocess.run(cc + ["-D_GNU_SOURCE", "-std=c11", "-Wall", "-Wextra", "-Werror"] + flags +
+                           ["-I" + directory, "-I" + str(library), str(fixture)] +
+                           list(map(str, sources)) + link + ["-o", str(binary)], check=True)
             result = subprocess.run([str(binary)], check=True, text=True, capture_output=True)
             self.assertEqual(result.stdout.count("PASS "), 15, result.stdout)
             print(result.stdout, end="")

@@ -25,6 +25,21 @@ struct adt_function_smc_gpio {
 static char dcp_pmgr_dev[16] = "DISP0_CPU0";
 static u32 dcp_die;
 
+/* Set when a DCP did not stop. Its buffers and mappings are kept, and the next
+ * stage must not be entered while the firmware may still use them. */
+static bool dcp_running;
+
+static void dcp_mark_running(void)
+{
+    printf("dcp: firmware did not stop; keeping its buffers and mappings\n");
+    dcp_running = true;
+}
+
+bool dcp_left_running(void)
+{
+    return dcp_running;
+}
+
 static int dcp_hdmi_dptx_init(dcp_dev_t *dcp, const display_config_t *cfg)
 {
     int node = adt_path_offset(adt, cfg->dp2hdmi_gpio);
@@ -176,7 +191,7 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
     if (!dcp)
         return NULL;
 
-    dcp->dart_dcp = dart_init_adt(cfg->dcp_dart, 0, sid, true);
+    dcp->dart_dcp = dart_init_adt_display(cfg->dcp_dart, 0, sid);
     if (!dcp->dart_dcp) {
         printf("dcp: failed to initialize DCP DART\n");
         goto out_free;
@@ -184,7 +199,7 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
     u64 vm_base = dart_vm_base(dcp->dart_dcp);
     dart_setup_pt_region(dcp->dart_dcp, cfg->dcp_dart, sid, vm_base);
 
-    dcp->dart_disp = dart_init_adt(cfg->disp_dart, 0, 0, true);
+    dcp->dart_disp = dart_init_adt_display(cfg->disp_dart, 0, 0);
     if (!dcp->dart_disp) {
         printf("dcp: failed to initialize DISP DART\n");
         goto out_dart_dcp;
@@ -220,6 +235,8 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
                                        : rtkit_boot(dcp->rtkit);
     if (!booted) {
         printf("dcp: failed to boot RTKit\n");
+        if (rtkit_has_owned_buffers(dcp->rtkit))
+            goto out_running;
         goto out_iovad;
     }
 
@@ -238,9 +255,11 @@ dcp_dev_t *dcp_init(const display_config_t *cfg)
     return dcp;
 
 out_afk:
-    afk_epic_shutdown(dcp->afk);
+    if (afk_epic_shutdown(dcp->afk) < 0)
+        goto out_running;
 out_rtkit:
-    rtkit_quiesce(dcp->rtkit);
+    if (!rtkit_quiesce(dcp->rtkit))
+        goto out_running;
     rtkit_free(dcp->rtkit);
 out_iovad:
     iovad_shutdown(dcp->iovad_dcp, dcp->dart_dcp);
@@ -249,6 +268,9 @@ out_dart_dcp:
     dart_shutdown(dcp->dart_dcp);
 out_free:
     free(dcp);
+    return NULL;
+out_running:
+    dcp_mark_running();
     return NULL;
 }
 
@@ -261,17 +283,38 @@ int dcp_shutdown(dcp_dev_t *dcp, bool sleep)
         sleep = false;
     }
     /* dcp/dcp0 on desktop M2 and M2 Pro/Max devices do not wake from sleep */
-    dcp_system_shutdown(dcp->system_ep);
-    dcp_dptx_shutdown(dcp->dptx_ep);
-    dcp_dpav_shutdown(dcp->dpav_ep);
-    free(dcp->phy);
-    afk_epic_shutdown(dcp->afk);
-    if (sleep) {
-        rtkit_sleep(dcp->rtkit);
-        pmgr_reset(dcp_die, dcp_pmgr_dev);
-    } else {
-        rtkit_quiesce(dcp->rtkit);
+    /* An interface whose endpoint did not stop stays allocated and attached,
+     * since its callbacks can still run while another endpoint is polled. */
+    int ret = 0;
+    if (dcp_system_shutdown(dcp->system_ep) < 0)
+        ret = -1;
+    else
+        dcp->system_ep = NULL;
+    if (dcp_dptx_shutdown(dcp->dptx_ep) < 0)
+        ret = -1;
+    else
+        dcp->dptx_ep = NULL;
+    if (dcp_dpav_shutdown(dcp->dpav_ep) < 0)
+        ret = -1;
+    else
+        dcp->dpav_ep = NULL;
+    /* The DPTX ports use the PHY until their endpoint has stopped. */
+    if (!dcp->dptx_ep) {
+        free(dcp->phy);
+        dcp->phy = NULL;
     }
+    /* The firmware may still use every buffer and mapping below until it has
+     * stopped, so keep them all and report the failure. */
+    if (ret < 0 || afk_epic_shutdown(dcp->afk) < 0) {
+        dcp_mark_running();
+        return -1;
+    }
+    if (!(sleep ? rtkit_sleep(dcp->rtkit) : rtkit_quiesce(dcp->rtkit))) {
+        dcp_mark_running();
+        return -1;
+    }
+    if (sleep)
+        pmgr_reset(dcp_die, dcp_pmgr_dev);
     rtkit_free(dcp->rtkit);
     dart_shutdown(dcp->dart_disp);
     iovad_shutdown(dcp->iovad_dcp, dcp->dart_dcp);

@@ -134,7 +134,9 @@ dcp_system_if_t *dcp_system_init(dcp_dev_t *dcp)
     return system;
 
 err_shutdown:
-    afk_epic_shutdown_ep(system->epic);
+    /* Callbacks from an endpoint that did not stop can still reach this. */
+    if (afk_epic_shutdown_ep(system->epic) < 0)
+        return NULL;
 err_free:
     free(system);
     return NULL;
@@ -142,9 +144,11 @@ err_free:
 
 int dcp_system_shutdown(dcp_system_if_t *system)
 {
-    if (system) {
-        afk_epic_shutdown_ep(system->epic);
-        free(system);
-    }
+    if (!system)
+        return 0;
+    /* An endpoint that did not stop can still call back into this interface. */
+    if (afk_epic_shutdown_ep(system->epic) < 0)
+        return -1;
+    free(system);
     return 0;
 }

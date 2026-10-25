@@ -302,7 +302,7 @@ def test_isp_fdt_fails_closed_and_exports_heap(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     source = (repo / "src/kboot.c").read_text()
     start = source.index("static int dt_set_isp_fwdata(void)")
-    end = source.index("static int dt_disable_missing_devs(", start)
+    end = source.index("\n}\n", start) + 3
     helper = source[start:end]
     harness = r"""
 #include <assert.h>
@@ -379,3 +379,59 @@ int main(void)
          "-o", str(program)], input=harness, text=True, check=True,
     )
     subprocess.run([str(program)], check=True)
+
+
+def test_isp_firmware_revision_admission_matrix(tmp_path):
+    """The combined switch must not broaden the source contributions' admission."""
+    repo = Path(__file__).resolve().parents[2]
+    source = (repo / "src/isp.c").read_text()
+    source = source[source.index("#define ISP_ASC_VERSION"):]
+    helpers = TESTS[:TESTS.index("int main(void)")]
+    matrix = r'''
+int main(void)
+{
+    const u32 chips[] = {T6030, T6031, T6034, T8122};
+    const int firmware[] = {V14_7, V26_6_2};
+    for (unsigned int i = 0; i < ARRAY_SIZE(chips); i++) {
+        for (unsigned int j = 0; j < ARRAY_SIZE(firmware); j++) {
+            reset();
+            chip_id = chips[i];
+            revision = chip_id == T8122 ? ISP_VER_T8122 : ISP_VER_T603X;
+            os_firmware.version = firmware[j];
+            os_firmware.string = j ? "26.6.2" : "14.7";
+            segments[0].iova = 0; segments[0].size = 0x9d4000;
+            segments[1].iova = 0x9d4000; segments[1].size = 0x41c000;
+            int ret = isp_init();
+            u64 phys, iova, size;
+            if (firmware[j] == V26_6_2 && chip_id != T8122) {
+                assert(ret != 0);
+                assert(isp_get_heap(&phys, &iova, &size) != 0);
+                assert(!isp_initialized && !allocations);
+            } else {
+                assert(ret == 0);
+                assert(isp_get_heap(&phys, &iova, &size) == 0);
+                assert(phys == 0x100000000ULL);
+                assert(iova == (0xdf0000 | isp_iova_base()));
+                assert(size == 0x210000 && allocations == 1);
+            }
+            assert(enabled == 1 && disabled == 1 && active == 1 && gated == 1);
+            assert(dapf_calls == 0);
+        }
+    }
+    /* Keep the native T8140 sequence and its one-segment policy untouched. */
+    reset(); success();
+    reset();
+    segments[0].iova = 0; segments[0].size = ISP_T8140_SEG_END;
+    segments_len = sizeof(segments[0]);
+    success();
+    return 0;
+}
+'''
+    binary = tmp_path / "isp-firmware-admission"
+    subprocess.run(
+        ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-format",
+         "-Wno-unused-function", "-fsanitize=address,undefined",
+         "-x", "c", "-", "-o", str(binary)],
+        input=HARNESS + source + helpers + matrix, text=True, check=True,
+    )
+    subprocess.run([str(binary)], check=True)

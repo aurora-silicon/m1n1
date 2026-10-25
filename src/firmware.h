@@ -134,6 +134,7 @@ enum fw_version {
     V14_6B1,
     V14_6,
     V14_7,
+    V14_8_3, // Same iBoot string as V14_7; only selected by firmware_gfx_version()
     V15_0B1,
     V15_0B2,
     V15_0B3,
@@ -184,8 +185,13 @@ enum fw_version {
     V26_3B2,
     V26_3,
     V26_4,
-    V26_6_1,
+    V26_5,
+    V26_5_2,
+    V26_6,
     V26_6_2,
+    V26_7,
+    V26_7_1,
+    V27_0,
     NUM_FW_VERSIONS,
 };
 
@@ -213,5 +219,26 @@ bool firmware_iboot_in_range(u32 min[IBOOT_VER_COMP], u32 max[IBOOT_VER_COMP],
                              u32 this[IBOOT_VER_COMP]);
 bool firmware_sfw_in_range(enum fw_version lower_bound, enum fw_version upper_bound);
 void firmware_parse_version(const char *s, u32 *out);
+/*
+ * GPU firmware ABI of the image loaded in gfx-asc, or NULL if it is not positively identified as
+ * a known image of the SoC `chip`
+ */
+const struct fw_version_info *firmware_gfx_version(u32 chip);
+/*
+ * The same, but with `experimental` also accepting the images listed as experimental: their ABI is
+ * taken to be that of the version they are listed with, without having been validated
+ */
+const struct fw_version_info *firmware_gfx_version_ex(u32 chip, bool experimental);
+
+/* Diagnostic identity only. A valid header does not establish a supported GPU ABI. */
+struct gfx_fw_image_info {
+    u8 uuid[16];
+    u32 rtkit_version_offset;
+    u32 patchbay_offset;
+    u32 patchbay_size;
+    u32 text_size;
+};
+bool firmware_gfx_image_info(struct gfx_fw_image_info *out);
+bool firmware_gfx_rtkit_version(char out[64]);
 
 #endif

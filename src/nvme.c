@@ -258,7 +258,7 @@ static bool nvme_ctrl_shutdown(void)
 static bool nvme_exec_command(struct nvme_queue *q, struct nvme_command *cmd, u64 *result)
 {
     /* A timed-out command may still own slot 0 and its DMA mappings. */
-    if (q->failed)
+    if (nvme_reboot_required || q->failed)
         return false;
 
     bool found = false;
@@ -693,6 +693,10 @@ bool nvme_shutdown(void)
         return true;
     }
 
+    /* A failed queue can still own DMA even when the controller looks ready. */
+    if (nvme_type == NVME_T8132 && (adminq.failed || ioq.failed))
+        goto out_preserve;
+
     if (nvme_type == NVME_T8132 && nvme_keep_running_for_linux) {
         u32 cc = read32(nvme_base + NVME_CC);
         u32 csts = read32(nvme_base + NVME_CSTS);
@@ -714,28 +718,35 @@ bool nvme_shutdown(void)
     memset(&cmd, 0, sizeof(cmd));
     cmd.opcode = NVME_ADMIN_CMD_DELETE_SQ;
     cmd.cdw10 = 1; // sq id
-    if (!nvme_exec_command(&adminq, &cmd, NULL))
+    if (!nvme_exec_command(&adminq, &cmd, NULL)) {
         printf("nvme: delete sq command failed\n");
+        if (nvme_type == NVME_T8132)
+            goto out_preserve;
+    }
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.opcode = NVME_ADMIN_CMD_DELETE_CQ;
     cmd.cdw10 = 1; // cq id
-    if (!nvme_exec_command(&adminq, &cmd, NULL))
+    if (!nvme_exec_command(&adminq, &cmd, NULL)) {
         printf("nvme: delete cq command failed\n");
+        if (nvme_type == NVME_T8132)
+            goto out_preserve;
+    }
 
-    if (!nvme_ctrl_shutdown())
+    if (!nvme_ctrl_shutdown()) {
         printf("nvme: timeout while waiting for controller shutdown\n");
-    if (nvme_type == NVME_T8132) {
-        write64_lo_hi(nvme_base + NVME_IOQ_CMDS, 0);
-        write64_lo_hi(nvme_base + NVME_IOQ_CQES, 0);
+        if (nvme_type == NVME_T8132)
+            goto out_preserve;
     }
     if (!nvme_ctrl_disable()) {
         printf("nvme: timeout while waiting for CSTS.RDY to clear\n");
         if (nvme_type == NVME_T8132)
-            return false;
+            goto out_preserve;
     }
 
     if (nvme_type == NVME_T8132) {
+        write64_lo_hi(nvme_base + NVME_IOQ_CMDS, 0);
+        write64_lo_hi(nvme_base + NVME_IOQ_CQES, 0);
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
         /* Stage 2 and U-Boot adopt this session without servicing its mailbox
          * (only Linux takes RTKit ownership again), so stop the IOP pushing
@@ -767,13 +778,20 @@ bool nvme_shutdown(void)
 
     printf("nvme: shutdown done\n");
     return true;
+
+out_preserve:
+    /* Leave every queue allocation and the live RTKit session owned. */
+    nvme_reboot_required = true;
+    nvme_adopt_live_session = false;
+    printf("nvme: unsafe post-M4 queue handoff; retaining DMA resources until reboot\n");
+    return false;
 }
 
 bool nvme_flush(u32 nsid)
 {
     struct nvme_command cmd;
 
-    if (!nvme_initialized)
+    if (nvme_reboot_required || !nvme_initialized)
         return false;
 
     memset(&cmd, 0, sizeof(cmd));
@@ -801,8 +819,9 @@ static bool nvme_submit_read(u32 nsid, u64 lba, void *buffer, u32 count, u64 prp
 
 bool nvme_read_blocks(u32 nsid, u64 lba, void *buffer, u32 count)
 {
-    if (!nvme_initialized || ioq.failed || !count || count > NVME_MAX_READ_BLOCKS ||
-        ((u64)buffer & (SZ_4K - 1)) || lba > UINT64_MAX - (count - 1))
+    if (nvme_reboot_required || !nvme_initialized || ioq.failed || !count ||
+        count > NVME_MAX_READ_BLOCKS || ((u64)buffer & (SZ_4K - 1)) ||
+        lba > UINT64_MAX - (count - 1))
         return false;
 
     if (count > 1 && nvme_multi_enabled) {
