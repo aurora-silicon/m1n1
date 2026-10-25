@@ -2,8 +2,7 @@
 """Run kboot_gpu.c's T6040 GPU fill on real FDTs with a modelled ADT, efuse page and SGX.
 
 The ADT values here are synthetic. The test checks what the fill accepts and refuses, that SGX
-power is put back after the register reads, and that nothing is published when it refuses. It
-does not check the power model's numbers.
+power is put back after the register reads, and that nothing is published when it refuses. The public reference case also checks the power model's maximum-power components.
 """
 
 from pathlib import Path
@@ -79,13 +78,17 @@ static struct {
     u64 dies, count;
     struct aux_perf_state states[6];
 } cs = {.dies = 1, .count = 6}, afr = {.dies = 1, .count = 4};
-static u64 region[5][2];
+struct adt_segment_ranges { u64 phys, iova, remap; u32 size, unk; };
+static struct adt_segment_ranges segments[2];
+static u64 region[6][2];
 static u32 base_pstate = 1;
 static bool have_base_pstate, efuse_fault, sgx_fault;
 static u32 map_a[16], map_b[16];
 static const char *const region_names[5] = {
     "gfx-handoff", "gfx-shared-l2-region", "gfx-shared-region", "gpu-region", "gfx-data",
 };
+
+static int adt_path_offset(void *tree, const char *path) { (void)tree; return !strcmp(path, "/arm-io/gfx-asc") ? 2 : -1; }
 
 static int adt_path_offset_trace(void *tree, const char *path, int *trace)
 {
@@ -102,6 +105,7 @@ static int adt_get_reg(void *tree, int *path, const char *prop, int index, u64 *
 static const void *adt_getprop(void *tree, int node, const char *name, u32 *len)
 {
     (void)tree; (void)node;
+    if (!strcmp(name, "segment-ranges")) { *len = sizeof(segments); return segments; }
     if (!strcmp(name, "perf-states")) { *len = sizeof(states); return states; }
     if (!strcmp(name, "cs-perf-states")) { *len = sizeof(cs); return &cs; }
     if (!strcmp(name, "afr-perf-states")) { *len = sizeof(afr); return &afr; }
@@ -112,6 +116,7 @@ static int adt_copy(const char *name, void *out, size_t size)
     u32 value;
     if (!strcmp(name, "perf-state-count")) value = 16;
     else if (!strcmp(name, "perf-state-table-count")) value = 2;
+    else if (!strcmp(name, "gpu-num-perf-states")) value = 10;
     else if (!strcmp(name, "gpu-perf-base-pstate") && have_base_pstate) value = base_pstate;
     else {
         for (int i = 0; i < 5; i++) {
@@ -165,10 +170,10 @@ static u32 read32(u64 addr)
 MAIN = r'''
 static const u32 good_a[16] = {0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 15};
 static const u32 good_b[16] = {0, 1, 2, 3, 4, 6, 7, 9, 11, 13, 15};
-static const char *const region_paths[5] = {
+static const char *const region_paths[6] = {
     "/reserved-memory/uat-handoff", "/reserved-memory/uat-l2-pagetables",
     "/reserved-memory/uat-pagetables", "/reserved-memory/uat-ttbs",
-    "/reserved-memory/gpu-fw-data",
+    "/reserved-memory/gpu-fw-data", "/reserved-memory/gpu-fw-text",
 };
 
 static void add_opp_table(const char *name, u32 phandle, int count, int volts)
@@ -199,7 +204,7 @@ static void world(void)
     add_opp_table("afr-opp", 12, 4, 1);
     int resv = fdt_add_subnode(dt, 0, "reserved-memory");
     assert(resv >= 0);
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         int node = fdt_add_subnode(dt, fdt_path_offset(dt, "/reserved-memory"),
                                    region_paths[i] + strlen("/reserved-memory/"));
         assert(node >= 0 && !fdt_setprop_string(dt, node, "status", "disabled"));
@@ -222,10 +227,12 @@ static void world(void)
         cs.states[i] = (struct aux_perf_state){650000u + i * 50000u, 400000000u + i * 200000000u};
     for (int i = 0; i < 4; i++)
         afr.states[i] = (struct aux_perf_state){700000u + i * 50000u, 500000000u + i * 250000000u};
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         region[i][0] = 0x105fff70000UL + i * 0x40000UL;
         region[i][1] = 0x4000;
     }
+    segments[0] = (struct adt_segment_ranges){.phys = region[5][0], .size = region[5][1]};
+    segments[1] = (struct adt_segment_ranges){.phys = region[4][0], .size = region[4][1]};
     memcpy(map_a, good_a, sizeof(map_a));
     memcpy(map_b, good_b, sizeof(map_b));
     base_pstate = 1;
@@ -249,7 +256,7 @@ static void expect_refused(const char *what, int expected_enables)
         fprintf(stderr, "%s: GPU was not disabled\n", what);
         exit(1);
     }
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < 6; i++)
         if (strcmp(status(region_paths[i]), "disabled")) {
             fprintf(stderr, "%s: %s left published\n", what, region_paths[i]);
             exit(1);
@@ -270,7 +277,7 @@ int main(void)
     assert(dt_set_gpu_t6040(dt) == 0);
     assert(!strcmp(status("gpu"), "okay"));
     assert(enables == 1 && restores == 1 && !sgx_on);
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         assert(!strcmp(status(region_paths[i]), "okay"));
         int len;
         const fdt64_t *reg = fdt_getprop(dt, fdt_path_offset(dt, region_paths[i]), "reg", &len);
@@ -286,7 +293,26 @@ int main(void)
     assert(map && len == 11 * 4 && fdt32_ld(&map[1]) == 1 && fdt32_ld(&map[10]) == 15);
     const fdt32_t *mw = fdt_getprop(dt, gpu, "apple,max-power-mw", &len);
     assert(mw && len == 4 && fdt32_ld(mw) > 0);
+    const fdt32_t *version = fdt_getprop(dt, gpu, "apple,t6040-handoff-version", &len);
+    assert(version && len == 4 && fdt32_ld(version) == 1);
+    const fdt32_t *mask = fdt_getprop(dt, gpu, "apple,core-mask", &len);
+    assert(mask && len == 4 && fdt32_ld(mask) == 0xfffff);
     puts("PASS accepted");
+
+    /* Public J616s reference check, not calibration for the machine under test. */
+    assert(t6040_cluster_mw(1030, 1578, 1921.5f, 1.0f) == 29712);
+    assert(t6040_cluster_mw(1045, 1578, 1944.0f, 1.0f) == 30830);
+    assert(t6040_cs_mw(910, 1470, 251.0f) == 8574);
+    assert(29712 + 30830 + 8574 == 69116);
+    puts("PASS public power reference");
+
+    world(); map_a[15] = 3; map_b[15] = 7;
+    assert(dt_set_gpu_t6040(dt) == 0 && !strcmp(status("gpu"), "okay"));
+    puts("PASS unused map fields");
+    world(); segments[1].phys += 0x4000;
+    expect_refused("DATA segment disagrees with gfx-data", 0);
+    world(); segments[0].phys = region[0][0];
+    expect_refused("TEXT overlaps handoff", 0);
 
     world(); map_a[1] = 0;
     expect_refused("A map selects the off state", 1);
@@ -349,4 +375,4 @@ def test_t6040_gpu_fill(tmp_path):
                     str(cfile), *sources, "-lm", "-o", str(binary)], check=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("PASS") == 15, result.stdout
+    assert result.stdout.count("PASS") == 19, result.stdout

@@ -774,8 +774,6 @@ static int t6040_read32(u64 addr, u32 *val)
  */
 static int t6040_perf_map(u64 base, u32 *index)
 {
-    u32 n = 0;
-
     for (u32 i = 0; i < 16; i += 2) {
         u32 w;
         if (t6040_read32(base + 2 * i, &w))
@@ -783,10 +781,9 @@ static int t6040_perf_map(u64 base, u32 *index)
         index[i] = w & 0xf;
         index[i + 1] = (w >> 16) & 0xf;
     }
-    for (u32 i = 1; i < 16; i++)
-        if (index[i])
-            n = i + 1;
-    if (n != T6040_STATES || index[0] != 0)
+    /* Only gpu-num-perf-states + 1 entries are meaningful; ignore unused fields. */
+    const u32 n = T6040_STATES;
+    if (index[0] != 0)
         return -1;
     for (u32 i = 1; i < n; i++)
         if (index[i] <= index[i - 1])
@@ -845,6 +842,7 @@ static const struct {
     {"gfx-shared-region", "/reserved-memory/uat-pagetables"},
     {"gpu-region", "/reserved-memory/uat-ttbs"},
     {"gfx-data", "/reserved-memory/gpu-fw-data"},
+    {NULL, "/reserved-memory/gpu-fw-text"},
 };
 
 static int dt_set_gpu_t6040(void *dt)
@@ -861,15 +859,20 @@ static int dt_set_gpu_t6040(void *dt)
         return 0;
     }
 
+    /* Written last, so an older loader or an interrupted fill cannot enable the GPU. */
+    int ret = fdt_delprop(dt, gpu, "apple,t6040-handoff-version");
+    if (ret && ret != -FDT_ERR_NOTFOUND)
+        return -1;
     size_t touched = 0;
     int sgx_path[8];
     int sgx = adt_path_offset_trace(adt, "/arm-io/sgx", sgx_path);
-    u32 count, tables, len;
+    u32 count, tables, num_states, len;
     u64 sgx_base;
     if (sgx < 0 || adt_get_reg(adt, sgx_path, "reg", 0, &sgx_base, NULL) < 0 ||
         ADT_GETPROP(adt, sgx, "perf-state-count", &count) != sizeof(count) ||
         ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) != sizeof(tables) ||
-        count != T6040_OPPS || tables != T6040_CLUSTERS)
+        ADT_GETPROP(adt, sgx, "gpu-num-perf-states", &num_states) != sizeof(num_states) ||
+        num_states != T6040_STATES - 1 || count != T6040_OPPS || tables != T6040_CLUSTERS)
         goto disable;
 
     /* Operating point 0 is the off state; every other one is checked here before any use. */
@@ -902,17 +905,28 @@ static int dt_set_gpu_t6040(void *dt)
     if (base_pstate < 1 || base_pstate >= T6040_STATES - 1)
         goto disable;
 
+    int asc = adt_path_offset(adt, "/arm-io/gfx-asc");
+    const struct adt_segment_ranges *segments = adt_getprop(adt, asc, "segment-ranges", &len);
+    if (asc < 0 || !segments || len != 2 * sizeof(*segments))
+        goto disable;
+
     /* The reserved regions, the OPP tables and the GPU node must all take the fill. */
     u64 region_base[ARRAY_SIZE(t6040_regions)], region_size[ARRAY_SIZE(t6040_regions)];
     for (size_t i = 0; i < ARRAY_SIZE(t6040_regions); i++) {
         char prop[64];
-        snprintf(prop, sizeof(prop), "%s-base", t6040_regions[i].name);
-        if (ADT_GETPROP(adt, sgx, prop, &region_base[i]) != sizeof(u64))
-            goto disable;
-        snprintf(prop, sizeof(prop), "%s-size", t6040_regions[i].name);
-        if (ADT_GETPROP(adt, sgx, prop, &region_size[i]) != sizeof(u64) || !region_base[i] ||
-            !region_size[i] || (region_base[i] & (SZ_16K - 1)) || (region_size[i] & (SZ_16K - 1)) ||
-            region_base[i] > UINT64_MAX - region_size[i] ||
+        if (t6040_regions[i].name) {
+            snprintf(prop, sizeof(prop), "%s-base", t6040_regions[i].name);
+            if (ADT_GETPROP(adt, sgx, prop, &region_base[i]) != sizeof(u64))
+                goto disable;
+            snprintf(prop, sizeof(prop), "%s-size", t6040_regions[i].name);
+            if (ADT_GETPROP(adt, sgx, prop, &region_size[i]) != sizeof(u64))
+                goto disable;
+        } else {
+            region_base[i] = segments[0].phys;
+            region_size[i] = segments[0].size;
+        }
+        if (!region_base[i] || !region_size[i] || (region_base[i] & (SZ_16K - 1)) ||
+            (region_size[i] & (SZ_16K - 1)) || region_base[i] > UINT64_MAX - region_size[i] ||
             fdt_path_offset(dt, t6040_regions[i].path) < 0)
             goto disable;
         for (size_t j = 0; j < i; j++)
@@ -920,6 +934,8 @@ static int dt_set_gpu_t6040(void *dt)
                 region_base[j] < region_base[i] + region_size[i])
                 goto disable;
     }
+    if (segments[1].phys != region_base[4] || segments[1].size != region_size[4])
+        goto disable;
     int table =
         t6040_opp_table(dt, gpu, "operating-points-v2", count, T6040_CLUSTERS * sizeof(u32));
     if (table < 0 || t6040_opp_table(dt, gpu, "apple,cs-opp", aux[0]->count, sizeof(u32)) < 0 ||
@@ -1035,7 +1051,8 @@ static int dt_set_gpu_t6040(void *dt)
         t6040_set_u32s(dt, gpu, "apple,perf-relative-a", rel_a, n) ||
         t6040_set_u32s(dt, gpu, "apple,perf-relative-b", rel_b, n) ||
         fdt_setprop_u32(dt, gpu, "apple,perf-base-pstate", base_pstate) ||
-        fdt_setprop_u32(dt, gpu, "apple,max-power-mw", power[n - 1]))
+        fdt_setprop_u32(dt, gpu, "apple,max-power-mw", power[n - 1]) ||
+        fdt_setprop_u32(dt, gpu, "apple,core-mask", masks[0]))
         goto disable;
 
     while (touched < ARRAY_SIZE(t6040_regions)) {
@@ -1043,6 +1060,10 @@ static int dt_set_gpu_t6040(void *dt)
         if (dt_set_resvmem(dt, t6040_regions[r].path, region_base[r], region_size[r]))
             goto disable;
     }
+
+    gpu = fdt_path_offset(dt, "gpu");
+    if (fdt_setprop_u32(dt, gpu, "apple,t6040-handoff-version", 1))
+        goto disable;
 
     printf("FDT: GPU: T6040 cores %u+%u, max power %u mW, OS firmware %s\n", active[0], active[1],
            power[n - 1], os_firmware.string);
