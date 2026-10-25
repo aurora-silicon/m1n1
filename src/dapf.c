@@ -148,7 +148,111 @@ struct dapf_instance {
 
 static_assert(sizeof(struct dapf_instance) == 16, "Invalid DAPF instance size");
 
-static int dapf_preserve_t8132(const char *path, int index, int node, int *dart_path)
+/* A T8132 DAPF bank has 16 slices of 0x40 bytes. */
+#define T8132_DAPF_SLICES 16
+
+struct dapf_slice {
+    u64 start;
+    u64 end;
+    u32 r0;
+    u32 r4;
+    u32 r20;
+};
+
+static void dapf_t8132_put(u64 base, const struct dapf_slice *slice)
+{
+    write32(base + 0x04, slice->r4);
+    write64(base + 0x08, slice->start);
+    write64(base + 0x10, slice->end);
+    write32(base + 0x00, slice->r0);
+    write32(base + 0x20, slice->r20);
+}
+
+static const struct dapf_t8110_config *dapf_t8132_config(const char *path, int node, u32 instance,
+                                                         u32 *count)
+{
+    char prop[32];
+    u32 length;
+
+    snprintf(prop, sizeof(prop), "dapf-instance-%u", instance);
+    const struct dapf_t8110_config *config = adt_getprop(adt, node, prop, &length);
+    if (!config || !length || length % sizeof(*config) ||
+        length / sizeof(*config) > T8132_DAPF_SLICES) {
+        printf("dapf: Invalid T8132 %s for %s\n", prop, path);
+        return NULL;
+    }
+
+    *count = length / sizeof(*config);
+    for (u32 i = 0; i < *count; i++) {
+        if (config[i].end < config[i].start) {
+            printf("dapf: Invalid T8132 %s slice %u for %s\n", prop, i, path);
+            return NULL;
+        }
+    }
+    return config;
+}
+
+/*
+ * Program a genuine T8132 DAPF bank with the t8110 records of its
+ * dapf-instance property, in the t8110 register order, then read every slice
+ * back. The low two bits of an end and all but the low byte of r0 do not read
+ * back. On any mismatch, every slice gets its previous values back.
+ */
+static int dapf_program_t8132(const char *path, u64 base, int node, u32 instance)
+{
+    struct dapf_slice want[T8132_DAPF_SLICES], had[T8132_DAPF_SLICES];
+    u32 count;
+    const struct dapf_t8110_config *config = dapf_t8132_config(path, node, instance, &count);
+
+    if (!config)
+        return -1;
+
+    for (u32 i = 0; i < count; i++) {
+        u64 slice = base + 0x40 * i;
+
+        had[i] = (struct dapf_slice){
+            .start = read64(slice + 0x08),
+            .end = read64(slice + 0x10),
+            .r0 = read32(slice + 0x00),
+            .r4 = read32(slice + 0x04),
+            .r20 = read32(slice + 0x20),
+        };
+        want[i] = (struct dapf_slice){
+            .start = config[i].start,
+            .end = config[i].end,
+            .r0 = (config[i].r0_hi << 4) | config[i].r0_lo,
+            .r4 = config[i].r4,
+            .r20 = config[i].r20,
+        };
+    }
+
+    for (u32 i = 0; i < count; i++)
+        dapf_t8132_put(base + 0x40 * i, &want[i]);
+
+    for (u32 i = 0; i < count; i++) {
+        u64 slice = base + 0x40 * i;
+
+        if (read32(slice + 0x04) != want[i].r4 || read64(slice + 0x08) != want[i].start ||
+            (read64(slice + 0x10) & ~3UL) != (want[i].end & ~3UL) ||
+            (read32(slice + 0x00) & 0xff) != want[i].r0 || read32(slice + 0x20) != want[i].r20) {
+            for (u32 j = 0; j < count; j++)
+                dapf_t8132_put(base + 0x40 * j, &had[j]);
+            printf("dapf: T8132 DAPF slice %u for %s did not read back; restored\n", i, path);
+            return -1;
+        }
+    }
+
+    printf("dapf: Programmed %u T8132 DAPF slices for %s\n", count, path);
+    return 0;
+}
+
+/*
+ * Validate the typed instance metadata of a T8132 DART and the bank selected
+ * by index: 1 for a genuine DAPF bank, its instance number in *instance; 0 for
+ * a selected GAPF bank with no DAPF instance, whose state is preserved; -1
+ * otherwise.
+ */
+static int dapf_select_t8132(const char *path, int index, int node, int *dart_path, u32 *instance)
 {
     u32 length;
     const struct dapf_instance *instances = adt_getprop(adt, node, "instance", &length);
@@ -208,9 +312,83 @@ static int dapf_preserve_t8132(const char *path, int index, int node, int *dart_
         return -1;
     }
 
-    /* Do not admit the legacy writer, even for a genuine T8132 DAPF bank. */
-    printf("dapf: T8132 DAPF programming is unsupported for %s; preserving filter state\n", path);
-    return -1;
+    *instance = instances[index].instance;
+    return 1;
+}
+
+/*
+ * Program the T8132 DAPF bank of a consumer whose handoff the OS requested
+ * and whose firmware the caller checked is halted (the J713 AOP).
+ */
+int dapf_init_t8132_halted(const char *path, int index)
+{
+    int dart_path[8];
+    int node = adt_path_offset_trace(adt, path, dart_path);
+    u32 instance;
+    u64 base;
+
+    if (chip_id != T8132 || node < 0) {
+        printf("dapf: No T8132 DAPF %s\n", path);
+        return -1;
+    }
+    if (dapf_select_t8132(path, index, node, dart_path, &instance) != 1)
+        return -1;
+    if (adt_get_reg(adt, dart_path, "reg", index, &base, NULL) < 0) {
+        printf("dapf: Error getting DAPF %s base address.\n", path);
+        return -1;
+    }
+    return dapf_program_t8132(path, base, node, instance);
+}
+
+/*
+ * The windows of a T8132 DAPF bank, merged to whole 16K pages and sorted:
+ * the MMIO its consumer's firmware reaches through the DART at the windows'
+ * physical addresses. Returns their count, at most max, or -1.
+ */
+int dapf_t8132_windows(const char *path, int index, struct dapf_window *out, int max)
+{
+    int dart_path[8];
+    int node = adt_path_offset_trace(adt, path, dart_path);
+    u32 instance, count;
+
+    if (chip_id != T8132 || node < 0 || max <= 0 ||
+        dapf_select_t8132(path, index, node, dart_path, &instance) != 1)
+        return -1;
+
+    const struct dapf_t8110_config *config = dapf_t8132_config(path, node, instance, &count);
+    if (!config)
+        return -1;
+
+    int used = 0;
+    for (u32 i = 0; i < count; i++) {
+        /* The end of a DAPF slice is inclusive. */
+        struct dapf_window window = {
+            .start = ALIGN_DOWN(config[i].start, SZ_16K),
+            .end = ALIGN_UP(config[i].end + 1, SZ_16K),
+        };
+        int pos = used;
+
+        if (window.end <= window.start)
+            return -1;
+        while (pos > 0 && out[pos - 1].start > window.start)
+            pos--;
+        if (pos > 0 && window.start <= out[pos - 1].end) {
+            out[pos - 1].end = max(out[pos - 1].end, window.end);
+        } else {
+            if (used == max)
+                return -1;
+            memmove(&out[pos + 1], &out[pos], (used - pos) * sizeof(*out));
+            out[pos] = window;
+            used++;
+        }
+        /* A grown window may now reach the ones after it. */
+        while (pos + 1 < used && out[pos + 1].start <= out[pos].end) {
+            out[pos].end = max(out[pos].end, out[pos + 1].end);
+            memmove(&out[pos + 1], &out[pos + 2], (used - pos - 2) * sizeof(*out));
+            used--;
+        }
+    }
+    return used;
 }
 
 int dapf_init(const char *path, int index)
@@ -223,8 +401,17 @@ int dapf_init(const char *path, int index)
         return -1;
     }
 
-    if (chip_id == T8132)
-        return dapf_preserve_t8132(path, index, node, dart_path);
+    if (chip_id == T8132) {
+        u32 instance;
+        int ret = dapf_select_t8132(path, index, node, dart_path, &instance);
+
+        if (ret <= 0)
+            return ret;
+        /* Do not admit the legacy writer, even for a genuine T8132 DAPF bank. */
+        printf("dapf: T8132 DAPF programming is unsupported for %s; preserving filter state\n",
+               path);
+        return -1;
+    }
 
     u32 pwr;
     if (!adt_getprop(adt, node, "clock-gates", &pwr))
@@ -335,6 +522,13 @@ static int dapf_init_j713(void *dt)
 
     while (entry->path != NULL) {
         if (adt_path_offset(adt, entry->path) < 0) {
+            entry++;
+            continue;
+        }
+
+        /* kboot programs the AOP's with its firmware handoff, once the AOP is
+         * known to be halted. */
+        if (!strcmp(entry->consumer, "/arm-io/aop")) {
             entry++;
             continue;
         }
