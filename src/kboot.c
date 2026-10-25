@@ -5833,6 +5833,107 @@ static int dt_setup_sio(void)
     return 0;
 }
 
+/* The T8132 AOP DART's DAPF bank has 16 slices; their windows merge to fewer. */
+#define T8132_AOP_DAPF_WINDOWS 16
+
+/*
+ * The J713 AOP firmware reaches its DAPF windows (MMIO) through its DART at
+ * their physical addresses: reserve them there, so that the OS maps them in
+ * the AOP's DART before it starts the firmware.
+ */
+static int dt_reserve_t8132_aop_windows(const char *path)
+{
+    struct dapf_window windows[T8132_AOP_DAPF_WINDOWS];
+    int count = dapf_t8132_windows("/arm-io/dart-aop", 1, windows, ARRAY_SIZE(windows));
+    if (count <= 0) {
+        printf("FDT: %s: no AOP DAPF windows\n", path);
+        return -1;
+    }
+
+    int node = fdt_path_offset(dt, path);
+    uint32_t dev_phandle = node < 0 ? 0 : fdt_get_phandle(dt, node);
+    if (!dev_phandle)
+        return -1;
+
+    for (int i = 0; i < count; i++) {
+        char node_name[64];
+        u64 size = windows[i].end - windows[i].start;
+
+        snprintf(node_name, sizeof(node_name), "asc-mmio@%lx", windows[i].start);
+        int mem_node =
+            dt_get_or_add_reserved_mem(node_name, "apple,asc-mmio", true, windows[i].start, size);
+        if (mem_node < 0)
+            return -1;
+        uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
+        if (dt_device_set_reserved_mem(mem_node, node_name, dev_phandle, windows[i].start, size) ||
+            dt_device_add_mem_region(path, mem_phandle, NULL) < 0)
+            return -1;
+    }
+
+    printf("FDT: %s: %d AOP DAPF windows reserved\n", path, count);
+    return 0;
+}
+
+/*
+ * J713: iBoot leaves the AOP halted, its DART's DAPF empty, its external code
+ * (__ETEXT) in DRAM at a fixed address and its log (__OS_LOG) at a new one
+ * every boot. When the OS asks for the AOP's handoff, program the DAPF, then
+ * reserve both segments at the IOVAs the firmware uses (their remap
+ * addresses: EC0p for __ETEXT, the physical address for __OS_LOG) and the
+ * DAPF windows. Without all of it the firmware cannot run, so on any failure
+ * the AOP is disabled.
+ */
+static int dt_set_t8132_aop(const char *path)
+{
+    const char *why;
+    int node;
+
+    if (fdt_node_check_compatible(dt, 0, "apple,j713"))
+        return 0; /* No other M4 board's AOP handoff is qualified. */
+
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0 ||
+        fdt_stringlist_search(dt, chosen, "linux-enablement-mac,dapf-handoff", "/arm-io/aop") < 0) {
+        why = "its handoff was not requested";
+        goto disable;
+    }
+
+    asc_dev_t *asc = asc_init("/arm-io/aop");
+    if (!asc) {
+        why = "its ASC is unavailable";
+        goto disable;
+    }
+    bool running = asc_cpu_running(asc);
+    asc_free(asc);
+    if (running) {
+        why = "its CPU is running";
+        goto disable;
+    }
+
+    if (dapf_init_t8132_halted("/arm-io/dart-aop", 1)) {
+        why = "its DAPF is not programmed";
+        goto disable;
+    }
+    if (dt_reserve_asc_segments("/arm-io/aop/iop-aop-nub", NULL, path, true, 0, true)) {
+        why = "its firmware segments are not reserved";
+        goto disable;
+    }
+    if (dt_reserve_t8132_aop_windows(path)) {
+        why = "its DAPF windows are not reserved";
+        goto disable;
+    }
+
+    printf("FDT: %s: AOP handed off with its DAPF and firmware segments\n", path);
+    return 0;
+
+disable:
+    printf("FDT: %s: disabling the AOP: %s\n", path, why);
+    node = fdt_path_offset(dt, path);
+    if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled"))
+        bail("FDT: %s: cannot disable the AOP\n", path);
+    return 0;
+}
+
 /*
  * The T6040/T6041 AOP runs its __TEXT and __DATA from its own SRAM, but iBoot
  * leaves its external code (__ETEXT) and its log (__OS_LOG) in DRAM. Reserve
@@ -5842,10 +5943,11 @@ static int dt_setup_sio(void)
  */
 static int dt_set_aop_firmware(void)
 {
-    if (chip_id != T6040 && chip_id != T6041)
+    if (chip_id != T6040 && chip_id != T6041 && chip_id != T8132)
         return 0;
 
-    int node = fdt_node_offset_by_compatible(dt, -1, "apple,t6041-aop");
+    int node = fdt_node_offset_by_compatible(
+        dt, -1, chip_id == T8132 ? "apple,t8132-aop" : "apple,t6041-aop");
     if (node < 0)
         return 0;
 
@@ -5858,6 +5960,9 @@ static int dt_set_aop_firmware(void)
         printf("FDT: AOP node path too long\n");
         return 0;
     }
+
+    if (chip_id == T8132)
+        return dt_set_t8132_aop(path);
 
     u32 len = 0;
     int anode = adt_path_offset(adt, "/arm-io/aop");
