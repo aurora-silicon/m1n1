@@ -151,16 +151,23 @@ int main(void) {
  assert(dapf_t8132_windows("/arm-io/dart-pmp",1,w,16)<0);
  chip_id=T8140;assert(dapf_t8132_windows("/arm-io/dart-aop",1,w,16)<0);
  untouched();
- /* A slice that bridges two windows, and one that lands before a window it overlaps. */
+ /* A slice that bridges two windows, and one that lands before a window it overlaps.
+  * The last two sets grow a window that then reaches the next one. */
  static const u64 spans[][2]={{0x10000,0x13fff},{0x20000,0x23fff},{0xc000,0x2ffff},
-                               {0x80000,0x80fff},{0x7c000,0x80000}};
- for(unsigned i=0;i<5;i++) {
+                               {0x80000,0x80fff},{0x7c000,0x80000},
+                               {0x4000,0x7fff},{0xc000,0xffff},{0x4000,0xffff},
+                               {0x10000,0x13fff},{0x20000,0x23fff},{0x12000,0x20fff}};
+ for(unsigned i=0;i<11;i++) {
   memcpy(config+52*i,nodes[0].config,52);memcpy(config+52*i,spans[i],8);memcpy(config+52*i+8,spans[i]+1,8);
  }
  reset();nodes[0].config=config;nodes[0].config_len=3*52;
  assert(dapf_t8132_windows("/arm-io/dart-aop",1,w,16)==1&&w[0].start==0xc000&&w[0].end==0x30000);
  reset();nodes[0].config=config+3*52;nodes[0].config_len=2*52;
  assert(dapf_t8132_windows("/arm-io/dart-aop",1,w,16)==1&&w[0].start==0x7c000&&w[0].end==0x84000);
+ reset();nodes[0].config=config+5*52;nodes[0].config_len=3*52;
+ assert(dapf_t8132_windows("/arm-io/dart-aop",1,w,16)==1&&w[0].start==0x4000&&w[0].end==0x10000);
+ reset();nodes[0].config=config+8*52;nodes[0].config_len=3*52;
+ assert(dapf_t8132_windows("/arm-io/dart-aop",1,w,16)==1&&w[0].start==0x10000&&w[0].end==0x24000);
  puts("AOP DAPF: writer, read-back, restore, refusals, J713 caller and windows pass");
  return 0;
 }

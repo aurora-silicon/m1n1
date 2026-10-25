@@ -373,7 +373,9 @@ int dapf_t8132_windows(const char *path, int index, struct dapf_window *out, int
         while (pos > 0 && out[pos - 1].start > window.start)
             pos--;
         if (pos > 0 && window.start <= out[pos - 1].end) {
-            out[pos - 1].end = max(out[pos - 1].end, window.end);
+            /* Coalesce from the window that grew. */
+            pos--;
+            out[pos].end = max(out[pos].end, window.end);
         } else {
             if (used == max)
                 return -1;
