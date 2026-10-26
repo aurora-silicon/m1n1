@@ -75,9 +75,9 @@
  * registers are.
  *
  * T6041 display block of the M4 Pro (chip T6040, J616s only), with the desktop 26.6.2 DCP firmware:
- * the T6031 handoff with T6041 values, armed only by the boot.bin config line
- * chosen.asahi,t6041-dcp=1, and nothing else on an unarmed boot (no __OS_LOG reservation either,
- * until that has been checked on this machine). The DCP maps through dart-dcp SID 23 and the
+ * the T6031 handoff with T6041 values, selected by the DT's dcp alias and compatible with the
+ * qualified OS firmware. Without that description, no __OS_LOG reservation or handoff is made.
+ * The DCP maps through dart-dcp SID 23 and the
  * display and its piodma through dart-disp0 SIDs 0 and 16, of 32 streams each, so these SIDs are
  * per SoC (struct dcp_soc .sids). Marker apple,t6041-handoff; the nodes stay disabled.
  *
@@ -219,7 +219,7 @@ struct dcp_soc {
     const char *dcp_compat;
     const char *disp_compat;
     const char *marker; /* set to <1> on dcp, display and piodma by the handoff */
-    const char *optin;  /* /chosen property: the boot.bin config line chosen.<optin>=1 arms */
+    const char *optin;  /* optional experiment; NULL selects the qualified DT/firmware profile */
     bool always;        /* reserve, lock and check on every boot, not only when armed; otherwise
                            dart-dcp is only locked by a handoff whose checks have all passed */
     bool oslog_always;  /* reserve the __OS_LOG buffers on every boot, even when not armed */
@@ -378,8 +378,8 @@ static const struct dcp_soc dcp_soc_t6031 = {
  * maps through dart-dcp SID 23 and the display and its piodma through dart-disp0 SIDs 0 and 16, of
  * 32 streams each (ADT sid, sid-count, l2-tt-N). The addresses are this ADT's, after the arm-io
  * ranges; segments and the display power state come from the ADT. The DCP image is not pinned:
- * the kernel accepts only the 26.6.2 firmware. Nothing happens unless the boot.bin config line
- * chosen.asahi,t6041-dcp=1 is set, and the display nodes stay disabled.
+ * the kernel accepts only the 26.6.2 firmware. The DT's dcp alias and compatible select the
+ * qualified firmware handoff; the display nodes stay disabled until kernel admission.
  */
 static const char *const dcp_boards_t6041[] = {"apple,j616s", NULL};
 
@@ -392,7 +392,7 @@ static const struct dcp_soc dcp_soc_t6041 = {
     .dcp_compat = "apple,t6041-dcp",
     .disp_compat = "apple,display-subsystem",
     .marker = "apple,t6041-handoff",
-    .optin = "asahi,t6041-dcp",
+    .optin = NULL,
     .adt_psreg = true,
     .board_gate = true,
     .any_uuid = true,
@@ -2336,10 +2336,24 @@ static int dcp6_publish(void *dt, const struct dcp6_dt *n)
 
 static bool dcp6_armed(void *dt)
 {
+    if (!dcp6.soc->optin) {
+        int node = fdt_path_offset(dt, "dcp");
+        return dcp6.soc->os_fw != V_UNKNOWN && os_firmware.version == dcp6.soc->os_fw &&
+               node >= 0 && !fdt_node_check_compatible(dt, node, dcp6.soc->dcp_compat);
+    }
+
     int chosen = fdt_path_offset(dt, "/chosen");
     int len = 0;
     const char *optin = chosen >= 0 ? fdt_getprop(dt, chosen, dcp6.soc->optin, &len) : NULL;
     return optin && len == 2 && !strcmp(optin, "1");
+}
+
+static void dcp6_log_unarmed(void)
+{
+    if (dcp6.soc->optin)
+        dlog("not armed (no chosen.%s=1): no display handoff\n", dcp6.soc->optin);
+    else
+        dlog("no qualified %s DT/firmware profile: no display handoff\n", dcp6.soc->dcp_compat);
 }
 
 /* The segments' reservations: __OS_LOG's is in place, the others do not collide with anything */
@@ -2859,7 +2873,7 @@ int dt_set_display_handoff(void *dt)
             dcp6_find_nubs();
             dcp6_reserve_oslogs(dt);
         }
-        dlog("not armed (no chosen.%s=1): no display handoff\n", dcp6.soc->optin);
+        dcp6_log_unarmed();
         return 0;
     }
 
@@ -2873,7 +2887,7 @@ int dt_set_display_handoff(void *dt)
     if (armed)
         dcp6_handoff(dt);
     else
-        dlog("not armed (no chosen.%s=1): no display handoff\n", dcp6.soc->optin);
+        dcp6_log_unarmed();
     if (dcp6.soc->ext)
         dcpext6_handoffs(dt);
     return 0;

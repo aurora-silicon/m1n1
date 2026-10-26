@@ -5413,7 +5413,8 @@ static int dt_set_display(void)
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6040")) {
         /*
          * Fail-soft T6041 display block handoff (kboot_display_handoff.c): nothing unless the
-         * board is a J616s and chosen.asahi,t6041-dcp=1 is set; the display nodes stay disabled.
+         * board is a J616s and the DT's dcp compatible and OS firmware select the qualified
+         * handoff; the display nodes stay disabled until the kernel admits that handoff.
          */
         return dt_set_display_handoff(dt);
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {

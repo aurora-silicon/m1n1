@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: MIT
+/dts-v1/;
+
+/* Synthetic selector fixture; no hardware resources are described. */
+/ {
+    compatible = "apple,j616s", "apple,t6040";
+    aliases {
+        dcp = &dcp;
+    };
+    dcp: dcp {
+        compatible = "apple,t6041-dcp", "apple,dcp";
+        status = "disabled";
+    };
+    chosen {
+    };
+};
