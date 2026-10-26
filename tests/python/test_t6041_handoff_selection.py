@@ -25,7 +25,7 @@ def test_t6041_handoff_selection(tmp_path):
         profile = block(source, f"static const struct dcp_soc dcp_soc_{name} =")
         fields = []
         for field in ("optin", "os_fw", "dcp_compat"):
-            value = re.search(r"\." + field + r"\s*=\s*([^,\n]+),", profile)
+            value = re.search(r"\." + field + r'\s*=\s*("(?:\\.|[^"\\])*"|[A-Za-z_][A-Za-z_0-9]*)\s*,', profile)
             assert value is not None
             fields.append(f".{field} = {value[1]}")
         profiles.append(f"static const struct dcp_soc profile_{name} = {{" + ", ".join(fields) + "};")
@@ -98,7 +98,7 @@ int main(int argc, char **argv)
     unit.write_text(harness)
     binary, dtb = tmp_path / "selector", tmp_path / "fixture.dtb"
     libfdt = repo / "src/libfdt"
-    files = ("fdt", "fdt_ro", "fdt_rw", "fdt_wip", "fdt_sw", "fdt_empty_tree", "fdt_strerror")
+    files = ("fdt", "fdt_ro", "fdt_rw", "fdt_wip", "fdt_sw", "fdt_empty_tree", "fdt_strerror", "fdt_addresses")
     subprocess.run([os.environ.get("CC", "cc"), "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                     "-O1", "-g", "-fsanitize=address,undefined", "-fno-sanitize-recover=undefined",
                     "-fno-omit-frame-pointer", "-I" + str(libfdt), str(unit),
