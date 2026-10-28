@@ -1165,11 +1165,33 @@ int main(int argc, char **argv)
             const fdt32_t *mr = fdt_getprop(dt, ext, "memory-region", NULL);
             check(ext >= 0 && mr && !strcmp(fdt_getprop(dt, ext, "status", NULL), "disabled"),
                   "external processor stays disabled for the kernel gate");
+            bool passed = i != 0 || !is(s, "external-refuse");
             for (int j = 0; j < 3; j++) {
                 int region = fdt_node_offset_by_phandle(dt, fdt32_ld(&mr[j]));
                 const char *status = fdt_getprop(dt, region, "status", NULL);
                 int len;
                 const fdt32_t *map = fdt_getprop(dt, region, "iommu-addresses", &len);
+                if (j == 0) {
+                    /* TEXT is the panel's region, shared: one tuple per processor. */
+                    const char *name = fdt_get_name(dt, region, NULL);
+                    bool shared = name && !strncmp(name, "dcp-text@", 9);
+                    bool mapped = false;
+                    for (int k = 0; shared && map && (k + 5) * 4 <= len; k += 5) {
+                        fdt64_t dva;
+                        memcpy(&dva, &map[k + 1], sizeof(dva));
+                        if (fdt32_ld(&map[k]) == fdt_get_phandle(dt, ext) &&
+                            fdt64_to_cpu(dva) == segs[SEG_TEXT].remap)
+                            mapped = true;
+                    }
+                    check((shared && mapped) == passed,
+                          "external text is the panel's text region, mapped for this processor");
+                    char ph_name[24];
+                    snprintf(ph_name, sizeof(ph_name), "dcpext%d-text", i);
+                    check((fdt_subnode_offset(dt, fdt_path_offset(dt, "/reserved-memory"),
+                                              ph_name) < 0) == passed,
+                          "the text placeholder is gone exactly when the text is shared");
+                    continue;
+                }
                 bool ready = status && !strcmp(status, "okay") && map && len == 5 * 4;
                 check(ready == (i != 0 || !is(s, "external-refuse")),
                       "external memory is ready exactly when its ADT passed");
