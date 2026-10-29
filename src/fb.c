@@ -460,11 +460,23 @@ void fb_init(bool clear)
     fb.size = cur_boot_args.video.stride * cur_boot_args.video.height;
     printf("fb init: %dx%d (%d) [s=%d] @%p\n", fb.width, fb.height, fb.depth, fb.stride, fb.hwptr);
 
-    mmu_add_mapping(cur_boot_args.video.base, cur_boot_args.video.base, ALIGN_UP(fb.size, 0x4000),
-                    MAIR_IDX_NORMAL_NC, PERM_RW);
+    u64 fb_base = cur_boot_args.video.base;
+    size_t fb_map_size = ALIGN_UP(fb.size, 0x4000);
 
     fb.ptr = malloc(fb.size);
+
+    /*
+     * Copy what is on screen through a cacheable mapping: reading the 30 MB of a 5K panel through
+     * the non-cacheable one takes over a second. Nothing holds a cached copy of the framebuffer
+     * here, and the lines this copy brings in are invalidated before the mapping changes.
+     */
+    mmu_rm_mapping(fb_base, fb_map_size);
+    mmu_add_mapping(fb_base, fb_base, fb_map_size, MAIR_IDX_NORMAL, PERM_RW);
+    dc_ivac_range(fb.hwptr, fb_map_size);
     memcpy(fb.ptr, fb.hwptr, fb.size);
+    dc_ivac_range(fb.hwptr, fb_map_size);
+    mmu_rm_mapping(fb_base, fb_map_size);
+    mmu_add_mapping(fb_base, fb_base, fb_map_size, MAIR_IDX_NORMAL_NC, PERM_RW);
 
     // This is the touchbar, make everything tiny
     if (chip_id == T8012) {

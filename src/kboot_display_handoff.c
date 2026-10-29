@@ -105,6 +105,11 @@
 #include "libfdt/libfdt.h"
 
 #define dlog(fmt, ...) printf("DCP: %s: " fmt, dcp6.soc->name, ##__VA_ARGS__)
+/*
+ * Routine details of a handoff that went as expected (registers, segments, mappings). They
+ * are printed only in DEBUG builds: on a boot console they cost about a second.
+ */
+#define dlog_debug(fmt, ...) dprintf("DCP: %s: " fmt, dcp6.soc->name, ##__VA_ARGS__)
 
 #define bail(...)                                                                                  \
     do {                                                                                           \
@@ -668,7 +673,7 @@ static int dcp6_oslog_conflict(void *dt, u64 base, u64 size)
             continue;
         if (base < a || base + size > a + s)
             bail("__OS_LOG 0x%lx+0x%lx straddles /memreserve/ 0x%lx+0x%lx\n", base, size, a, s);
-        dlog("__OS_LOG 0x%lx+0x%lx lies inside /memreserve/ 0x%lx+0x%lx\n", base, size, a, s);
+        dlog_debug("__OS_LOG 0x%lx+0x%lx lies inside /memreserve/ 0x%lx+0x%lx\n", base, size, a, s);
     }
 
     /* the /reserved-memory part, with no /memreserve/ entries in the way */
@@ -949,8 +954,8 @@ static __attribute__((noinline)) void dcp6_reserve_oslogs(void *dt)
 
     for (int i = 0; i < dcp6.nnubs; i++)
         if (logs[i].add)
-            dlog("%s __OS_LOG reserved: /reserved-memory/%s (0x%lx+0x%lx, no-map)\n", dcp6.nubs[i],
-                 logs[i].name, logs[i].phys, logs[i].size);
+            dlog_debug("%s __OS_LOG reserved: /reserved-memory/%s (0x%lx+0x%lx, no-map)\n",
+                       dcp6.nubs[i], logs[i].name, logs[i].phys, logs[i].size);
 }
 
 /* ---- ADT description (dry run) ---- */
@@ -1437,7 +1442,7 @@ static void dcp6_describe_streams(const char *what, u64 base)
     }
     for (int sid = 0; sid < dcp6_streams(); sid++)
         if (tcr[sid] || ttbr[sid])
-            dlog("%s SID %d: TCR 0x%x TTBR 0x%x\n", what, sid, tcr[sid], ttbr[sid]);
+            dlog_debug("%s SID %d: TCR 0x%x TTBR 0x%x\n", what, sid, tcr[sid], ttbr[sid]);
 }
 
 /* Sets dart-dcp's PROTECT_TTBR_TCR (prot: PROTECT as read), which stays set until reset */
@@ -1661,10 +1666,10 @@ static int dcp6_derive_segs(const struct adt_segment_ranges *seg, int n, const c
     dcp6.defs = dcp6.derived;
     for (int i = 0; i < n; i++) {
         if (i == oslog)
-            dlog("dcp segment %d: %s, physical buffer\n", i, dcp6.derived[i].name);
+            dlog_debug("dcp segment %d: %s, physical buffer\n", i, dcp6.derived[i].name);
         else
-            dlog("dcp segment %d: %s, region-id-%d\n", i, dcp6.derived[i].name,
-                 dcp6.derived[i].region_id);
+            dlog_debug("dcp segment %d: %s, region-id-%d\n", i, dcp6.derived[i].name,
+                       dcp6.derived[i].region_id);
     }
     return 0;
 }
@@ -1974,14 +1979,16 @@ static void dcp6_dry_run(void)
         s->ok = !dcp6_walk(s, sids[i].dart, sids[i].vm, sids[i].base) && !dcp6_check_sid(s);
         if (!s->ok)
             continue;
+#ifdef DEBUG
         u64 pages = 0;
         for (int j = 0; j < s->nruns; j++)
             pages += s->runs[j].size / DART_PAGE;
-        dlog("%s SID %d: %d mappings, %lu pages, all in firmware segments (", s->what, s->sid,
-             s->nruns, pages);
+        dlog_debug("%s SID %d: %d mappings, %lu pages, all in firmware segments (", s->what, s->sid,
+                   s->nruns, pages);
         for (int j = 0; j < s->nruns; j++)
-            printf("%s%d@0x%lx", j ? " " : "", s->runs[j].seg, s->runs[j].dva);
-        printf(")\n");
+            dprintf("%s%d@0x%lx", j ? " " : "", s->runs[j].seg, s->runs[j].dva);
+        dprintf(")\n");
+#endif
     }
 }
 
@@ -2163,7 +2170,8 @@ static int dcp6_check_adt(void)
     if (soc->any_uuid) {
         if (!dcp6_is_uuid(uuid, len))
             bail("the dcp firmware image has no well-formed ADT uuid\n");
-        dlog("dcp firmware image %s, not pinned here: the kernel's board record decides\n", uuid);
+        dlog_debug("dcp firmware image %s, not pinned here: the kernel's board record decides\n",
+                   uuid);
     } else if (!uuid || len != strlen(soc->uuid) + 1 || memcmp(uuid, soc->uuid, len)) {
         bail("dcp firmware is not image %s\n", soc->uuid);
     }
