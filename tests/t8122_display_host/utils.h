@@ -5,6 +5,15 @@
 #include "soc.h"
 #include "types.h"
 #include <stdio.h>
+/* As in src/utils.h: dprintf() prints only in DEBUG builds. */
+#undef dprintf
+#ifdef DEBUG
+#define dprintf(...) printf(__VA_ARGS__)
+#else
+#define dprintf(...)                                                                               \
+    do {                                                                                           \
+    } while (0)
+#endif
 #define ARRAY_SIZE(s)        (sizeof(s) / sizeof((s)[0]))
 #define ALIGN_UP(x, a)       (((x) + ((a)-1)) & ~((a)-1))
 #define BIT(x)               (1UL << (x))

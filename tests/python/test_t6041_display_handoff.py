@@ -30,7 +30,8 @@ def build_host(tmp, unknown_profile=False):
         pytest.skip("no host C compiler")
     src = tmp / "src"
     src.mkdir()
-    # The code under test next to the stand-ins, so that its #include "utils.h" finds them
+    # The code under test next to the stand-ins, so that its #include "utils.h" finds them.
+    # It is built as DEBUG so that the handoff details the scenarios check are printed.
     code = (ROOT / "src/kboot_display_handoff.c").read_text()
     if unknown_profile:
         # An unqualified profile must never match even when the loaded firmware is unknown too.
@@ -45,7 +46,7 @@ def build_host(tmp, unknown_profile=False):
         shutil.copy(header, src)
     binary = tmp / "t6041-display-host"
     subprocess.run(
-        [cc, "-std=gnu11", "-D_GNU_SOURCE", "-O1", "-g", "-Wall", "-Wno-unused-function",
+        [cc, "-std=gnu11", "-D_GNU_SOURCE", "-DDEBUG", "-O1", "-g", "-Wall", "-Wno-unused-function",
          "-Wno-format", "-Wno-format-truncation", "-fsanitize=address,undefined",
          "-fno-omit-frame-pointer", "-fno-sanitize-recover=undefined",
          "-I", str(src), "-I", str(ROOT / "src"),
