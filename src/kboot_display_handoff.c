@@ -2971,11 +2971,28 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
     u32 owner = dcp6_phandle(dt, ext->dt_path);
     if (!owner)
         return -1;
-    for (int i = 0; i < 3; i++) {
+    /*
+     * TEXT is the panel's own region: give it this processor's mapping and
+     * point the text entry at it, as dcpext6 does, instead of describing the
+     * same memory a second time. The text placeholder is then deleted.
+     */
+    char text_name[64];
+    const struct dcp6_seg *text = &segs[SEG_TEXT];
+    snprintf(text_name, sizeof(text_name), "dcp-text@%lx", text->phys);
+    int shared = dcp6_find_resv(dt, text_name, text->phys, text->size);
+    if (shared < 0 || fdt_node_check_compatible(dt, shared, "apple,asc-mem") ||
+        dcp6_append_iommu_addr(dt, shared, owner, DCP6_DART_VM_BASE,
+                               text->remap - DCP6_DART_VM_BASE, text->size))
+        return -1;
+    shared = dcp6_find_resv(dt, text_name, text->phys, text->size);
+    u32 shared_ph = shared < 0 ? 0 : fdt_get_phandle(dt, shared);
+    if (!shared_ph)
+        return -1;
+    for (int i = 1; i < 3; i++) {
         const struct dcp6_seg *s = &segs[seg_index[i]];
         char name[64];
         fdt64_t region_reg[2] = {cpu_to_fdt64(s->phys), cpu_to_fdt64(s->size)};
-        if (i && dcp6_resv_conflict(dt, s->phys, s->size, ext->name))
+        if (dcp6_resv_conflict(dt, s->phys, s->size, ext->name))
             return -1;
         snprintf(name, sizeof(name), "%s-%s@%lx", ext->name, parts[i], s->phys);
         int region = fdt_node_offset_by_phandle(dt, ph[i]);
@@ -2988,6 +3005,13 @@ static int t6041_ext_fill(void *dt, const struct t6041_ext *ext)
             fdt_setprop_string(dt, region, "status", "okay"))
             return -1;
     }
+    fdt32_t mr_new[3] = {cpu_to_fdt32(shared_ph), cpu_to_fdt32(ph[1]), cpu_to_fdt32(ph[2])};
+    node = fdt_path_offset(dt, ext->dt_path);
+    if (node < 0 || fdt_setprop(dt, node, "memory-region", mr_new, sizeof(mr_new)))
+        return -1;
+    int placeholder = fdt_node_offset_by_phandle(dt, ph[0]);
+    if (placeholder < 0 || fdt_del_node(dt, placeholder))
+        return -1;
     node = fdt_path_offset(dt, ext->dt_path);
     if (node < 0 || firmware_set_fdt(dt, node, "apple,firmware-version", &os_firmware) ||
         firmware_set_fdt(dt, node, "apple,firmware-compat", &os_firmware))
