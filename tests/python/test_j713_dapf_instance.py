@@ -37,6 +37,10 @@ _Static_assert(sizeof(u64) == 8, "the m1n1 host fixture requires an LP64 host");
 #define PMGR_PS_ACTUAL 0xf0U
 #define PMGR_PS_ACTIVE 15
 #define FIELD_GET(mask,val) (((val)&(mask)) >> __builtin_ctz(mask))
+#define ALIGN_UP(x, a)   (((x) + ((a) - 1)) & ~((a) - 1))
+#define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
+#define max(a, b) (((a) > (b)) ? (a) : (b))
+#define SZ_16K (1 << 14)
 static int chip_id = T8132, pmgr_initialized = 1;
 static void *adt;
 struct node {
@@ -96,6 +100,7 @@ static int pmgr_find_device(unsigned id,const struct pmgr_device **out)
 static uintptr_t pmgr_device_get_addr(unsigned die,const struct pmgr_device *dev)
 {assert(!die&&dev==&device);return 0x1000;}
 static u32 read32(u64 addr){assert(addr==0x1000);return consumer_active?0xf0:0;}
+static u64 read64(u64 addr){(void)addr;assert(chip_id!=T8132);return 0;}
 static void write32(u64 addr,u32 value){(void)addr;(void)value;filter_writes++;assert(chip_id!=T8132);}
 static void write64(u64 addr,u64 value){(void)addr;(void)value;filter_writes++;assert(chip_id!=T8132);}
 static int fdt_path_offset(const void *dt,const char *p){(void)dt;(void)p;return 1;}
@@ -205,7 +210,8 @@ def test_j713_instance_and_power_flow(tmp_path):
         entries.append(f'{{"{node["name"]}",inst{i},cfg{i},sizeof(inst{i}),sizeof(cfg{i}),'
                        f'gates{i},{len(gates)},{{{bases}}},{{{sizes}}},{len(node["reg"])}}}')
     inputs = "\n".join(declarations) + '\nstatic const struct node original[3]={' + ",".join(entries) + '};\n'
-    harness = PREFIX + pmgr + "\n" + production + inputs + TESTS
+    window = block((repo / "src/dapf.h").read_text(), "struct dapf_window {") + ";\n"
+    harness = PREFIX + window + pmgr + "\n" + production + inputs + TESTS
     cfile, binary = tmp_path / "dapf-instance.c", tmp_path / "dapf-instance"
 
     def run(text, negative=False, label="production"):
@@ -218,8 +224,7 @@ def test_j713_instance_and_power_flow(tmp_path):
 
     run(harness)
     controls = [
-        ("central admission", 'if (chip_id == T8132)\n        return dapf_preserve_t8132(path, index, node, dart_path);',
-         'if (false) return dapf_preserve_t8132(path, index, node, dart_path);'),
+        ("central admission", 'if (chip_id == T8132) {\n        u32 instance;', 'if (false) {\n        u32 instance;'),
         ("partial records", 'length % sizeof(*instances) ||', 'false ||'),
         ("duplicate records", 'instances[i].type == instances[j].type &&', 'false &&'),
         ("false absence", '!has_dapf && instances[index].type == DAPF_INSTANCE_GAPF',
