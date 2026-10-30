@@ -1689,6 +1689,46 @@ err:
     return -1;
 }
 
+/* Copy calibration at boot, never substitute another machine's DART values. */
+static int dt_copy_pciec_dart_tunables(const char *adt_path, const char *dt_alias)
+{
+    const struct adt_tunable_info tunable = {
+        .adt_name = "dart-tunables-instance-0",
+        .fdt_name = "apple,tunable",
+        .reg_size = 0x4000,
+        .required = true,
+    };
+    const char *fdt_path = fdt_get_alias(dt, dt_alias);
+    if (!fdt_path)
+        return -1;
+    int host = fdt_path_offset(dt, fdt_path);
+    if (host < 0)
+        return -1;
+
+    int len;
+    const fdt32_t *map = fdt_getprop(dt, host, "iommu-map", &len);
+    /* PCIe-C describes one RID range and a one-cell stream specifier. */
+    if (!map || len != 4 * sizeof(*map))
+        return -1;
+    int dart = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(map[1]));
+    if (dart < 0 || fdt_node_check_compatible(dt, dart, "apple,t8110-dart"))
+        return -1;
+
+    /* Keep existing board tables, including the qualified T600x values. */
+    if (fdt_getprop(dt, dart, "apple,tunable", NULL))
+        return 0;
+    int adt_node = adt_path_offset(adt, adt_path);
+    if (adt_node < 0)
+        return -1;
+
+    if (dt_append_acio_tunable(adt_node, dart, &tunable)) {
+        /* The converter may have appended a prefix before rejecting input. */
+        fdt_delprop(dt, dart, "apple,tunable");
+        return -1;
+    }
+    return 0;
+}
+
 static int dt_set_pcie_tunables(void)
 {
     char adt_path[32];
@@ -1702,6 +1742,9 @@ static int dt_set_pcie_tunables(void)
         snprintf(fdt_alias, sizeof(fdt_alias), "usb4_%d_pcie", i);
 
         dt_copy_pciec_tunables(adt_path, fdt_alias);
+
+        snprintf(adt_path, sizeof(adt_path), "/arm-io/dart-apciec%d", i);
+        dt_copy_pciec_dart_tunables(adt_path, fdt_alias);
     }
 
     return 0;
