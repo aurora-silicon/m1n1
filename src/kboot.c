@@ -5850,6 +5850,49 @@ disable:
 }
 
 /*
+ * The AOP's accelerometer and gyroscope report only once the OS has sent them
+ * the machine's calibration. Copy it from the ADT services into the matching
+ * children of the OS AOP node; a missing service or property is skipped.
+ */
+static void dt_set_aop_motion_cal(const char *path)
+{
+    static const char *const services[] = {"accel", "gyro"};
+    static const char *const props[][2] = {
+        {"range-intr-cal", "apple,range-intrinsic-cal"},
+        {"nominal-extr-cal", "apple,nominal-extrinsic-cal"},
+        {"range-extr-cal", "apple,range-extrinsic-cal"},
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(services); i++) {
+        char adt_path[64], name[32];
+
+        snprintf(adt_path, sizeof(adt_path), "/arm-io/aop/iop-aop-nub/%s", services[i]);
+        int anode = adt_path_offset(adt, adt_path);
+        int aop = fdt_path_offset(dt, path);
+        int node = aop < 0 ? aop : fdt_subnode_offset(dt, aop, services[i]);
+        if (anode < 0 || node < 0)
+            continue;
+
+        int copied = 0;
+        for (size_t j = 0; j < ARRAY_SIZE(props); j++) {
+            u32 len = 0;
+
+            snprintf(name, sizeof(name), "%s-%s", services[i], props[j][0]);
+            const void *val = adt_getprop(adt, anode, name, &len);
+            if (!val || !len)
+                continue;
+            if (fdt_setprop(dt, node, props[j][1], val, len)) {
+                printf("FDT: %s/%s: cannot set %s\n", path, services[i], props[j][1]);
+                continue;
+            }
+            copied++;
+        }
+        printf("FDT: %s/%s: %d of %d calibration properties\n", path, services[i], copied,
+               (int)ARRAY_SIZE(props));
+    }
+}
+
+/*
  * The T6040/T6041 AOP runs its __TEXT and __DATA from its own SRAM, but iBoot
  * leaves its external code (__ETEXT) and its log (__OS_LOG) in DRAM. Reserve
  * those segments with the IOVAs the firmware uses for them (their remap
@@ -5875,6 +5918,8 @@ static int dt_set_aop_firmware(void)
         printf("FDT: AOP node path too long\n");
         return 0;
     }
+
+    dt_set_aop_motion_cal(path);
 
     if (chip_id == T8132)
         return dt_set_t8132_aop(path);
