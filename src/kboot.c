@@ -18,6 +18,7 @@
 #include "iodev.h"
 #include "isp.h"
 #include "kboot_atc.h"
+#include "kboot_n1.h"
 #include "kboot_display_facts.h"
 #include "kboot_gpu_t8122.h"
 #include "kboot_pmp_t8122.h"
@@ -6950,6 +6951,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_wifi())
         return -1;
     if (dt_set_bluetooth())
+        return -1;
+    if (kboot_setup_n1(dt))
         return -1;
     if (dt_set_uboot())
         return -1;
