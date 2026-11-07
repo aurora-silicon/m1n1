@@ -18,11 +18,23 @@
  *
  * Only run when the payload sets chosen.asahi,t6050-n1=1 (or =2 with the SMC release):
  * unmeasured on J716s.
+ *
+ * =3 (=4 with the SMC release) is for a boot chain whose chainloading stage-1 reads the ESP and
+ * then stops ANS, so this stage finds it stopped and the check above refuses.
+ * pcie_t6050_n1_train_ans() starts ANS with nvme_init() and reads a block, trains as =1/=2 with
+ * storage live, then requires the same register state and the same block, and stops ANS again
+ * with nvme_stop() (also on M4 and later), so Linux gets ANS as that stage-1 left it and no RTKit
+ * buffer of this session stays live. If storage is in doubt, Linux could not mount its root, so
+ * this resets the SoC through the watchdog instead and iBoot counts a failed boot. With ANS
+ * already running, =3/=4 train as =1/=2.
  */
 
 #include "pcie_t6050.h"
 #include "adt.h"
+#include "malloc.h"
+#include "nvme.h"
 #include "pmgr.h"
+#include "rtkit.h"
 #include "smc.h"
 #include "string.h"
 #include "tunables.h"
@@ -302,6 +314,7 @@ static const char *const storage_ps[] = {"APCIE_ST0", "APCIE_ST1",     "FAB6_SOC
                                          "ANS",       "APCIE_SYS_ST0", "APCIE_SYS_ST1"};
 static u64 storage_addr[ST_COUNT];
 static u32 storage_ref[ST_COUNT];
+static bool storage_have_ref;
 #define NVME_BOOT_STATUS_OK 0xde71ce55
 
 static int storage_find(void)
@@ -347,8 +360,10 @@ static int storage_check(const char *tag, bool reference)
 
     for (int i = 0; i < ST_COUNT; i++)
         cur[i] = read32(storage_addr[i]);
-    if (reference)
+    if (reference) {
         memcpy(storage_ref, cur, sizeof(cur));
+        storage_have_ref = true;
+    }
     for (int i = 0; i < ST_COUNT && !reference; i++) {
         if (cur[i] == storage_ref[i])
             continue;
@@ -671,4 +686,63 @@ void pcie_t6050_storage_lost(const char *why)
     wdt_reboot();
     while (true)
         ;
+}
+
+#define ANS_RUNNING() (read32(storage_addr[ST_ANS_CTRL]) & BIT(4))
+
+/* Stop the ANS this file started; it must really stop, as it was when we came */
+static void ans_stop(void)
+{
+    if (!nvme_stop())
+        pcie_t6050_storage_lost("nvme_stop failed");
+    if (ANS_RUNNING())
+        pcie_t6050_storage_lost("ANS still running after nvme_stop");
+    printf("pcie-t6050: ANS stopped again for Linux\n");
+}
+
+int pcie_t6050_n1_train_ans(bool smc_release)
+{
+    const u32 nsid = 1, lba = 1; /* the GPT header of the 4 KiB-block namespace */
+
+    TRY(storage_find());
+    if (ANS_RUNNING()) {
+        printf("pcie-t6050: ANS already running: training as =1/=2\n");
+        return pcie_t6050_n1_train(smc_release);
+    }
+
+    printf("pcie-t6050: ANS stopped (0x%x): starting it\n", read32(storage_addr[ST_ANS_CTRL]));
+    rtkit_set_boot_timeout(10 * USEC_PER_SEC); /* ANS can take ~3 s to answer after a stop */
+    bool up = nvme_init();
+    rtkit_set_boot_timeout(0);
+    if (!up) {
+        if (ANS_RUNNING())
+            pcie_t6050_storage_lost("nvme_init failed, ANS left running");
+        FAIL("nvme_init failed, ANS stopped as before: not training\n");
+    }
+
+    u8 *blk = memalign(SZ_16K, 2 * SZ_4K);
+    if (!blk || !nvme_read(nsid, lba, blk)) {
+        free(blk);
+        ans_stop();
+        FAIL("NVMe read before the training failed: not training\n");
+    }
+    printf("pcie-t6050: NVMe block %u read (%s)\n", lba,
+           memcmp(blk, "EFI PART", 8) ? "no GPT signature" : "GPT header");
+
+    int ret = pcie_t6050_n1_train(smc_release);
+
+    /* Whatever the outcome: the same storage registers, the same block, read through ANS */
+    if (ret == N1_STORAGE_LOST)
+        pcie_t6050_storage_lost("during the port 0 training");
+    if (storage_have_ref && storage_check("after training", false))
+        pcie_t6050_storage_lost("registers");
+    if (!nvme_read(nsid, lba, blk + SZ_4K))
+        pcie_t6050_storage_lost("read failed");
+    if (memcmp(blk, blk + SZ_4K, SZ_4K))
+        pcie_t6050_storage_lost("block differs");
+    free(blk);
+    printf("pcie-t6050: storage after training: NVMe read identical\n");
+
+    ans_stop();
+    return ret;
 }

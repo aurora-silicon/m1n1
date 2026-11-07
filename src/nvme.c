@@ -135,6 +135,7 @@ static bool nvme_initialized = false;
 static bool nvme_reboot_required;
 bool nvme_adopt_live_session = false;
 bool nvme_keep_running_for_linux = false;
+static bool nvme_stop_requested;
 static u8 nvme_die;
 
 static asc_dev_t *nvme_asc = NULL;
@@ -697,7 +698,7 @@ bool nvme_shutdown(void)
     if (nvme_type == NVME_T8132 && (adminq.failed || ioq.failed))
         goto out_preserve;
 
-    if (nvme_type == NVME_T8132 && nvme_keep_running_for_linux) {
+    if (nvme_type == NVME_T8132 && nvme_keep_running_for_linux && !nvme_stop_requested) {
         u32 cc = read32(nvme_base + NVME_CC);
         u32 csts = read32(nvme_base + NVME_CSTS);
         u32 boot_status = read32(nvme_base + NVME_BOOT_STATUS);
@@ -747,6 +748,9 @@ bool nvme_shutdown(void)
     if (nvme_type == NVME_T8132) {
         write64_lo_hi(nvme_base + NVME_IOQ_CMDS, 0);
         write64_lo_hi(nvme_base + NVME_IOQ_CQES, 0);
+    }
+    /* nvme_stop() goes on below and stops ANS as on M1-M3 */
+    if (nvme_type == NVME_T8132 && !nvme_stop_requested) {
 #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
         /* Stage 2 and U-Boot adopt this session without servicing its mailbox
          * (only Linux takes RTKit ownership again), so stop the IOP pushing
@@ -785,6 +789,20 @@ out_preserve:
     nvme_adopt_live_session = false;
     printf("nvme: unsafe post-M4 queue handoff; retaining DMA resources until reboot\n");
     return false;
+}
+
+/*
+ * Stop ANS completely, on M4 and later too, where nvme_shutdown() leaves the RTKit session and its
+ * buffers live for a later stage to adopt. For a caller that booted a stopped ANS itself and hands
+ * it to an OS that boots it again: nothing of this session outlives the call, so no firmware-owned
+ * buffer is left in what the OS sees as free RAM.
+ */
+bool nvme_stop(void)
+{
+    nvme_stop_requested = true;
+    bool ret = nvme_shutdown();
+    nvme_stop_requested = false;
+    return ret;
 }
 
 bool nvme_flush(u32 nsid)
