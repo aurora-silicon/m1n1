@@ -5372,6 +5372,12 @@ static bool skip_pmp_prop(const char *prop_name)
     return false;
 }
 
+/* A PMP tunable's length: the ADT flags the top bit of the property size, which is not length. */
+static u32 pmp_prop_size(const struct adt_property *prop)
+{
+    return prop->size & 0x7fffffff;
+}
+
 /*
  * Bytes dt_set_pmp() adds to the device tree: one "apple,tunable-<name>" property per PMP tunable,
  * each with its FDT property header, its value padded to four bytes and its name in the strings.
@@ -5389,7 +5395,7 @@ static u32 pmp_tunables_size(void)
     {
         if (skip_pmp_prop(prop->name))
             continue;
-        need += sizeof(struct fdt_property) + ALIGN_UP(prop->size & 0x7fffffff, 4) +
+        need += sizeof(struct fdt_property) + ALIGN_UP(pmp_prop_size(prop), 4) +
                 strlen("apple,tunable-") + strlen(prop->name) + 1;
     }
     return need;
@@ -5503,7 +5509,7 @@ static int dt_set_pmp(void)
             continue;
         char prop_name[128];
         snprintf(prop_name, sizeof(prop_name), "apple,tunable-%s", prop->name);
-        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, prop->size))
+        if (fdt_setprop(dt, pmp_node, prop_name, prop->value, pmp_prop_size(prop)))
             bail("FDT: failed to transfer pmp tunable");
     }
     pmp_node = fdt_path_offset(dt, "pmp");
