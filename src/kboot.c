@@ -18,6 +18,7 @@
 #include "iodev.h"
 #include "isp.h"
 #include "kboot_atc.h"
+#include "kboot_n1.h"
 #include "kboot_display_facts.h"
 #include "kboot_gpu_t8122.h"
 #include "kboot_pmp_t8122.h"
@@ -154,6 +155,18 @@ static bool kboot_show_notch(void)
             return chosen_params[i][1] && !strcmp(chosen_params[i][1], "1");
     }
     return false;
+}
+
+/* The value of payload variable chosen.<name>, or NULL */
+const char *kboot_get_chosen(const char *name)
+{
+    for (int i = 0; i < MAX_CHOSEN_PARAMS; i++) {
+        if (!chosen_params[i][0])
+            break;
+        if (!strcmp(chosen_params[i][0], name))
+            return chosen_params[i][1];
+    }
+    return NULL;
 }
 
 static int dt_set_rng_seed_sep(int node)
@@ -6996,6 +7009,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_wifi())
         return -1;
     if (dt_set_bluetooth())
+        return -1;
+    if (kboot_setup_n1(dt))
         return -1;
     if (dt_set_uboot())
         return -1;
